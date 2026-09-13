@@ -739,6 +739,22 @@ fn read_windows_do_not_hide_corruption_between_invocations() {
 }
 
 #[test]
+fn first_dedup_comparison_rejects_corruption_at_batch_edges_and_short_tail() {
+    let exact_len = 1024 * 1024 + 37;
+    for page_index in [0, 7, 8, 255, 256] {
+        let device = FaultDevice::blank(20);
+        let mut store = format(device.clone());
+        let _first = put_stream(&mut store, exact_len);
+        let prefix = pattern_chunk(0, 64);
+        device.flip_durable_page_with_prefix(&prefix, page_index * PAGE_SIZE + 7);
+        let mut writer = store.begin_blob(OBJECT_KIND, exact_len, None).unwrap();
+        stream_into_writer(&mut writer, exact_len);
+        assert!(block_on(writer.commit()).is_err(),
+            "first dedup must reject changed page {page_index}");
+    }
+}
+
+#[test]
 fn identical_streams_share_one_blob_but_publish_independent_revocable_objects() {
     let exact_len = 1024 * 1024 + 4097;
     let device = FaultDevice::blank(20);

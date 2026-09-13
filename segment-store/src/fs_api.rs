@@ -755,7 +755,14 @@ impl<D: PageDevice> SegmentStore<D> {
         if meta.bytes_len == 0 {
             return Ok(Vec::new());
         }
-        let mut encoded = self.read_verified_blob(object).await?;
+        let encoded = self.read_verified_blob(object).await?;
+        Self::fs_data_content_from_verified(encoded, meta)
+    }
+
+    fn fs_data_content_from_verified(
+        mut encoded: Vec<u8>,
+        meta: &FsDataNodeMeta,
+    ) -> Result<Vec<u8>, FsRootPublishError<D::Error>> {
         if encoded.len() != meta.encoded_len() {
             return Err(FsRootPublishError::InvalidRoot);
         }
@@ -2567,13 +2574,34 @@ impl<D: PageDevice> SegmentStore<D> {
                         .ancestors
                         .get(jump)
                         .ok_or(FsRootPublishError::InvalidRoot)?;
+                    let expected_index = current_index
+                        .checked_sub(1u64 << jump)
+                        .ok_or(FsRootPublishError::InvalidRoot)?;
+                    if expected_index == index {
+                        // The destination will be read in full. Authenticate its
+                        // metadata from that same verified buffer instead of
+                        // first issuing a separate directed leaf proof.
+                        let mapping = self.fs_mapping_for_reference(reference, FS_DATA_V1_KIND)?;
+                        if mapping.reference_codec != REFERENCE_CODEC_FS_V1 {
+                            return Err(FsRootPublishError::InvalidRoot);
+                        }
+                        let object = self.recover_fs_reference(reference, FS_DATA_V1_KIND)?;
+                        let encoded = self.read_verified_blob(&object).await?;
+                        let next_node = decode_fs_data_node_v1_prefix(&encoded)?;
+                        if next_node.encoded_len() as u64 != object.exact_len()
+                            || next_node.chunk_index != expected_index
+                            || next_node.total_len >= node.total_len
+                            || next_node.total_len.checked_add(node.bytes_len as u64)
+                                .is_none_or(|len| len > node.total_len)
+                        {
+                            return Err(FsRootPublishError::InvalidRoot);
+                        }
+                        return Ok(Some(Self::fs_data_content_from_verified(encoded, &next_node)?));
+                    }
                     let next = self.recover_fs_data_reference(reference).await?;
                     let FsPersistentDataLayout::Stream(next_node) = &next.layout else {
                         return Err(FsRootPublishError::InvalidRoot);
                     };
-                    let expected_index = current_index
-                        .checked_sub(1u64 << jump)
-                        .ok_or(FsRootPublishError::InvalidRoot)?;
                     if next_node.chunk_index != expected_index
                         || next_node.total_len >= node.total_len
                         || next_node.total_len + node.bytes_len as u64 > node.total_len
@@ -3046,6 +3074,43 @@ mod tests {
             block_on(store.read_fs_data_chunk(&tail, tail.chunk_count())).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn final_data_hop_verifies_once_and_rejects_invalid_target() {
+        let device = TestDevice::blank(32);
+        let mut store = format(device.clone());
+        let bytes = alloc::vec![0x5a; 1024 * 1024 + 37];
+        let first = block_on(store.commit_fs_data_chunk(None, &bytes)).unwrap();
+        let tail = block_on(store.commit_fs_data_chunk(Some(&first), b"tail")).unwrap();
+        let FsPersistentDataLayout::Stream(meta) = &first.layout else { panic!("stream"); };
+        block_on(store.read_fs_data_node_content(&first.object, meta)).unwrap();
+        device.media.lock().unwrap().read_count = 0;
+        assert_eq!(block_on(store.read_fs_data_node_content(&first.object, meta)).unwrap(), bytes);
+        let direct = device.media.lock().unwrap().read_count;
+        device.media.lock().unwrap().read_count = 0;
+        assert_eq!(block_on(store.read_fs_data_chunk(&tail, 0)).unwrap(), Some(bytes));
+        assert_eq!(device.media.lock().unwrap().read_count, direct,
+            "final hop must not add a directed prefix verification");
+
+        let mut wrong_index = tail.clone();
+        let reference = store.fs_reference_for(&tail.object).unwrap();
+        let FsPersistentDataLayout::Stream(node) = &mut wrong_index.layout else { panic!("stream"); };
+        node.ancestors[0] = reference;
+        assert!(block_on(store.read_fs_data_chunk(&wrong_index, 0)).is_err());
+
+        let mut wrong_total = tail.clone();
+        let FsPersistentDataLayout::Stream(node) = &mut wrong_total.layout else { panic!("stream"); };
+        node.total_len = meta.total_len;
+        assert!(block_on(store.read_fs_data_chunk(&wrong_total, 0)).is_err());
+
+        // Corrupt content beyond the structural prefix after a successful read.
+        // No prior metadata/proof observation may hide damaged target bytes.
+        let mut media = device.media.lock().unwrap();
+        let page = *media.visible.iter().find(|(_, page)| page.iter().all(|b| *b == 0x5a)).unwrap().0;
+        media.visible.get_mut(&page).unwrap()[123] ^= 1;
+        drop(media);
+        assert!(block_on(store.read_fs_data_chunk(&tail, 0)).is_err());
     }
 
     #[test]
@@ -3707,6 +3772,436 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn full_sink_batch_publication_recovers_at_every_page_mutation() {
+        let chunk_sizes = [4096_usize; 32];
+        let chunks: Vec<Vec<u8>> = chunk_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| alloc::vec![index as u8 + 1; *size])
+            .collect();
+        // Include room for the complete first batch plus its retry and the
+        // live namespace root; the ordinary 64-entry fixture is too small.
+        let test_limits = StoreLimits { max_catalog_entries: 128, ..limits() };
+        let run = |device: &TestDevice| -> (SegmentStore<TestDevice>, StoreMaintenance) {
+            let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+            block_on(store.format(FormatOptions {
+                store_uuid: StoreUuid::new(*b"VIBE-FS-ROOT-V1!").unwrap(),
+                cleaner_reserve_segments: 6,
+                limits: test_limits,
+            })).unwrap();
+            let root = empty_root(&mut store, 1, 2);
+            block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+            for index in 0..3_u8 {
+                drop(block_on(store.commit_fs_data_chunk(None, &alloc::vec![index + 0x60; 8192])).unwrap());
+            }
+            block_on(store.collect_garbage()).unwrap();
+            let maintenance = store.mint_maintenance_root().unwrap();
+            (store, maintenance)
+        };
+
+        let probe_device = TestDevice::blank(64);
+        let (mut probe, probe_maintenance) = run(&probe_device);
+        let baseline = probe.info().unwrap();
+        probe_device.reset_mutations();
+        block_on(probe.stage_fs_data_chunks_for_maintenance(&probe_maintenance, None, &chunks))
+            .unwrap();
+        let complete = probe.info().unwrap();
+        let mutation_count = probe_device.mutation_count();
+        assert!(mutation_count > 0);
+
+        for boundary in 0..mutation_count {
+            for action in [
+                FaultAction::NotSubmitted,
+                FaultAction::AmbiguousNone,
+                FaultAction::AmbiguousDurable,
+            ] {
+                let device = TestDevice::blank(64);
+                let (mut store, maintenance) = run(&device);
+                device.arm(boundary, action);
+                assert!(block_on(
+                    store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)
+                )
+                .is_err());
+                device.power_cycle();
+
+                let mut cold =
+                    SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+                block_on(cold.mount()).unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: cold mount failed: {error:?}")
+                });
+                let info = cold.info().unwrap();
+                // Atomicity: the batch is entirely present or entirely absent.
+                assert!(
+                    info.object_count == baseline.object_count
+                        || info.object_count == complete.object_count,
+                    "boundary {boundary} {action:?} recovered a partial batch",
+                );
+                // The recovered store must accept the same batch again.
+                let maintenance = cold.mint_maintenance_root().unwrap();
+                let tail = block_on(
+                    cold.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: re-stage failed: {error:?}")
+                });
+                for (index, expected) in chunks.iter().enumerate() {
+                    assert_eq!(block_on(cold.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                        Some(expected.clone()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "multi-segment publication fault qualification"]
+    fn multi_segment_batch_recovers_at_sampled_mutations() {
+        multi_segment_batch_fault_matrix(false);
+    }
+
+    #[test]
+    #[ignore = "exhaustive multi-segment publication faults; supports bounded shards"]
+    fn multi_segment_batch_recovers_at_every_page_mutation() {
+        multi_segment_batch_fault_matrix(true);
+    }
+
+    fn multi_segment_batch_fault_matrix(exhaustive: bool) {
+        let chunk_sizes = [4096_usize; 331];
+        let chunks: Vec<Vec<u8>> = chunk_sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| alloc::vec![(index as u8).wrapping_add(1); *size])
+            .collect();
+        // Include room for the complete first batch plus its retry and the
+        // live namespace root; the ordinary 64-entry fixture is too small.
+        let test_limits = StoreLimits { max_catalog_entries: 1024, recovery_memory_bytes: 64 * 1024 * 1024, ..limits() };
+        let run = |device: &TestDevice| -> (SegmentStore<TestDevice>, StoreMaintenance) {
+            let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+            block_on(store.format(FormatOptions {
+                store_uuid: StoreUuid::new(*b"VIBE-FS-ROOT-V1!").unwrap(),
+                cleaner_reserve_segments: 6,
+                limits: test_limits,
+            })).unwrap();
+            let root = empty_root(&mut store, 1, 2);
+            block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+            for index in 0..3_u8 {
+                drop(block_on(store.commit_fs_data_chunk(None, &alloc::vec![index + 0x60; 8192])).unwrap());
+            }
+            block_on(store.collect_garbage()).unwrap();
+            let maintenance = store.mint_maintenance_root().unwrap();
+            (store, maintenance)
+        };
+
+        let probe_device = TestDevice::blank(64);
+        let (mut probe, probe_maintenance) = run(&probe_device);
+        let baseline = probe.info().unwrap();
+        probe_device.reset_mutations();
+        let probe_tail = block_on(probe.stage_fs_data_chunks_for_maintenance(&probe_maintenance, None, &chunks))
+            .unwrap();
+        let complete_reference = probe.fs_reference_for(&probe_tail.object).unwrap();
+        let complete = probe.info().unwrap();
+        let mutation_count = probe_device.mutation_count();
+        assert!(mutation_count > 0);
+
+        let boundaries: Vec<_> = if exhaustive {
+            let bound = |name: &str, default: usize| -> usize {
+                std::env::var(name).map(|value| value.parse().expect("invalid fault shard bound"))
+                    .unwrap_or(default)
+            };
+            let start = bound("VIBEOS_MULTI_FAULT_START", 0);
+            let end = bound("VIBEOS_MULTI_FAULT_END", mutation_count);
+            assert!(start < end && end <= mutation_count, "invalid or empty fault shard");
+            std::println!("MULTI_FAULT_RANGE start={start} end={end} total={mutation_count}");
+            (start..end).collect()
+        } else {
+            let mut boundaries: Vec<_> = (0..mutation_count).step_by(256).collect();
+            boundaries.extend(mutation_count.saturating_sub(16)..mutation_count);
+            boundaries.sort_unstable(); boundaries.dedup();
+            boundaries
+        };
+        std::println!("MULTI_SEGMENT mutations={mutation_count} selected={} exhaustive={exhaustive}", boundaries.len());
+        for boundary in boundaries {
+            for action in [
+                FaultAction::NotSubmitted,
+                FaultAction::AmbiguousNone,
+                FaultAction::AmbiguousDurable,
+            ] {
+                let device = TestDevice::blank(64);
+                let (mut store, maintenance) = run(&device);
+                device.arm(boundary, action);
+                assert!(block_on(
+                    store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)
+                )
+                .is_err());
+                device.power_cycle();
+
+                let mut cold =
+                    SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+                block_on(cold.mount()).unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: cold mount failed: {error:?}")
+                });
+                let info = cold.info().unwrap();
+                // Atomicity: the batch is entirely present or entirely absent.
+                assert!(
+                    info.object_count == baseline.object_count
+                        || info.object_count == complete.object_count,
+                    "boundary {boundary} {action:?} recovered a partial batch",
+                );
+                assert_eq!(info.generation, if info.object_count == baseline.object_count {
+                    baseline.generation
+                } else { complete.generation });
+                if info.object_count == complete.object_count {
+                    let recovered_tail = block_on(cold.recover_fs_data_reference(complete_reference)).unwrap();
+                    for (index, expected) in chunks.iter().enumerate() {
+                        assert_eq!(block_on(cold.read_fs_data_chunk(&recovered_tail, index as u64)).unwrap(),
+                            Some(expected.clone()), "recovered content boundary {boundary} {action:?} chunk {index}");
+                    }
+                }
+                // The recovered store must accept the same batch again.
+                let maintenance = cold.mint_maintenance_root().unwrap();
+                let tail = block_on(
+                    cold.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("boundary {boundary} {action:?}: re-stage failed: {error:?}")
+                });
+                for index in [0, 127, 255, 330] {
+                    let expected = &chunks[index];
+                    assert_eq!(block_on(cold.read_fs_data_chunk(&tail, index as u64)).unwrap(),
+                        Some(expected.clone()));
+                }
+            }
+            if exhaustive { std::println!("MULTI_FAULT_PASS boundary={boundary} outcomes=3"); }
+        }
+    }
+
+    #[test]
+    #[ignore = "large multi-segment cold-read qualification"]
+    fn multi_segment_batch_cold_mount_reads_every_chunk() {
+        use vibeos_segment_format::PhysicalPointer;
+        for after_gc in [false, true] {
+            for count in [331_usize, 512, 1000] {
+                let device = TestDevice::blank(64);
+                let test_limits = StoreLimits {
+                    max_catalog_entries: 4096,
+                    recovery_memory_bytes: 64 * 1024 * 1024,
+                    ..limits()
+                };
+                let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+                block_on(store.format(FormatOptions {
+                    store_uuid: StoreUuid::new(*b"VIBE-FS-ROOT-V1!").unwrap(),
+                    cleaner_reserve_segments: 6,
+                    limits: test_limits,
+                })).unwrap();
+                let root = empty_root(&mut store, 1, 2);
+                block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+                drop(root);
+                if after_gc {
+                    for index in 0..3_u8 {
+                        drop(block_on(store.commit_fs_data_chunk(None, &alloc::vec![index + 0x60; 8192])).unwrap());
+                    }
+                    block_on(store.collect_garbage()).unwrap();
+                }
+                assert_eq!(store.require_current_generation().unwrap().allocation_version, 2);
+                let first_generation = store.require_current_generation().unwrap().next_segment_generation;
+                let before = store.info().unwrap();
+                // Unique full-width index avoids wrapping user content patterns.
+                let chunks: Vec<Vec<u8>> = (0..count).map(|index| {
+                    let mut bytes = alloc::vec![0x5a; 4096];
+                    bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    bytes
+                }).collect();
+                let maintenance = store.mint_maintenance_root().unwrap();
+                let tail = block_on(store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)).unwrap();
+                let reference = store.fs_reference_for(&tail.object).unwrap();
+                let complete = store.info().unwrap();
+                assert_eq!(complete.generation, before.generation + 1);
+                assert_eq!(complete.object_count, before.object_count + count as u32);
+                let state = store.require_current_generation().unwrap();
+                let mut metadata_segments = alloc::collections::BTreeSet::new();
+                for pointer in state.cas.as_ref().unwrap().blobs.iter().map(|blob| blob.manifest)
+                    .chain([state.catalog_root, state.allocation_root]) {
+                    if let PhysicalPointer::Value(pointer) = pointer {
+                        if pointer.segment_generation >= first_generation {
+                            metadata_segments.insert(pointer.segment_no);
+                        }
+                    }
+                }
+                assert!(metadata_segments.len() >= if count == 1000 { 4 } else { 2 });
+                let metadata_count = metadata_segments.len();
+                drop(tail); drop(maintenance); drop(store);
+                device.power_cycle();
+                // Construct a new runtime and recover the tail solely from its
+                // typed identity; no old handle or mounted-state cache survives.
+                let mut cold = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+                block_on(cold.mount()).unwrap();
+                let recovered = cold.info().unwrap();
+                assert_eq!(recovered.generation, complete.generation);
+                assert_eq!(recovered.object_count, complete.object_count);
+                let tail = block_on(cold.recover_fs_data_reference(reference)).unwrap();
+                assert_eq!(tail.chunk_count(), count as u64);
+                for (index, expected) in chunks.iter().enumerate() {
+                    assert_eq!(block_on(cold.read_fs_data_chunk(&tail, index as u64)).unwrap(), Some(expected.clone()),
+                        "after_gc={after_gc} count={count} chunk={index}");
+                }
+                std::println!("MULTI_COLD after_gc={after_gc} count={count} metadata_segments={metadata_count} generation={} verified={count}", recovered.generation);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "large live multi-segment batch GC qualification"]
+    fn multi_segment_batch_survives_gc_and_cold_namespace_recovery() {
+        let device = TestDevice::blank(64);
+        let test_limits = StoreLimits {
+            max_catalog_entries: 4096,
+            recovery_memory_bytes: 64 * 1024 * 1024,
+            ..limits()
+        };
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-ROOT-V1!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: test_limits,
+        })).unwrap();
+        let chunks: Vec<Vec<u8>> = (0..331_u64).map(|index| {
+            let mut bytes = alloc::vec![0x71; 4096];
+            bytes[..8].copy_from_slice(&index.to_le_bytes()); bytes
+        }).collect();
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)).unwrap();
+        let entries = [FsNodeEntryInput {
+            pending: None, key: b"large-stream", value: b"metadata", child: None, data: Some(&tail),
+        }];
+        let root = block_on(store.commit_fs_transaction_for_maintenance(
+            &maintenance, None, NAMESPACE, 1, 2, 1, &entries, &[],
+        )).unwrap();
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &root)).unwrap();
+        let original_blobs: Vec<_> = store.require_current_generation().unwrap().cas.as_ref().unwrap().blobs
+            .iter().filter(|blob| blob.blob_key.object_kind() == FS_DATA_V1_KIND).cloned().collect();
+        assert_eq!(original_blobs.len(), 331);
+        drop(root); drop(tail); drop(maintenance);
+        // Only the persistent namespace keeps the stream live. Fresh dead
+        // objects give the collector reclaimable work without runtime pins.
+        let mut moved = 0;
+        for round in 0..8_u8 {
+            for index in 0..4_u8 {
+                drop(block_on(store.commit_fs_data_chunk(None, &alloc::vec![round * 4 + index; 128 * 1024])).unwrap());
+            }
+            block_on(store.collect_garbage()).unwrap();
+            let current = &store.require_current_generation().unwrap().cas.as_ref().unwrap().blobs;
+            moved = original_blobs.iter().filter(|old| current.iter().any(|new|
+                new.blob_key == old.blob_key && new.manifest != old.manifest)).count();
+            if moved > 0 { break; }
+        }
+        assert!(moved > 0, "fixture must actually relocate live metadata");
+        drop(store);
+        device.power_cycle();
+        let mut cold = SegmentStore::new_with_runtime_context(device, test_limits, runtime());
+        block_on(cold.mount()).unwrap();
+        let root = block_on(cold.recover_fs_root(NAMESPACE)).unwrap().unwrap();
+        let entries = block_on(cold.read_fs_tree(&root, FsTreeKind::Inode, 8)).unwrap();
+        assert_eq!(entries.len(), 1);
+        let tail = entries[0].content.as_ref().unwrap();
+        assert_eq!(tail.chunk_count(), 331);
+        for (index, expected) in chunks.iter().enumerate() {
+            assert_eq!(block_on(cold.read_fs_data_chunk(tail, index as u64)).unwrap(), Some(expected.clone()));
+        }
+        std::println!("MULTI_GC relocated_manifests={moved} cold_verified=331");
+    }
+
+    #[test]
+    #[ignore = "fragmented physical metadata publication and cold recovery"]
+    fn multi_segment_batch_uses_fragmented_free_segments_and_cold_recovers() {
+        let device = TestDevice::blank(96);
+        let test_limits = StoreLimits {
+            max_catalog_entries: 4096,
+            recovery_memory_bytes: 64 * 1024 * 1024,
+            ..limits()
+        };
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime());
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-ROOT-V1!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: test_limits,
+        })).unwrap();
+        use crate::allocation_v2::SegmentAllocation;
+        use vibeos_segment_format::PhysicalPointer;
+        let initial_root = empty_root(&mut store, 1, 2);
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 0, &initial_root)).unwrap();
+        drop(initial_root);
+        let mut retained = Vec::new();
+        for round in 0..5_u64 {
+            for index in 0..12_u64 {
+                let mut bytes = alloc::vec![0x61; if index % 2 == 0 { 4096 } else { 128 * 1024 }];
+                bytes[..8].copy_from_slice(&(round * 12 + index).to_le_bytes());
+                let object = block_on(store.commit_fs_data_chunk(None, &bytes)).unwrap();
+                if index % 3 != 0 { retained.push(object); }
+            }
+            if round > 1 { retained.drain(..4); }
+            block_on(store.collect_garbage()).unwrap();
+        }
+        let prefix = {
+            let state = store.require_current_generation().unwrap();
+            (0..state.admitted_segments).take_while(|number|
+                state.allocation.segment_state(*number) == Some(SegmentAllocation::Free)).count() as u64
+        };
+        assert!(prefix >= 2);
+        // Consume the leading contiguous space with real committed objects,
+        // leaving two segments for the batch's packed data. Its metadata must
+        // then select the isolated free slots created by normal GC above.
+        for index in 0..prefix {
+            let state = store.require_current_generation().unwrap();
+            let first_free = (0..state.admitted_segments).find(|number|
+                state.allocation.segment_state(*number) == Some(SegmentAllocation::Free)).unwrap();
+            if first_free == prefix - 2 { break; }
+            assert!(first_free < prefix - 2, "filler overshot desired allocation frontier");
+            let mut bytes = alloc::vec![0x83; 4096];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            retained.push(block_on(store.commit_fs_data_chunk(None, &bytes)).unwrap());
+        }
+        let first_generation = store.require_current_generation().unwrap().next_segment_generation;
+        let chunks: Vec<Vec<u8>> = (0..331_u64).map(|index| {
+            let mut bytes = alloc::vec![0x71; 4096];
+            bytes[..8].copy_from_slice(&index.to_le_bytes()); bytes
+        }).collect();
+        let maintenance = store.mint_maintenance_root().unwrap();
+        let tail = block_on(store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)).unwrap();
+        let state = store.require_current_generation().unwrap();
+        let mut metadata_segments = alloc::collections::BTreeSet::new();
+        for pointer in state.cas.as_ref().unwrap().blobs.iter().map(|blob| blob.manifest)
+            .chain([state.catalog_root, state.allocation_root]) {
+            if let PhysicalPointer::Value(pointer) = pointer {
+                if pointer.segment_generation >= first_generation { metadata_segments.insert(pointer.segment_no); }
+            }
+        }
+        let metadata_segments: Vec<_> = metadata_segments.into_iter().collect();
+        assert!(metadata_segments.len() >= 2);
+        assert!(metadata_segments.windows(2).any(|pair| pair[1] > pair[0] + 1),
+            "fixture must actually publish to nonadjacent metadata segments: {metadata_segments:?}");
+        let entries = [FsNodeEntryInput {
+            pending: None, key: b"large-stream", value: b"metadata", child: None, data: Some(&tail),
+        }];
+        let root = block_on(store.commit_fs_transaction_for_maintenance(
+            &maintenance, None, NAMESPACE, 2, 2, 1, &entries, &[],
+        )).unwrap();
+        block_on(store.compare_exchange_fs_root(NAMESPACE, 1, &root)).unwrap();
+        drop(root); drop(tail); drop(maintenance); drop(retained);
+        drop(store);
+        device.power_cycle();
+        let mut cold = SegmentStore::new_with_runtime_context(device, test_limits, runtime());
+        block_on(cold.mount()).unwrap();
+        let root = block_on(cold.recover_fs_root(NAMESPACE)).unwrap().unwrap();
+        let entries = block_on(cold.read_fs_tree(&root, FsTreeKind::Inode, 8)).unwrap();
+        assert_eq!(entries.len(), 1);
+        let tail = entries[0].content.as_ref().unwrap();
+        assert_eq!(tail.chunk_count(), 331);
+        for (index, expected) in chunks.iter().enumerate() {
+            assert_eq!(block_on(cold.read_fs_data_chunk(tail, index as u64)).unwrap(), Some(expected.clone()));
+        }
+        std::println!("FRAGMENTED_MULTI metadata_segments={metadata_segments:?} cold_verified=331");
     }
 
     fn root_switch_fixture() -> (

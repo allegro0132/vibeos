@@ -169,7 +169,7 @@ fn persistent_object_read_requested_allocation() {
         TransactionId, ObjectId, ObjectKind, GrantRecord, DerivationId, SlotIdentity,
         SpaceId, DurableRights, ResourceKind, GrantFlags, RootPolicy};
     for (history_records, size) in [0usize, 256].into_iter().flat_map(|history_records| {
-        [4096usize, 65536, 131072, 368640].into_iter().map(move |size| (history_records, size))
+        [4096usize, 65536, 131072, 368640, 524288].into_iter().map(move |size| (history_records, size))
     }) {
         let device = Device::new();
         let limits = StoreLimits { recovery_memory_bytes: 64 * 1024 * 1024, ..StoreLimits::default() };
@@ -227,5 +227,115 @@ fn persistent_object_read_requested_allocation() {
         assert_eq!(device.writes.load(Ordering::Relaxed), 0);
         assert_eq!(device.flushes.load(Ordering::Relaxed), 0);
         println!("OBJECT_READ_MEMORY history_records={history_records} size={size} peak_extra={peak} calls={calls} read_pages={}", device.reads.load(Ordering::Relaxed));
+    }
+}
+
+#[test]
+#[ignore = "isolated host allocation measurement"]
+fn streaming_blob_verification_requested_allocation() {
+    for size in [4096, 128 * 1024, 1024 * 1024] {
+        let device = Device::new();
+        let limits = StoreLimits { recovery_memory_bytes: 64 * 1024 * 1024, ..StoreLimits::default() };
+        let mut store = SegmentStore::new(device.clone(), limits);
+        run(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(),
+            cleaner_reserve_segments: 4, limits })).unwrap();
+        let content = vec![0x5a; size];
+        let mut writer = store.begin_blob(7, size as u64, None).unwrap();
+        for chunk in content.chunks(4096) { run(writer.write_chunk(chunk)).unwrap(); }
+        let object = run(writer.commit()).unwrap();
+        for full in [true, false] {
+            device.reset();
+            let baseline = LIVE.load(Ordering::Relaxed);
+            PEAK.store(baseline, Ordering::Relaxed);
+            let calls = ALLOCATION_CALLS.load(Ordering::Relaxed);
+            let requested = REQUESTED_BYTES.load(Ordering::Relaxed);
+            if full {
+                let verified = run(store.verify_blob(&object)).unwrap();
+                assert_eq!(verified.descriptor.byte_len, size as u64);
+            } else {
+                let chunk = run(store.get_blob_chunk(&object, 0)).unwrap();
+                assert_eq!(chunk.bytes, content[..4096]);
+            }
+            let calls = ALLOCATION_CALLS.load(Ordering::Relaxed) - calls;
+            let requested = REQUESTED_BYTES.load(Ordering::Relaxed) - requested;
+            let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+            assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+            assert_eq!(device.flushes.load(Ordering::Relaxed), 0);
+            println!("MERKLE_READ_MEMORY size={size} full={full} calls={calls} requested_bytes={requested} peak_extra={peak} read_pages={}",
+                device.reads.load(Ordering::Relaxed));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requested-allocation probe; run alone"]
+fn first_dedup_commit_requested_allocation() {
+    for size in [4096, 128 * 1024, 1024 * 1024 + 37, 4 * 1024 * 1024 + 37] {
+        let device = Device::new();
+        let limits = StoreLimits { recovery_memory_bytes: 64 * 1024 * 1024, ..StoreLimits::default() };
+        let mut store = SegmentStore::new(device.clone(), limits);
+        run(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(),
+            cleaner_reserve_segments: 4, limits })).unwrap();
+        let content = vec![0x5a; size];
+        for duplicate in [false, true] {
+            let mut writer = store.begin_blob(7, size as u64, None).unwrap();
+            for chunk in content.chunks(4096) { run(writer.write_chunk(chunk)).unwrap(); }
+            device.reset();
+            let baseline = LIVE.load(Ordering::Relaxed);
+            PEAK.store(baseline, Ordering::Relaxed);
+            let calls = ALLOCATION_CALLS.load(Ordering::Relaxed);
+            let requested = REQUESTED_BYTES.load(Ordering::Relaxed);
+            let object = run(writer.commit()).unwrap();
+            let calls = ALLOCATION_CALLS.load(Ordering::Relaxed) - calls;
+            let requested = REQUESTED_BYTES.load(Ordering::Relaxed) - requested;
+            let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+            println!("DEDUP_COMMIT_MEMORY size={size} duplicate={duplicate} calls={calls} requested_bytes={requested} peak_extra={peak} read_pages={}",
+                device.reads.load(Ordering::Relaxed));
+            assert_eq!(run(store.verify_blob(&object)).unwrap().descriptor.byte_len, size as u64);
+        }
+    }
+}
+
+#[test]
+#[ignore = "isolated batch requested-allocation probe; run alone"]
+fn batch_publication_requested_allocation() {
+    for (count, size) in [(1, 4096), (8, 4096), (32, 4096), (100, 4096),
+                           (128, 4096), (256, 4096), (330, 4096),
+                           (32, 128 * 1024), (100, 128 * 1024)] {
+        let device = Device::new();
+        let limits = StoreLimits { recovery_memory_bytes: 64 * 1024 * 1024, ..StoreLimits::default() };
+        let (runtime, _quota, provisioner) = StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+            &vibeos_segment_store::fs_typed_reference_kinds()).unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits, runtime);
+        run(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(),
+            cleaner_reserve_segments: 4, limits })).unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let id = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(id);
+        let records = vec![chain.append(None, RecordBody::Format).unwrap()];
+        let import = PersistentAuthorityImport::from_m4(&records, id, &[], b"batch allocation probe", vec![]).unwrap();
+        let _view = run(store.import_persistent_authority(&maintenance, import)).unwrap();
+        for index in 0..3u8 {
+            drop(run(store.commit_fs_data_chunk_for_maintenance(
+                &maintenance, None, &vec![index + 1; 4096])).unwrap());
+        }
+        run(store.collect_garbage()).unwrap();
+        let chunks: Vec<Vec<u8>> = (0..count).map(|index| vec![(index as u8).wrapping_add(1); size]).collect();
+        device.reset();
+        let baseline = LIVE.load(Ordering::Relaxed);
+        PEAK.store(baseline, Ordering::Relaxed);
+        IO_PEAK.store(baseline, Ordering::Relaxed);
+        let calls = ALLOCATION_CALLS.load(Ordering::Relaxed);
+        let requested = REQUESTED_BYTES.load(Ordering::Relaxed);
+        let tail = run(store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)).unwrap();
+        let calls = ALLOCATION_CALLS.load(Ordering::Relaxed) - calls;
+        let requested = REQUESTED_BYTES.load(Ordering::Relaxed) - requested;
+        let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+        let io_peak = IO_PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
+        println!("BATCH_MEMORY count={count} size={size} calls={calls} requested_bytes={requested} peak_extra={peak} io_peak_extra={io_peak} write_pages={} write_requests={} flushes={}",
+            device.writes.load(Ordering::Relaxed), device.write_requests.load(Ordering::Relaxed), device.flushes.load(Ordering::Relaxed));
+        for (index, expected) in chunks.iter().enumerate() {
+            assert_eq!(run(store.read_fs_data_chunk(&tail, index as u64)).unwrap(), Some(expected.clone()));
+        }
     }
 }

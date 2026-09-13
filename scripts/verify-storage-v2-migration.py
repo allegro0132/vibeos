@@ -77,6 +77,7 @@ FS_ROOT_LEN = 0xB0
 FS_NODE_HEADER_LEN = 0x40
 FS_ENTRY_HEADER_LEN = 0x30
 FS_DATA_HEADER_LEN = 0x40
+FS_DATA_CHUNK_MAX_LEN = 4 * 1024 * 1024
 FS_REFERENCE_LEN = 0x28
 
 
@@ -1930,7 +1931,7 @@ def parse_fs_data(payload: bytes) -> dict[str, Any]:
     ancestor_count = u16(payload, 0x24)
     require(ancestor_count == chunk_index.bit_length(), "FsDataV1 ancestor count is invalid")
     bytes_at = FS_DATA_HEADER_LEN + ancestor_count * FS_REFERENCE_LEN
-    require(bytes_at + bytes_len == len(payload) and bytes_len <= PAGE, "FsDataV1 body length is invalid")
+    require(bytes_at + bytes_len == len(payload) and bytes_len <= FS_DATA_CHUNK_MAX_LEN, "FsDataV1 body length is invalid")
     ancestors = [
         parse_fs_reference(
             payload[FS_DATA_HEADER_LEN + index * FS_REFERENCE_LEN:FS_DATA_HEADER_LEN + (index + 1) * FS_REFERENCE_LEN],
@@ -2619,6 +2620,30 @@ def external_record_selftest() -> int:
     return cases
 
 
+def fs_data_length_selftest() -> int:
+    def payload(size: int) -> bytes:
+        encoded = bytearray(FS_DATA_HEADER_LEN + size)
+        encoded[:8] = b"VIBEFSD1"
+        struct.pack_into("<HHIQQIH", encoded, 8, 1, FS_DATA_HEADER_LEN,
+                         len(encoded), 0, size, size, 0)
+        return bytes(encoded)
+
+    cases = 0
+    for size in [0, PAGE, PAGE + 1, 128 * 1024, FS_DATA_CHUNK_MAX_LEN]:
+        require(len(parse_fs_data(payload(size))["bytes"]) == size,
+                "valid multi-page FsDataV1 rejected")
+        cases += 1
+    for malformed in [payload(FS_DATA_CHUNK_MAX_LEN + 1), payload(PAGE + 1)[:-1],
+                      payload(0) + b"x"]:
+        try:
+            parse_fs_data(malformed)
+        except ValueError:
+            cases += 1
+        else:
+            raise AssertionError("invalid FsDataV1 length accepted")
+    return cases
+
+
 def selftest() -> dict[str, Any]:
     image = fixture()
     unmanaged_prefix_baseline = bytes(image[:M4_FIRST * BLOCK])
@@ -2631,7 +2656,7 @@ def selftest() -> dict[str, Any]:
     )
     old = parse_control(page_at(image, CONTROL_FIRST, 0), page_at(image, CONTROL_FIRST, 1))
     body, seal = encode_control(STAGED, 2)
-    cases = 1 + external_record_selftest() + extended_authority_stream_selftest()
+    cases = 1 + external_record_selftest() + extended_authority_stream_selftest() + fs_data_length_selftest()
     for length in range(PAGE + 1):
         candidate = parse_control(body[:length] + bytes(PAGE - length), bytes(PAGE))
         require(select_control([old, candidate])["generation"] == 1, "body prefix selected V2")

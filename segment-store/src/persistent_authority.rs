@@ -1480,8 +1480,12 @@ impl<D: PageDevice> SegmentStore<D> {
                     .ok_or(PersistentAuthorityError::PolicyMismatch)?,
                 None => &recovered.bytes,
             };
-            for chunk in content.chunks(LEAF_SIZE) {
-                writer.write_chunk(chunk).await?;
+            let candidate_root = *logical_roots.get(&stable_id)
+                .ok_or(PersistentAuthorityError::PolicyMismatch)?;
+            if !writer.preflight_existing_content(content, candidate_root).await? {
+                for chunk in content.chunks(LEAF_SIZE) {
+                    writer.write_chunk(chunk).await?;
+                }
             }
             let staged = Box::pin(writer.stage_commit()).await?;
             // The staged blob's content address must equal the identity the
@@ -1539,7 +1543,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 && staged.predecessor_for_delta_test().is_some_and(|base| base.authority_root != PhysicalPointer::Null)
             {
                 let base = staged.predecessor_for_delta_test().ok_or(StoreError::Corrupt)?;
-                let resident = base.resident_heap_bytes()
+                let resident = staged.tracked_heap_bytes()
                     .and_then(|n| n.checked_add(snapshot.allocated_bytes()?))
                     .and_then(|n| n.checked_add(persistent_roots.allocated_bytes()?))
                     .ok_or(StoreError::MemoryLimit)?;
@@ -1547,8 +1551,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 // already written scratch; full fused admission remains open.
                 let workspace = self.limits.recovery_memory_bytes.checked_sub(resident)
                     .ok_or(StoreError::MemoryLimit)?;
-                let prepared = crate::authority_delta::PreparedBaseForTest::prepare::<D::Error>(&snapshot, workspace)?;
-                let (bytes, depth) = crate::authority_delta::encode_next_for_test(
+                let (bytes, depth, prepared) = crate::authority_delta::encode_prepared_next_for_test(
                     &self.device, base, &snapshot, workspace, experimental_cached.as_ref()).await?;
                 experimental_successor = Some((prepared, depth));
                 bytes
@@ -1564,8 +1567,21 @@ impl<D: PageDevice> SegmentStore<D> {
             let successor_workspace = self.limits.recovery_memory_bytes
                 .checked_sub(persistent_roots.allocated_bytes().ok_or(StoreError::MemoryLimit)?)
                 .ok_or(StoreError::MemoryLimit)?;
-            let prepared_snapshot = snapshot.prepare_publication(authority_bytes, successor_workspace)
-                .map_err(|error| match error {
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            let prepared_snapshot = if experimental_successor.is_some() {
+                let other_resident = staged.tracked_heap_bytes()
+                    .and_then(|bytes| bytes.checked_add(persistent_roots.allocated_bytes()?))
+                    .ok_or(StoreError::MemoryLimit)?;
+                // Bounds tracked staging/snapshot overlap, not shared runtime
+                // proof tables or later publisher workspace.
+                snapshot.prepare_publication_with_resident(authority_bytes, other_resident,
+                    self.limits.recovery_memory_bytes)
+            } else {
+                snapshot.prepare_publication(authority_bytes, successor_workspace)
+            };
+            #[cfg(not(any(test, feature = "experimental-authority-delta")))]
+            let prepared_snapshot = snapshot.prepare_publication(authority_bytes, successor_workspace);
+            let prepared_snapshot = prepared_snapshot.map_err(|error| match error {
                     AuthoritySnapshotError::MemoryLimit => PersistentAuthorityError::Store(StoreError::MemoryLimit),
                     error => PersistentAuthorityError::Snapshot(error),
                 })?;
@@ -1803,13 +1819,9 @@ impl<D: PageDevice> SegmentStore<D> {
             .ok_or(StoreError::MemoryLimit)?;
         let workspace = self.limits.recovery_memory_bytes.checked_sub(resident)
             .ok_or(StoreError::MemoryLimit)?;
-        // Prepare the successor digest before I/O, while only the borrowed
-        // inputs are live. Its encoder workspace drops before delta encoding;
-        // successful publication must not allocate metadata to install a cache.
-        let prepared = crate::authority_delta::PreparedBaseForTest::prepare::<D::Error>(
-            &snapshot, workspace,
-        )?;
-        let (bytes, depth) = crate::authority_delta::encode_next_for_test(
+        // Reuse the digest computed by this encoding invocation. Preparing the
+        // fixed-size witness adds no metadata allocation after encoding.
+        let (bytes, depth, prepared) = crate::authority_delta::encode_prepared_next_for_test(
             &self.device, state, &snapshot, workspace, cached.as_ref(),
         ).await?;
         // Admit the tracked Vec-backed clone while output and inputs remain
@@ -2250,9 +2262,9 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     /// Return the Merkle root of one logical object, computing and caching it
-    /// on first sight. A valid record stream never redefines an ObjectId's
-    /// content, and non-successor installations clear the cache, so the hit
-    /// path is sound without re-hashing the object bytes.
+    /// on first sight. Only committed IDs may reuse a cached root: a failed
+    /// import can leave speculative entries for IDs whose retry uses different
+    /// content. Non-successor installations clear both caches.
     fn cached_logical_root(
         &mut self,
         recovered: &vibeos_durable_format::RecoveredObject,
@@ -2266,9 +2278,15 @@ impl<D: PageDevice> SegmentStore<D> {
             self.logical_roots.insert(stable_id, (kind, len, root));
             return Ok(root);
         }
-        if let Some((cached_kind, cached_len, root)) = self.logical_roots.get(&stable_id) {
-            if *cached_kind == kind && *cached_len == len {
-                return Ok(*root);
+        if self
+            .committed_ids_cache
+            .as_ref()
+            .is_some_and(|(_, ids)| ids.contains(&stable_id))
+        {
+            if let Some((cached_kind, cached_len, root)) = self.logical_roots.get(&stable_id) {
+                if *cached_kind == kind && *cached_len == len {
+                    return Ok(*root);
+                }
             }
         }
         let descriptor = BlobDescriptor::from_content(kind, &recovered.bytes)

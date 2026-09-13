@@ -554,12 +554,22 @@ fn as_legacy_full_prefix_image(
     image: &BTreeMap<u64, Page>,
     cleaner_reserve_segments: u32,
 ) -> BTreeMap<u64, Page> {
+    as_legacy_prefix_image_with_free_tail(image, cleaner_reserve_segments, 0)
+}
+
+fn as_legacy_prefix_image_with_free_tail(
+    image: &BTreeMap<u64, Page>,
+    cleaner_reserve_segments: u32,
+    additional_free_segments: u64,
+) -> BTreeMap<u64, Page> {
     const LEGACY_ALLOCATION_KIND: u32 = 0xffff_0002;
     let mut legacy = image.clone();
     let selected = selected_checkpoint(image);
     assert_eq!(selected.authority_root, PhysicalPointer::Null);
     let original_reserve = selected.cleaner_reserve_segments;
-    let segment_no = selected.admitted_segments - u64::from(cleaner_reserve_segments) - 1;
+    let segment_no = selected.admitted_segments.checked_sub(u64::from(cleaner_reserve_segments))
+        .and_then(|number| number.checked_sub(additional_free_segments + 1)).unwrap();
+    assert!(segment_no >= selected.next_segment_generation, "legacy carrier must not overwrite source records");
     let segment_generation = selected.next_segment_generation;
     let checkpoint_generation = selected.binding.generation + 1;
     let next_segment_generation = segment_generation + 1;
@@ -1072,30 +1082,47 @@ fn full_gc_keeps_shared_blob_with_policy(policy: vibeos_segment_store::CatalogDe
 
 #[test]
 fn every_gc_mutation_boundary_recovers_g_or_g_plus_one_and_resumes_to_g_plus_two() {
-    const SEGMENTS: u64 = 16;
-    let seed_device = MemoryDevice::blank(SEGMENTS);
+    gc_mutation_matrix(16, 1, 1);
+}
+
+#[test]
+fn extended_gc_mutation_boundaries_preserve_source_epochs_and_live_payloads() {
+    gc_mutation_matrix(96, 20, 17);
+}
+
+fn gc_mutation_matrix(segments: u64, object_count: usize, minimum_sources: u32) {
+    let seed_device = MemoryDevice::blank(segments);
     let mut seed = format(seed_device.clone());
-    let bytes = vec![0x5a; PAGE_SIZE];
-    let object = put(&mut seed, &bytes);
-    block_on(seed.synchronize_gc_roots(&[&object])).unwrap();
+    // Capture the complete input object-to-Blob bindings without a test-side
+    // replay implementation; GC itself also publishes a complete snapshot.
+    seed.set_catalog_delta_policy(vibeos_segment_store::CatalogDeltaPolicy::Never);
+    let mut objects = Vec::new();
+    for index in 0..object_count {
+        objects.push(put(&mut seed, &vec![index as u8 + 1; PAGE_SIZE]));
+    }
+    let roots: Vec<_> = objects.iter().collect();
+    block_on(seed.synchronize_gc_roots(&roots)).unwrap();
     let old = seed.info().unwrap();
     let image = seed_device.durable_image();
+    let (_, expected_cas) = cas_at_selected_checkpoint(&image);
     let (seed_checkpoint, seed_allocation) = allocation_at_selected_checkpoint(&image);
     assert_eq!(seed_checkpoint.binding.generation, old.generation);
-    let sources: Vec<_> = (0..seed_allocation.admitted_segments)
-        .filter(|&segment_no| {
-            seed_allocation.segment_state(segment_no) == Some(SegmentAllocation::Allocated)
-        })
-        .collect();
-    assert!(
-        !sources.is_empty(),
-        "GC fault seed must have source segments"
-    );
-
-    let probe_device = FaultDevice::from_image(SEGMENTS, image.clone());
+    let probe_device = FaultDevice::from_image(segments, image.clone());
     let mut probe = mount_fault(probe_device.clone(), StoreRuntimeContext::new());
     probe_device.reset_mutation_count();
-    block_on(probe.collect_garbage()).unwrap();
+    let telemetry = block_on(probe.collect_garbage()).unwrap();
+    assert!(telemetry.reclaimed_segments >= minimum_sources);
+    assert!(telemetry.copied_bytes > 0, "fixture must relocate live payloads");
+    let (_, complete_allocation) = allocation_at_selected_checkpoint(&probe_device.durable_image());
+    let sources: Vec<_> = (0..seed_allocation.admitted_segments)
+        .filter(|&segment| seed_allocation.segment_state(segment) == Some(SegmentAllocation::Allocated)
+            && complete_allocation.segment_state(segment) == Some(SegmentAllocation::Free))
+        .collect();
+    assert_eq!(sources.len(), telemetry.reclaimed_segments as usize);
+    if object_count == 1 {
+        assert_eq!(sources.len() as u64, seed_allocation.counts().unwrap().allocated,
+            "original fixture must still check every allocated source");
+    }
     let boundary_count = probe_device.mutation_count();
     assert!(boundary_count > 30, "GC did not exercise real media stages");
 
@@ -1108,9 +1135,12 @@ fn every_gc_mutation_boundary_recovers_g_or_g_plus_one_and_resumes_to_g_plus_two
         FaultAction::Pending(Effect::Visible),
         FaultAction::Pending(Effect::Durable),
     ];
+    println!("GC matrix sources={} copied={} boundaries={} cases={}",
+        telemetry.reclaimed_segments, telemetry.copied_bytes, boundary_count,
+        boundary_count * actions.len());
     for boundary in 0..boundary_count {
         for action in actions {
-            let device = FaultDevice::from_image(SEGMENTS, image.clone());
+            let device = FaultDevice::from_image(segments, image.clone());
             let mut store = mount_fault(device.clone(), StoreRuntimeContext::new());
             device.arm(boundary, action);
             match action {
@@ -1128,7 +1158,7 @@ fn every_gc_mutation_boundary_recovers_g_or_g_plus_one_and_resumes_to_g_plus_two
             assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
 
             device.power_cycle();
-            let mut recovered = SegmentStore::new(device.clone(), limits());
+            let mut recovered = SegmentStore::new_with_runtime_context(device.clone(), limits(), StoreRuntimeContext::new());
             let selected = block_on(recovered.mount()).unwrap_or_else(|error| {
                 panic!("mutation {boundary}, action {action:?}: cold mount failed: {error:?}")
             });
@@ -1136,7 +1166,16 @@ fn every_gc_mutation_boundary_recovers_g_or_g_plus_one_and_resumes_to_g_plus_two
             let durable_generation =
                 assert_source_epoch_state(&device.durable_image(), old.generation, &sources, &case);
             assert_eq!(selected.generation, durable_generation, "{case}");
-            assert_eq!(selected.object_count, 1, "{case}");
+            let (_, recovered_allocation) = allocation_at_selected_checkpoint(&device.durable_image());
+            for segment in 0..seed_allocation.admitted_segments {
+                if seed_allocation.segment_state(segment) == Some(SegmentAllocation::Allocated)
+                    && !sources.contains(&segment)
+                {
+                    assert_eq!(recovered_allocation.segment_state(segment),
+                        Some(SegmentAllocation::Allocated), "{case}: unselected segment {segment}");
+                }
+            }
+            assert_eq!(selected.object_count as usize, object_count, "{case}");
 
             if selected.generation != old.generation + 2 {
                 let resumed = block_on(recovered.collect_garbage())
@@ -1146,11 +1185,30 @@ fn every_gc_mutation_boundary_recovers_g_or_g_plus_one_and_resumes_to_g_plus_two
             }
 
             device.power_cycle();
-            let mut final_cold = SegmentStore::new(device.clone(), limits());
+            let mut final_cold = SegmentStore::new_with_runtime_context(device.clone(), limits(), StoreRuntimeContext::new());
             let final_info = block_on(final_cold.mount())
                 .unwrap_or_else(|error| panic!("{case}: final cold mount failed: {error:?}"));
             assert_eq!(final_info.generation, old.generation + 2, "{case}");
-            assert_eq!(final_info.object_count, 1, "{case}");
+            assert_eq!(final_info.object_count as usize, object_count, "{case}");
+            let final_image = device.durable_image();
+            let (checkpoint, cas) = cas_at_selected_checkpoint(&final_image);
+            assert_eq!(cas.objects, expected_cas.objects, "{case}: object-to-Blob bindings");
+            let context = CasCodecContext::new(checkpoint.binding.store_uuid,
+                checkpoint.admitted_segments, checkpoint.next_segment_generation).unwrap();
+            for index in 0..object_count {
+                let bytes = vec![index as u8 + 1; PAGE_SIZE];
+                let descriptor = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND, &bytes).unwrap();
+                let key = vibeos_segment_store::BlobKey::sha256(OBJECT_KIND, bytes.len() as u64, descriptor.root).unwrap();
+                let mapping = cas.blobs.iter().find(|mapping| mapping.blob_key == key)
+                    .unwrap_or_else(|| panic!("{case}: missing live object {index}"));
+                let manifest = decode_blob_manifest(
+                    &pointer_payload(&final_image, mapping.manifest), context).unwrap();
+                assert_eq!(manifest.blob_key, key);
+                let encoded: Vec<u8> = manifest.extents.iter()
+                    .flat_map(|extent| pointer_payload(&final_image, extent.pointer)).collect();
+                assert_eq!(encoded, vibeos_blob_format::encode_blob(OBJECT_KIND, &bytes).unwrap(),
+                    "{case}: live object {index} encoded payload and Merkle tree");
+            }
             assert_eq!(
                 assert_source_epoch_state(&device.durable_image(), old.generation, &sources, &case,),
                 old.generation + 2,
@@ -2155,9 +2213,11 @@ fn cold_mount_does_not_reuse_highest_object_id_collected_by_gc() {
 fn partial_gc_retains_unselected_manifest_across_reuse_and_cold_mount() {
     let device = MemoryDevice::blank(64);
     let mut store = format(device.clone());
-    // Keep enough dead sources that both 8- and 16-source rounds can
+    // This fixture inspects the checkpoint's base CAS snapshot directly.
+    store.set_catalog_delta_policy(vibeos_segment_store::CatalogDeltaPolicy::Never);
+    // Keep enough dead sources that even extended 32-source rounds can
     // yield without selecting the live manifest this fixture protects.
-    for value in 0..10_u8 {
+    for value in 0..20_u8 {
         drop(put(&mut store, &[value; PAGE_SIZE]));
     }
     let bytes = vec![0x6d; 128 * 1024];
@@ -2170,7 +2230,7 @@ fn partial_gc_retains_unselected_manifest_across_reuse_and_cold_mount() {
     let PhysicalPointer::Value(original_value) = original else { panic!("manifest pointer"); };
     for round in 0..2_u8 {
         if round != 0 {
-            for value in 0..10_u8 {
+            for value in 0..20_u8 {
                 drop(put(&mut store, &[0x80 + value; PAGE_SIZE]));
             }
         }
@@ -2206,4 +2266,105 @@ fn partial_gc_retains_unselected_manifest_across_reuse_and_cold_mount() {
         assert_eq!(block_on(cold.get_blob_chunk(&live, leaf as u32)).unwrap().bytes,
             bytes[leaf * PAGE_SIZE..(leaf + 1) * PAGE_SIZE]);
     }
+}
+
+#[test]
+fn bounded_extended_gc_preserves_live_objects_across_sparse_and_dense_rounds() {
+    let mut saw_extended = false;
+    let mut saw_dense_fallback = false;
+    for payload_bytes in [PAGE_SIZE, 512 * 1024] {
+        let device = MemoryDevice::blank(128);
+        let mut store = format(device.clone());
+        let runtime = store.runtime_context();
+        let mut retained = Vec::new();
+        for index in 0..40 {
+            retained.push(put(&mut store, &vec![index as u8 + 1; payload_bytes]));
+        }
+        let roots: Vec<_> = retained.iter().collect();
+        block_on(store.synchronize_gc_roots(&roots)).unwrap();
+        for _ in 0..3 {
+            let telemetry = block_on(store.collect_garbage()).unwrap();
+            assert_eq!(telemetry.live_blob_count, 40);
+            assert!(telemetry.reclaimed_segments <= 32);
+            if telemetry.reclaimed_segments > 16 {
+                saw_extended = true;
+                assert!(telemetry.copied_bytes <= 4 * 1024 * 1024);
+                assert!(telemetry.target_segments <= 6);
+            }
+            if telemetry.copied_bytes > 4 * 1024 * 1024 {
+                saw_dense_fallback = true;
+                assert!(telemetry.reclaimed_segments <= 16);
+            }
+            let mut cold = SegmentStore::new_with_runtime_context(
+                device.clone(), limits(), runtime.clone(),
+            );
+            assert_eq!(block_on(cold.mount()).unwrap().generation, telemetry.reuse_generation);
+            for (index, object) in retained.iter().enumerate() {
+                for chunk in [0, (payload_bytes / PAGE_SIZE - 1) as u32] {
+                    assert_eq!(
+                        block_on(cold.get_blob_chunk(object, chunk)).unwrap().bytes,
+                        vec![index as u8 + 1; PAGE_SIZE],
+                    );
+                }
+            }
+            store = cold;
+        }
+    }
+    assert!(saw_extended, "fixture must exercise more than 16 sources");
+    assert!(saw_dense_fallback, "fixture must exercise the dense-store fallback");
+}
+
+#[test]
+#[ignore = "legacy multi-segment batch publication qualification"]
+fn legacy_v1_multi_segment_batch_publishes_and_cold_reads() {
+    use vibeos_segment_store::{decode_allocation, fs_typed_reference_kinds, FsNodeEntryInput, FsTreeKind};
+    const SEGMENTS: u64 = 64;
+    let test_limits = StoreLimits { max_catalog_entries: 4096, recovery_memory_bytes: 64 * 1024 * 1024, ..limits() };
+    let (runtime, provisioner) = StoreRuntimeContext::with_typed_reference_kinds_and_maintenance_provisioner(&fs_typed_reference_kinds()).unwrap();
+    let seed_device = MemoryDevice::blank(SEGMENTS);
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), test_limits, runtime.clone());
+    block_on(seed.format(FormatOptions { store_uuid: StoreUuid::new(*b"M7.5-GC-TEST!!!!").unwrap(),
+        cleaner_reserve_segments: 6, limits: test_limits })).unwrap();
+    drop(put(&mut seed, &[0x31; 4096]));
+    let image = as_legacy_prefix_image_with_free_tail(&seed_device.durable_image(), 6, 48);
+    let legacy = decode_allocation(&pointer_payload(&image, selected_checkpoint(&image).allocation_root)).unwrap();
+    assert_eq!(legacy.allocated_prefix_segments, 10);
+    drop(seed);
+    let device = MemoryDevice { page_count: admitted_pages(SEGMENTS).unwrap(), pages: Arc::new(Mutex::new(image)) };
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), test_limits, runtime);
+    block_on(store.mount()).unwrap();
+    let before = store.info().unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let chunks: Vec<Vec<u8>> = (0..331_u64).map(|index| {
+        let mut bytes = vec![0x51; 4096]; bytes[..8].copy_from_slice(&index.to_le_bytes()); bytes
+    }).collect();
+    let tail = block_on(store.stage_fs_data_chunks_for_maintenance(&maintenance, None, &chunks)).unwrap();
+    let published = device.durable_image();
+    let checkpoint = selected_checkpoint(&published);
+    let allocation = decode_allocation(&pointer_payload(&published, checkpoint.allocation_root)).unwrap();
+    assert_eq!(checkpoint.binding.generation, before.generation + 1);
+    assert!(allocation.allocated_prefix_segments > legacy.allocated_prefix_segments);
+    let (_, snapshot) = cas_at_selected_checkpoint(&published);
+    let mut metadata_segments: Vec<_> = snapshot.blobs.iter().map(|blob| blob.manifest)
+        .chain([checkpoint.catalog_root, checkpoint.allocation_root])
+        .filter_map(|pointer| match pointer {
+            PhysicalPointer::Value(pointer) if pointer.segment_generation >= legacy.next_segment_generation => Some(pointer.segment_no),
+            _ => None,
+        }).collect();
+    metadata_segments.sort_unstable(); metadata_segments.dedup();
+    assert_eq!(metadata_segments, [allocation.allocated_prefix_segments - 2, allocation.allocated_prefix_segments - 1]);
+    let entries = [FsNodeEntryInput { pending: None, key: b"stream", value: b"metadata", child: None, data: Some(&tail) }];
+    let root = block_on(store.commit_fs_transaction_for_maintenance(&maintenance, None, 91, 1, 2, 1, &entries, &[])).unwrap();
+    block_on(store.compare_exchange_fs_root(91, 0, &root)).unwrap();
+    drop(root); drop(tail); drop(maintenance); drop(store);
+    let (runtime, _) = StoreRuntimeContext::with_typed_reference_kinds_and_maintenance_provisioner(&fs_typed_reference_kinds()).unwrap();
+    let mut cold = SegmentStore::new_with_runtime_context(device, test_limits, runtime);
+    block_on(cold.mount()).unwrap();
+    let root = block_on(cold.recover_fs_root(91)).unwrap().unwrap();
+    let entries = block_on(cold.read_fs_tree(&root, FsTreeKind::Inode, 8)).unwrap();
+    let tail = entries[0].content.as_ref().unwrap();
+    for (index, expected) in chunks.iter().enumerate() {
+        assert_eq!(block_on(cold.read_fs_data_chunk(tail, index as u64)).unwrap(), Some(expected.clone()));
+    }
+    println!("LEGACY_MULTI chunks=331 prefix_before={} prefix_after={} cold_verified=331", legacy.allocated_prefix_segments, allocation.allocated_prefix_segments);
 }

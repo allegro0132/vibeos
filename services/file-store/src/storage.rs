@@ -2176,12 +2176,13 @@ mod io_trace {
     /// committed since, so its device reads drop by more than half.
     #[test]
     fn later_collection_rounds_reuse_authenticated_edges() {
-        // 900 files on a 36-segment device: the free-segment floor forces a
-        // collection round every third create+unlink pair.
+        // Keep pressure until two rounds have actually been observed. The
+        // bounded extended GC policy can reclaim enough for more than the
+        // old eight-operation fixture; do not assume a fixed GC cadence.
         let fixture = fixture_with(900, 36);
         let device = fixture.device.clone();
         let mut rounds: Vec<(u64, u64, u64)> = Vec::new(); // (read pages, hits, misses)
-        for sample in 0..8_u32 {
+        for sample in 0..32_u32 {
             let bytes = payload(300 + sample);
             let path = crate::RelPath::parse(&alloc::format!("gc-{sample}")).unwrap();
             let mut tx = fixture.root.begin().unwrap();
@@ -2202,6 +2203,7 @@ mod io_trace {
                     .sum();
                 let (_, hits, misses) = fixture.backend.store.lock().unwrap().typed_edge_cache_stats();
                 rounds.push((pages, hits, misses));
+                if rounds.len() == 2 { break; }
             }
         }
         assert!(rounds.len() >= 2, "expected at least two collection rounds, saw {rounds:?}");

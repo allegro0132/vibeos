@@ -23,7 +23,19 @@ enum DeltaError {
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+#[cfg(test)]
+std::thread_local! {
+    static ENCODED_SNAPSHOT_HASHES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_snapshot_hash_count_for_test() -> usize {
+    ENCODED_SNAPSHOT_HASHES.with(|count| count.replace(0))
+}
+
 fn snapshot_digest(metadata: &[u8], records: &[u8]) -> [u8; 32] {
+    #[cfg(test)]
+    ENCODED_SNAPSHOT_HASHES.with(|count| count.set(count.get() + 1));
     let mut hasher = Sha256::new();
     hasher.update(metadata);
     hasher.update(records);
@@ -56,6 +68,24 @@ fn encode_with_prefix(
     encode_with_prefix_bounded(base, next, prefix, usize::MAX).map(|(bytes, _)| bytes)
 }
 
+// Transient proof of the exact borrowed snapshot encoded in this invocation.
+// Reusing it preserves validation and digest checks without encoding twice.
+struct CanonicalBase<'a> {
+    snapshot: &'a PersistentAuthoritySnapshot,
+    metadata: Vec<u8>,
+    digest: [u8; 32],
+    peak: usize,
+}
+
+impl<'a> CanonicalBase<'a> {
+    fn prepare(snapshot: &'a PersistentAuthoritySnapshot, budget: usize) -> Result<Self, DeltaError> {
+        let (metadata, peak) = crate::authority_snapshot::encode_snapshot_bounded(snapshot, false, budget)
+            .map_err(metadata_error)?;
+        let digest = snapshot_digest(&metadata, snapshot.record_stream());
+        Ok(Self { snapshot, metadata, digest, peak })
+    }
+}
+
 // The caller owns both input snapshots. Charge encoder allocations only and
 // release predecessor metadata before reserving the final delta buffer.
 fn encode_with_prefix_bounded(
@@ -70,9 +100,16 @@ fn encode_with_prefix_bounded(
     {
         return Ok((None, 0));
     }
-    let (before, mut peak) = crate::authority_snapshot::encode_snapshot_bounded(
-        base, false, maximum_bytes,
-    ).map_err(metadata_error)?;
+    encode_prepared_prefix_bounded(CanonicalBase::prepare(base, maximum_bytes)?, next, prefix, maximum_bytes)
+}
+
+fn encode_prepared_prefix_bounded(
+    prepared: CanonicalBase<'_>,
+    next: &PersistentAuthoritySnapshot,
+    prefix: usize,
+    maximum_bytes: usize,
+) -> Result<(Option<Vec<u8>>, usize), DeltaError> {
+    let CanonicalBase { snapshot: base, metadata: before, digest: before_digest, mut peak } = prepared;
     let after_budget = maximum_bytes.checked_sub(before.capacity()).ok_or(DeltaError::Memory)?;
     let (after, after_peak) = crate::authority_snapshot::encode_snapshot_bounded(
         next, false, after_budget,
@@ -89,7 +126,6 @@ fn encode_with_prefix_bounded(
     if len >= next_len {
         return Ok((None, peak));
     }
-    let before_digest = snapshot_digest(&before, base.record_stream());
     drop(before);
     let output_budget = maximum_bytes.checked_sub(after.capacity()).ok_or(DeltaError::Memory)?;
     if len > output_budget { return Err(DeltaError::Memory); }
@@ -358,7 +394,6 @@ fn encode_link_bounded(
     context: LinkContext,
     budget: usize,
 ) -> Result<(Option<Vec<u8>>, usize), DeltaError> {
-    use vibeos_segment_format::encode_physical_pointer;
     let Some(depth) = predecessor_depth
         .checked_add(1)
         .filter(|&n| n <= MAX_REPLAY_DEPTH)
@@ -366,6 +401,14 @@ fn encode_link_bounded(
         return Ok((None, 0));
     };
     let (bytes, peak) = encode_with_prefix_bounded(base, next, LINK_HEADER, budget)?;
+    finish_encoded_link(bytes, peak, base.checkpoint_generation(), next.checkpoint_generation(), predecessor, depth, context)
+}
+
+fn finish_encoded_link(
+    bytes: Option<Vec<u8>>, peak: usize, base_generation: u64, next_generation: u64,
+    predecessor: vibeos_segment_format::PhysicalPointer, depth: u32, context: LinkContext,
+) -> Result<(Option<Vec<u8>>, usize), DeltaError> {
+    use vibeos_segment_format::encode_physical_pointer;
     let Some(mut bytes) = bytes else { return Ok((None, peak)); };
     if bytes.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
         return Ok((None, peak));
@@ -375,8 +418,8 @@ fn encode_link_bounded(
     let mut pointer = [0; vibeos_segment_format::POINTER_SIZE];
     encode_physical_pointer(predecessor, &mut pointer).map_err(|_| DeltaError::Invalid)?;
     bytes[16..112].copy_from_slice(&pointer);
-    bytes[112..120].copy_from_slice(&base.checkpoint_generation().to_le_bytes());
-    bytes[120..128].copy_from_slice(&next.checkpoint_generation().to_le_bytes());
+    bytes[112..120].copy_from_slice(&base_generation.to_le_bytes());
+    bytes[120..128].copy_from_slice(&next_generation.to_le_bytes());
     decode_link(&bytes, context)?;
     Ok((Some(bytes), peak))
 }
@@ -853,6 +896,7 @@ pub(crate) struct VerifiedBaseForTest {
 // Prepared before media mutation under the caller's remaining workspace.
 // Only the exact snapshot supplied to prepare may be published before bind.
 // This value has no heap allocations and is not itself a provenance witness.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PreparedBaseForTest {
     generation: u64,
     digest: [u8; 32],
@@ -922,15 +966,20 @@ impl VerifiedBaseForTest {
     }
 
     fn matches_bounded(&self, state: &crate::store::MountedState, budget: usize) -> Result<bool, DeltaError> {
+        Ok(self.matching_base(state, budget)?.is_some())
+    }
+
+    fn matching_base<'a>(&self, state: &'a crate::store::MountedState, budget: usize)
+        -> Result<Option<CanonicalBase<'a>>, DeltaError>
+    {
         if self.generation != state.generation || self.root != state.authority_root
             || self.admitted != state.admitted_segments || self.next_segment != state.next_segment_generation
             || self.store_uuid != state.superblock.binding.store_uuid || self.depth > MAX_REPLAY_DEPTH {
-            return Ok(false);
+            return Ok(None);
         }
         let snapshot = state.persistent_authority.as_ref().ok_or(DeltaError::Invalid)?;
-        let (metadata, _) = crate::authority_snapshot::encode_snapshot_bounded(snapshot, false, budget)
-            .map_err(metadata_error)?;
-        Ok(self.digest == snapshot_digest(&metadata, snapshot.record_stream()))
+        let prepared = CanonicalBase::prepare(snapshot, budget)?;
+        if self.digest == prepared.digest { Ok(Some(prepared)) } else { Ok(None) }
     }
 }
 
@@ -950,17 +999,29 @@ pub(crate) async fn encode_next_for_test<D: crate::PageDevice>(
         next_segment_generation: state.next_segment_generation,
         checkpoint_generation: next.checkpoint_generation(),
     };
-    let cached = match cached {
-        Some(cached) if cached.matches_bounded(state, workspace_bytes).map_err(codec_store_error)? => Some(cached),
-        _ => None,
+    let matched = match cached {
+        Some(cached) => cached.matching_base(state, workspace_bytes).map_err(codec_store_error)?
+            .map(|prepared| (cached, prepared)),
+        None => None,
     };
-    if let Some(cached) = cached {
-        let base = state.persistent_authority.as_ref().ok_or(crate::StoreError::Corrupt)?;
-        if next.checkpoint_generation() <= base.checkpoint_generation() {
+    if let Some((cached, prepared)) = matched {
+        let base_generation = prepared.snapshot.checkpoint_generation();
+        if next.checkpoint_generation() <= base_generation {
             return Err(crate::StoreError::Corrupt);
         }
-        return match encode_link_bounded(base, next, state.authority_root, cached.depth, context, workspace_bytes)
-            .map_err(codec_store_error)? {
+        let depth = cached.depth.checked_add(1).filter(|&n| n <= MAX_REPLAY_DEPTH
+            && next.record_stream().len() > prepared.snapshot.record_stream().len()
+            && next.record_stream().starts_with(prepared.snapshot.record_stream()));
+        let encoded = if let Some(depth) = depth {
+            let (bytes, peak) = encode_prepared_prefix_bounded(prepared, next, LINK_HEADER, workspace_bytes)
+                .map_err(codec_store_error)?;
+            finish_encoded_link(bytes, peak, base_generation, next.checkpoint_generation(),
+                state.authority_root, depth, context).map_err(codec_store_error)?
+        } else {
+            drop(prepared);
+            (None, 0)
+        };
+        return match encoded {
             (Some(bytes), _) => Ok((bytes, cached.depth + 1)),
             (None, _) => crate::authority_snapshot::encode_snapshot_bounded(next, true, workspace_bytes)
                 .map(|(bytes, _)| (bytes, 0)).map_err(|error| codec_store_error(metadata_error(error))),
@@ -981,6 +1042,30 @@ pub(crate) async fn encode_next_for_test<D: crate::PageDevice>(
                 .map(|(bytes, _)| (bytes, 0)).map_err(|error| codec_store_error(metadata_error(error)))
         }
     }
+}
+
+// Only this encoder may turn its own freshly validated output into a prepared
+// witness. Never accept caller/device bytes here: the delta result digest is
+// trustworthy because encode_next_for_test computed it from `next` in this call.
+// Binding to physical state still happens only after publication and read-back.
+pub(crate) async fn encode_prepared_next_for_test<D: crate::PageDevice>(
+    device: &D,
+    state: &crate::store::MountedState,
+    next: &PersistentAuthoritySnapshot,
+    workspace_bytes: usize,
+    cached: Option<&VerifiedBaseForTest>,
+) -> Result<(Vec<u8>, u32, PreparedBaseForTest), crate::StoreError<D::Error>> {
+    let (bytes, depth) = encode_next_for_test(device, state, next, workspace_bytes, cached).await?;
+    let result_digest = if depth == 0 {
+        digest(&bytes)
+    } else {
+        bytes.get(LINK_HEADER + 88..LINK_HEADER + 120)
+            .and_then(|slice| slice.try_into().ok()).ok_or(crate::StoreError::Corrupt)?
+    };
+    let prepared = PreparedBaseForTest {
+        generation: next.checkpoint_generation(), digest: result_digest,
+    };
+    Ok((bytes, depth, prepared))
 }
 
 pub(crate) async fn replay_device_for_test<D: crate::PageDevice>(

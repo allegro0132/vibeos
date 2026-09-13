@@ -80,10 +80,16 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_ROOT_SET: u32 = 0xffff_0020;
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
-/// Upper bound on source segments relocated by one collection round. Bounds
-/// the foreground pause and the round's read/copy volume; remaining dead
-/// space is reclaimed by subsequent rounds.
+/// Ordinary source limit. Low-copy rounds may extend it under the additional
+/// byte and target bounds below; dense rounds retain this fallback. These
+/// work bounds do not imply a wall-clock deadline on a particular device.
 const GC_MAX_SOURCES_PER_ROUND: usize = 16;
+// Amortize repeated manifest walks only for low-copy collections. Keep the
+// original 16-source fallback for dense stores; extension also has a bound
+// on complete target segments (Blob + metadata + framing/padding).
+const GC_EXTENDED_SOURCES_PER_ROUND: usize = 32;
+const GC_EXTENDED_COPY_BYTES: u64 = 4 * 1024 * 1024;
+const GC_EXTENDED_TARGET_SEGMENTS: usize = 6;
 
 /// Allocate page I/O scratch directly in its final heap representation so the
 /// segment-builder futures remain safe for the kernel's bounded stack.
@@ -1539,10 +1545,13 @@ fn ranked_gc_sources(
     for manifest in manifests {
         for extent in &manifest.extents {
             let segment_no = pointer_segment(extent.pointer).ok_or(GcError::Corrupt)?;
-            let slot = ranked
-                .iter_mut()
-                .find(|entry| entry.1 == segment_no)
-                .ok_or(GcError::Corrupt)?;
+            // Construction above keeps segment numbers strictly ascending
+            // until the final live-byte sort. Resolve sparse segment IDs in
+            // that order instead of rescanning every allocated segment.
+            let index = ranked
+                .binary_search_by_key(&segment_no, |entry| entry.1)
+                .map_err(|_| GcError::Corrupt)?;
+            let slot = &mut ranked[index];
             slot.0 = slot
                 .0
                 .checked_add(extent.payload_byte_len)
@@ -2551,17 +2560,11 @@ async fn load_live_manifests<D: PageDevice>(
     manifests
         .try_reserve_exact(mark.live_blobs().len())
         .map_err(|_| GcError::MemoryLimit)?;
+    // Manifests and their extent capacities are immutable after insertion.
+    // Maintain the exact retained sum instead of rescanning all prior entries
+    // for each blob (quadratic in the number of live manifests).
+    let mut existing_extents = 0_usize;
     for key in mark.live_blobs() {
-        let existing_extents =
-            manifests
-                .iter()
-                .try_fold(0_usize, |bytes, manifest: &BlobManifest| {
-                    vector_bytes(
-                        manifest.extents.capacity(),
-                        core::mem::size_of::<ManifestExtent>(),
-                    )
-                    .and_then(|more| bytes.checked_add(more).ok_or(GcError::ArithmeticOverflow))
-                })?;
         let blob = cas
             .blobs
             .binary_search_by_key(key, |blob| blob.blob_key)
@@ -2608,6 +2611,9 @@ async fn load_live_manifests<D: PageDevice>(
         if manifest.blob_key != *key {
             return Err(GcError::Corrupt.into());
         }
+        existing_extents = existing_extents.checked_add(vector_bytes(
+            manifest.extents.capacity(), core::mem::size_of::<ManifestExtent>(),
+        )?).ok_or(GcError::ArithmeticOverflow)?;
         manifests.push(manifest);
     }
     Ok(manifests)
@@ -2705,6 +2711,7 @@ async fn verify_staged_copied_extent<D: PageDevice>(
     checkpoint_generation: u64,
     next_segment_generation: u64,
     declared: &ManifestExtent,
+    whole_blob: Option<&BlobManifest>,
     memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), GcStoreError<D::Error>> {
     let maximum_bytes =
@@ -2729,6 +2736,35 @@ async fn verify_staged_copied_extent<D: PageDevice>(
     })?;
     if observed.bytes.len() != maximum_bytes {
         return Err(GcError::CorruptAt("relocate-copied-payload-length").into());
+    }
+    if let Some(manifest) = whole_blob {
+        let extent = observed.extent;
+        if manifest.extents.len() != 1
+            || declared.extent_index != 0
+            || declared.extent_count != 1
+            || declared.encoded_offset != 0
+            || declared.payload_byte_len != manifest.encoded_blob_len
+            || extent.object_kind != manifest.blob_key.object_kind()
+            || extent.extent_index != declared.extent_index
+            || extent.extent_count != declared.extent_count
+            || extent.content_byte_len != manifest.blob_key.exact_len()
+            || extent.encoded_blob_len != manifest.encoded_blob_len
+            || extent.encoded_offset != declared.encoded_offset
+            || extent.payload_byte_len != declared.payload_byte_len
+            || extent.merkle_root != manifest.blob_key.merkle_root()
+        {
+            return Err(GcError::CorruptAt("relocate-whole-envelope-descriptor").into());
+        }
+        let blob = BlobView::decode(&observed.bytes)
+            .map_err(|_| GcError::CorruptAt("relocate-whole-envelope-header"))?;
+        if blob.descriptor().object_kind != manifest.blob_key.object_kind()
+            || blob.descriptor().byte_len != manifest.blob_key.exact_len()
+            || blob.descriptor().root != manifest.blob_key.merkle_root()
+        {
+            return Err(GcError::CorruptAt("relocate-whole-envelope-identity").into());
+        }
+        blob.verify_all()
+            .map_err(|_| GcError::CorruptAt("relocate-whole-envelope-tree"))?;
     }
     drop(observed);
 
@@ -3064,6 +3100,7 @@ async fn relocate_live_state<D: PageDevice>(
                     plan.relocation_generation,
                     target_next_generation,
                     extent,
+                    (manifest.extents.len() == 1).then_some(&manifest),
                     memo,
                 )
                 .await?;
@@ -3074,7 +3111,9 @@ async fn relocate_live_state<D: PageDevice>(
         // Untouched Blobs were authenticated when their own commit published
         // them, and re-verifying the complete live set every round makes one
         // collection cost reads proportional to the store's total content.
-        if relocated {
+        // A single copied envelope was already checked in full while its
+        // authenticated payload was resident, including every tree node.
+        if relocated && manifest.extents.len() != 1 {
             verify_manifest_blob(device, staged_state, &manifest, memo)
                 .await
                 .map_err(|error| match error {
@@ -3958,7 +3997,16 @@ impl<D: PageDevice> SegmentStore<D> {
         let candidate_bytes = vector_bytes(candidate.capacity(), core::mem::size_of::<u64>())?;
         memory.retain(candidate_bytes)?;
         let mut selected = None;
-        for prefix_len in 1..=ranked_sources.len() {
+        let mut candidate_live_bytes = 0_u64;
+        for prefix_len in 1..=ranked_sources.len().min(GC_EXTENDED_SOURCES_PER_ROUND) {
+            candidate_live_bytes = candidate_live_bytes
+                .checked_add(ranked_sources[prefix_len - 1].0)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            if prefix_len > GC_MAX_SOURCES_PER_ROUND
+                && candidate_live_bytes > GC_EXTENDED_COPY_BYTES
+            {
+                break;
+            }
             validate_gc_source_budget(
                 &state.allocation,
                 prefix_len,
@@ -3988,10 +4036,12 @@ impl<D: PageDevice> SegmentStore<D> {
                 allocation_len,
             )?;
             let reservation = required.checked_add(1).ok_or(GcError::ArithmeticOverflow)?;
-            // Bound one collection round: relocating an unbounded number of
-            // sources makes the foreground pause proportional to total dead
-            // space. Net yield still decides between admissible prefixes.
-            if candidate.len() > GC_MAX_SOURCES_PER_ROUND {
+            // Exact placement includes all rewritten manifests, checkpoint
+            // roots and framing. Bound their total footprint as well as Blob
+            // copy bytes before permitting a larger low-live source prefix.
+            if candidate.len() > GC_MAX_SOURCES_PER_ROUND
+                && required > GC_EXTENDED_TARGET_SEGMENTS
+            {
                 break;
             }
             // The cleaner reserve guarantees worst-case progress, but when more
@@ -4551,6 +4601,30 @@ mod tests {
             ranked_gc_sources(&selected(), &manifests).unwrap(),
             vec![(0, 2), (PAGE_SIZE as u64, 0), (2 * PAGE_SIZE as u64, 1)]
         );
+    }
+
+    #[test]
+    fn source_ranking_handles_sparse_ids_repeated_extents_and_invalid_sources() {
+        let allocation = AllocationV2::new(9, 30, 2, &[
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+        ], &[]).unwrap();
+        let manifests = vec![packing_manifest_at(0, 3, 5),
+            packing_manifest_at(1, 1, 1), packing_manifest_at(2, 2, 1)];
+        assert_eq!(ranked_gc_sources(&allocation, &manifests).unwrap(),
+            vec![(0, 3), (3 * PAGE_SIZE as u64, 1), (3 * PAGE_SIZE as u64, 5)]);
+        for segment in [0, 2, 4, 6, u64::MAX] {
+            assert_eq!(ranked_gc_sources(&allocation,
+                &[packing_manifest_at(0, 1, segment)]), Err(GcError::Corrupt));
+        }
+        let mut overflow = packing_manifest_at(0, 1, 5);
+        overflow.extents[0].payload_byte_len = u64::MAX;
+        assert_eq!(ranked_gc_sources(&allocation,
+            &[overflow, packing_manifest_at(1, 1, 5)]), Err(GcError::ArithmeticOverflow));
     }
 
     #[test]

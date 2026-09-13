@@ -253,12 +253,15 @@ fn granted_import(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
     grant: &GrantRecord,
 ) -> PersistentAuthorityImport {
+    let recovered = vibeos_durable_format::preflight_recovery(records, store_id()).unwrap();
+    let roots: Vec<_> = recovered.committed_grants().iter()
+        .filter(|entry| entry.grant.flags.is_root())
+        .map(|entry| RootPolicy { grant: entry.grant.clone() }).collect();
+    assert!(roots.iter().any(|root| root.grant == *grant));
     PersistentAuthorityImport::from_m4(
         records,
         store_id(),
-        &[RootPolicy {
-            grant: grant.clone(),
-        }],
+        &roots,
         POLICY,
         Vec::new(),
     )
@@ -539,4 +542,46 @@ fn compact_fused_append_uses_one_segment_and_recovers_content() {
     let after = device.durable_image();
     assert_eq!(allocated(after.clone()) - before, 1);
     assert_eq!(recovered_objects(after, 4096), 1);
+}
+
+#[test]
+fn duplicate_external_append_recovers_old_or_complete_mapping_at_every_cut() {
+    let size = 1024 * 1024 + 37;
+    fn state(image: BTreeMap<u64, Page>, size: usize) -> (u64, Vec<u8>, u64) {
+        let device = FaultDevice::from_image(SEGMENTS, image);
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[]).unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(store.mount()).unwrap();
+        let view = block_on(store.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+        assert!(!view.objects().is_empty());
+        for object in view.objects() {
+            assert_eq!(block_on(store.read_persistent_object(object)).unwrap(), payload(size));
+        }
+        (view.checkpoint_generation(), view.record_stream().to_vec(), u64::from(store.info().unwrap().object_count))
+    }
+    let (image, _) = prepared_image();
+    let seed = FaultDevice::from_image(SEGMENTS, image);
+    assert!(matches!(drive_append_with(&seed, size, true), Poll::Ready(Ok(()))));
+    let image = seed.durable_image();
+    let before = state(image.clone(), size);
+    let probe = FaultDevice::from_image(SEGMENTS, image.clone());
+    assert!(matches!(drive_append_with(&probe, size, true), Poll::Ready(Ok(()))));
+    let boundaries = probe.mutation_count();
+    let after = state(probe.durable_image(), size);
+    assert_eq!(after.0, before.0 + 1);
+    assert_eq!(after.2, before.2 + 1);
+    assert!(boundaries > 0);
+    for boundary in 0..boundaries {
+        let device = FaultDevice::from_image(SEGMENTS, image.clone());
+        device.arm(boundary);
+        assert!(drive_append_with(&device, size, true).is_pending(), "cut {boundary}");
+        let observed = state(device.durable_image(), size);
+        assert!(observed == before || observed == after, "partial duplicate publication at cut {boundary}");
+        if observed == before {
+            let retry = FaultDevice::from_image(SEGMENTS, device.durable_image());
+            assert!(matches!(drive_append_with(&retry, size, true), Poll::Ready(Ok(()))));
+            assert_eq!(state(retry.durable_image(), size), after);
+        }
+    }
+    println!("duplicate external preflight: {boundaries} publication cut boundaries");
 }

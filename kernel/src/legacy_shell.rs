@@ -3290,7 +3290,7 @@ async fn storage_file_tree_bench(
         return;
     }
     if (workload == "file-sequential" && size > 512 * 1024 * 1024)
-        || (workload == "file-batch-create-unique" && (count > 100 || size == 0 || size > 128 * 1024))
+        || (workload == "file-batch-create-unique" && (count > 1000 || (count > 100 && size > 4096) || size == 0 || size > 128 * 1024))
         || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
         || (workload == "file-batch-create" && count > 100 && (count > 1000 || size > 4096)) {
         unsupported("staged persistence exceeds the bounded guest benchmark budget");

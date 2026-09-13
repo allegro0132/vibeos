@@ -2099,6 +2099,141 @@ fn append_external_object_records(
 }
 
 #[test]
+fn external_dedup_preflight_rejects_false_content_and_corrupt_media_without_writes() {
+    for size in [128 * 1024 + 37, 1024 * 1024 + 37] {
+        let device = MemoryDevice::blank();
+        let (runtime, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+            cleaner_reserve_segments: 4,
+            limits: limits(),
+        }))
+        .unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let mut records = format_records();
+        let initial =
+            block_on(store.import_persistent_authority(&maintenance, import(&records, &[])))
+                .unwrap();
+        let principal = initial.principals()[0].clone();
+        let writer = store
+            .derive_persistent_authority_writer(&maintenance)
+            .unwrap();
+        let mut generation = initial.checkpoint_generation();
+        let content = vec![0x5a; size];
+        let root = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, &content)
+            .unwrap()
+            .root;
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let (next, id) = append_external_object_records(&records, content.len() as u64, root);
+            let recovered = vibeos_durable_format::preflight_recovery(&next, store_id())
+                .unwrap()
+                .committed_objects()
+                .iter()
+                .find(|object| object.object_id == id)
+                .unwrap()
+                .clone();
+            let mut update = import(&next, &[]);
+            update
+                .attach_external_payload(id.get(), content.clone())
+                .unwrap();
+            let result = block_on(
+                store.append_persistent_authority(&writer, generation, update, &principal),
+            )
+            .unwrap();
+            assert_eq!(
+                block_on(store.read_appended_object(&result, &recovered)).unwrap(),
+                content
+            );
+            generation = result.view().checkpoint_generation();
+            handles.push(result);
+            records = next;
+        }
+        let cas = store.mounted.as_ref().unwrap().cas.as_ref().unwrap();
+        assert_eq!((cas.objects.len(), cas.blobs.len()), (2, 1));
+        assert_eq!(
+            store
+                .principal_quota_usage(&principal)
+                .unwrap()
+                .committed_logical_bytes,
+            2 * content.len() as u64
+        );
+        let usage = store.principal_quota_usage(&principal).unwrap();
+        assert_eq!(
+            usage.committed_physical_bytes,
+            2 * canonical_attributable_physical_bytes(content.len() as u64).unwrap()
+        );
+        let (next, id) = append_external_object_records(&records, content.len() as u64, root);
+        let mut false_content = content.clone();
+        *false_content.last_mut().unwrap() ^= 1;
+        let mut update = import(&next, &[]);
+        update
+            .attach_external_payload(id.get(), false_content)
+            .unwrap();
+        let before = device.snapshot();
+        assert!(block_on(
+            store.append_persistent_authority(&writer, generation, update, &principal)
+        )
+        .is_err());
+        assert_eq!(
+            device.snapshot(),
+            before,
+            "a false declared-root hit must not write scratch or metadata"
+        );
+        assert_eq!(store.info().unwrap().generation, generation);
+        assert_eq!(store.principal_quota_usage(&principal).unwrap(), usage);
+
+        // A prior successful hit cannot hide later damage to the shared payload.
+        let mut pages = device.pages.lock().unwrap();
+        let page = *pages
+            .iter()
+            .find(|(_, page)| page.iter().all(|byte| *byte == 0x5a))
+            .unwrap()
+            .0;
+        pages.get_mut(&page).unwrap()[123] ^= 1;
+        drop(pages);
+        let mut update = import(&next, &[]);
+        update.attach_external_payload(id.get(), content).unwrap();
+        let before = device.snapshot();
+        assert!(block_on(
+            store.append_persistent_authority(&writer, generation, update, &principal)
+        )
+        .is_err());
+        assert_eq!(device.snapshot(), before);
+        assert_eq!(store.info().unwrap().generation, generation);
+        assert_eq!(store.principal_quota_usage(&principal).unwrap(), usage);
+        if size < 512 * 1024 {
+            // A failed fresh external identity may be retried with different
+            // inline content under the same still-uncommitted stable ID.
+            device.pages.lock().unwrap().get_mut(&page).unwrap()[123] ^= 1;
+            let replacement = vec![0x3c; size];
+            let (retry_records, retry_id) = append_next_object_records(&records, &replacement);
+            assert_eq!(retry_id, id);
+            let recovered = vibeos_durable_format::preflight_recovery(&retry_records, store_id())
+                .unwrap()
+                .committed_objects()
+                .iter()
+                .find(|object| object.object_id == retry_id)
+                .unwrap()
+                .clone();
+            let result = block_on(store.append_persistent_authority(
+                &writer,
+                generation,
+                import(&retry_records, &[]),
+                &principal,
+            ))
+            .unwrap();
+            assert_eq!(
+                block_on(store.read_appended_object(&result, &recovered)).unwrap(),
+                replacement
+            );
+        }
+    }
+}
+
+#[test]
 fn external_object_appends_recover_and_verify_end_to_end() {
     let device = MemoryDevice::blank();
     let (runtime, _quota, maintenance_provisioner) =
@@ -2693,15 +2828,31 @@ fn experimental_delta_cold_writer_preserves_budget_and_read_errors() {
     let failed = ReadFailure(device.clone());
     assert!(matches!(block_on(crate::authority_delta::encode_next_for_test(
         &failed, state, &next, 0, Some(&witness))), Err(crate::StoreError::MemoryLimit)));
+    crate::authority_delta::take_snapshot_hash_count_for_test();
     let warm = block_on(crate::authority_delta::encode_next_for_test(
         &failed, state, &next, limits().recovery_memory_bytes, Some(&witness))).unwrap();
+    // One predecessor check plus one successor digest; no second hash of the
+    // already matched predecessor. ReadFailure also proves no replay I/O.
+    assert_eq!(crate::authority_delta::take_snapshot_hash_count_for_test(), 2);
     assert!(matches!(block_on(crate::authority_delta::encode_next_for_test(
         &failed, state, &next, cold_bytes.len(), Some(&witness))), Err(crate::StoreError::MemoryLimit)));
+    for cached in [None, Some(&witness)] {
+        let (bytes, depth, prepared) = block_on(crate::authority_delta::encode_prepared_next_for_test(
+            &device, state, &next, limits().recovery_memory_bytes, cached)).unwrap();
+        assert_eq!((bytes, depth), (cold_bytes.clone(), cold_depth));
+        assert_eq!(prepared, crate::authority_delta::PreparedBaseForTest::prepare::<TestError>(
+            &next, limits().recovery_memory_bytes).unwrap());
+    }
     assert_eq!(warm, (cold_bytes, cold_depth));
     // Non-appending history must still materialize within the same allowance.
     let materialized = crate::PersistentAuthoritySnapshot::new(state.generation + 1,
         root_policy_commitment(POLICY), base.record_stream().to_vec(), vec![], base.principals().to_vec()).unwrap();
     let expected_full = crate::encode_persistent_authority_snapshot(&materialized).unwrap();
+    let (bytes, depth, prepared) = block_on(crate::authority_delta::encode_prepared_next_for_test(
+        &failed, state, &materialized, expected_full.len(), Some(&witness))).unwrap();
+    assert_eq!((bytes, depth), (expected_full.clone(), 0));
+    assert_eq!(prepared, crate::authority_delta::PreparedBaseForTest::prepare::<TestError>(
+        &materialized, limits().recovery_memory_bytes).unwrap());
     assert!(matches!(block_on(crate::authority_delta::encode_next_for_test(
         &failed, state, &materialized, expected_full.len() - 1, Some(&witness))), Err(crate::StoreError::MemoryLimit)));
     assert_eq!(block_on(crate::authority_delta::encode_next_for_test(
@@ -3292,6 +3443,20 @@ fn metadata_placement_uses_provisional_allocation_and_preserves_reserve_policy()
     assert_eq!(state.find_free_run_in(&provisional, 2, 1, 0, false), None);
     assert_eq!(state.find_free_run_in(&provisional, 16, 1, 0, true), None);
     assert_eq!(state.find_free_run_in(&provisional, 4, 0, 0, true), None);
+
+    // Multi-segment metadata may bind isolated free slots. Reserving one
+    // slot plus all remaining metadata slots must still charge the complete
+    // set against cleaner + root-policy headroom, not merely the first slot.
+    state.allocation_version = 2;
+    state.admitted_segments = 64;
+    let fragmented = AllocationV2::new(9, 100, 2, &[Allocated, Free].repeat(32), &[]).unwrap();
+    let headroom = u64::from(state.cleaner_reserve_segments + crate::store::ROOT_POLICY_HEADROOM_SEGMENTS);
+    let available = 32 - headroom;
+    assert_eq!(state.find_free_run_in(&fragmented, 0, 2, 0, false), None);
+    assert_eq!(state.find_free_run_in(&fragmented, 0, 1, available - 1, false), Some(1));
+    assert_eq!(state.find_free_run_in(&fragmented, 0, 1, available, false), None);
+    assert_eq!(state.find_free_run_in(&fragmented, 0, 1, 31, true), Some(1));
+    assert_eq!(state.find_free_run_in(&fragmented, 0, 1, 32, true), None);
 }
 
 #[test]

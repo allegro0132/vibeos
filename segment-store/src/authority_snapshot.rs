@@ -628,6 +628,23 @@ impl PreparedPublicationSnapshot<'_> {
 }
 
 impl PersistentAuthoritySnapshot {
+    // Experimental publication phase only. `other_resident` includes the
+    // predecessor state and root table. Charge this source and the owned
+    // encoding as well before reserving successor tables/log capacity.
+    #[cfg(any(test, feature = "experimental-authority-delta"))]
+    pub(crate) fn prepare_publication_with_resident(
+        &self,
+        encoded: Vec<u8>,
+        other_resident: usize,
+        maximum_bytes: usize,
+    ) -> Result<PreparedPublicationSnapshot<'_>, AuthoritySnapshotError> {
+        let workspace = other_resident.checked_add(self.allocated_bytes().ok_or(AuthoritySnapshotError::MemoryLimit)?)
+            .and_then(|bytes| bytes.checked_add(encoded.capacity()))
+            .and_then(|bytes| maximum_bytes.checked_sub(bytes))
+            .ok_or(AuthoritySnapshotError::MemoryLimit)?;
+        self.prepare_publication(encoded, workspace)
+    }
+
     pub(crate) fn prepare_publication(
         &self,
         encoded: Vec<u8>,
@@ -1650,6 +1667,35 @@ mod tests {
         let successor = prepared.finish();
         assert_eq!(successor, value);
         assert_eq!(successor.record_stream.as_ptr(), reserved);
+    }
+
+    #[test]
+    fn publication_overlap_charges_source_encoding_and_successor_capacity() {
+        let value = sample();
+        let tables = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>()
+            + value.external_roots.len() * core::mem::size_of::<PersistentRootEntry>();
+        let mut spare = Vec::with_capacity(value.record_stream.len() + 4096);
+        spare.resize(16, 0);
+        for encoded in [encode_persistent_authority_snapshot(&value).unwrap(), vec![0; 16], spare] {
+            let other = 1234;
+            let resident = other + value.allocated_bytes().unwrap() + encoded.capacity();
+            let extra_log = if encoded.capacity() < value.record_stream.len() { value.record_stream.len() } else { 0 };
+            let exact = resident + tables + extra_log;
+            let copy = || {
+                let mut bytes = Vec::with_capacity(encoded.capacity());
+                bytes.extend_from_slice(&encoded);
+                bytes
+            };
+            for denied in [0, resident - 1, exact - 1] {
+                assert!(matches!(value.prepare_publication_with_resident(copy(), other, denied),
+                    Err(AuthoritySnapshotError::MemoryLimit)));
+            }
+            assert!(matches!(value.prepare_publication_with_resident(copy(), usize::MAX, usize::MAX),
+                Err(AuthoritySnapshotError::MemoryLimit)));
+            let prepared = value.prepare_publication_with_resident(encoded, other, exact).unwrap();
+            assert_eq!(prepared.finish(), value);
+        }
     }
 
     #[test]

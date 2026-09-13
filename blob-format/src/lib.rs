@@ -671,11 +671,41 @@ impl<'a> BlobView<'a> {
     }
 
     pub fn verify_all(&self) -> Result<(), BlobError> {
-        let expected = build_tree(self.descriptor.object_kind, self.data, self.geometry)?;
-        for (index, hash) in expected.iter().enumerate() {
-            if tree_hash(self.tree_bytes, index)? != *hash {
+        // Authenticate leaves first, then each parent from already checked
+        // children. The immutable encoded tree supplies storage; no second
+        // tree allocation is needed. decode() has bound its root to the header.
+        for index in 0..self.geometry.padded_leaves {
+            let expected = if index < self.geometry.leaf_count {
+                leaf_hash(
+                    self.descriptor.object_kind,
+                    index as u32,
+                    chunk_at(self.data, self.geometry.leaf_count, index)?,
+                )
+            } else {
+                empty_hash(self.descriptor.object_kind, index as u32)
+            };
+            if tree_hash(self.tree_bytes, index)? != expected {
                 return Err(BlobError::TreeMismatch);
             }
+        }
+        let mut base = 0usize;
+        let mut width = self.geometry.padded_leaves;
+        let mut level = 1u32;
+        while width > 1 {
+            let parent_base = base.checked_add(width).ok_or(BlobError::LengthOverflow)?;
+            for offset in (0..width).step_by(2) {
+                let expected = node_hash(
+                    level,
+                    &tree_hash(self.tree_bytes, base + offset)?,
+                    &tree_hash(self.tree_bytes, base + offset + 1)?,
+                );
+                if tree_hash(self.tree_bytes, parent_base + offset / 2)? != expected {
+                    return Err(BlobError::TreeMismatch);
+                }
+            }
+            base = parent_base;
+            width /= 2;
+            level = level.checked_add(1).ok_or(BlobError::LengthOverflow)?;
         }
         Ok(())
     }

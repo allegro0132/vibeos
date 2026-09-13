@@ -30,6 +30,7 @@ mod maintenance;
 #[cfg(test)]
 mod maintenance_growth_tests;
 mod mark;
+mod metadata_layout;
 mod migration;
 mod persistent_authority;
 #[cfg(test)]

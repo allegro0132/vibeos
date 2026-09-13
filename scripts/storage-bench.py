@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -417,6 +418,74 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
     return result
 
 
+def process_cpu_seconds(value: str) -> float:
+    """Parse ps TIME (minutes:seconds, hours:minutes:seconds, optional days)."""
+    days, clock = value.split("-", 1) if "-" in value else ("0", value)
+    parts = clock.split(":")
+    require(len(parts) in (2, 3), "invalid ps CPU time")
+    total = float(parts[-1]) + 60 * int(parts[-2])
+    if len(parts) == 3:
+        total += 3600 * int(parts[0])
+    total += 86400 * int(days)
+    require(math.isfinite(total) and total >= 0, "invalid ps CPU time")
+    return total
+
+
+class HostTelemetry:
+    """Opt-in diagnostic sidecar. Its sampling overhead is not subtracted."""
+
+    def __init__(self, output: Any, process: Any, run_id: str, vm_index: int):
+        self.output = output
+        self.process = process
+        self.coordinates = dict(run_id=run_id, vm_index=vm_index, qemu_pid=process.pid)
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.failure: Exception | None = None
+        self.emit("start", interval_seconds=1.0, cpu_source="ps TIME",
+                  note="diagnostic overhead included; wall intervals include serial transport")
+        self.thread = threading.Thread(target=self.sample, name="qemu-host-telemetry", daemon=True)
+        self.thread.start()
+
+    def emit(self, event: str, **fields: Any) -> None:
+        with self.lock:
+            row = dict(schema="vibeos.storage-bench.host", version=1,
+                       **self.coordinates, event=event, monotonic_ns=time.monotonic_ns(),
+                       wall_time_ns=time.time_ns(), **fields)
+            self.output.write(json.dumps(row, sort_keys=True) + "\n")
+            self.output.flush()
+
+    def sample(self) -> None:
+        try:
+            while not self.stopping.is_set():
+                begin = time.monotonic_ns()
+                try:
+                    result = subprocess.run(
+                        ["ps", "-p", str(self.process.pid), "-o", "time=", "-o", "state="],
+                        capture_output=True, text=True, timeout=2, check=False,
+                        env={**os.environ, "LC_ALL": "C"})
+                    fields: dict[str, Any] = {"poll_started_ns": begin,
+                        "poll_elapsed_ns": time.monotonic_ns() - begin,
+                        "load_average": list(os.getloadavg()), "ps_exit_code": result.returncode}
+                    if result.returncode == 0:
+                        cpu, state = result.stdout.strip().split(None, 1)
+                        fields.update(cpu_seconds=process_cpu_seconds(cpu), process_state=state)
+                    else:
+                        fields["error"] = result.stderr.strip() or "process unavailable"
+                    self.emit("poll", **fields)
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    self.emit("poll_error", poll_started_ns=begin, error=str(error))
+                self.stopping.wait(1.0)
+        except Exception as error:
+            self.failure = error
+
+    def close(self) -> None:
+        self.stopping.set()
+        self.thread.join()  # ps has a two-second timeout.
+        if self.failure is not None:
+            raise self.failure
+        self.emit("stop", qemu_returncode=self.process.returncode)
+
+
 def wait_for(stream: Any, process: subprocess.Popen[bytes], marker: bytes,
              timeout: float, transcript: Any = None) -> bytes:
     selector = selectors.DefaultSelector()
@@ -481,10 +550,13 @@ def run_vibeos(args: argparse.Namespace) -> int:
     total = args.warmups + args.samples
     output = args.output.open("x" if not args.overwrite else "w", encoding="utf-8")
     transcript = None
+    telemetry_output = None
     failed = False
     try:
         if args.serial_log is not None:
             transcript = args.serial_log.open("wb" if args.overwrite else "xb")
+        if args.host_telemetry is not None:
+            telemetry_output = args.host_telemetry.open("w" if args.overwrite else "x", encoding="utf-8")
         for vm_index in range(args.vms):
             with tempfile.TemporaryDirectory(prefix="vibeos-storage-bench-") as temporary:
                 disk = Path(temporary) / "data.raw"
@@ -502,10 +574,15 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 env = environment(qemu_args, qemu_version)
                 env["storage_throttle"] = storage_throttle(args)
                 env["memory_mib"] = args.memory_mib
+                if telemetry_output is not None:
+                    env["host_telemetry"] = {"interval_seconds": 1.0, "cpu_source": "ps TIME"}
                 env.update(artifact_hashes)
                 process = subprocess.Popen(qemu_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT)
+                monitor = None
                 try:
+                    if telemetry_output is not None:
+                        monitor = HostTelemetry(telemetry_output, process, run_id, vm_index)
                     assert process.stdin is not None and process.stdout is not None
                     boot = wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout, transcript)
                     env.update(guest_storage_geometry(boot))
@@ -537,12 +614,18 @@ def run_vibeos(args: argparse.Namespace) -> int:
                                 if getattr(args, "content_class", None):
                                     extra += f" {args.content_class}"
                             command = f"storage bench {args.object_bytes} {seed}{extra}\n".encode()
+                        if monitor is not None:
+                            monitor.emit("sample_begin", sample_index=index if index < args.warmups else index - args.warmups,
+                                         warmup=index < args.warmups, seed=seed)
                         process.stdin.write(command)
                         process.stdin.flush()
                         data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout, transcript)
                         prefix_at = data.rfind(PREFIX.encode())
                         if b"\n" not in data[prefix_at:]:
                             data += wait_for(process.stdout, process, b"\n", args.sample_timeout, transcript)
+                        if monitor is not None:
+                            monitor.emit("sample_received", sample_index=index if index < args.warmups else index - args.warmups,
+                                         warmup=index < args.warmups, seed=seed)
                         sample = guest_record_from(data)
                         require(sample.get("backend") == args.backend,
                                 f"expected {args.backend}, guest selected {sample.get('backend')}")
@@ -560,10 +643,14 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     process.stdin.flush()
                 finally:
                     try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
-                        process.wait(timeout=5)
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.terminate()
+                            process.wait(timeout=5)
+                    finally:
+                        if monitor is not None:
+                            monitor.close()
                 if args.retain_images is not None:
                     args.retain_images.mkdir(parents=True, exist_ok=True)
                     retained = args.retain_images / f"vm-{vm_index:03d}.raw"
@@ -574,6 +661,8 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 if failed:
                     return 1
     finally:
+        if telemetry_output is not None:
+            telemetry_output.close()
         if transcript is not None:
             transcript.close()
         output.close()
@@ -883,6 +972,9 @@ def require_baseline_evidence(records: list[dict[str, Any]], manifest_path: Path
 
 
 def selftest() -> None:
+    for value, expected in [("00:01.25", 1.25), ("02:03", 123),
+                            ("01:02:03.5", 3723.5), ("2-01:02:03", 176523)]:
+        assert process_cpu_seconds(value) == expected
     base = {
         "schema": RECORD_SCHEMA, "version": 1, "run_id": "test", "backend": "storage-v2",
         "layer": "object", "workload": "durable-put-get", "status": "ok", "vm_index": 0,
@@ -1035,6 +1127,8 @@ def main() -> int:
     run.add_argument("--sample-timeout", type=float, default=300)
     run.add_argument("--serial-log", type=Path,
                      help="save raw guest serial output, including diagnostic lines")
+    run.add_argument("--host-telemetry", type=Path,
+                     help="opt-in host/QEMU CPU diagnostic JSONL; sampling overhead is included, never subtracted")
     run.add_argument("--stop-on-failure", action="store_true",
                      help="stop after the first non-ok sample and return exit status 1")
     run.add_argument("--overwrite", action="store_true")

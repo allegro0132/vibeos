@@ -9240,3 +9240,2458 @@ delta remains opt-in and full memory admission remains incomplete.
 Evidence: `target/storage-delta-growth-abba-20260912/`, including raw records,
 serial logs, source/build/command manifests, `summary.json`, quarter/phase data
 and image hashes in `phases.json`, retained image and `offline.json`.
+
+### Reuse the encoded successor digest (2026-09-12)
+
+The experimental fused and standalone publishers previously prepared the next
+snapshot witness by encoding its metadata and hashing the canonical snapshot,
+then repeated that work during delta encoding. A private encoder wrapper now
+returns the prepared witness with its freshly encoded output: delta output
+already contains the computed successor digest; full fallback hashes the encoded
+snapshot. It accepts no external encoded bytes. Physical binding still happens
+only after successful publication and read-back. Snapshot validation, delta
+replay, cache matching and checkpoint ordering remain in place. This removes one
+successor metadata validation/allocation pass and, on delta output, one complete
+successor hash. It does not complete publication-memory admission.
+
+Cold and warm encoding tests compare returned witnesses with independent
+canonical preparation; full fallback receives the same check. The feature unit
+suite passes 278 tests (one ignored), including mutation/cancellation matrices.
+Default compilation and the feature QEMU firmware build pass.
+
+An isolated old/new/new/old QEMU comparison repeats the preceding 256-operation
+4 KiB configuration. Both versions enable delta and use a 64-page cache. All
+1,024 samples pass, and every per-sample I/O counter matches across all runs:
+8,437,760 read bytes, 31,084,544 write bytes, 1,606 read requests, 1,662 write
+requests and 825 flushes per run.
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Before | 13.678071 | 34.7230 |
+| After | 11.201048 | 31.6285 |
+| After, repeat | 11.393334 | 31.7485 |
+| Before, repeat | 11.619467 | 29.3805 |
+
+The mean operation sum falls 10.69%, but the control spread is 16.28% and the
+last control median is lower than either candidate median. This run therefore
+does not establish a stable latency improvement. It is evidence of unchanged
+I/O and correct output, not a reliable speedup estimate or real SD performance.
+The candidate image is byte-identical to the preceding candidate image (SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`). Independent
+verification accepts both checkpoint copies with explicit delta admission;
+default verification rejects delta history. Evidence, including source backups,
+builds, commands, tests, raw timings and image checks:
+`target/storage-delta-encoded-witness-20260912/`.
+
+### Reuse the matched predecessor encoding (2026-09-12)
+
+Warm delta encoding previously validated and encoded the predecessor metadata
+and hashed its canonical bytes for cache matching, then repeated those steps
+to construct the delta. Matching now returns a transient `CanonicalBase` that
+borrows the exact immutable snapshot and owns its validated metadata, digest
+and preparation peak. The same invocation consumes that proof while encoding
+the successor. Physical-root, generation, geometry, UUID, depth and canonical
+digest matching still run. The retained predecessor metadata remains charged
+against successor encoding; it is dropped before reserving output or entering
+full fallback. No persistent proof is broadened to authorize another state.
+
+A test-only thread-local counter verifies exactly two canonical snapshot hashes
+on a warm append: one predecessor check and one successor hash. A failing-read
+device proves that this path does not perform replay I/O. Cold/warm output
+equivalence, fallback, tiny-budget failures and corrupted media remain covered.
+The first implementation passes the 278-test feature suite (one ignored). After
+removing a duplicate prefix comparison and adding the counter assertion, the
+final source passes all 15 experimental tests and 18 codec tests; default check
+and feature firmware build also pass.
+
+A 64-operation QEMU functional run uses the same 4 KiB/seed-32/64-page-cache and
+throttled configuration as the preceding growth-prefix fixture. All records
+pass, including the two growth boundaries. Every per-sample I/O counter matches
+that fixture: 258,048 read bytes/63 requests, 7,036,928 write bytes/406 requests,
+and 203 flushes. The resulting image is byte-identical, SHA-256
+`1002c5f5fe00fae4e62463b9278ee2b7ea5dadf4e668623edb1efb87d0b5185e`.
+Independent verification accepts generation 69, depth 31, both checkpoints and
+64 CAS objects with explicit delta admission; default verification rejects
+delta history. This establishes reduced duplicate computation and unchanged
+output, not a latency estimate or SD performance result. Evidence:
+`target/storage-delta-base-proof-20260912/`.
+
+### Complete ABBA after both digest reuse changes (2026-09-12)
+
+The full firmware was rebuilt from current source and the current delta ELF's
+source manifest rechecked. The same 256-operation, seed-32, 4 KiB, 64-page-cache,
+128 MiB, single-TCG-hart throttled workload runs full/delta/delta/full, without
+overlapping builds or tests. All 1,024 samples pass, but timing is inconclusive:
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 12.979442 | 34.4535 |
+| Delta | 72.656521 | 32.3960 |
+| Delta, repeat | 11.139142 | 29.7175 |
+| Full, repeat | 11.621434 | 29.0730 |
+
+The first delta run slows markedly through samples 196–234, including ordinary
+operations. High-I/O samples 206/234 take 15.838849/19.512670 seconds versus
+1.592152/1.938308 seconds in the repeated delta run. Even the full controls have
+an 11.04% spread. No run or sample is excluded, and no stable latency improvement
+is established. This anomaly needs contemporaneous host scheduling/CPU evidence;
+the current data do not identify its cause. QEMU arguments match between delta
+runs except for their fresh temporary disk paths.
+
+Within each build, all per-sample I/O counters repeat exactly. Full reads
+8,097,792 and writes 53,694,464 bytes; delta reads 8,437,760 (+4.20%) and writes
+31,084,544 (-42.11%) bytes. Both flush 825 times. The final delta image again
+matches the earlier candidate byte-for-byte, SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`.
+Independent verification accepts generation 273, depth 22, both checkpoints and
+256 CAS objects with explicit admission; default verification rejects delta
+history. No SD performance claim is made. Raw records, commands, manifests,
+phase/quartile sums, diagnostic anomaly indices and offline results are in
+`target/storage-delta-digest-abba-20260912/`.
+
+### Opt-in host telemetry for latency diagnosis (2026-09-12)
+
+`scripts/storage-bench.py run-vibeos --host-telemetry PATH` writes a separate
+JSONL diagnostic timeline. It records run/VM/QEMU PID coordinates, monotonic and
+wall timestamps, sample-begin/sample-received markers with seed and warmup
+coordinates, and approximately one poll per second of QEMU cumulative `ps TIME`,
+process state and host load averages. Poll duration and errors are explicit;
+missing CPU values are not replaced with zero. Polling stops during cleanup.
+The ordinary benchmark environment records that telemetry was enabled. It is
+off by default and does not change the guest metrics or exclude slow samples.
+
+Sampling has overhead: use the same setting on both sides of a diagnostic
+comparison, and do not mix it silently with ordinary baseline runs. Host command
+intervals include serial transport and other runner/guest work outside the guest
+timer. CPU windows bracketed by one-second polls include adjacent operations and
+idle gaps; they are not precise per-operation CPU costs or direct proof of a
+scheduling/storage cause. Large monotonic/wall or CPU-time differences are clues
+for follow-up, not automatic reasons to discard samples.
+
+The runner selftest passes, including CPU-time parsing. A live 64-operation
+check verifies all marker coordinates, monotonic timestamps, nondecreasing CPU
+time, successful lifecycle cleanup and 20 error-free polls. Its per-sample I/O
+and final disk match the earlier 64-operation fixture exactly. The independent
+image verifier passes. Evidence: `target/storage-host-telemetry-20260912/`.
+
+A full 256-operation diagnostic run also passes, with 80 error-free polls,
+maximum poll gap 1.024 seconds and median collection duration 5.85 ms. The prior
+multi-second anomaly does not recur: samples 206/234 take 1.605667/1.958959 guest
+seconds. Their approximately 3.04-second bracketing poll windows accumulate
+0.77/0.83 QEMU CPU seconds, including nearby work; this does not identify the
+cause of the earlier anomalous run. Operation sum 11.849230 seconds and median
+33.7805 ms are diagnostic observations, not an uninstrumented speedup estimate.
+Every per-sample I/O counter matches the earlier delta run, and the final image
+is byte-identical (SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`). Independent
+verification accepts both checkpoints with explicit admission; default rejects
+delta history. Evidence and the timeline analysis script:
+`target/storage-host-telemetry-pressure-20260912/`.
+
+### Charge the experimental successor preparation overlap (2026-09-12)
+
+Experimental fused publication previously subtracted only the root table before
+reserving successor snapshot tables and, for short deltas, a complete log buffer.
+It now also charges the still-live predecessor state's tracked resident heap,
+the source snapshot's allocated capacities and the encoded output's capacity.
+Checked addition/subtraction refuses an overflowing or exhausted budget before
+reserving successor storage. This applies when the experimental fused encoder
+prepared a successor witness, including its full-materialization fallback;
+default publication behavior is unchanged.
+
+This is one publication-phase overlap check, not whole-operation admission.
+Scratch staging may already have written media. Staged extent/manifest/sink
+buffers, runtime proof structures and later publisher workspace still need
+their own complete accounting. The change does not establish a throughput or
+latency improvement; it closes an undercount needed for bounded experimental
+publication on constrained guests.
+
+Boundary tests cover full output, short delta output and output with spare
+capacity; exact budgets succeed, one byte less fails and overflow fails. The
+complete feature unit suite passes 279 tests (one ignored), including the
+mutation/cancellation matrices. Default compilation and feature QEMU firmware
+build pass. A 256-operation QEMU pressure run accepts every sample under the
+existing configuration. Every per-sample I/O counter matches the prior delta
+run, and the final image is byte-identical (SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`). Independent
+verification accepts both checkpoints with explicit admission and rejects the
+delta history by default. Evidence:
+`target/storage-delta-publication-overlap-20260912/`.
+
+### Charge staged buffers during experimental encoding/preparation (2026-09-12)
+
+The experimental fused path now includes the staged object's owned buffers in
+both its delta-codec allowance and successor-preparation overlap check. The
+tracked amount adds manifest extents, scratch extents, scratch segments and
+payload-hash Vec capacities to the predecessor state's tracked resident heap.
+PageSink charges its entry-array capacity plus each live boxed page. Empty
+reserved arrays still count; clearing sink entries releases the boxes without
+pretending that retained entry capacity disappeared. All arithmetic is checked.
+Batch entries without an owned predecessor report only their own buffers; their
+shared base must be charged separately by any future caller.
+
+The capacity/lifetime test covers empty-but-reserved arrays, adding boxed pages
+and clearing them while retaining slots. The full feature suite passes 280
+tests (one ignored), default compilation and feature firmware build pass. The
+existing 256-operation QEMU pressure configuration still accepts every sample.
+All per-sample I/O counters match the preceding delta run and the final disk is
+byte-identical, SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`.
+Independent image verification accepts both checkpoints with explicit delta
+admission; default verification rejects delta history. Evidence:
+`target/storage-staged-resident-20260912/`.
+
+This extends tracked overlap admission, not the full operation limit: shared
+quota/runtime proof structures, caller-owned import/index buffers, allocator
+overhead and subsequent publisher temporaries remain outside this check. No
+latency or SD performance improvement is inferred from this admission change.
+
+### Release single-publication scratch buffers before read-back (2026-09-12)
+
+The default single-object publisher now drops its two 4 KiB segment-header
+buffers and temporary payload-reference Vec once their writes have completed
+(or have been copied into PageSink). They no longer overlap segment finalization,
+checkpoint I/O and the larger read-back capture. Read-back verification also
+borrows the exact published manifest encoding instead of allocating a second
+identical encoding. Staged-blob verification and observed-versus-expected byte
+comparison remain intact.
+
+The preallocated-device allocation probe measures the following import peaks
+in bytes, with all read/write page counts, write requests and flushes unchanged:
+
+| Prior history records | Object bytes | Before peak | After peak |
+| ---: | ---: | ---: | ---: |
+| 0 | 4,096 | 334,052 | 325,764 |
+| 0 | 65,536 | 590,108 | 581,564 |
+| 0 | 131,072 | 967,644 | 959,356 |
+| 0 | 368,640 | 2,398,188 | 2,389,900 |
+| 256 | 4,096 | 592,168 | 592,168 |
+| 256 | 65,536 | 914,728 | 914,728 |
+| 256 | 131,072 | 1,260,840 | 1,260,840 |
+| 256 | 368,640 | 2,662,336 | 2,654,048 |
+
+The affected cases also make one fewer allocation (256 or 512 fewer gross
+requested bytes for the manifest); other peaks/call counts are unchanged. Early
+release reduces live overlap rather than total header allocation volume. This
+is a measured host allocation improvement, not a latency or SD throughput claim.
+
+The complete feature unit suite passes 280 tests (one ignored). Default QEMU
+file-tree acceptance passes all three boots, including links, removal, GC
+pressure, cold recovery and powered-off image verification. Duo compilation
+passes; no physical SD test was run. Evidence, before-source snapshot, allocation
+logs/comparison and retained QEMU verification logs:
+`target/storage-publication-buffer-lifetime-20260912/`.
+
+### Reserve the complete batch read-back table (2026-09-12)
+
+Batch read-back previously reserved `manifest count + 2` slots for both requests
+and expected byte slices, then pushed catalog, allocation and optional authority
+entries. Authority-bearing batches could therefore trigger implicit Vec growth
+after the fallible reservation. Both tables now reserve the checked sum of all
+actual entries once. The dedicated-metadata branch also drops its two header
+pages before segment finalization; the open-segment branch already consumes its
+temporary reference table promptly. Verification requests and byte comparisons
+are unchanged.
+
+The same allocation probe shows two fewer allocation calls and 640 fewer gross
+requested bytes for each 4/64/128 KiB append with 256 prior history records.
+Their peaks fall by 256 bytes: 592,168 to 591,912; 914,728 to 914,472; and
+1,260,840 to 1,260,584. Other measured shapes are unchanged. All read/write page
+counts, write requests and flushes match. This is a small measured allocation
+improvement and removal of implicit growth, not evidence of latency or SD gains.
+
+The complete feature suite passes 280 tests (one ignored), the default QEMU
+file-tree gate passes its three boots including GC/cold recovery/offline image
+verification, and Duo compilation passes. The allocation probe finishes before
+the correctness gates; the gates are not timing experiments. Evidence:
+`target/storage-batch-readback-reserve-20260912/`.
+
+### Current 128 KiB full-versus-delta diagnostic ABBA (2026-09-12)
+
+Fresh current-source ELFs run full/delta/delta/full with 64 unique 128 KiB
+durable put+get operations per run, seed 32, no warmups, 128 MiB RAM, a 64-page
+cache and one TCG hart. Read/write limits remain 4/2 MiB/s and 400/200 IOPS.
+Host telemetry is enabled equally on both builds. Builds finish before timing;
+all 256 samples validate and every per-sample I/O counter repeats within its
+build. All host polls succeed; maximum observed poll gap is 1.023 seconds.
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 3.933482 | 57.8970 |
+| Delta | 3.011933 | 42.4895 |
+| Delta, repeat | 3.051257 | 45.0685 |
+| Full, repeat | 4.177144 | 67.5995 |
+
+Mean sums fall from 4.055313 to 3.031595 seconds (-25.24%); both delta runs are
+below both full runs. Full/delta two-run spreads are 6.01%/1.30%. The average of
+run medians falls 30.23%. Put sums average 3.539362 versus 2.620655 seconds
+(-25.96%), get sums 0.515951 versus 0.410940 seconds (-20.35%). These are results
+for this short, instrumented workload, not sustained throughput or an SD result.
+
+| Per-run I/O | Full | Delta |
+| --- | ---: | ---: |
+| Read bytes | 5,251,072 | 2,174,976 |
+| Write bytes | 17,424,384 | 15,425,536 |
+| Read requests | 362 | 140 |
+| Write requests | 476 | 470 |
+| Flushes | 203 | 203 |
+| Put read bytes | 2,121,728 | 2,072,576 |
+| Get read bytes | 3,129,344 | 102,400 |
+
+Writes fall 11.47%, total reads 58.58%; most avoided reads belong to get directly
+following put. Reduced cache displacement by smaller metadata is a plausible
+explanation under this 256 KiB cache, not a separately established causal result.
+The gain must not be attributed entirely to hashing/encoding or extrapolated to
+larger caches, cold reads, longer GC pressure, Linux comparison or real SD media.
+Command gaps still permit throttle-credit recovery and are excluded from sums.
+
+Independent verification accepts generation 69, depth 31, both checkpoints and
+64 CAS objects with explicit delta admission; default verification rejects its
+delta history. The workload has no durably granted authority objects. Evidence,
+including manifests, commands, raw samples, host timelines, phase analysis and
+retained image: `target/storage-medium-delta-20260912/`.
+
+### 128 KiB cache-capacity sensitivity: default 512 pages (2026-09-12)
+
+Repeat the preceding full/delta/delta/full experiment at the default 512-page
+cache (2 MiB). The workload, source, 128 MiB guest, single TCG hart, read/write
+limits and telemetry setting are unchanged. Both ELFs are freshly built with
+the unmodified cache declaration. All 256 samples and timeline coordinates
+validate; all host polls succeed, maximum poll gap 1.021 seconds.
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 3.972144 | 61.8835 |
+| Delta | 2.862710 | 42.3840 |
+| Delta, repeat | 2.856221 | 42.1920 |
+| Full, repeat | 3.931664 | 59.5330 |
+
+Mean operation sums are 3.951904 versus 2.859466 seconds (-27.64%), with
+full/delta two-run spreads of 1.02%/0.23%. The average of run medians falls
+30.34%. Mean put sums fall 3.563207 to 2.517691 seconds (-29.34%); get sums fall
+0.388698 to 0.341775 seconds (-12.07%). This is a short instrumented QEMU result,
+not a sustained-throughput, cold-read or real-SD result.
+
+Both builds now perform zero device reads during the measured samples. Writes
+remain 17,424,384 versus 15,425,536 bytes (-11.47%), 476 versus 470 write requests,
+and 203 flushes each, with exact per-sample repeatability within each build.
+The latency advantage therefore survives removal of the device-read difference
+seen at 64 pages. Cache displacement explains the earlier read-count difference
+but cannot alone explain the observed latency advantage; further attribution
+must examine writes and metadata processing rather than assume a pure cache
+effect. This experiment does not isolate those two remaining contributions.
+
+The delta disk is byte-identical across cache capacities, SHA-256
+`fc7f600a7b8069c6a10d39055bf70c2fab7577adbd4265e56add356156f35542`.
+Independent verification accepts generation 69, depth 31, both checkpoints and
+64 CAS objects with explicit delta admission; default rejects its delta history.
+No durably granted authority objects are present in this workload. Evidence:
+`target/storage-medium-cache512-20260912/`.
+
+### 128 KiB sensitivity without QEMU rate limits (2026-09-12)
+
+Reuse the exact preceding 512-page-cache ELFs after checking their source
+manifest, and repeat full/delta/delta/full with the same 64 unique 128 KiB
+operations, seed 32, 128 MiB, one TCG hart and telemetry. Only QEMU's bandwidth
+and IOPS limit arguments are removed. All 256 records and timeline coordinates
+validate, all polls succeed, and each build's per-sample I/O repeats exactly.
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 2.147781 | 32.1710 |
+| Delta | 2.190479 | 32.6105 |
+| Delta, repeat | 2.203788 | 32.7400 |
+| Full, repeat | 2.197204 | 32.1390 |
+
+Mean sums are 2.172493 versus 2.197133 seconds (+1.13%), with full/delta two-run
+spreads of 2.27%/0.61%. This does not establish a latency improvement. Mean put
+sums rise from 1.816396 to 1.862667 seconds (+2.55%); get sums fall from 0.356097
+to 0.334467 seconds (-6.07%). The experiment still includes device/host/flush
+and diagnostic overhead and must not be treated as pure CPU timing.
+
+Both builds still perform zero measured device reads. Writes remain 17,424,384
+versus 15,425,536 bytes (-11.47%), 476 versus 470 write requests, and 203 flushes
+each. The preceding limited-run latency advantage therefore does not survive
+removal of the rate limits in this workload. This supports prioritizing reduced
+write amplification under constrained storage and longer pressure testing,
+rather than assuming a general execution-time advantage. It does not isolate
+bandwidth from IOPS effects or predict a specific SD card's behavior.
+
+The candidate image is byte-identical to the limited 512-page run, SHA-256
+`fc7f600a7b8069c6a10d39055bf70c2fab7577adbd4265e56add356156f35542`.
+Independent verification accepts generation 69, depth 31, both checkpoints and
+64 CAS objects with explicit admission; default rejects delta history. Evidence:
+`target/storage-medium-unthrottled-20260912/`.
+
+### 256-operation 128 KiB growth/GC pressure (2026-09-12)
+
+Extend the 64-page-cache limited workload to 256 unique 128 KiB operations
+(32 MiB logical payload) using the same verified ELFs. Full and delta run once
+each, with telemetry, seed 32, 128 MiB, single TCG hart and the earlier 4/2 MiB/s,
+400/200 IOPS limits. Both runs validate all records and timeline coordinates;
+host polls report no errors, maximum gap 1.040 seconds. This is a longer
+functional/I/O comparison, not a repeated timing-effect estimate.
+
+| Entire run | Full | Delta |
+| --- | ---: | ---: |
+| Write bytes | 98,754,560 | 71,634,944 |
+| Read bytes | 53,751,808 | 30,846,976 |
+| Write requests | 2,882 | 1,979 |
+| Flushes | 825 | 825 |
+| Write bytes / logical payload bytes | 2.9431 | 2.1349 |
+| Observed operation sum seconds | 36.847987 | 23.254118 |
+
+Writes fall 27.46% and reads 42.61%, including growth, full-materialization
+fallbacks and collection. The first 64 operations' I/O matches the preceding
+short run. Per-64-operation write bytes are full 17,424,384 / 23,138,304 /
+23,298,048 / 34,893,824 and delta 15,425,536 / 15,622,144 / 15,654,912 /
+24,932,352. Flush counts per quarter match: 203 / 198 / 200 / 224. Get reads
+fall from 24,895,488 to 1,003,520 bytes; put reads instead rise from 28,856,320
+to 29,843,456 bytes. Total read savings must not hide that distinction.
+
+Long-tail samples 206/234 remain: full 3.629416/4.611288 seconds, delta
+3.622509/4.617275 seconds. Serial evidence identifies two GC rounds at each
+point after growth is exhausted. Both builds report identical per-round GC
+read requests (287, 350, 380, 378), write requests (22, 31, 31, 32), copied bytes
+(1,099,264 then 2,061,120 three times), and 16 reclaimed segments per round.
+The second round follows the existing free-space hysteresis, deliberately
+reclaiming past the floor to amortize later collections. Removing it blindly
+would trade pause size for collection frequency; the next useful target is
+per-round scanning/relocation cost. Ordinary append improvements have not
+removed these maintenance pauses.
+
+Independent verification accepts generation 273, depth 22, both checkpoints
+and 256 CAS objects with explicit admission; default rejects delta history.
+No physical SD test or sustained-throughput claim is made. Evidence:
+`target/storage-medium-pressure-20260912/`.
+
+### Linear manifest-capacity accounting during GC (2026-09-12)
+
+`load_live_manifests` previously rescanned every already-loaded manifest to
+recompute retained extent capacity before reading the next one. With B live
+blobs, that accounting alone revisited B(B-1)/2 entries. Since loaded manifests
+and their capacities are immutable, it now maintains the checked sum once per
+decoded manifest. Actual Vec capacities, not logical lengths, remain charged;
+payload/decoder admission and overflow checks are preserved. This changes the
+accounting work to B updates without changing manifest reads or verification.
+
+The full feature suite passes 280 tests (one ignored), the default three-boot
+QEMU file-tree gate passes GC pressure/cold recovery/offline verification, and
+Duo compilation passes. No latency or I/O improvement was measured in this
+turn, and the multi-second relocation tails are not claimed resolved. The
+copied-extent digest/padding checks and whole-blob Merkle verification still
+perform their existing reads; safely sharing a read-back snapshot requires
+separate bounded-memory work. Evidence:
+`target/storage-gc-manifest-accounting-20260912/`.
+
+### Rejected physical-order GC manifest loading (2026-09-12)
+
+Trial: reserve a budgeted Vec of live CAS indices, sort it by physical segment
+and descriptor location, load/authenticate manifests in that order, then restore
+canonical BlobKey ordering before planning. Charge the index/manifest overlap
+before releasing the index. This differs from the earlier rejected reverse-key
+traversal, but targets the same cache-locality hypothesis.
+
+An initial full feature suite passes 280 tests (one ignored); after correcting
+the telemetry accounting order, all 22 GC-filtered tests pass. A 256-operation
+128 KiB limited QEMU run per build, 64-page cache/128 MiB/single TCG hart with
+host telemetry, validates all 512 records. Both ELFs use the default full writer.
+The control ELF predates the linear-capacity accounting change as well, so this
+is not an isolated CPU-timing comparison for physical sorting.
+
+| Entire run | Control | Trial |
+| --- | ---: | ---: |
+| Read bytes | 53,751,808 | 53,755,904 |
+| Read requests | 2,758 | 2,759 |
+| Write bytes | 98,754,560 | 98,754,560 |
+| Write requests | 2,882 | 2,882 |
+| Flushes | 825 | 825 |
+| Observed operation sum seconds | 37.876519 | 37.054141 |
+
+The only I/O difference is one additional 4 KiB read at sample 234. GC-episode
+times remain about 3.6/4.6 seconds. A one-pair timing change with differing host
+variation and the control's older accounting does not establish a benefit.
+Reject the added sorting/index allocation because targeted I/O does not improve.
+The source is restored byte-for-byte to this experiment's baseline, preserving
+the preceding linear-capacity accounting optimization.
+
+The stopped trial image passes the independent default verifier with its
+unmanaged-prefix baseline; default checkpoint recovery accepts generation 273,
+both copies and 256 CAS objects. Evidence: `target/storage-gc-physical-order-20260912/`.
+This directory separates the physical-order experiment from the older
+`storage-gc-manifest-order-20260912` reverse-key trial; see its provenance note
+for build scratch names briefly reused before the separation. No runtime
+physical-order optimization remains and no SD performance claim is made.
+
+### GC single-envelope readback reuse and allocation-free Merkle verification (2026-09-12)
+
+`BlobView::verify_all` now authenticates every real/padded leaf and then every
+parent against the immutable encoded tree. Each parent uses children already
+verified at the preceding level; decoding still binds the final root to the
+header. This retains complete tree validation while removing the second tree
+allocation. A thread-local allocator test observes zero allocations during
+verification for empty, boundary, padded and large objects through 4 MiB.
+Existing prefix/tree-node mutation and streaming tests also pass.
+
+GC reuses an authenticated copied payload for complete verification when the
+object has one extent. It checks manifest/extent identity and geometry, the blob
+header, all Merkle nodes and the existing final-page zero padding. Physical
+pointer, segment-seal and payload-hash validation still run. Multi-extent
+objects retain the previous streaming verification path. No new payload copy
+or cache is introduced.
+
+A limited QEMU comparison uses the default full writer, 64 cache pages, 128 MiB,
+one TCG hart, 256 unique 128 KiB durable put/get operations per build, and host
+telemetry. Read/write limits are 4/2 MiB/s and 400/200 IOPS. Both runs validate all
+256 samples. The control ELF also predates linear GC manifest accounting, so
+CPU timing does not isolate the single-envelope change.
+
+| Entire run | Control | Candidate |
+| --- | ---: | ---: |
+| Read bytes | 53,751,808 | 53,751,808 |
+| Read requests | 2,758 | 2,758 |
+| Write bytes | 98,754,560 | 98,754,560 |
+| Write requests | 2,882 | 2,882 |
+| Flushes | 825 | 825 |
+| Observed operation sum seconds | 59.284375 | 58.820141 |
+| Median operation milliseconds | 152.9575 | 186.8400 |
+
+There is **no measured physical I/O reduction**. The single pair is noisy:
+control sample 234 takes 11.899512 seconds versus 5.085942 for the candidate,
+while sample 206 changes from 3.657797 to 4.556343 seconds. Neither the operation
+sum nor these tails establish a speedup. The retained benefit is removal of
+redundant logical verification work/buffers and the independently tested
+allocation-free tree walk; SD performance is unmeasured.
+
+The feature-enabled segment-store suite passes 280 tests (one ignored). The
+stopped default-format candidate image passes the independent migration
+verifier with its unmanaged-prefix baseline, including 256 CAS objects.
+Evidence: `target/storage-gc-single-envelope-20260912/`, including commands,
+ELF/source hashes, raw samples, host telemetry and offline verification.
+`formatted-source.json` records whitespace-only formatting after the measured
+firmware build; the original build hashes remain in their original manifests.
+
+Final gates pass: default QEMU file-tree across three boots (hard links,
+symlink, recursive removal, GC pressure, cold recovery and powered-off
+verification), plus the Milk-V Duo release compile check. This is compile
+coverage for Duo, not a real-device benchmark.
+
+### Current 128 KiB GC phase attribution (2026-09-12)
+
+Temporary phase hooks on the current single-envelope runtime isolate physical
+I/O across four collections in 256 unique 128 KiB durable put/get samples.
+Configuration remains default full metadata, 64 cache pages, 128 MiB, one TCG
+hart, 4/2 MiB/s and 400/200 read/write IOPS. All samples pass; every sample's
+seven counters exactly matches the preceding uninstrumented candidate.
+Diagnostic times are not used. Both source files are restored byte-for-byte
+before running the instrumented ELF.
+
+| Four rounds combined | Read requests | Read bytes |
+| --- | ---: | ---: |
+| Typed children / mark | 0 | 0 |
+| Manifest loading / planning | 879 | 3,600,384 |
+| Relocation staging | 161 | 7,389,184 |
+| Root readback | 139 | 1,732,608 |
+| Manifest / blob readback | 212 | 7,598,080 |
+| Publication / reuse | 4 | 98,304 |
+| Total | 1,395 | 20,418,560 |
+
+GC writes total 9,695,232 bytes / 116 requests / 30 flushes. Manifest loading
+accounts for 63.0% of read requests but 17.6% of read bytes; source plus object
+readback accounts for 73.4% of read bytes. Thus small manifest accesses dominate
+request count even after avoiding duplicate single-envelope verification.
+Current source selection caps each round at 16 source segments; each pressure
+episode executes two rounds and reloads the live manifests. The next bounded
+experiment tests 32 sources per round to measure whether fewer passes outweigh
+larger round work. This does not yet justify changing the production pause cap.
+Evidence: `target/storage-medium-gc-phases-current-20260912/`, including exact
+before/trial sources, ELF, source restoration hashes, commands, serial phase
+trace, raw samples and reconciled per-round/combined counters.
+
+### Temporary 32-source GC round trial (2026-09-12)
+
+Build a trial with only `GC_MAX_SOURCES_PER_ROUND` changed from 16 to 32,
+then restore the runtime source before execution. Use the same 256 unique
+128 KiB pressure workload/configuration as the phase diagnostic above, without
+phase hooks. The control is the preceding single-envelope candidate, not the
+older pre-accounting ELF. All 256 trial samples pass.
+
+| Entire workload | 16-source control | 32-source trial |
+| --- | ---: | ---: |
+| GC rounds | 4 | 2 |
+| Source segments reclaimed | 64 | 64 |
+| GC copied blob bytes | 7,282,624 | 7,557,440 |
+| Read requests | 2,758 | 2,322 |
+| Read bytes | 53,751,808 | 52,068,352 |
+| Write requests | 2,882 | 2,858 |
+| Write bytes | 98,754,560 | 98,484,224 |
+| Flushes | 825 | 809 |
+
+Total read requests decrease 15.81%, read bytes 3.13%, write bytes 0.27% and
+flushes 1.94%. GC read requests alone decrease from 1,395 to 959. Both reclaim
+64 source segments, but the trial copies 274,816 additional blob bytes and
+moves the second pressure event from sample 234 to 236. This is a whole-run
+comparison with changed GC scheduling, not identical per-round work.
+
+Observed operation sums are 58.820141 versus 34.266323 seconds. The control's
+host variation and unrepeated sequential measurements prevent attributing this
+large timing difference to the change. Trial pressure operations take 3.300692
+and 4.216592 seconds; larger individual rounds can still worsen pause bounds
+on other liveness distributions or slow devices. The trial stopped image
+passes the independent default verifier with 256 CAS objects and its unmanaged
+prefix baseline.
+
+**Production source remains capped at 16.** The evidence supports investigating
+amortized manifest loading/round overhead with a bound on copied bytes or an
+explicit maintenance budget. It does not qualify an unconditional larger pause
+cap, and no new 32-source fault-injection or real-SD qualification is claimed.
+Evidence: `target/storage-gc-source32-trial-20260912/`, including the exact
+one-line trial, restoration hashes, build/ELF, commands, telemetry, raw samples,
+GC records, comparison and independent image verification.
+
+### Bounded extension of low-copy GC rounds (2026-09-13)
+
+Retain a bounded version of the preceding 32-source experiment. Ordinary
+prefixes through 16 sources retain their previous selection rules. A larger
+prefix may contain at most 32 sources, at most 4 MiB of authoritative live Blob
+payload, and at most six relocation target segments. Exact placement includes
+rewritten manifests, catalog/authority/allocation roots, record framing and
+padding; the separate G+2 barrier reservation remains additional. The running
+Blob-byte sum uses checked arithmetic over the existing authoritative ranking.
+All existing target-capacity, memory admission and net-yield checks remain.
+No extra allocation is introduced for the byte sum. These are work bounds,
+not a millisecond deadline or a universal 4 MiB bound for ordinary dense rounds.
+
+The added integration test retains 40 unique objects for both 4 KiB and
+512 KiB payloads, runs three collections each and cold-mounts/reads the first
+and last chunk of every object after every round. It proves that the fixture
+actually exercises both >16-source bounded extension and >4 MiB ordinary
+fallback. Existing retained-manifest corruption/pointer-stability coverage is
+preserved with 20 dead writes instead of ten per round. That fixture now uses
+full CAS snapshots explicitly because its raw helper reads the checkpoint's
+base snapshot rather than replaying catalog deltas. The initial failures and
+corrected runs remain in evidence; no integrity assertion was removed.
+
+All 25 GC integration tests pass, including existing mutation/cancellation
+recovery coverage; all 280 feature-enabled unit tests pass (one ignored).
+Default QEMU file-tree passes three boots, GC/cold recovery and powered-off
+verification. Duo release compile check passes. These do not establish SD
+latency or exhaustive large-source fault coverage.
+
+| 256 unique 128 KiB operations | 16-source control | Bounded extension |
+| --- | ---: | ---: |
+| GC rounds | 4 | 2 |
+| Source segments reclaimed | 64 | 63 |
+| GC copied blob bytes | 7,282,624 | 7,420,032 |
+| Read requests | 2,758 | 2,313 |
+| Read bytes | 53,751,808 | 51,748,864 |
+| Write requests | 2,882 | 2,857 |
+| Write bytes | 98,754,560 | 98,324,480 |
+| Flushes | 825 | 809 |
+
+Default full writer, 64 cache pages, 128 MiB, one TCG hart, 4/2 MiB/s and
+400/200 read/write IOPS, with host telemetry. No heavy build/test overlaps this
+performance run. All 256 samples pass; the stopped image passes independent
+verification with 256 CAS objects and its unmanaged-prefix baseline. Total
+read requests decrease 16.13%, read bytes 3.73%, write bytes 0.44%. GC reads
+alone fall from 1,395 to 950 requests. The new rounds select 32 and 31 sources,
+copying 3,297,792 and 4,122,240 bytes: the second stops before exceeding 4 MiB.
+The second pressure event moves from sample 234 to 236, and total reclaimed
+sources differ by one; this is an end-to-end workload comparison, not an equal
+source-set microbenchmark. Free segments after the final pressure event are 37
+in both cases.
+
+Observed operation sums are 58.820141 versus 34.559880 seconds and candidate
+pressure operations take 3.306981/4.108337 seconds. The noisy historical control
+and single candidate run do not support a replicated latency claim. The
+request-count result is the retained performance evidence; real SD behavior
+and latency tails remain unmeasured.
+
+Evidence: `target/storage-gc-bounded-round-20260912/` (started before midnight),
+including the before source, build/ELF, commands, raw samples/telemetry, GC
+records, comparison, independent image report, all test logs and saved
+file-tree evidence. `final-source.json` records the comment-only clarification
+after the measured build and tests. Production now uses the bounded extension;
+the earlier unconditional 32-source trial remains unretained.
+
+### Extended-round mutation and cancellation recovery matrix (2026-09-13)
+
+Strengthen the retained bounded-GC optimization with an integration fault
+matrix that actually selects 32 sources and copies live Blob payloads. The
+96-segment fixture retains 20 distinct 4 KiB objects and copies 46,816 encoded
+Blob bytes across 145 write/flush mutation boundaries. Seven failure modes at
+every boundary produce 1,015 cases: not-submitted failure, ambiguous failure
+with no/visible/durable effects, and pending cancellation with the same three
+effects. The ordinary fixture still exercises all three allocated sources,
+47 boundaries and 329 cases.
+
+For every case, require the failed/cancelled instance to demand recovery; cold
+mount must select G, G+1 or G+2. Selected sources must respectively be Allocated,
+Retired with the correct generation, or Free. Unselected allocated segments
+must remain allocated. Resume incomplete collections through G+2, cold-mount
+again, compare all original object-to-Blob bindings, and compare each complete
+encoded object (including Merkle tree) with an independently encoded expected
+value. The matrix uses full input CAS snapshots for direct binding comparison;
+it does not claim catalog-delta-specific fault coverage.
+
+The first harness revision shared a runtime context across independent fault
+cases and correctly encountered RecoveryRequired from prior poison state.
+The final harness gives every instance an independent context and verifies
+content directly from the cold recovered image. A temporary test compile error
+used BlobKey from the wrong crate; corrected logs are retained alongside the
+initial attempts. No runtime correction was necessary.
+
+Final full GC integration suite: 26 passed, zero failed, including the extended
+1,015-case matrix, ordinary 329-case matrix, and existing acknowledged-corruption
+checks. This adds large-source boundary coverage for failure/cancellation;
+acknowledged-corrupt-media coverage remains the existing separate fixture.
+No new runtime change, QEMU timing run or SD performance claim in this turn.
+Evidence: `target/storage-gc-extended-faults-20260913/`, including before/final
+test source hashes and complete final test output.
+
+### Bounded GC on 4 KiB objects, limited QEMU ABBA (2026-09-13)
+
+Run saved single-envelope/16-source and bounded-extension ELFs in A-B-B-A
+order, each from the same blank template with 256 unique 4 KiB durable put/get
+samples (seeds 32..287). Default full writer, 64 cache pages, 128 MiB, one TCG
+hart, 4/2 MiB/s and 400/200 read/write IOPS, host telemetry on, zero warmups.
+Current GC source hash matches the bounded build's final manifest; subsequent
+changes are tests/docs. No build or heavy verification overlaps timed runs.
+All 1,024 samples pass. Each version's two repetitions have exactly identical
+per-sample seven I/O counters and GC records.
+
+| Per 256-operation run | 16-source | Bounded extension |
+| --- | ---: | ---: |
+| Read requests | 1,565 | 1,130 |
+| Read bytes | 8,097,792 | 5,935,104 |
+| Write requests | 1,857 | 1,830 |
+| Write bytes | 53,694,464 | 53,137,408 |
+| Flushes | 825 | 809 |
+| GC rounds | 4 | 2 |
+| Source segments reclaimed | 64 | 64 |
+| GC copied encoded Blob bytes | 237,440 | 246,400 |
+
+Read requests decrease 27.80%, read bytes 26.71%, write bytes 1.04% and flushes
+1.94%. GC read requests alone decrease from 1,283 to 848. Candidate GC copies
+107,520/138,880 bytes per round, well inside the 4 MiB extension bound. The
+second pressure sample moves from 234 to 236; this is the complete workload's
+I/O outcome, not identical per-round source selection. The retained candidate
+image independently verifies status ok with 256 CAS objects and its unmanaged
+prefix baseline.
+
+| Observed timing | A1 | B1 | B2 | A2 |
+| --- | ---: | ---: | ---: | ---: |
+| Operation sum seconds | 11.946225 | 38.455633 | 11.424816 | 15.483013 |
+| Median operation ms | 28.876 | 101.505 | 34.395 | 43.063 |
+| Pre-first-GC sum, samples 0..205, seconds | 6.243298 | 33.562477 | 6.466178 | 8.871970 |
+
+Do not discard B1. All-run means are 13.714619 versus 24.9402245 seconds; the
+candidate mean is worse by 81.85%, with within-version spreads of 25.79% for A
+and 108.38% for B. These runs do not establish an overall latency improvement.
+The first 206 samples have identical physical counters across all four runs,
+before this GC selection change is exercised. B1's QEMU CPU accumulation
+between first/last polls is 9.04 seconds (others 9.17/10.31/10.46), while its
+host load-1 peaks near 33 and its poll interval spans 116.16 seconds (others
+78.80–83.00). These coarse intervals include boot and quiet gaps; this is
+correlation supporting environmental variation, not per-operation CPU or a
+causal scheduling diagnosis. No SD latency claim is made.
+
+Evidence: `target/storage-gc-bounded-4k-abba-20260913/`: commands/ELF hashes,
+all raw samples and serial logs, telemetry, exact repeated-counter assertions,
+summary, timing diagnostic and independent stopped-image report. This turn
+adds repeatable small-object I/O evidence and retains the noisy timing result;
+no additional runtime change.
+
+### GC live-byte ranking uses existing sorted IDs (2026-09-13)
+
+`ranked_gc_sources` previously located the allocated segment for each live
+extent with a linear `iter_mut().find`. The table is constructed in strictly
+ascending segment-number order and is sorted by live bytes only after all
+accumulation completes. Use binary search on that existing segment-number
+order, then update the same entry with checked byte addition.
+
+For E live extents and S allocated segments, the lookup component changes from
+O(E*S) to O(E*log S). Initial allocation traversal and final live-byte sort are
+unchanged. No second index, allocation, cache or device operation is added.
+Missing/free/out-of-range source references still report corruption; byte-sum
+overflow still fails. Final ordering remains (live bytes, segment number),
+including deterministic equal-byte ties.
+
+Both ranking tests pass. The new case uses sparse allocated IDs, several
+extents on one source, zero-live segments, equal-live ties, invalid source IDs
+and overflow. All 26 GC integration tests pass, including extended 32-source
+failure/cancellation recovery and complete object/binding checks. Default QEMU
+file-tree passes three boots with GC, cold recovery and powered-off validation;
+Duo release compile check passes. No timing benchmark or new physical-I/O
+reduction is claimed for this CPU-work optimization.
+
+Evidence: `target/storage-gc-rank-lookup-20260913/`, with before/after source,
+hash, ranking and full GC logs, default QEMU gate/evidence, and Duo compile log.
+
+### Fixed-size output for streaming Merkle node reads (2026-09-13)
+
+Full streaming verification and single-chunk proofs previously allocated a
+32-byte Vec for every stored Merkle node read. `ManifestRangeReader` now shares
+its existing range/pointer validation and page-window logic through a private
+generic output constructor: ordinary reads still create a fallible Vec after
+validation, while `read_hash` returns a fixed `[u8; 32]`. Tree emission checking
+and proof sibling gathering consume that array directly. Hash/content window
+selection, read-ahead, failed-read invalidation and every hash comparison are
+unchanged; no new cache or weaker verification path is introduced.
+
+An isolated host allocator probe uses a preallocated page device, creates the
+object outside measurement, then measures public full verification and the
+first verified chunk separately. Before/after read page counts are identical;
+all calls perform zero writes/flushes. The full-mode allocation reductions equal
+all padded tree nodes, and chunk-mode reductions equal proof height.
+
+| Operation / size | Allocation calls before → after | Requested bytes before → after | Peak extra bytes before → after | Read pages |
+| --- | ---: | ---: | ---: | ---: |
+| Full / 4 KiB | 11 → 10 | 54,400 → 54,464 | 37,416 → 37,512 | 11 |
+| Full / 128 KiB | 105 → 42 | 310,336 → 308,416 | 144,128 → 144,192 | 43 |
+| Full / 1 MiB | 779 → 268 | 1,259,424 → 1,243,168 | 157,024 → 157,088 | 274 |
+| Chunk / 4 KiB | 7 → 7 | 16,824 → 16,824 | 12,344 → 12,344 | 3 |
+| Chunk / 128 KiB | 14 → 9 | 21,240 → 21,080 | 16,632 → 16,600 | 4 |
+| Chunk / 1 MiB | 19 → 11 | 30,120 → 29,864 | 25,160 → 25,128 | 6 |
+
+This removes 511 node allocations from a 1 MiB full verification, but does not
+reduce its peak: the measured host peak rises by 64 bytes (96 for 4 KiB full).
+For 4 KiB full verification, gross requested bytes also rise by 64 despite one
+fewer allocation. Retain as a reduction in repeated allocation work for larger
+trees, not a universal memory-footprint improvement. These are host requested
+allocations, not a guest heap watermark, device throughput or SD latency result.
+
+All 281 feature-enabled unit tests pass (one ignored), including streaming and
+proof corruption coverage. All 26 GC integration tests pass, including the
+extended failure/cancellation matrix. Default QEMU file-tree passes three boots,
+GC pressure, cold recovery and powered-off verification; Duo compile check
+passes. No performance timing run in this turn.
+
+Evidence: `target/storage-merkle-node-buffer-20260913/`, including before/after
+source, exact allocation probe logs, parsed differences/assertions, source
+hashes, unit/GC logs, QEMU evidence and Duo build log. The reproducible ignored
+probe is `streaming_blob_verification_requested_allocation` in
+`segment-store/tests/authority_publication_memory.rs`; run it alone with
+`--ignored --nocapture --test-threads=1`.
+
+### Fill the verified large-object result directly (2026-09-13)
+
+`read_and_verify_resolved_blob` already reserved the complete logical output,
+but allocated a temporary Vec for each leaf and copied that leaf into the
+output after hashing. Initialize the reserved result and pass each checked
+output slice to the existing range reader's output constructor. Stream the
+same slice into the Merkle builder, then verify all emitted tree nodes as
+before. Checked filled/end offsets and the final filled-length assertion cover
+short final leaves. The buffer stays private until the complete tree and final
+descriptor pass; failures/cancellation cannot return partial unverified data.
+
+Extend the isolated persistent-object allocation probe with a 512 KiB object,
+whose encoded envelope exceeds the 512 KiB batched-read threshold. For both
+zero and 256 historical records, full read allocation calls decrease from 140
+to 12, exactly removing 128 leaf allocations. Requested extra peak decreases
+from 673,168 to 669,056 bytes (4,112 bytes). Read pages remain 144; writes and
+flushes remain zero. At 4/64/128/360 KiB, the existing batched path keeps identical
+allocation-call/page counts; measured peak decreases by 16 bytes in each case.
+These are host requested-allocation measurements, not guest heap/RSS or SD
+latency. No performance timing claim is made.
+
+The existing proof/full-read test now includes 512 KiB + 37 bytes to exercise
+an incomplete final leaf alongside its existing 360 KiB through 64 MiB cases,
+exact proof-page checks and corruption rejection. All 281 feature-enabled unit
+tests pass (one ignored); all 26 GC integration tests pass. Default QEMU
+file-tree passes three boots, GC pressure, cold recovery and powered-off image
+verification; Duo release compile check passes.
+
+Evidence: `target/storage-direct-read-output-20260913/`: before/after source,
+allocation logs and parsed differences, source hashes, full test logs, QEMU
+logs/evidence and Duo check. The probe remains
+`persistent_object_read_requested_allocation` with
+`--ignored --nocapture --test-threads=1`. Runtime changes are confined to the
+large-object read/output path; no durable format or device-I/O change.
+
+### 1 MiB QEMU timing for the two read-allocation optimizations (2026-09-13)
+
+Build both ELFs from the current runtime, changing only CAS read code between
+the pre-node-array/pre-direct-output source and the current two optimizations.
+Other runtime code, including bounded GC and ranked-source lookup, is common.
+Temporary source switches and the 64-page cache override are restored exactly
+before execution. Each A-B-B-A sequence performs 16 unique 1 MiB
+`object-v2-large` samples per fresh image, seeds 32..47, 128 MiB, one TCG hart,
+zero warmups and host telemetry. One sequence uses 4/2 MiB/s and 400/200
+read/write IOPS; the other removes only those four limits and reuses the same
+ELFs. No build/heavy verification overlaps timing. All 128 samples pass; there
+are no GC rounds in these runs.
+
+All seven physical counters match for each sample between builds and repeats.
+Aggregate I/O is also identical between throttle modes: 256 reads / 18,239,488
+read bytes, 368 writes / 20,357,120 write bytes, and 56 flushes per 16 samples.
+Both retained stopped images independently verify status ok and 16 CAS objects
+with their unmanaged-prefix baseline. Telemetry reports no polling errors.
+
+| Mean operation sum for 16 samples | Control seconds | Current seconds | Change |
+| --- | ---: | ---: | ---: |
+| Limited | 12.088393 | 12.0541975 | -0.28% |
+| No configured I/O limits | 3.2946185 | 2.9353395 | -10.91% |
+
+Limited totals are 12.025968/12.150818 for A and 11.993798/12.114597 for B;
+within-pair spreads are 1.03%/1.00%. Put means change 8.9687655→8.873950 seconds
+(-1.06%) while get means change 3.1196275→3.1802475 seconds (+1.94%). Thus this
+limited run does not demonstrate a read or overall latency improvement.
+
+Without configured limits, totals are 3.254848/3.334389 for A and
+2.901644/2.969035 for B; spreads are 2.41%/2.30%. Put means change
+2.085164→1.8560675 seconds (-10.99%) and get means change
+1.2094545→1.079272 seconds (-10.76%). These repeated local QEMU observations
+support a runtime benefit when I/O limits do not dominate. They are not a
+pure CPU measurement, sustained throughput or real-SD latency qualification.
+Operation sums exclude runner quiet gaps. The combined comparison does not
+attribute the timing effect separately to node arrays versus direct output.
+
+Evidence: `target/storage-large-read-abba-20260913/` and
+`target/storage-large-read-unthrottled-20260913/`, with exact before/after source,
+source restoration hashes, build logs, ELFs/command hashes, raw samples,
+serial/host telemetry, repeated-counter assertions, phase-effect summaries
+and independent image reports. No additional runtime change in this turn.
+
+### Physical write-size trace for 1 MiB objects (2026-09-13)
+
+Use QEMU's `virtio_blk_handle_write`, `virtio_blk_handle_read` and
+`blk_co_pwritev` tracing on the saved current 1 MiB ELF. Four unique
+`object-v2-large` samples use the same 64-page-cache/128 MiB/single-hart limited
+configuration as the preceding timing comparison. All four samples pass and
+every sample's seven counters exactly matches the untraced current run.
+Diagnostic timings are excluded.
+
+The trace contains 113 writes / 5,218,304 bytes. Exclude the leading 15 boot
+writes / 114,688 bytes, ending with control activation writes; the remaining
+98 requests / 5,103,616 bytes reconcile with the workload. Partition this
+ordered suffix by each sample's request count and independently assert every
+sample's byte sum. QEMU's text trace has no timestamps here, so this is ordered
+counter reconciliation, not time-based attribution. The exact wrapper and
+actual injected QEMU arguments are saved.
+
+Sample 1 (zero-based, after the first growth/setup sample) has 22 write requests:
+
+| Request bytes | Count |
+| ---: | ---: |
+| 4,096 | 6 |
+| 8,192 | 3 |
+| 16,384 | 2 |
+| 20,480 | 1 |
+| 32,768 | 1 |
+| 73,728 | 1 |
+| 131,072 | 8 |
+
+The eight 128 KiB writes are contiguous. They already meet the configured
+single-request limit: virtio-core `BLOCK_MAX_TRANSFER_SIZE` is 128 KiB and
+SDHCI `MAX_TRANSFER_BLOCKS` is 256 × 512 bytes. The platform splits writes at
+`MAX_PAGES_PER_REQUEST`, so increasing only the CAS streaming buffer cannot
+reduce those physical requests. These are software-configured bounds, not a
+claim about the controller's hardware maximum.
+
+The final three 4 KiB writes target sectors 2088, 2080, 2088: checkpoint slot
+0's clear-seal/body/seal protocol (V2 starts at sector 2048). Required intervening
+flush/readback ordering prevents blindly coalescing them. The remaining smaller
+writes include noncontiguous layout/framing work; the trace does not justify
+removing durability boundaries or adding a larger generic write buffer. Further
+request reduction needs a specific ordering-safe metadata batching change or
+a separately qualified device transfer-limit change.
+
+The stopped image independently verifies status ok with four CAS objects and
+its unmanaged-prefix baseline. No runtime change in this turn. Evidence:
+`target/storage-large-write-trace-20260913/`: event list, tracing wrapper,
+actual QEMU arguments, raw trace, raw benchmark/serial/host logs, per-sample
+write profile, counter reconciliation and independent image report.
+
+### Staged large-object canonical header batching (2026-09-13)
+
+Retain the canonical 4 KiB header in the existing staged-publication PageSink,
+only after streaming content/tree buffers have drained. Physical sorting then
+combines this page with its adjacent descriptor pages. The ordinary public
+streaming `BlobWriter::commit` retains its prior header submission behavior;
+this change must not create a metadata sink for that path. Compact encoding
+is unchanged. Dedup comparison reads the retained header through the existing
+sink overlay, and publication still drains and authenticates the target before
+checkpointing. Checkpoint clear/body/seal and flush ordering are unchanged.
+
+Compare four unique 1 MiB `object-v2-large` samples (seeds 32–35) against the
+preceding physical-write trace, using the same 64-page cache, 128 MiB, one-hart
+QEMU configuration and 4/2 MiB/s, 400/200 IOPS read/write limits. Each sample
+passes and saves exactly two physical write requests. Aggregate writes fall
+98 → 90 at identical 5,103,616 bytes; all read counters and flush counts are
+unchanged. Stable sample 1 falls 22 → 20 writes (9.1%). Its separate 4 KiB
+header at sector 34976, 16 KiB prefix at 34944 and 8 KiB descriptor pair at
+34984 become one 28 KiB request at 34944. The final checkpoint writes remain
+sectors 2088 / 2080 / 2088. Trace reconciliation excludes the same 15 boot
+writes and checks each sample's byte sum. These are request-count results;
+traced timings are excluded and no real SD latency benefit is claimed.
+
+Four additional all-duplicate 1 MiB samples pass on a fresh image. Independent
+powered-off verification accepts both images: unique run has four CAS objects
+and four blobs; duplicate run has four CAS objects and one blob. These are
+boot-local benchmark handles, not four persisted authority grants. The mixed
+batch regression now includes both 4 KiB and 512 KiB + 37 byte pairs, exercises
+same-batch duplicate scratch disposal, verifies all returned content and checks
+cold-mount object/blob counts.
+
+The existing isolated allocation probe, at histories 0 and 256 and sizes
+4/64/128/360/512 KiB, reports identical allocation calls, requested bytes and
+peak extra heap against the preceding direct-read-output baseline. This is
+an observed whole-operation peak, not a claim that retaining one header costs
+no resident memory. For 360 and 512 KiB imports, write requests fall by two
+at each history length; read/write pages and flushes are unchanged. Full-read
+allocation and read-page measurements are unchanged.
+
+Validation: final runtime passes 281 feature-enabled unit tests (one ignored),
+26 GC recovery tests, all six fused-append recovery tests (including large,
+1 MiB, external 2 MiB and small external cut-boundary scenarios), the separately
+rerun expanded mixed-batch test, default three-boot QEMU file-tree regression,
+and Duo release compile check. The unit suite preceded the test-only mixed-batch
+expansion; that expanded test then passed separately. Temporary cache override
+is restored and hash-checked. No real-device test or durability relaxation.
+
+Evidence: `target/storage-large-header-batch-20260913/` contains before-source,
+build/source manifests, ELF, trace/actual QEMU arguments, request profile and
+reconciliation, unique/duplicate serial and benchmark logs, retained images,
+independent image reports, allocation output, final test/build logs and copied
+QEMU functional evidence. Intermediate `unit.log`/`gc-recovery.log` belong to an
+earlier broader buffering trial; use `unit-final.log`/`gc-recovery-final.log`
+for the retained runtime. The benchmark ELF precedes only the test-only fixture
+expansion recorded by `final-source.json`.
+
+### Bounded first-dedup comparison reads (2026-09-13)
+
+The same-layout first-dedup path in `compare_manifests` previously alternated
+single-page reads of scratch and existing payloads. It now compares up to eight
+adjacent pages per side, with fallible buffers bounded to 64 KiB total (previous
+simultaneous page buffers: 8 KiB). It still scans existing segment descriptors,
+compares every exact payload byte, hashes the entire existing payload, and checks
+both the pointer hash and freshly computed scratch hash. Short-tail handling and
+cross-layout fallback are unchanged. Overlay reads preserve the staged header
+from the preceding optimization. No successful-verification cache policy changes.
+
+Four all-duplicate 1 MiB QEMU samples use the preceding header-batching ELF as
+control and the same fresh image template, seeds 32–35, 64-page cache, 128 MiB,
+one hart, and 4/2 MiB/s / 400/200 IOPS limits. All pass. At sample 1, the first
+actual dedup comparison, physical reads fall 573 → 101 (82.4%) and read bytes
+3,530,752 → 3,518,464. Its 16 writes / 1,179,648 bytes and three flushes remain
+identical. Samples 0, 2 and 3 have identical physical counters: new content and
+subsequent verified dedup hits are unaffected. The small byte-count difference
+is observed with the platform cache; it is not a reduction in required comparison
+coverage. A single pair does not establish latency improvement or real SD
+performance. No timing claim is made.
+
+Independent stopped-image verification reports status ok, four CAS objects and
+one unique blob. All 13 CAS streaming tests pass, including a new corruption
+regression at pages 0, 7, 8, 255 and short-tail page 256 of a 1 MiB + 37-byte
+object before its first dedup attempt. The existing mixed compact/large staged
+batch test and all six fused-append cut-boundary tests pass. Default three-boot
+QEMU file-tree regression also passes.
+
+Evidence: `target/storage-dedup-compare-batch-20260913/` contains the before source,
+candidate build and source manifests, benchmark/serial/host logs, comparison
+JSON, retained disk, independent verifier report, functional logs and an isolated
+requested-allocation comparison. The added allocation probe measures commit after
+writer content has already been buffered; its baseline is not total heap usage.
+
+The isolated allocation probe compares identical new test code against before
+and after runtime source, restoring the candidate by byte equality and hash.
+For first duplicate commits, allocation calls are 88 → 86 at 4 KiB,
+216 → 152 at 128 KiB, and 617 → 93 at 1 MiB + 37. Requested bytes at the latter
+size fall 2,644,980 → 613,364. Extra commit peaks are respectively unchanged
+130,348; **181,968 → 214,736 (+32,768 bytes)**; and unchanged 28,864. The last
+number is relative to live allocations after streaming, including buffers freed
+during commit; it does not contradict the 64 KiB simultaneous comparison bound.
+Host read-page counts are identical in each pair, and all nonduplicate commit
+measurements are unchanged. The higher 128 KiB peak is an accepted bounded cost
+of reducing device requests. The initial new probe compilation used a private
+read API and failed; the retained probe uses the public full verifier and passes.
+
+Duo release `file-tree,legacy-shell` compile check passes. Both temporary source
+substitution and cache configuration are restored and hash-checked. Real SD
+hardware qualification remains outstanding.
+
+### ABBA timing qualification of first-dedup batching (2026-09-13)
+
+Run saved header-batching control and dedup-read-batching candidate ELFs in
+ABBA order, each on a fresh disk with four all-duplicate 1 MiB samples, seeds
+32–35, 64-page cache, 128 MiB and one hart. Repeat the same ABBA sequence with
+only QEMU throttling removed. Limited mode uses 4/2 MiB/s and 400/200 read/write
+IOPS. Host telemetry is enabled consistently; no build or heavy verification
+runs overlap either sequence. There are 32 successful samples total, but only
+**two first-dedup observations per build per mode**. This is a small paired
+qualification, not a distribution or p99 claim.
+
+| First-dedup phase mean | Limited before | Limited after | Unthrottled before | Unthrottled after |
+| --- | ---: | ---: | ---: | ---: |
+| put | 1,746.421 ms | 929.291 ms | 153.5665 ms | 98.576 ms |
+| following get | 188.1905 ms | 280.082 ms | 34.593 ms | 33.7765 ms |
+| put + get | 1,934.6115 ms | 1,209.373 ms | 188.1595 ms | 132.3525 ms |
+
+Limited first-dedup put improves 46.79%, but its following get regresses 48.83%;
+combined latency improves 37.49%. The before/after pair spreads for combined
+latency are 0.69% / 0.36%. Unthrottled combined latency improves 29.66%, with
+pair spreads 8.94% / 2.50%; get's 2.36% mean improvement is smaller than its
+repeat spread, so it is not a demonstrated independent get speedup. The get
+regression is associated with the throttled execution here; throttle-credit
+interaction is a hypothesis, not a measured causal attribution.
+
+Every per-sample physical counter repeats exactly within each build and also
+matches across throttle modes. First-dedup put reads fall 558 → 88 at identical
+2,424,832 bytes. The following get reads fall 15 → 13 and 1,105,920 → 1,093,632
+bytes; reporting only overall reads would conflate this small cache effect with
+the comparison batching. New content and subsequent verified-hit samples have
+unchanged physical counters. Independent stopped-image verifiers accept both
+candidate images. Current runtime source is hash-checked against the benchmark
+candidate; no runtime change in this qualification turn.
+
+Evidence: `target/storage-dedup-limited-abba-20260913/` and
+`target/storage-dedup-unthrottled-abba-20260913/` retain commands and ELF hashes,
+all serial/sample/host logs, analysis scripts and raw phase/counter summaries,
+candidate images and offline verifier results. These timings apply to this
+QEMU configuration, not real SD hardware or sustained mixed-workload service.
+
+### Comparison-local segment proof reuse (2026-09-13)
+
+Same-layout multi-extent dedup comparison now uses a single-entry
+`VerifiedSegmentScans` memo, bounded to 4 KiB, created and discarded within the
+comparison. Adjacent extents of the same sealed segment reuse its freshly
+verified descriptor/summary/seal chain. Single-extent objects skip memo creation;
+cross-layout fallback is unchanged. Oversized proofs or failed optional memo
+allocation still use the ordinary scanner. Each pointer is interpreted against
+the verified proof, and every payload remains independently read, byte-compared
+and hashed. No proof carries trust into a subsequent comparison invocation.
+
+Four all-duplicate 1 MiB samples, on the same 64-page-cache / 128 MiB / one-hart
+QEMU setup with 4/2 MiB/s and 400/200 IOPS limits, pass. Against the preceding
+batched-read candidate, first-dedup put reads decrease 88 → 83 requests and
+2,424,832 → 2,367,488 bytes (five requests / 56 KiB saved). Its get counters stay
+13 requests / 1,093,632 bytes; write counters and flushes are unchanged. The
+other three samples have identical physical counters. Overall first-dedup reads
+are 101 → 96. This single counter comparison is not a latency claim.
+
+The existing isolated requested-allocation probe, at 1 MiB + 37 bytes, reports
+first-dedup commit read pages 624 → 582, calls 93 → 85, requested bytes
+613,364 → 513,004, and unchanged extra peak 28,864. Peak is relative to the
+already-buffered writer and is not total heap use. All measurements for
+4/128 KiB and for nonduplicate commits are unchanged. Initial trial memoized
+single-extent objects too; the retained version explicitly skips them. Use
+`memory-final.log`, `cas-streaming-final.log`, `final.elf` and
+`sources-final.json` for retained-code evidence, not the initial trial logs.
+
+All 13 streaming tests pass, including first-dedup payload corruption at batch
+boundaries and a short tail. Independent powered-off image verification accepts
+four CAS objects sharing one blob. Evidence:
+`target/storage-dedup-local-scan-20260913/`, including before/trial/final source
+provenance, build/benchmark logs, retained image, comparison script and JSON,
+allocation results and offline verifier output. Temporary cache configuration
+and current source hashes are checked against the final build manifest.
+
+Final gates also pass: 11 memo-filtered unit tests (including budget/horizon
+coverage), the mixed compact/large duplicate batch test, all six fused-append
+recovery tests, default three-boot QEMU file-tree regression and Duo release
+`file-tree,legacy-shell` compile check. QEMU functional logs/reports are copied
+into the evidence directory. Real SD validation remains outstanding.
+
+### Multi-segment qualification of local dedup proofs (2026-09-13)
+
+Compare the preceding batched-read ELF with the comparison-local proof ELF at
+4 MiB + 37 and 16 MiB + 37 logical bytes. Each fresh QEMU VM performs three
+all-duplicate operations: new content, first dedup, subsequent verified hit.
+Order is before4 / after4 / after16 / before16. Configuration is unchanged:
+64-page cache, 128 MiB, one hart, 4/2 MiB/s and 400/200 read/write IOPS, with
+consistent host telemetry. No build or heavy verifier overlaps the benchmark.
+All 12 operations pass exact guest content/descriptor readback. This is one
+counter comparison per size, not a latency distribution or ABBA timing claim.
+
+| Logical bytes | First-dedup put read requests | First-dedup put read bytes | Saved |
+| ---: | ---: | ---: | --- |
+| 4,194,341 | 312 → 294 | 9,351,168 → 9,138,176 | 18 requests / 208 KiB |
+| 16,777,253 | 1,173 → 1,123 | 36,667,392 → 36,061,184 | 50 requests / 592 KiB |
+
+Every get counter, write counter and flush count is unchanged. New-content and
+subsequent verified-hit operations have identical physical counters. The bounded
+one-entry memo therefore continues reducing repeated segment proof reads across
+these larger layouts; it does not need a whole-object proof cache to do so.
+Both stopped candidate images independently verify status ok, each with three
+CAS objects sharing one blob. These are boot-local benchmark object identities.
+
+Extend the existing isolated first-dedup allocation probe with 4 MiB + 37, running
+identical probe code against before/after runtime and restoring the candidate by
+byte equality plus hash. First-dedup commit read pages fall 2,244 → 2,178;
+allocation calls 144 → 130; requested bytes 1,058,620 → 891,620. Extra commit peak
+is unchanged at 78,016 bytes. Nonduplicate measurements are unchanged. The probe
+baseline includes the already-buffered writer; this is neither total heap nor a
+16 MiB memory measurement. The 16 MiB QEMU run demonstrates successful execution
+within this guest configuration, not precise peak allocation accounting.
+
+Evidence: `target/storage-dedup-multisegment-20260913/` retains saved-ELF hashes,
+commands, all sample/serial/host logs, comparison script and JSON, both candidate
+images and offline verifier reports, before/after memory logs and restored source
+hashes. Runtime source is unchanged in this turn; only the ignored allocation
+probe gains the larger case. Real SD performance qualification remains pending.
+
+### Current file-tree phase profile and recent CAS comparison (2026-09-13)
+
+Profile current 16/64 MiB `file-sequential` on fresh QEMU disks, then compare
+64 MiB with the saved pre-header-batching ELF from
+`storage-large-read-abba-20260913/after.elf`. Current ELF is the final local-dedup
+proof candidate. Both include the preceding direct full-read improvements;
+recent differences are header batching and the two dedup comparison optimizations.
+Use seed 71, 64-page cache, 128 MiB, one hart, no warmup, one sample per fresh VM,
+4/2 MiB/s / 400/200 read/write IOPS and consistent host telemetry. No heavy work
+overlaps benchmark runs. All three samples validate and perform exact full
+content readback before deleting the file. This is not a write-only workload,
+and the single pair supports physical-counter comparison, not a speed bound.
+
+| Current workload phase | 16 MiB reads/writes/flushes | 64 MiB reads/writes/flushes |
+| --- | ---: | ---: |
+| stage | 31 / 189 / 10 | 376 / 727 / 26 |
+| publish | 1 / 6 / 3 | 1 / 6 / 3 |
+| verify | 262 / 0 / 0 | 1,078 / 0 / 0 |
+| remove | 2 / 6 / 3 | 2 / 6 / 3 |
+
+Current totals are 201 writes / 18,157,568 bytes at 16 MiB and 739 writes /
+71,430,144 bytes at 64 MiB. Host-block write amplification against logical file
+bytes is 1.082275 and 1.064392 respectively, including publication and removal.
+This excludes any internal SD-card FTL amplification. Read totals are 296 /
+17,907,712 bytes and 1,457 / 72,392,704 bytes.
+
+At 64 MiB the control has 783 writes and the candidate 739 (44 fewer, 5.62%).
+All savings occur in stage: 771 → 727 requests at identical 71,118,848 bytes.
+Every read counter, total write bytes and all 32 flushes remain identical;
+publish/verify/remove physical counters are identical. The 44 saved writes are
+consistent with two header-adjacent requests per each of 22 staged chunks;
+this phase-level experiment does not separately trace their addresses.
+
+The stager uses 3 MiB persistent chunks and four-chunk batches, bounded to 12 MiB
+of content capacity. At 64 MiB, verification alone reads 69,910,528 bytes in
+1,078 requests, while all pre-verification staging reads total 2,449,408 bytes.
+A future request-size trace should therefore examine full file-data verification,
+rather than assume that another write-buffer increase will reduce byte traffic.
+Current stage buffering and durability boundaries are unchanged in this turn.
+
+Evidence: `target/storage-file-current-profile-20260913/` retains source/ELF
+hashes, commands, sample/serial/host logs, per-phase comparison JSON, retained
+images and independent verifier reports. Since the workload removes its file,
+powered-off image validation is complementary format/recovery evidence, not a
+replacement for the guest's complete live content comparison. Real SD hardware
+performance remains unverified.
+
+### Physical read trace of full file verification (2026-09-13)
+
+Trace one current 64 MiB `file-sequential` run with the same ELF/configuration
+as the preceding phase profile. All seven physical counters exactly match that
+untraced run and guest full-content verification passes. Exclude leading boot
+reads, partition the remaining ordered read stream by existing stage/publish/
+verify/remove request counters, and independently check every phase's byte sum.
+QEMU text events have no timestamps here: this is ordered counter reconciliation,
+not time-based attribution. Timings from this diagnostic are excluded.
+
+Verification accounts for 1,078 reads / 69,910,528 bytes. Use the existing raw-image
+parser to verify all 28 touched segments, including descriptor chains and payload
+hashes, and classify read pages by their physical extent ranges; all parse checks
+pass. Canonical header/content/tree labels follow the split extent indices, and
+non-payload pages are grouped as framing/anchor. Result:
+
+| Physical extent category | Requests by size | Total bytes |
+| --- | --- | ---: |
+| canonical content | 67 × 4 KiB; 21 × 124 KiB; 491 × 128 KiB | 67,297,280 |
+| canonical header | 46 × 4 KiB | 188,416 |
+| canonical tree | 288 × 4 KiB; 88 × 8 KiB | 1,900,544 |
+| catalog | 46 × 4 KiB | 188,416 |
+| framing/anchor | 21 × 8 KiB; 10 × 16 KiB | 335,872 |
+
+Repeated physical page reads within the verification phase total 192 pages /
+768 KiB: tree pages 480 KiB, and catalog/header/content pages 96 KiB each. These
+are actual backend repeat reads, not merely repeated logical cache accesses.
+Content bulk requests already use 128 KiB or extent-boundary tails; tree requests
+are a more specific target than increasing the general content read-ahead window.
+
+Source inspection finds a candidate redundant operation in
+`read_fs_data_chunk`: each skip-list hop recovers a node with
+`read_fs_data_node_meta` (directed first-leaf verification for large nodes), then
+the final target goes through `read_fs_data_node_content` and full verification.
+A proposed follow-up is to decode and validate the final target metadata from
+its fully verified bytes, while keeping directed verification for intermediate
+hops and preserving all index/total-length/reference checks. The trace does not
+assign every small request to this caller, and this proposal is not implemented
+or claimed as a measured saving in this turn.
+
+Evidence: `target/storage-file-read-trace-20260913/` retains the event list,
+tracing wrapper and actual QEMU arguments, raw trace/sample/serial/host logs,
+ordered reconciliation script/profile, extent classification script/report,
+stopped image and independent format verifier report. No runtime change or
+real SD measurement in this diagnostic.
+
+### Verify the final file-data target once (2026-09-13)
+
+`read_fs_data_chunk` now treats the final skip-list hop separately. It resolves
+the target through the existing reference/kind/codec checks, reads and fully
+verifies the blob once, decodes the structural prefix from those verified bytes,
+and checks encoded length, target index and parent/child total-length relations.
+Only then is the prefix removed in place and content returned. Intermediate
+hops retain directed first-leaf verification, and reading an already-held tail
+uses the prior path. No new full-content copy or persistent verification cache
+is introduced. Invalid final-node metadata is rejected after full verification;
+intermediate nodes are still rejected using their bounded prefix read.
+
+Compare current 16/64 MiB file-sequential samples with the immediately preceding
+file profile, at seed 71, 64-page cache, 128 MiB, one hart and 4/2 MiB/s / 400/200
+read/write IOPS. Both pass exact full content readback. Only verification-phase
+requests change:
+
+| Workload | Verify read requests | Verify read bytes | Whole-workload read requests |
+| --- | ---: | ---: | ---: |
+| 16 MiB | 262 → 237 | 17,612,800 unchanged | 296 → 271 |
+| 64 MiB | 1,078 → 973 | 69,910,528 unchanged | 1,457 → 1,352 |
+
+The 25/105 saved requests are 9.54%/9.74% of verification reads. Every stage,
+publish and remove physical counter, all write counters and flush counts remain
+identical. In this cached QEMU run the benefit is fewer requests, not fewer
+physical read bytes. Timings are excluded: this is a single counter comparison,
+and the initial test compilation was allowed alongside benchmark startup. No
+real SD latency claim is made.
+
+All 19 file API tests pass. The new focused regression warms the same metadata
+state and asserts that a final-hop read uses exactly as many device pages as a
+direct full target read. It separately rejects wrong target indices, invalid
+parent/child total lengths and content corruption beyond the structural prefix
+after a successful read. Existing mixed-size/skip-list, cold recovery and
+publication cut-boundary tests also pass.
+
+The broader file-service suite exposed a stale GC pressure fixture: eight
+create/unlink pairs now cause only one collection under the previously retained
+extended-source GC policy. Replacing this turn's file API with its saved prior
+source reproduces the exact same failure (one observed round, 8,636 read pages,
+zero cache hits). Adjust only the fixture to allow at most 32 pairs and stop
+when two rounds are observed; preserve all hit/reduced-read assertions. The
+final suite passes 28 tests with five ignored. GC runtime policy is unchanged.
+
+Default QEMU three-boot file-tree regression, Duo release file-tree/legacy-shell
+compile check and independent stopped-image verification at both sizes pass.
+The benchmark ELF precedes only test additions/fixture changes; runtime source
+substitution and temporary cache configuration are restored and hash-checked.
+
+Evidence: `target/storage-file-target-verify-20260913/` contains before/runtime
+source manifests, final test-source hashes, ELF and commands, all benchmark and
+phase-counter reports, initial/final tests, the baseline GC-fixture reproduction,
+QEMU functional evidence, retained images and offline verifier reports. Deleted
+benchmark files were verified in the guest before removal; offline image checks
+are complementary structural recovery evidence.
+
+### ABBA qualification of single-pass file targets (2026-09-13)
+
+Run the preceding and current target-verification ELFs in ABBA order for one
+64 MiB `file-sequential` operation per fresh VM, seed 71, no warmup, 64-page
+cache, 128 MiB, one hart and consistent host telemetry. Repeat the full sequence
+with only QEMU throttling removed. Limited mode uses 4/2 MiB/s and 400/200
+read/write IOPS. No compilation/tests/heavy verification overlap these timed
+sequences. All eight samples pass; both candidate stopped images independently
+verify. Every physical counter repeats exactly within a build and matches
+between throttle modes (whole-workload reads 1,457 → 1,352, same bytes).
+
+| Mean seconds | Limited before | Limited after | Unthrottled before | Unthrottled after |
+| --- | ---: | ---: | ---: | ---: |
+| staging | 34.9277585 | 34.9435955 | 3.6060855 | 3.592059 |
+| verification, including pattern check | 16.598778 | 16.6110815 | 2.4769065 | 2.4510465 |
+| verification reader only | 15.4071955 | 15.2016755 | 1.3852275 | 1.353481 |
+| whole write/read/remove operation | 51.6114345 | 51.641816 | 6.1027305 | 6.063049 |
+
+Limited total changes +0.059%, smaller than before/after pair spreads
+0.239%/0.083%; it demonstrates no overall latency improvement. Unthrottled total
+changes -0.650%, smaller than the candidate pair spread of 3.333% (control
+0.617%), also insufficient for an overall speed claim. Unthrottled reader-only
+mean changes -2.292%, with pair spreads 0.655%/1.073%; this is a small positive
+reader observation with only two measurements per version, not a robust speed
+bound. Full verification includes independent pattern-check work and has a
+larger candidate spread. No samples or phases are discarded.
+
+Keep the optimization for verified request-count reduction and preserved
+correctness, rather than claim a broad throughput improvement. Byte traffic and
+configured bandwidth limits are unchanged. These results do not establish real
+SD latency or sustained mixed-workload gains.
+
+Evidence: `target/storage-file-target-limited-abba-20260913/` and
+`target/storage-file-target-unthrottled-abba-20260913/` retain commands/ELF hashes,
+all serial/sample/host logs, analysis scripts and per-run phase/counter summaries,
+retained candidate images and offline verifier reports. Current source hashes
+match the qualified runtime/test state. No runtime changes in this turn.
+
+### Verify duplicate imports before scratch payload writes (2026-09-13)
+
+The single-fresh-object fused persistent-authority import now uses its candidate
+content root to look up an existing Blob before streaming the scratch copy. A
+hit must pass fresh manifest/envelope validation, byte-for-byte comparison with
+the entire input, full Merkle verification and exact per-extent payload SHA-256
+verification. The declared external root is only a lookup selector. An ordered
+tree pass completes the extent hashes without rereading all content. Normal
+scratch preparation/seal clearing, independent object identity, authority
+publication and checkpoint barriers remain in force. No-hit imports retain the
+streaming path; generic streaming commits and multi-fresh-object imports are
+unchanged. Every hit rechecks media; there is no new verified-content cache.
+
+Failed read-only preflight can restore the mounted predecessor without writing.
+A regression exposed a stale logical-root cache on retry with changed inline
+content under the same uncommitted ID. Restrict cache reuse to committed IDs;
+speculative roots are recomputed on retry. The regression failed with
+`Cas(HashCollision)` before the fix and passes afterward. False input and
+corrupted existing media leave the complete test-device image, generation and
+principal quota usage unchanged at 128 KiB + 37 and 1 MiB + 37.
+
+Admission remains conservative: scratch capacity and full canonical quota are
+reserved before the preflight. Principal logical/physical charges remain the
+original full per-object charges, even for duplicates; only the existing
+anonymous unique-byte telemetry receives the dedup discount. This change does
+not establish reduced peak heap usage or admit previously out-of-budget work.
+
+QEMU uses 128 MiB, one hart, a 64-page cache and temporary cloned disks with
+4/2 MiB/s and 400/200 read/write IOPS. Four 1 MiB `object-v2-large` samples,
+all-duplicate content, seed 32 and no warmup cover new/first-repeat/later-repeat
+imports. Compare against `storage-dedup-local-scan-20260913/final.elf`; the
+intervening file-target-only change does not enter this object workload.
+The final retry-fixed build passes all samples and exactly matches the previous
+qualified build's seven whole-workload I/O counters in every sample.
+
+| 1 MiB put + get sample | Before | After |
+| --- | ---: | ---: |
+| first duplicate write requests | 16 | 6 |
+| first duplicate write bytes | 1,179,648 | 77,824 |
+| first duplicate read requests | 96 | 44 |
+| first duplicate read bytes | 3,461,120 | 2,400,256 |
+| first duplicate flush requests | 3 | 3 |
+| next duplicate write bytes | 1,179,648 | 77,824 |
+| next duplicate read bytes | 1,142,784 | 2,392,064 |
+
+Each repeat saves 1,101,824 write bytes (93.4% for the first two repeats);
+the fourth sample's metadata grows by one page on both versions. New unique
+content has identical physical counters. Later duplicates incur more reads:
+the old path can trust its process-local dedup comparison cache after writing
+scratch, whereas this path verifies the existing payload afresh before skipping
+those writes. Therefore this is a write-traffic reduction with a read tradeoff,
+not a universal I/O or throughput improvement. Tests/builds overlap these
+counter-only diagnostics; timings are excluded, and no SD latency or FTL write
+amplification claim is made.
+
+Evidence: `target/storage-import-preflight-dedup-20260913/`. The retained final
+firmware is `retry-fixed.elf`, with source hashes, restored cache configuration,
+commands, serial/host/sample logs and stopped images under matching names.
+`comparison-qualified.json` remains numerically valid because all final counters
+match. `after.elf` is an early prototype without restored preparation/exact
+extent checks; `final.elf` adds preparation; `qualified.elf` adds exact checks
+but precedes the retry-cache fix. These superseded prototypes are not final
+qualification. Initial quota-test failures used an incorrect discounted
+principal-charge expectation; the corrected test enforces original semantics.
+
+The final build also passes three 16 MiB + 37 multi-segment samples against
+`storage-dedup-multisegment-20260913/after16.jsonl` with matching configuration.
+Unique content's counters remain identical. Each duplicate drops from 150 to
+13 write requests and 17,936,384 to 106,496 write bytes (99.406% reduction),
+with four flushes unchanged. First-duplicate reads drop from 1,322 / 53,899,264
+bytes to 433 / 36,519,936 bytes; the later duplicate rises from 200 / 17,862,656
+to 433 / 36,511,744. This confirms the same read/write tradeoff across segments.
+Both final stopped images independently verify with status `ok`.
+
+Final validation: 284 segment-store unit tests pass (one ignored), seven fused
+append recovery tests pass, 26 GC recovery tests pass and 28 file-service tests
+pass (five ignored). The new duplicate publication fault matrix covers every
+one of its 29 write/flush mutation boundaries: cold recovery selects exactly
+the predecessor or complete successor record stream/object count, verifies all
+admitted payload bytes, and retries predecessor outcomes to the exact successor.
+Exact-payload checker tests cover arbitrary input splits, wrong hashes,
+noncontiguous extents and truncation. The final default QEMU three-boot
+file-tree/powered-off regression and Duo release compile check also pass.
+`retry-before-fix.log` retains the reproduced retry failure;
+`retry-fixed-test.log` and the `*-retry-fixed.log` suites qualify the correction.
+All runtime source hashes match `sources-retry-fixed.json`; the temporary
+64-page firmware override is restored. `git diff --check` passes.
+
+### ABBA timing of duplicate-import preflight (2026-09-13)
+
+Qualify the preceding change with isolated ABBA runs of the local-scan control
+and final `retry-fixed.elf`, each fresh VM executing four 1 MiB all-duplicate
+samples with seed 32, no warmup, 128 MiB and a 64-page cache. Run limited mode
+(4/2 MiB/s, 400/200 read/write IOPS), then repeat with only the limits removed.
+No compiler or QEMU process was present before launch; no builds/tests/heavy
+verification overlap either timed sequence. All 32 samples pass, both candidate
+stopped images independently verify, and all seven physical counters repeat
+exactly within versions and across modes. Runtime source hashes remain unchanged.
+
+| Mean put + get seconds by sample position | Limited before | Limited after | Change | Unthrottled before | Unthrottled after | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| new unique | 0.765679 | 0.7816435 | +2.09% | 0.1444345 | 0.1250225 | -13.44% |
+| first duplicate | 1.2027735 | 0.5345585 | -55.56% | 0.1222365 | 0.1120085 | -8.37% |
+| next duplicate | 0.7001695 | 0.530058 | -24.30% | 0.096072 | 0.102657 | +6.85% |
+| final duplicate | 0.698077 | 0.53472 | -23.40% | 0.103406 | 0.1086055 | +5.03% |
+
+There are only two observations per version per position. Limited duplicate
+combined reductions substantially exceed pair spreads (all below 1.30%). Unique
+content's apparent changes are within control spread (limited 3.10%,
+unthrottled 29.53%) and do not establish a gain/regression. Unthrottled first
+repeat's 8.37% reduction exceeds its pair spreads (2.22%/0.98%); later combined
+regressions are smaller than at least one pair spread (5.33%/11.35% and
+6.81%/0.73%), so their exact magnitude remains uncertain.
+
+Preserve phase regressions rather than hide them in combined times. Limited
+later get rises 0.196916 -> 0.290195 seconds (+47.37%) and 0.195104 ->
+0.2939115 (+50.64%), while corresponding put falls about 52%. Additional
+preflight reads may consume shared throttle credits before get; this is an
+explanation to investigate, not established causal attribution. In unthrottled
+mode the last put rises 0.0604545 -> 0.076115 seconds (+25.90%), exceeding both
+pair spreads (2.86%/0.69%); the preceding put's +10.22% is within candidate
+spread (17.29%). This confirms an actual fast-backend CPU/read tradeoff and
+motivates reducing preflight verification overhead next. Every observation,
+including the slow initial unthrottled control sample, is retained.
+
+Keep the optimization for its large write-traffic savings and measured limited
+combined benefit; do not claim universal throughput improvement or transfer
+QEMU timings to real SD media. Evidence directories:
+`target/storage-import-preflight-limited-abba-20260913/` and
+`target/storage-import-preflight-unthrottled-abba-20260913/` include scripts,
+commands/ELF hashes, all serial/host/sample logs, per-position analysis with raw
+values and pair spreads, candidate images and independent verifier results.
+This turn changes qualification evidence and documentation, not runtime code.
+
+### Rejected verifier leaf-buffer reuse trial (2026-09-13)
+
+Try replacing `verify_resolved_blob`'s per-leaf Vec with one fallibly allocated
+buffer bounded by min(content length, 4 KiB), released before the ordered exact
+payload tree pass. Byte comparison, Merkle emissions and extent SHA verification
+remain unchanged. The shared verifier serves ordinary full verification as well
+as duplicate-import preflight. No other runtime edits enter this trial.
+
+An isolated host full-verification allocation probe shows:
+
+| Content | Allocation calls before -> trial | Requested bytes before -> trial | Extra peak bytes before -> trial | Read pages |
+| --- | ---: | ---: | ---: | ---: |
+| 4 KiB | 10 -> 10 | 54,640 -> 54,672 | 37,688 -> 37,720 | 11 |
+| 128 KiB | 42 -> 11 | 308,592 -> 181,648 | 144,368 -> 144,400 | 43 |
+| 1 MiB | 268 -> 13 | 1,243,344 -> 198,896 | 157,264 -> 157,296 | 274 |
+
+Directed-read measurements are unchanged. The extra 32 peak bytes are measured,
+not omitted; this is a whole ordinary-verifier probe, not a measurement of whole
+persistent-import heap admission. It confirms lower allocation traffic, not a
+latency improvement.
+
+Run isolated limited and unthrottled ABBA comparisons against the retained
+preflight `retry-fixed.elf`: four 1 MiB all-duplicate samples per fresh VM,
+seed 32, no warmup, one hart, 128 MiB, 64-page cache; limits 4/2 MiB/s and
+400/200 read/write IOPS. All 32 samples pass. Every physical counter is identical
+before/after, repeats within each version and matches across throttle modes.
+No build/test/heavy offline verification overlaps timing.
+
+| Mean put + get seconds | Limited before | Limited trial | Unthrottled before | Unthrottled trial |
+| --- | ---: | ---: | ---: | ---: |
+| new unique | 0.7760375 | 0.775547 | 0.124948 | 0.149451 |
+| first duplicate | 0.5322195 | 0.5285345 | 0.1103285 | 0.110701 |
+| next duplicate | 0.5334175 | 0.5326925 | 0.106498 | 0.109276 |
+| final duplicate | 0.533964 | 0.536666 | 0.108203 | 0.108954 |
+
+Limited combined changes are all smaller than at least one pair spread.
+Unthrottled unique put rises 0.0873405 -> 0.1120655 seconds (+28.31%);
+combined rises 19.61%, exceeding before/trial pair spreads 2.88%/0.19%.
+Unthrottled next-duplicate combined rises 2.61%, exceeding spreads 1.32%/1.22%.
+Other repeated combined changes (+0.34%, +0.69%) are within at least one spread.
+Each position has only two observations per build. These observations do not
+establish a cause for the regression, and should not be generalized to SD
+hardware. In particular, reduced allocations alone do not justify this build.
+
+Reject the trial: it offers no stable measured duplicate latency gain and has a
+substantial repeatable unique-content regression in this comparison. Preserve
+`cas.rejected.rs`, the exact runtime diff and candidate ELF, then restore the
+saved source byte-for-byte. All retained runtime hashes again match
+`storage-import-preflight-dedup-20260913/sources-retry-fixed.json`; no change
+from this trial remains in runtime code. Do not use `after.elf` from this trial
+as a qualified performance candidate.
+
+Correctness tests on the trial passed: adversarial preflight/retry regression,
+13 CAS streaming tests (including empty blobs, corruption and cancellation),
+seven fused publication recovery tests, default QEMU three-boot file-tree test,
+Duo release compile check and both independent stopped-image verifications.
+No tests are rerun on the exact restored runtime because it is byte-identical
+to the already-qualified prior build. Evidence, allocation logs, source hashes,
+trial diff, ABBA commands/raw timings/analysis and recovery artifacts are in
+`target/storage-verifier-reuse-buffer-20260913/`, with timing subdirectories
+`limited/` and `unthrottled/`. The next optimization needs evidence on verification
+CPU/read cost beyond the allocator; this rejected experiment narrows that search.
+
+### Reuse proof windows for ordered tree hashing (2026-09-13)
+
+Trace the retained duplicate-import implementation before changing it. The four
+1 MiB samples reproduce all untraced counters. Partition the ordered physical
+read suffix by guest put/get request counts and reconcile every phase's read
+bytes independently. Parse the accessed segments from the stopped image using
+the independent storage layout parser: four segments, no parse errors. First
+repeat put reads 1,069,056 content bytes, 65,536 tree bytes, 4,096 header bytes,
+4,096 catalog bytes and 155,648 framing/anchor bytes. Exactly 32,768 tree bytes
+repeat: four 8 KiB Merkle-proof reads followed by one 32 KiB ordered extent-hash
+read. Trace evidence is `target/storage-preflight-read-trace-20260913/`; the
+stopped image also independently verifies. Trace ordering identifies requests,
+not CPU-time attribution.
+
+The retained `ManifestRangeReader::read_buffer` change searches invocation-local
+proof windows for tree-extent reads as well as 32-byte hash reads. Ordinary
+content/header reads retain the direct slot-zero path. Misses still choose the
+original content/proof slots and preserve read-ahead and cache budgets. The exact
+extent-hash pass can consume tree snapshots just used by full Merkle verification.
+There is no cache across invocations, no new page allocation, and byte/root/extent
+validation and failure invalidation remain in force. The leaf-buffer reuse trial
+remains reverted. The broader initial experiment is distinguished below.
+
+At 1 MiB each repeat put drops 29 -> 28 reads and saves exactly 32 KiB. Following
+get reads 8 KiB more in the first two repeats due to changed device-cache state;
+whole put/get therefore saves 24 KiB in those positions and 32 KiB in the final
+repeat (44 -> 43 requests). New content has identical counters; all writes and
+flushes are identical. At 16 MiB + 37, where the tree exceeds the proof-window
+budget, all three samples have identical before/after counters and phases.
+Do not generalize the small-tree savings to larger trees. These initial runs
+are counter diagnostics and overlap compilation/tests; their timings are excluded.
+
+The existing proof-batch regression now also performs full Merkle plus exact
+extent verification on a 1 MiB object without a device cache, asserts that each
+tree page appears in exactly one physical read, and checks the complete result.
+The regression passes along with 284 segment-store unit tests (one ignored),
+13 CAS streaming tests, seven fused recovery tests and 28 file-service tests
+(five ignored). Adversarial preflight/retry, corruption, empty input and cold
+recovery coverage remains intact. Default QEMU three-boot file-tree/powered-off
+validation, Duo release compile check and independent 1/16 MiB image verification
+pass.
+
+Evidence: `target/storage-preflight-tree-cache-20260913/` contains saved prior
+source, runtime/test diff, ELF/build/source manifests, counter comparisons,
+all tests and functional evidence, commands, retained images and verifier output.
+The benchmark ELF precedes only a comment correction and the new test assertion;
+`final-source-hashes.json` records current source. The temporary 64-page build
+override is restored. No real SD timing or flash write-amplification claim is made.
+
+The initial broad cache-search variant (`after.elf`) is not qualified for
+retention. Its isolated 32-sample ABBA comparison preserves the read savings and
+passes both offline image checks, but unthrottled duplicate put/get regresses
+11.79%, 11.71% and 13.53%, exceeding pair spreads in each position. Unique
+put/get regresses 9.62%. Limited duplicate combined changes are -1.33%, -1.57%
+and -0.60%, with only the first exceeding both spreads; unique combined rises
+1.25%. Preserve all phases/raw observations in `limited/` and `unthrottled/`.
+The broad variant's correctness results above remain valid, but lower read
+traffic does not justify its CPU-side regression. A follow-up variant limits
+cross-window lookup to tree extents and preserves direct slot-zero content
+selection; `cas.broad.rs` records the original broad trial.
+
+Retain the tree-only variant as `scoped.elf`, with matching
+`sources-scoped.json` / `final-source-hashes.json`. Unlike the initial ELF it
+includes the new regression assertion and corrected comment. Its dedicated
+proof/preflight, 13 streaming and seven fused recovery tests pass. All 48 scoped
+ABBA samples pass, and their counters repeat exactly across limited mode and
+two unthrottled ABBA sequences. Scoped 16 MiB + 37 also passes all three samples
+with identical counters to the prior implementation. All four scoped candidate
+images independently verify. No compilation/test/heavy verification overlaps
+any timing sequence; the later 16 MiB diagnostic is counter-only.
+
+| Scoped mean put + get seconds | Limited before | Limited after | Unthrottled before (4 observations) | Unthrottled after (4 observations) |
+| --- | ---: | ---: | ---: | ---: |
+| new unique | 0.7649745 | 0.776173 | 0.12377875 | 0.12357575 |
+| first duplicate | 0.529027 | 0.5266185 | 0.110610 | 0.110101 |
+| next duplicate | 0.5311415 | 0.522117 | 0.1086805 | 0.11225625 |
+| final duplicate | 0.524079 | 0.524869 | 0.1083715 | 0.11227975 |
+
+Limited next-repeat improves 1.70%, exceeding pair spreads 0.28%/0.13%; other
+limited changes are within at least one pair spread. The scoped fast-backend
+results do not reproduce the broad variant's consistent double-digit regression,
+but are not a general speedup: pooled changes are -0.16%, -0.46%, +3.29% and
++3.61%. Keep the slow 133.114 ms next-repeat and 122.782 ms final-repeat candidate
+observations; their cause is unproven. Candidate ranges span 33.395 ms and
+15.060 ms in these positions. This evidence supports stable I/O reduction, not
+a guarantee of improved average/tail latency on fast backends. The remaining
+variation warrants future qualification rather than selectively discarding
+samples. Timing evidence is in `scoped-limited/`, `scoped-unthrottled/` and
+`scoped-unthrottled-repeat/`; pooled raw values are preserved separately.
+
+Final scoped regression completes successfully: 284 segment-store unit tests
+(one ignored), 28 file-service tests (five ignored), default QEMU three-boot
+recovery/powered-off verification and Duo release compile check all pass.
+`unit-scoped.log`, `file-scoped.log`, `qemu-scoped.log` and `duo-scoped.log`
+qualify the retained variant; hashes still match and `git diff --check` passes.
+
+### Current unique-object write amplification (2026-09-13)
+
+Reprofile unique content with the retained tree-only cache firmware
+`storage-preflight-tree-cache-20260913/scoped.elf`. Use fresh cloned disks,
+128 MiB, one hart, 64-page cache, `object-v2-large`, unique content, seed 32,
+no warmup and three samples per VM at 4 KiB, 128 KiB, 360 KiB, 1 MiB and
+16 MiB. Limits are 4/2 MiB/s and 400/200 read/write IOPS. All 15 samples and
+all five stopped-image verifications pass. This is a physical-counter baseline,
+not an ABBA latency comparison or cold-read baseline; small payloads remain in
+the device cache after put (4 KiB samples have zero physical read requests).
+
+| User payload | Stable write bytes (samples 1/2) | Write / user bytes | Write requests | Flushes |
+| --- | ---: | ---: | ---: | ---: |
+| 4 KiB | 106,496 | 26.000x | 6 | 3 |
+| 128 KiB | 237,568 | 1.8125x | 7 | 3 |
+| 360 KiB | 536,576 | 1.4556x | 13 | 3 |
+| 1 MiB | 1,257,472 | 1.1992x | 20 | 3 |
+| 16 MiB | 18,006,016 | 1.0732x | 169 | 4 |
+
+Both stable positions match these write/flush counters at every size. First
+samples include initialization/activation overhead and have eight flushes;
+retain them separately in `profile.json` rather than mix them into steady writes.
+The ratio is host-visible logical device traffic divided by benchmark user
+payload, including its wrapper, formatting, metadata and checkpoint writes.
+It is not SD controller/FTL physical write amplification. In particular, the
+4 KiB benchmark's stored logical object is 4,256 bytes including a 160-byte
+wrapper; its canonical blob is 4,480 bytes and occupies two 4 KiB pages.
+
+Trace a separate fresh 4 KiB three-sample run. All counters exactly match the
+untraced baseline. Split the ordered write suffix by sample request counts and
+independently reconcile bytes. Sample 1 consists of a 72 KiB front run, 16 KiB
+segment-tail run, one 4 KiB preclear, and three 4 KiB checkpoint writes. The
+independent layout parser validates the corresponding sealed segment without
+errors, finding five extents. The traced stopped image independently verifies.
+
+| Stable 4 KiB put's physical writes | Bytes |
+| --- | ---: |
+| Five extent body/seal pairs | 40,960 |
+| Segment header plus summary/seal records | 24,576 |
+| Canonical blob payload pages | 8,192 |
+| Four metadata payload pages | 16,384 |
+| Checkpoint clear/body/seal | 12,288 |
+| Next scratch-seal preclear | 4,096 |
+| Total | 106,496 |
+
+The four metadata payloads are the 256-byte blob manifest, 640-byte CAS catalog,
+2,752-byte persistent-authority snapshot and 137-byte allocation map, each
+rounded to one 4 KiB page. Their independent extent envelopes cost another
+32 KiB within the 40 KiB above. Fixed segment/extent framing alone accounts for
+64 KiB, or 61.5% of the total. Preclear contributes only 3.8%; eliminating its
+single page is neither a complete solution nor permission to weaken its crash
+protocol. Reducing the authority snapshot's encoded bytes alone cannot remove
+a page in this small fixture; compact metadata framing or amortizing durable
+publication across admitted batches is the larger opportunity. Either needs an
+explicit compatibility/recovery design: this evidence does not authorize silently
+changing record interpretation or relaxing per-operation durability.
+
+Next prioritize the fixed metadata-envelope cost for small unique objects over
+further dedup-read micro-optimizations. Larger-object traffic is already much
+closer to content size in this short workload; long histories, GC pressure,
+concurrent batches and actual SD behavior remain outside this baseline.
+
+Evidence: `target/storage-unique-current-profile-20260913/` preserves matching
+source/ELF hashes, all commands/serial/sample/host logs, retained images, verifier
+results and `analyze.py` to reproduce both profiles and the trace reconciliation.
+`trace4k/` includes actual QEMU arguments, trace, per-sample writes, parsed extent
+records and exact write breakdown. Current runtime hashes remain unchanged;
+this turn adds measurements and diagnosis, with no runtime modification.
+
+### Complete batch prefixes before bounded drains (2026-09-13)
+
+Measure the existing `file-batch-create-unique` path before changing disk format.
+Small content remains inline until the trusted-service fused transaction stages
+its data, inode/dirent nodes, namespace root and authority switch under one
+checkpoint. Batch-created files are verified byte-for-byte by the guest. Fresh
+QEMU VMs use 128 MiB, one hart, a 64-page cache, 4 KiB unique content, seed 32,
+no warmup and two samples at 1/8/32/100 files. This is a file workload including
+namespace construction and verification, not the preceding raw-object workload.
+All eight baseline samples and all four stopped images verify.
+
+The baseline already amortizes publication cost, but writing grows unexpectedly
+fragmented at 32 and 100 files. `commit_staged_batch_snapshot` initially merges
+content pages into its sink, then appends metadata with bounded drains, and only
+later adds the open segment's header and content descriptors in
+`seal_batch_segment`. A full sink thus drains sparse content before its missing
+prefix pages arrive. Metadata descriptor pages can also drain before being
+restaged by the final full-record prefix, causing duplicate physical writes.
+
+Extract `stage_batch_prefix` from `seal_batch_segment`. For the shared-open
+publication path only, stage its header and existing content descriptors before
+appending metadata in physical order. The bounded drain can now submit complete
+content runs and carry its final incomplete run forward. Finish using the same
+`finalize_segment` over all content and metadata records, without restaging the
+prefix. Other closed/dedicated-segment paths keep their existing behavior through
+the extracted helper. On-disk bytes/record identities and the checkpoint protocol
+are unchanged. The 64-page drain threshold, 32-page request ceiling, last-write
+selection and error/cancellation guard are retained; total heap peak is not
+claimed unchanged merely from retaining those thresholds.
+
+| Unique 4 KiB files | Sample | Write requests before -> after | Write bytes before -> after |
+| --- | --- | ---: | ---: |
+| 1 | initial / next | 11 -> 11 / 7 -> 7 | 196,608 -> 196,608 / 180,224 -> 180,224 |
+| 8 | initial / next | 12 -> 12 / 8 -> 8 | 397,312 -> 397,312 / 385,024 -> 385,024 |
+| 32 | initial | 103 -> 17 | 1,265,664 -> 1,093,632 |
+| 32 | next | 128 -> 14 | 1,527,808 -> 1,191,936 |
+| 100 | initial | 343 -> 34 | 4,096,000 -> 3,223,552 |
+| 100 | next | 339 -> 30 | 4,108,288 -> 3,235,840 |
+
+At 100 files the next sample saves 91.15% of write requests and 21.24% of write
+bytes (872,448 bytes); flush counts remain four initially / three subsequently.
+Initial activation and namespace shape affect totals, so retain both positions.
+This is less redundant device traffic, not a claim that fixed extent framing
+has been removed. As a larger-content guard, 100 unique 128 KiB files pass on
+both builds in the same 128 MiB VM: writes 291 -> 138, bytes 17,289,216 ->
+16,416,768, reads 625 / 16,252,928 bytes and seven flushes unchanged. This proves
+that fixture remains admitted, not a universal whole-operation heap bound.
+Counter diagnostics overlap correctness builds/tests; their timings are excluded.
+
+Correctness: 284 existing segment-store unit tests, 28 file-service tests and
+seven fused append recovery tests pass. Add a 32-chunk V2 test whose content
+fills the sink: interrupt every individual page/flush mutation using not-submitted,
+ambiguous-not-durable and ambiguous-durable failures, cold-mount the old or whole
+new batch, then retry and read all 32 chunks. It passes. The first fixture failed
+at a completed publication's retry because the old 64-entry test limit could
+not hold the namespace root plus two 32-object batches; raise only this fixture
+to 128 entries, preserve every fault point and all retry assertions, and keep
+the failed log. Default QEMU three-boot recovery/powered-off test and Duo release
+compile check pass. All candidate 4 KiB batch images independently verify.
+
+The larger baseline image exposed an existing offline-verifier bug:
+`parse_fs_data` still capped content at one page, while the retained Rust format
+admits up to 4 MiB per node. Align the independent verifier's explicit ceiling
+with `FS_DATA_CHUNK_MAX_LEN`; preserve all framing, ancestor, exact-length and
+cumulative-length checks. Add eight positive/negative parser selftests including
+4 KiB + 1, 128 KiB, the 4 MiB boundary, over-limit content, truncation and trailing
+bytes. The verifier passes 25,142 selftest cases, then independently validates
+both old and new 100×128 KiB images. The original baseline rejection is retained;
+this is a tooling compatibility fix, not a relaxation of runtime format rules.
+
+Evidence: `target/storage-small-batch-profile-20260913/` holds the baseline;
+`target/storage-batch-prefix-order-20260913/` holds prior source, extracted runtime
+diff, final source hashes, firmware/build log, all sample/serial/host logs,
+comparisons, temporary retained images and recovery/verification evidence. The
+firmware precedes only new test additions; runtime hashes match, and the temporary
+cache override is restored. The independent verifier source and its prior copy
+are recorded. No actual SD device was used.
+
+Isolated ABBA timing qualification (all builds/tests/offline checks completed
+before timing) uses one 100-file create-and-verify operation per fresh VM, two
+observations per build per mode. All eight samples pass, physical counters repeat
+exactly within builds and across modes, and both candidate stopped images verify.
+
+| Mean whole-operation seconds | Before | After | Change | Before/after pair spread |
+| --- | ---: | ---: | ---: | ---: |
+| 4/2 MiB/s, 400/200 read/write IOPS | 3.272093 | 2.7684425 | -15.39% | 0.029% / 0.130% |
+| unthrottled | 0.246420 | 0.255144 | +3.54% | 0.133% / 1.971% |
+
+Both changes exceed the observed pair spreads; do not hide the fast-backend
+regression. Retain this optimization for its large repeatable request/byte
+reduction and slow-backend benefit, while recording the additional fast-backend
+cost. It does not demonstrate universal latency gains or real SD performance.
+Exact timing/commands/raw counters and verifier results are in `limited/` and
+`unthrottled/`. `git diff --check` passes; final hashes include the new fault
+fixture and independent-verifier correction. The disk format, authority semantics
+and durability barriers remain unchanged.
+
+### Heap qualification of batch-prefix ordering (2026-09-13)
+
+Add an ignored isolated host probe, `batch_publication_requested_allocation`,
+using the existing allocation meter and preallocated device. A governed runtime
+registers the file reference kinds, imports an empty authority, creates/drops
+three maintenance data objects and collects them before measurement, entering
+the allocation-V2 path. Input chunks and device backing are allocated before the
+baseline. Measure the complete `stage_fs_data_chunks_for_maintenance` call, then
+verify every returned chunk outside the allocation window. This covers shared
+batch publication of a skip-linked data stream, not full file namespace/authority
+root-switch construction or a real asynchronous device driver.
+
+Run six cases alone against the retained runtime, temporarily substitute the
+saved preceding CAS source for the identical probe, then restore the retained
+source byte-for-byte and repeat. Every allocation and I/O counter in all six
+retained cases repeats exactly. No concurrency, firmware/cache override or
+runtime policy change enters this probe.
+
+| Chunks × bytes | Extra heap peak before | After | Change | Allocation calls before -> after |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 4 KiB | 214,180 | 214,180 | 0 | 142 -> 136 |
+| 8 × 4 KiB | 587,836 | 592,204 | +4,368 | 476 -> 456 |
+| 32 × 4 KiB | 1,463,260 | 1,359,532 | -103,728 | 1,669 -> 1,601 |
+| 100 × 4 KiB | 4,082,780 | 3,902,988 | -179,792 | 5,149 -> 4,946 |
+| 32 × 128 KiB | 5,602,204 | 5,602,204 | 0 | 3,869 -> 3,801 |
+| 100 × 128 KiB | 16,813,100 | 16,813,100 | 0 | 12,024 -> 11,819 |
+
+Requested allocation bytes fall in every case. For 100 × 4 KiB they fall
+21,813,272 -> 21,050,312; for 100 × 128 KiB, 111,104,748 -> 110,264,844.
+These are cumulative allocation traffic, not retained heap or device traffic.
+The small 8-chunk peak increase is retained and is not described as zero-cost.
+
+The live heap observed at device API entry changes differently from whole-call
+peak: 8 × 4 KiB rises 348,996 -> 465,228; 32 × 4 KiB rises 1,111,764 ->
+1,232,556; 100 × 4 KiB rises 3,358,164 -> 3,776,012. Filling prefixes earlier
+changes what is held while I/O begins. Actual driver/DMA allocations or concurrent
+work could add to that live set; the immediate host device does not measure such
+an overlap. Thus the evidence supports bounded behavior in these fixtures, not
+whole-operation admission on every target or a proof that unchanged drain
+thresholds imply unchanged heap peaks. The 64 MiB probe recovery budget is
+permissive and does not replace target-budget testing.
+
+Write counters also confirm the same mechanism: 32 × 4 KiB data chunks drop
+288 -> 246 written pages / 96 -> 17 requests; 100 × 4 KiB drops 896 -> 726
+pages / 302 -> 32 requests. At 100 × 128 KiB, 4,117 -> 3,947 pages and
+250 -> 136 requests. Flush counts are identical within each pair. These data-
+stream counts differ from the preceding namespace benchmark and must not be
+combined with it as if they measured the same operation.
+
+Evidence: `target/storage-batch-prefix-memory-20260913/` has source/probe hashes,
+original/candidate allocation logs, exact-repeat log, comparison script/results
+and restoration evidence. Initial fixture attempts used the wrong authority
+composition (ungoverned import, then unprincipaled raw writes); the qualified
+fixture uses governed maintenance operations throughout. `after-qualified.log`,
+`before.log` and `after-repeat.log` are the comparison evidence. This turn adds
+the reusable probe and qualification; retained runtime source is unchanged and
+`git diff --check` passes. No SD performance claim follows from host allocation
+measurements.
+
+### Transfer encoded segment pages into deferred sinks (2026-09-13)
+
+Remove redundant page allocations/copies while preserving the preceding batch
+publication order. `stage_batch_prefix` transfers its two newly encoded header
+pages with `push_owned`; it no longer copies those boxes into another pair.
+`finalize_segment`, only when both deferred barriers and a sink are present,
+transfers its four newly encoded summary/segment-seal pages into that sink and
+returns the same seal identity. The original direct-write/non-deferred path is
+unchanged. Page order, encodings and the caller's checkpoint barrier remain
+identical; ownership transfer neither submits an early write nor skips a barrier.
+
+The isolated six-case batch allocation probe passes and confirms exact savings:
+
+| Batch data | Fewer allocations | Fewer cumulative requested bytes |
+| --- | ---: | ---: |
+| 1 / 8 / 32 / 100 × 4 KiB (each fixture) | 6 | 24,576 |
+| 32 × 128 KiB | 12 | 49,152 |
+| 100 × 128 KiB | 24 | 98,304 |
+
+This is six avoided page copies per sealed batch segment (two header plus four
+summary/seal pages). Every measured whole-call heap peak, device-entry live-heap
+peak, written-page count, write-request count and flush count is exactly the same
+as the preceding retained probe. Do not claim a peak-memory reduction: those
+peaks occur outside the eliminated temporary overlap. All returned content is
+verified. The reduction is cumulative allocation/copy traffic, not on-disk bytes.
+
+QEMU counter diagnostics at 1/8/32/100 unique 4 KiB files, two samples each, all
+pass with every physical counter identical to the preceding build. All four
+stopped images independently verify. Default three-boot file-tree/powered-off
+recovery and Duo release compile check pass. These initial diagnostics overlap
+correctness builds/tests, so their timings are excluded.
+
+Evidence: `target/storage-owned-seal-pages-20260913/` includes saved preceding
+CAS source, exact runtime diff, matching firmware/source/probe hashes, allocation
+comparison, benchmark logs/commands, stopped images and verifier/recovery output.
+Temporary cache configuration is restored. No additional memory-budget admission
+or real SD performance claim follows from this ownership change.
+
+Final correctness qualification passes 285 segment-store unit tests (one ignored),
+26 GC recovery tests, seven fused append recovery tests and 28 file-service tests
+(five ignored), including the full-sink per-page fault matrix. All source hashes
+still match the firmware/probe manifest; `git diff --check` passes.
+
+Isolated ABBA runs compare the preceding prefix-order firmware with this build
+for one 100-file create-and-verify workload per fresh VM. Use 128 MiB, one hart,
+64-page cache, 4 KiB unique content and seed 32. No build/test/heavy verifier runs
+overlap timing. All eight samples pass, all physical counters repeat exactly
+within builds and across limited/unthrottled modes, and both timed candidate
+images independently verify.
+
+| Mean seconds | Before | After | Change | Before/after pair spread |
+| --- | ---: | ---: | ---: | ---: |
+| 4/2 MiB/s, 400/200 read/write IOPS | 2.7657695 | 2.721449 | -1.60% | 0.060% / 0.002% |
+| Unthrottled | 0.262613 | 0.2053035 | -21.82% | 5.955% / 3.507% |
+
+Both reductions exceed observed pair spreads, but each version has only two
+observations per mode. These are whole-build QEMU results; they do not isolate
+how much comes from allocation, copying or compiler-generated async code, and
+do not establish real SD gains. Retain the ownership transfer for eliminated
+redundant allocation/copy work, preserved correctness and this measured result.
+All timing values, including the slower control repetition, remain in `limited/`
+and `unthrottled/` with commands/ELF hashes, raw logs and analysis.
+
+### Owned segment pages: sequential-file qualification (2026-09-13)
+
+Extend the preceding ownership-transfer comparison to one 16 MiB
+`file-sequential` workload per fresh VM, seed 71, no warmup. Compare
+`storage-batch-prefix-order-20260913/after.elf` with
+`storage-owned-seal-pages-20260913/after.elf`; both already contain prefix
+ordering and proof-window reuse. Use ABBA, 128 MiB, one hart and a 64-page
+firmware cache. Limited mode uses 4/2 MiB/s and 400/200 read/write IOPS;
+unthrottled mode removes only those limits. No builds, tests or heavy offline
+verification overlap timed runs. This qualification changes no runtime source.
+
+| Mean seconds, limited | Before | After | Change | Before/after pair spread |
+| --- | ---: | ---: | ---: | ---: |
+| Stage data | 8.958654 | 8.6792735 | -3.12% | 0.537% / 0.180% |
+| Publish | 0.073969 | 0.0744355 | +0.63% | 3.090% / 3.935% |
+| Full verification | 4.1339365 | 4.135031 | +0.03% | 0.160% / 0.049% |
+| Remove | 0.008918 | 0.0064805 | -27.33% | 1.413% / 1.373% |
+| Whole workload | 13.1754775 | 12.8952205 | -2.13% | 0.434% / 0.115% |
+
+| Mean seconds, unthrottled | Before | After | Change | Before/after pair spread |
+| --- | ---: | ---: | ---: | ---: |
+| Stage data | 1.0893855 | 0.7963325 | -26.90% | 1.742% / 5.788% |
+| Publish | 0.0129825 | 0.010791 | -16.88% | 1.040% / 0.815% |
+| Full verification | 0.6187355 | 0.582729 | -5.82% | 0.424% / 1.923% |
+| Remove | 0.008718 | 0.0064985 | -25.46% | 0.665% / 0.539% |
+| Whole workload | 1.7298215 | 1.396351 | -19.28% | 0.941% / 4.107% |
+
+Whole-workload and staging reductions exceed observed pair spreads in both
+modes, with only two observations per version per mode. Limited publication and
+full verification changes are within spreads. Within limited verification,
+reader time rises 3.8395335 -> 3.8574905 s (+0.47%, spreads 0.240% / 0.108%);
+retain this small regression. Pattern checking falls 0.2938835 -> 0.2770105 s
+(-5.74%, spreads 5.370% / 0.744%), leaving total verification essentially flat.
+Unthrottled reader time falls 0.336636 -> 0.318858 s (-5.28%, spreads
+0.648% / 1.108%), and pattern checking falls 0.281837 -> 0.263622 s (-6.46%,
+spreads 1.711% / 2.906%). These subphases are included in verification, not
+additional whole-workload costs. Removal gains are only about 2.2–2.4 ms.
+
+All eight guest samples pass full-content checks. Every physical counter is
+identical across both versions and both modes: 17,907,712 read bytes in 271
+requests, 18,157,568 write bytes in 201 requests, 16 flushes, and 488 total
+requests/used interrupts. Both retained candidate images independently verify
+with an unchanged unmanaged prefix. The workload removes its file, so final
+image structural verification complements rather than replaces the guest's
+content verification. Source hashes remain unchanged.
+
+Evidence: `target/storage-owned-seal-sequential-limited-20260913/` and
+`target/storage-owned-seal-sequential-unthrottled-20260913/` contain runners,
+commands/ELF hashes, all raw timings, phase analysis, source manifests, retained
+candidate images, offline results and cross-mode `qualification.json` checks.
+These are whole-build QEMU observations, not a causal attribution of every saved
+cycle to page copying, a peak-memory reduction, or a real SD performance result.
+
+### Rejected isolated-page sink submission trial (2026-09-13)
+
+Trial a direct borrow of the sink's owned page for one-page physical runs,
+allocating the contiguous run buffer only when a multi-page run occurs. Keep
+`write_pages`, ascending last-write-wins ordering, the 32-page request ceiling,
+64-page bounded drain threshold and failure/cancellation cleanup unchanged.
+The rationale was to avoid copying isolated preclear/tail pages into a run buffer.
+
+The six batch-publication allocation fixtures (1/8/32/100 × 4 KiB and
+32/100 × 128 KiB) pass, but every allocation count, requested-byte total,
+whole-call peak, device-entry live-heap peak and I/O counter is identical to the
+retained owned-seal build. These workloads still allocate a multi-page buffer.
+No measured memory or device-traffic gain supports the additional async branch.
+
+An isolated unthrottled ABBA compares the retained owned-seal firmware with the
+candidate: 100 unique 4 KiB files, seed 32, 128 MiB, one hart, 64-page cache,
+one sample and no warmup per fresh VM. Builds/tests finish before timing.
+All four guest content checks pass, and every physical counter is identical:
+522 reads / 3,072,000 bytes, 34 writes / 3,223,552 bytes, four flushes and
+560 total requests/interrupts. Before times are 202.951 and 206.152 ms;
+candidate times are 208.909 and 208.225 ms. Means rise 204.5515 -> 208.567 ms
+(+1.96%), versus pair spreads 1.565% / 0.328%. Only two samples per version
+are available; this is insufficient to generalize the regression, but gives no
+reason to retain the speculative copy optimization. No limited-backend speedup
+or real SD benefit is inferred from unchanged I/O.
+
+Reject and restore the runtime exactly. Retain only the drain test expansion
+from failure at request 2 to every request 1–6, including both singleton tails.
+The candidate also passes bounded-drain singleton cancellation, ordered-stream
+failure/cancellation and full-sink per-page publication recovery. Evidence lives
+in `target/storage-sink-single-page-20260913/`: saved before/rejected source,
+allocation logs, candidate build/source hashes, ABBA commands and raw logs,
+analysis, fault-test logs and runtime restoration assertion. Its `after.elf` is
+an experimental rejected build, not the retained implementation.
+
+The retained expanded drain test passes after restoration. The stopped candidate
+image independently verifies with an unchanged unmanaged prefix. Cross-build
+allocation/I/O equality checks and `git diff --check` pass.
+
+### SD command demand behind page-level counters (2026-09-13)
+
+Audit the current SD backend before interpreting QEMU request savings as card
+command savings. `kernel/src/sdhci_blk.rs::Card::read_blocks` can permanently
+fall back to CMD17 per sector for a session. Its write path can use an unsplit
+qualified multiblock mode, adaptive blind CMD25 bursts, or CMD24 per sector.
+The blind safe floor is eight sectors (4 KiB), versus the advertised maximum
+256 sectors (128 KiB). `write_sector_tracked` in the hardware driver also calls
+`flush`, which issues at least one CMD13; the multiblock path leaves readiness
+barriers to explicit Flush requests. Thus page requests and hardware commands
+are different quantities even when the same bytes reach the device.
+
+The following is a conditional command model, not a hardware measurement:
+replay the same aligned, at-most-128-KiB requests from retained QEMU evidence,
+with successful steady-state transfers and no probes, retries or readback.
+Exclude CMD12/CMD23, bus configuration and controller reset traffic. CMD13
+counts are lower bounds because readiness can require repeated polls. Real SD
+cache behavior may change the request stream. The source evidence identifies
+which historical optimization each comparison isolates.
+
+| Workload | Unsplit write data commands | Blind 4 KiB CMD25 bursts | Fallback CMD24 | Fallback minimum CMD13 |
+| --- | ---: | ---: | ---: | ---: |
+| Stable unique 4 KiB object | 6 | 26 | 208 | 211 |
+| 100 files before prefix ordering | 343 | 1,000 | 8,000 | 8,004 |
+| 100 files after prefix ordering | 34 | 787 | 6,296 | 6,300 |
+| Current 16 MiB sequential file workflow | 201 | 4,433 | 35,464 | 35,480 |
+
+Prefix ordering reduces unsplit write commands by 90.09% in this first-sample
+batch comparison, but blind-floor/fallback data commands by only 21.30%, matching
+the saved bytes. This differs from the previously reported subsequent-sample
+counts (339 -> 30 requests); do not mix those populations. Conversely, the owned
+page transfer leaves all modeled commands unchanged. It improves software work,
+not the SD protocol. For sequential files, fallback reads would also expand
+271 requests to 34,976 CMD17 commands; the 100-file read stream expands 522 to
+6,000. These counts do not predict latency or internal flash write amplification.
+
+This evidence prioritizes reducing metadata bytes for small writes, retaining
+large qualified transfers, and exposing actual backend mode/command counts in
+future card qualification. Removing per-sector status checks is a distinct
+protocol change: existing host tests deliberately fail at MMIO publication and
+do not prove successful card readiness/error behavior. QEMU virtio timings
+cannot qualify that change, so this audit does not silently remove those checks.
+
+`target/storage-sd-command-model-20260913/analyze.py` reproduces the projection
+from four identified JSONL samples with input/driver SHA-256 hashes. It checks
+4 KiB/128 KiB command geometry and rejects malformed aggregate geometry;
+`analysis.json` records assumptions and all counters. No runtime changes.
+
+The current SD driver host suite passes all 17 tests; these cover range checks,
+command publication and failure paths, not successful physical-card transfers.
+`git diff --check` passes.
+
+### Batch scale and the metadata-segment boundary (2026-09-13)
+
+Extend the maintenance data-stream allocation fixture beyond 100 chunks before
+raising the unique-file benchmark guard. Use the existing 16-segment in-memory
+device, governed maintenance authority, allocation-v2 setup after GC and a
+permissive 64 MiB recovery budget. Inputs are allocated before measurement;
+returned stream chunks are fully read and compared after measurement. This is
+a data-stream batch, not a namespace transaction or a 128 MiB guest admission.
+The one-byte content pattern wraps at 256; FsData indices/ancestor references
+still make different stream nodes distinct. Do not describe it as 330 unique
+raw user buffers.
+
+| 4 KiB chunks | Extra heap peak | Live heap at device entry | Allocations | Written pages / requests / flushes |
+| --- | ---: | ---: | ---: | ---: |
+| 128 | 4,907,652 B | 4,780,676 B | 6,331 | 924 / 38 / 4 |
+| 256 | 8,866,000 B | 8,458,004 B | 12,826 | 1,835 / 68 / 5 |
+| 330 | 14,419,376 B | 13,894,532 B | 16,656 | 2,363 / 84 / 5 |
+
+331, 332 and 512 chunks fail at `stage_fs_data_chunks_for_maintenance` with
+`Store(Store(Format(InvalidField)))`, not `MemoryLimit`. In this fixture 330/331
+brackets the metadata-layout boundary: `commit_staged_batch_snapshot` places all
+new manifests, the catalog and allocation record into one metadata segment;
+its data area is pages 2 through 1019. `build_record` encodes each record before
+the final capacity check, so crossing the boundary is exposed as a format error.
+The successful large batches use about 7.22 / 7.17 / 7.16 written pages per
+4 KiB chunk; additional batching barely reduces that per-item framing cost.
+There is no evidence here that simply removing the shell's 100-file guard will
+support 1,000 unique files, or that more memory alone solves the boundary.
+
+Keep the 128/256/330 cases in the ignored allocation probe, with wrapping pattern
+generation to avoid arithmetic overflow above 255. Existing six cases retain
+their content bytes. No runtime format, publication semantics, guest guard or
+memory budget is changed. Supporting substantially larger atomic batches needs
+metadata spread across segments (or a versioned compact representation), with
+all roots published by the same checkpoint and recovery qualification; splitting
+one atomic namespace transaction into separately visible commits is not an
+acceptable substitute.
+
+Evidence: `target/storage-batch-scale-20260913/` retains baseline probe source,
+isolated per-size logs, exact temporary-source hashes, restoration assertions,
+runner scripts, boundary failures and the final expanded probe log. Temporary
+probes restore source byte-for-byte before the retained test-only edit. These
+host allocation counters do not measure real SD timing or driver/DMA overlap.
+
+The expanded nine-case probe passes; all allocation and I/O counters exactly
+repeat the isolated scale runs and the original six retained cases.
+`git diff --check` passes.
+
+### Multi-segment metadata layout prototype (2026-09-13)
+
+Add a test-only, allocation-free `MetadataCursor` in
+`segment-store/src/metadata_layout.rs` as the first implementation step toward
+removing the preceding batch boundary. It places indivisible descriptor/payload
+records within pages 2..1020, starts a new relative segment and resets ordinals
+when the remaining space is insufficient, and rejects exhausted segment budgets
+without changing cursor state. Relative indices must be bound to reserved physical
+segments before encoding pointers; the prototype does not allocate device space.
+
+Three tests pass: all 1,019 starting tail positions × 1,016 valid record spans;
+malformed records/cursors and exhausted-budget state preservation; and 1,000
+three-page manifest records followed by a 65-page catalog span, three-page
+authority and three-page allocation records. The last model occupies four
+metadata segments with no record crossing a boundary. Its catalog size is a
+geometry fixture, not an assertion about every 1,000-object authority state.
+
+This remains `cfg(test)` and is not called by publication. The 331-chunk runtime
+failure remains unresolved; no capacity, timing, write-byte or memory-admission
+improvement is claimed. Integration must reserve/bind all metadata segments,
+update allocation and generation accounting, seal the complete chain, capture
+all readback ranges, and publish one checkpoint. Atomic namespace publication
+must remain intact. The current allocation helper checks cleaner/root-policy
+headroom; blindly allocating segments independently would bypass that reservation
+requirement. Fragmented free-space policy also needs explicit handling.
+
+`target/storage-metadata-layout-20260913/` contains passing test output, source
+hashes and a source-based integration checklist covering recovery, faults, retry,
+GC, fragmentation, memory and QEMU qualification. Runtime implementation and
+its qualification remain pending. `git diff --check` passes.
+
+### Multi-segment batch metadata publication candidate (2026-09-13)
+
+Integrate `MetadataCursor` into `commit_batch_snapshot`. Preflight the ordered
+manifest, catalog/delta, optional authority and allocation record spans; records
+remain indivisible. Keep the shared-open-segment path when the entire metadata
+set fits. Otherwise reserve all dedicated metadata segments before encoding
+physical pointers, respecting cleaner reserve and root-policy headroom. V1
+extends its contiguous prefix; V2 selects free segments in ascending physical
+order and can bind a fragmented set. Account for every added segment in the
+allocation transition and generation frontier.
+
+Each dedicated segment gets its own header, ordinals, summary and seals, chained
+from the preceding data/metadata segment. The allocation record remains last.
+Update the successor's final/predecessor chain entries and include all metadata
+segments in readback ranges. One checkpoint publishes the entire batch; no
+transaction is split into separately visible commits. The existing record ABI
+is unchanged. The old v1 allocation-size estimate of zero is also corrected to
+the actual fixed payload length when planning record geometry.
+
+Host maintenance-stream results (4 KiB chunks, permissive 64 MiB recovery budget):
+
+| Chunks / device segments | Result | Extra heap peak | Written pages / requests / flushes |
+| --- | --- | ---: | ---: |
+| 331 / 16 | Full content check passes | 14,361,996 B | 2,376 / 85 / 5 |
+| 512 / 16 | Full content check passes | 21,701,448 B | 3,662 / 126 / 6 |
+| 1,000 / 16 | Capacity(Payload) | Not measured | Not a successful run |
+| 1,000 / 64 | Full content check passes | 42,054,536 B | 7,127 / 237 / 7 |
+
+The 331/512 cases previously failed with `Format(InvalidField)`. The larger
+1,000-chunk device is explicit and does not prove admission in a 128 MiB guest;
+its input buffers are outside the measured peak. These are data-stream chunks,
+not a complete 1,000-file namespace transaction. Per-item metadata framing still
+costs pages; this change removes a batch capacity boundary, not those bytes.
+
+All nine original allocation cases pass with unchanged write pages, requests
+and flushes. Most add one 16-byte allocation and 16 bytes of measured heap peak;
+330 × 4 KiB adds eight cumulative requested bytes / 16 peak bytes, and
+100 × 128 KiB has unchanged allocation count, 24 fewer cumulative requested
+bytes and eight more peak bytes. Do not describe this as zero-overhead.
+The QEMU 100-unique-file diagnostic passes with counters identical to the
+retained owned-seal build. Diagnostic timing overlaps correctness work and is
+excluded. The release benchmark firmware builds and its temporary cache override
+is restored. The pre-existing unit suite plus layout tests passes 288 tests,
+one ignored (before registering the new ignored cross-segment fault smoke test).
+
+Evidence: `target/storage-metadata-multisegment-20260913/` contains saved runtime
+source/diff, build manifests, original and enlarged-device probe runs, restored
+probe hashes, nine-case comparison, QEMU logs and the sampled fault test output.
+The new ignored recovery test samples 26 of 2,381 mutation positions with three
+failure outcomes, including the last 16 positions and distributed early writes.
+This is explicitly not exhaustive multi-segment fault qualification. Further
+work remains on exhaustive cut coverage, fragmented-space recovery/GC, complete
+namespace batches in QEMU, isolated timing and target-budget admission. Treat the
+implementation as a candidate until that qualification is complete.
+
+The 78 sampled failure cases pass cold-mount old-or-complete recovery, retry
+and selected chunk checks. This does not replace full-content cold verification
+or exhaustive cuts. The QEMU stopped image independently verifies, the Duo
+release compile check passes, source hashes match the build manifest and
+`git diff --check` passes. No actual SD device was exercised.
+
+### Full cold reads and large QEMU namespace batches (2026-09-13)
+
+The retained ignored `multi_segment_batch_cold_mount_reads_every_chunk` test
+publishes 331, 512 and 1,000 unique-index 4 KiB chunks, both immediately after
+namespace setup and after GC. All six cases pass (3,686 chunks checked after
+cold mount). Destroy the original handles/store, power-cycle the device, create
+a fresh runtime, recover the tail from its typed identity, then compare every
+chunk. Assert one checkpoint-generation advance, the complete object count,
+and actual new metadata pointers spanning two segments (331/512) or four
+(1,000). The 64-segment host fixture uses a permissive 64 MiB recovery budget;
+this is not a whole-operation memory-admission proof.
+
+An initial fixture assumption incorrectly treated the no-GC case as allocation
+v1. The current formatter already produces v2; that assertion failed before the
+batch operation. The corrected test explicitly asserts v2 and names the two
+cases by GC history. It does not cover legacy v1 images. Preserve the initial
+logs rather than presenting them as a runtime regression or v1 qualification.
+
+Run real namespace create-and-full-verify diagnostics on fresh temporary disks
+in 128 MiB QEMU, one hart, 64-page cache, seed 32 and unique 4 KiB file content:
+
+| Files | Status | Read bytes / requests | Write bytes / requests | Flushes |
+| --- | --- | ---: | ---: | ---: |
+| 331 | Pass | 9,809,920 / 1,686 | 10,272,768 / 90 | 5 |
+| 512 | Pass | 15,294,464 / 2,623 | 15,769,600 / 132 | 6 |
+| 1,000 | Pass | 29,138,944 / 5,041 | 30,629,888 / 248 | 8 |
+
+All three stopped images independently verify, including their live file trees
+and unchanged unmanaged prefixes. This extends beyond the maintenance-stream
+fixture: the guest stages separate files, commits the namespace transaction and
+checks each file's complete byte pattern. The initial 331/512 diagnostics overlap
+correctness/verification work; no timing comparison is derived from these runs.
+
+The shell's unique-file benchmark now admits up to 1,000 files when each is at
+most 4 KiB; counts up to 100 retain the previous 128 KiB per-file bound. The
+initial experiments temporarily widened the guard in separately recorded builds,
+then restored it byte-for-byte. The final qualified build uses the retained,
+narrower guard with no temporary shell edit. This guard is a tested diagnostic
+range, not a promise that every populated volume or concurrent workload has
+sufficient capacity/memory. No SD latency claim follows from QEMU results.
+
+Evidence: `target/storage-metadata-cold-read-20260913/`,
+`target/storage-metadata-qemu-large-20260913/` (331 and `512/`), and
+`target/storage-metadata-qemu-1000-20260913/` (initial experiment and final
+`qualified/`). Commands, firmware/source hashes, content-check logs, preserved
+images and independent verifier results are retained. Exhaustive multi-segment
+fault coverage, fragmented-space recovery/GC, legacy-v1 compatibility and
+isolated before/after performance remain outstanding.
+
+The final qualified 1,000-file firmware passes full guest verification and
+independent stopped-image verification. All counters exactly repeat the initial
+1,000-file experiment, source hashes match the build manifest (including the
+retained shell guard), the cache override is restored and `git diff --check`
+passes. No processes from this qualification remain running.
+
+### Resumable exhaustive cross-segment fault qualification (2026-09-13)
+
+Retain the sampled fault test and add an ignored exhaustive variant sharing the
+same 331-chunk publication fixture. By default it visits every one of 2,381
+page-write/flush mutation positions. Explicit `VIBEOS_MULTI_FAULT_START` and
+`VIBEOS_MULTI_FAULT_END` select a nonempty half-open shard; malformed/out-of-range
+bounds fail. Each position tests NotSubmitted, AmbiguousNone and AmbiguousDurable.
+Cold recovery must have the exact old or complete object count and matching
+checkpoint generation. Whenever recovery exposes the new batch, recover its tail
+by typed identity and compare all 331 chunks before retrying publication. Retry
+still checks chunks 0/127/255/330. Thus full content is checked for a fault-exposed
+new batch, while retry verification remains sampled; do not conflate the two.
+
+The strengthened tail shard [2365, 2381) passes all 48 outcomes. The allocation
+reservation policy test also passes an alternating allocated/free 64-segment map:
+there is no contiguous two-segment run, but a one-slot request plus the remaining
+slots can reserve the complete fragmented set up to the cleaner/root-policy
+floor. Requesting one additional slot is refused. This validates the reservation
+gate, not physical fragmented publication, GC or cold recovery on such a volume.
+
+The full campaign is launched from
+`target/storage-metadata-fault-exhaustive-20260913/full/run.py` using a copied,
+SHA-256-pinned test executable and source manifest. It runs disjoint 64-position
+shards and checks successful exit plus every expected per-position result before
+recording coverage. A missing/duplicate/out-of-range result or test failure stops
+the campaign. Final success requires all 2,381 positions / 7,143 outcomes; the
+48-outcome tail shard alone does not satisfy this requirement. The runner refuses
+to overwrite existing evidence. Test bounds allow a separately recorded shard
+to be rerun without redefining the required full coverage.
+
+At this entry's creation the full campaign is still running; `full/coverage.json`
+records completed shards and the active range, and each shard has its raw log.
+A running-state file alone does not prove a live process; monitor the actual exec
+session and use terminal results for completion. No runtime code changes in this
+qualification turn. Timed QEMU comparisons must wait until the campaign is idle.
+Full fragmented-space recovery/GC, legacy-v1 compatibility and performance
+qualification remain outstanding. `git diff --check` passes.
+
+### Live cross-segment batch relocation and cold recovery (2026-09-13)
+
+Add the ignored `multi_segment_batch_survives_gc_and_cold_namespace_recovery`
+test. Publish a 331-chunk stream using the multi-segment metadata writer, attach
+it to an inode-tree entry and persist its Fs namespace root. Release all stream,
+root and maintenance handles before collection; only the persistent root keeps
+the stream live. Add dead objects to provide collection work, and require actual
+relocation of data manifests before accepting the fixture. After destroying the
+store and power-cycling its device, create a new runtime, recover the namespace
+and its data reference, then compare every chunk.
+
+The retained test passes: all 331 data manifests move and all 331 chunks verify
+after cold mount. Its relocation predicate filters `FS_DATA_V1_KIND`, so moving
+only an inode/dirent/root manifest cannot satisfy the assertion. The first run
+counted all 334 manifests, including three structural objects; the strengthened
+run explicitly reports the 331 data manifests. Evidence preserves both logs.
+The 64-segment host fixture uses a permissive 64 MiB recovery budget. This is
+successful live relocation of a typed Fs namespace, not a GC power-cut matrix,
+a deliberately fragmented allocation fixture, or guest memory admission.
+
+Evidence: `target/storage-metadata-gc-20260913/` contains build/test output,
+source hash and qualification results. No runtime source changes. An in-memory
+comparison removes only the newly added GC test from the current source and
+matches every file hash in the already-running exhaustive fault campaign's pinned
+manifest, confirming that this test addition does not invalidate that runtime
+qualification. `git diff --check` passes.
+
+The 2,381-position / 7,143-outcome fault campaign remains in progress in its
+original exec session. Per-position progress in an active shard is provisional
+until that shard exits successfully and the runner validates complete coverage.
+Its completion, fragmented-space recovery, legacy-v1 compatibility and isolated
+performance comparisons remain outstanding; no new QEMU timing is collected
+while it runs.
+
+### Legacy allocation-v1 cross-segment publication (2026-09-13)
+
+Generalize the existing M7.4 legacy-image fixture to optionally leave ordinary
+free space beyond the cleaner reserve. The original full-prefix helper passes
+zero extra space and retains its old callers. The new case starts from encoded
+media: a legacy allocation extent and checkpoint, not a patched in-memory
+`allocation_version`. A 64-segment image starts with a 10-segment allocated
+prefix and a six-segment cleaner reserve. Existing CAS content remains unchanged.
+
+The ignored `legacy_v1_multi_segment_batch_publishes_and_cold_reads` test mounts
+that image, publishes 331 unique-index 4 KiB stream chunks under one checkpoint,
+and decodes the newly written allocation payload with the v1 decoder. Its prefix
+grows 10 -> 14. Decode the published CAS snapshot and require new manifest/catalog/
+allocation pointers to occupy exactly metadata segments 12 and 13, the final two
+contiguous segments of that prefix. Thus this exercises the v1 dedicated-segment
+branch across the old single-metadata-segment boundary.
+
+Attach the stream to a persistent Fs namespace, destroy all handles and the
+store, create a fresh runtime, recover the namespace and compare all 331 chunks.
+The new test passes together with all four pre-existing tests selected by
+`legacy_`, including the legacy GC bootstrap mutation matrix. This is successful
+v1 publication plus cold namespace reading, not a new per-write fault matrix for
+the legacy multi-segment branch. The fixture uses a permissive 64 MiB host
+recovery budget and makes no SD timing or guest memory-admission claim.
+
+Evidence: `target/storage-metadata-legacy-20260913/` retains initial and qualified
+logs, test-source hash and result summary. No runtime code changes. The pinned
+v2 exhaustive fault campaign remains running in its original session; its first
+64-position shard has completed and its 192 outcomes/log hash were independently
+checked. Active-shard results are not counted as completed coverage. Full v2 fault
+coverage, deliberately fragmented physical publication/recovery and isolated
+performance qualification remain outstanding. `git diff --check` passes.
+
+### Physical fragmented metadata publication and cold recovery (2026-09-13)
+
+Add the ignored `multi_segment_batch_uses_fragmented_free_segments_and_cold_recovers`
+test. Build a real 96-segment test volume using five rounds of normal 4 KiB /
+128 KiB object commits and collection. Retain selected runtime handles during
+fixture construction and release older ones to create holes. Consume the leading
+contiguous free range with additional real commits, leaving room for packed batch
+data ahead of the isolated metadata slots. No allocation bitmap or physical
+record is patched to fabricate fragmentation.
+
+Publish 331 unique-index 4 KiB stream chunks. Inspect the actual new manifest,
+catalog and allocation pointers and require at least two metadata segments with
+a physical gap. The passing fixture places metadata in segments **26 and 28**;
+segment 27 is occupied. A run that accidentally chooses a contiguous set fails the
+fixture assertion and cannot count as fragmented coverage. Attach the stream to
+the persistent Fs namespace, release all construction handles, destroy the store,
+power-cycle the device and recover through a fresh runtime and namespace root.
+All 331 chunks compare equal after cold mount.
+
+This validates physical fragmented placement plus successful cold recovery. It
+complements the earlier reservation-policy test and live GC relocation test;
+it does not replace a power-cut matrix on this particular fragmented layout.
+The fixture uses a permissive 64 MiB host recovery budget and is not a guest
+memory-admission or SD timing result.
+
+Evidence: `target/storage-fragmentation-probe-20260913/` records the initial
+normal-GC free-space observations, exact restoration of the temporary exploratory
+source, final publication/cold-read log and qualification/source hash. The retained
+test includes the complete fixture construction. Removing only the subsequently
+added GC and fragmentation tests from current source reproduces every source hash
+of the running pinned fault campaign; runtime and campaign test logic are unchanged.
+`git diff --check` passes.
+
+The exhaustive 2,381-position campaign remains live in its original session.
+Full fault coverage and isolated before/after performance qualification remain
+pending; successful fragmented cold recovery does not establish either.
+
+### Independent fault-coverage audit (2026-09-13)
+
+`target/storage-metadata-fault-exhaustive-20260913/full/audit.py` independently
+checks the pinned executable hash, completed-log hashes, contiguous shard ranges,
+exact shard headers, every expected position with three outcomes, and successful
+test termination. Its negative checks reject duplicate/missing positions, wrong
+outcome counts, wrong range headers and truncated terminal results. Active-shard
+progress is excluded. `--require-complete` exits 2 for partial coverage and can
+succeed only after all 2,381 positions / 7,143 outcomes pass; a failed runner exits
+1. Runner-state reporting does not establish process liveness, which is checked
+through the original exec session.
+
+The current partial audit verifies 192 positions / 576 outcomes. The strict
+completion invocation correctly exits 2. The original campaign remains running;
+no runtime source or benchmark timings change during this audit.

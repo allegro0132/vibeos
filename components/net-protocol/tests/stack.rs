@@ -1247,3 +1247,65 @@ fn frontend_direct_transfer_preserves_bytes_across_wrap_and_backpressure() {
         Err(vibeos_net_protocol::TcpFrontendDriveError::Stack(StackError::AuthorityRevoked))
     );
 }
+
+#[test]
+fn icmp_echo_preserves_changing_payloads_and_rejects_bad_checksums() {
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for pair in bytes.chunks(2) {
+            sum += ((pair[0] as u32) << 8) | pair.get(1).copied().unwrap_or(0) as u32;
+        }
+        while sum >> 16 != 0 { sum = (sum & 65535) + (sum >> 16); }
+        !(sum as u16)
+    }
+    let inbound = Endpoint::new("icmp-in", 4);
+    let outbound = Endpoint::new("icmp-out", 4);
+    let stamp = session_stamp();
+    let mut space = CSpace::new("icmp-stack");
+    let (_, rx) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, tx) = authority(&mut space, &outbound, Rights::SEND);
+    let mut stack = StaticIpv4TcpStack::new(server_config(), stamp, rx, tx).unwrap();
+    let mut arp = vec![0; 42];
+    arp[..6].copy_from_slice(&SERVER_MAC);
+    arp[6..12].copy_from_slice(&CLIENT_MAC);
+    arp[12..22].copy_from_slice(&[8, 6, 0, 1, 8, 0, 6, 4, 0, 1]);
+    arp[22..28].copy_from_slice(&CLIENT_MAC);
+    arp[28..32].copy_from_slice(&CLIENT_IP);
+    arp[38..42].copy_from_slice(&SERVER_IP);
+    inbound.try_send(StampedPacket::copy_from(&arp, stamp).unwrap()).unwrap();
+    stack.poll_network(0).unwrap();
+    while outbound.try_recv().is_some() {}
+    for (seq, length) in [1472usize, 1, 81, 82, 83, 511, 512, 513, 1471].into_iter().enumerate() {
+        let mut frame = vec![0; 42 + length];
+        frame[..6].copy_from_slice(&SERVER_MAC);
+        frame[6..12].copy_from_slice(&CLIENT_MAC);
+        frame[12..14].copy_from_slice(&[8, 0]);
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&((28 + length) as u16).to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 1;
+        frame[26..30].copy_from_slice(&CLIENT_IP);
+        frame[30..34].copy_from_slice(&SERVER_IP);
+        let check = checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&check.to_be_bytes());
+        frame[34] = 8;
+        frame[38..40].copy_from_slice(&0x4d52u16.to_be_bytes());
+        frame[40..42].copy_from_slice(&(seq as u16).to_be_bytes());
+        for (i, b) in frame[42..].iter_mut().enumerate() { *b = (i.wrapping_mul(73) ^ seq) as u8; }
+        let check = checksum(&frame[34..]);
+        frame[36..38].copy_from_slice(&check.to_be_bytes());
+        inbound.try_send(StampedPacket::copy_from(&frame, stamp).unwrap()).unwrap();
+        stack.poll_network((seq * 2 + 1) as u64).unwrap();
+        let reply = outbound.try_recv().unwrap().into_packet(stamp).unwrap();
+        let bytes = reply.as_bytes();
+        assert_eq!(&bytes[26..30], &SERVER_IP);
+        assert_eq!(&bytes[30..34], &CLIENT_IP);
+        assert_eq!(&bytes[34..36], &[0, 0]);
+        assert_eq!(&bytes[38..42 + length], &frame[38..]);
+        assert_eq!(checksum(&bytes[34..42 + length]), 0);
+        frame[36] ^= 1;
+        inbound.try_send(StampedPacket::copy_from(&frame, stamp).unwrap()).unwrap();
+        stack.poll_network((seq * 2 + 2) as u64).unwrap();
+        assert!(outbound.try_recv().is_none());
+    }
+}

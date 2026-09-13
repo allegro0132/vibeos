@@ -127,3 +127,25 @@ fn mmio_resource_geometry_is_exact() {
         assert!(Mmio::new(CONTROL).is_ok());
     }
 }
+
+#[test]
+fn readonly_recycle_opt_in_preserves_admission_and_post_dma_invalidation() {
+    let (mut c, e) = cache();
+    let r = DmaRegion { physical: 0x42000000, bytes: 128 };
+    unsafe { c.recycle_readonly(r) };
+    assert_eq!(e.borrow().len(), 4); // conservative default: two lines + barriers
+    let mut c = c.with_readonly_recycle(true);
+    e.borrow_mut().clear();
+    unsafe { c.recycle_readonly(r) };
+    assert_eq!(*e.borrow(), [Event::Barrier]);
+    e.borrow_mut().clear();
+    c.for_cpu(r, DmaDirection::FromDevice);
+    assert_eq!(*e.borrow(), [Event::Barrier, Event::Write(0x200, r.physical),
+        Event::Write(0x200, r.physical + 64), Event::Barrier]);
+    e.borrow_mut().clear();
+    let bad = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        c.recycle_readonly(DmaRegion { physical: 0x42000001, bytes: 128 });
+    }));
+    assert!(bad.is_err());
+    assert!(e.borrow().is_empty());
+}

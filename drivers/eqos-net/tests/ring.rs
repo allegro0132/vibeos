@@ -4,6 +4,7 @@ use vibeos_eqos_net::{descriptor, ring::*};
 
 #[derive(Clone, Debug, PartialEq)]
 enum Event {
+    Recycle(u64, usize),
     Reset,
     Configure,
     Start,
@@ -24,9 +25,14 @@ struct State {
     stop: bool,
     start: bool,
     configure: bool,
+    fast_recycle: bool,
+    tx_checksum: bool,
+    tx_data: Vec<u8>,
+    tx_source: usize,
 }
 struct Model(Rc<RefCell<State>>);
 unsafe impl Backend for Model {
+    fn tx_checksum_capable(&self) -> bool { self.0.borrow().tx_checksum }
     fn reset(&mut self) -> bool {
         let mut s = self.0.borrow_mut();
         s.events.push(Event::Reset);
@@ -58,7 +64,10 @@ unsafe impl Backend for Model {
         s.words.insert((a, w), v);
     }
     fn copy_tx(&mut self, a: u64, p: &[u8]) {
-        self.0.borrow_mut().events.push(Event::Tx(a, p.len()));
+        let mut s = self.0.borrow_mut();
+        s.events.push(Event::Tx(a, p.len()));
+        s.tx_data = p.to_vec();
+        s.tx_source = p.as_ptr() as usize;
     }
     fn copy_rx(&mut self, a: u64, p: &mut [u8]) {
         self.0.borrow_mut().events.push(Event::Rx(a, p.len()));
@@ -69,6 +78,14 @@ unsafe impl Backend for Model {
     }
     fn for_cpu(&mut self, a: u64, n: usize, d: Direction) {
         self.0.borrow_mut().events.push(Event::Cpu(a, n, d));
+    }
+    unsafe fn recycle_rx(&mut self, a: u64, n: usize) {
+        if self.0.borrow().fast_recycle {
+            self.0.borrow_mut().events.push(Event::Recycle(a, n));
+            self.barrier();
+        } else {
+            self.for_device(a, n, Direction::FromDevice);
+        }
     }
     fn barrier(&mut self) {
         self.0.borrow_mut().events.push(Event::Barrier);
@@ -95,6 +112,10 @@ fn model() -> (Ring<Model>, Rc<RefCell<State>>) {
         stop: true,
         start: true,
         configure: true,
+        fast_recycle: false,
+        tx_checksum: false,
+        tx_data: Vec::new(),
+        tx_source: 0,
     }));
     let backend = Box::leak(Box::new(Model(state.clone())));
     (Ring::new(backend, layout()).unwrap(), state)
@@ -374,27 +395,133 @@ fn small_packets_sync_only_complete_cache_lines() {
 }
 
 #[test]
-fn tx_batch_defers_status_sync_until_pressure_and_reclaims_before_reuse() {
-    let (mut r, s) = started();
-    for _ in 0..3 { r.transmit(&[7; 60]).unwrap(); }
-    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Cpu(..) | Event::Read(..))));
-    s.borrow_mut().words.insert((layout().tx_descriptors, 3), 0x10000000);
-    s.borrow_mut().events.clear();
-    r.transmit(&[7; 60]).unwrap();
-    assert_eq!(r.pending(), 3);
-    let events = &s.borrow().events;
-    let reclaim = events.iter().position(|e| *e == Event::Cpu(layout().tx_buffers, BUFFER, Direction::ToDevice)).unwrap();
-    let copy = events.iter().position(|e| matches!(e, Event::Tx(..))).unwrap();
-    assert!(reclaim < copy);
+fn checksum_request_respects_hardware_and_own_publication() {
+    for hardware in [false, true] {
+        let (mut r, s) = started();s.borrow_mut().tx_checksum = hardware;
+        let mut f = [0u8;54];f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        f[14]=0x45;f[16..18].copy_from_slice(&40u16.to_be_bytes());f[23]=6;f[46]=0x50;
+        let before = f;
+        r.transmit_checksum(&f).unwrap();
+        assert_eq!(f, before);
+        assert_eq!(s.borrow().tx_source == f.as_ptr() as usize, hardware);
+        let words=&s.borrow().words;
+        let status=words[&(layout().tx_descriptors,3)];
+        assert_eq!((status>>16)&3, if hardware {3} else {0});
+        assert_ne!(status & descriptor::OWN,0);
+        assert_eq!(s.borrow().tx_data[24..26]==[0,0],hardware);
+        assert_eq!(s.borrow().tx_data[50..52]==[0,0],hardware);
+        assert_eq!(s.borrow().events.last(),Some(&Event::Tail(false,layout().tx_descriptors+STRIDE as u64)));
+    }
 }
 
 #[test]
-fn tx_pressure_completion_error_prevents_further_dma_publication() {
+fn checksum_request_rejection_never_publishes_and_fallback_preserves_caller() {
     let (mut r, s) = started();
-    for _ in 0..3 { r.transmit(&[7; 60]).unwrap(); }
-    s.borrow_mut().words.insert((layout().tx_descriptors, 3), 0x10008000);
+    s.borrow_mut().tx_checksum = true;
+    let mut f = [0u8;54]; f[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    f[14]=0x45; f[16..18].copy_from_slice(&40u16.to_be_bytes()); f[23]=6; f[46]=0x50;
+    for (at, value) in [(14,0x44), (20,0x20), (21,1), (46,0x10)] {
+        let mut invalid=f;invalid[at]=value;
+        s.borrow_mut().events.clear();
+        assert_eq!(r.transmit_checksum(&invalid),Err(Error::Packet));
+        assert!(s.borrow().events.is_empty());
+    }
+    f[24]=0xaa;f[50]=0xbb;
+    let before=f;r.transmit_checksum(&f).unwrap();
+    assert_eq!(f,before);
+    assert_ne!(s.borrow().tx_source,f.as_ptr() as usize);
+    assert_eq!(&s.borrow().tx_data[24..26],&[0,0]);
+    assert_eq!(&s.borrow().tx_data[50..52],&[0,0]);
+    assert_eq!((s.borrow().words[&(layout().tx_descriptors,3)]>>16)&3,3);
+}
+
+#[test]
+fn rx_status_is_read_only_after_completion_and_before_slot_rearm() {
+    use vibeos_eqos_net::descriptor::RxChecksum as C;
+    let (mut r, s) = started();
+    let desc=layout().rx_descriptors;
+    let complete=(1<<29)|(1<<28)|(1<<26)|64;
     s.borrow_mut().events.clear();
-    assert_eq!(r.transmit(&[7; 60]), Err(Error::Descriptor(descriptor::Error::Hardware)));
-    assert!(r.quarantined());
-    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Tx(..) | Event::Word(..) | Event::Tail(..))));
+    s.borrow_mut().words.insert((desc,1),0x12);
+    s.borrow_mut().words.insert((desc,3),complete|descriptor::OWN);
+    assert_eq!(r.receive_with_status(&mut [0;BUFFER]).unwrap(),None);
+    assert!(!s.borrow().events.contains(&Event::Read(desc,1)));
+    s.borrow_mut().words.insert((desc,3),complete);
+    s.borrow_mut().events.clear();
+    let mut output=[0;BUFFER];
+    let frame=r.receive_with_status(&mut output).unwrap().unwrap();
+    assert_eq!(frame.bytes,60);assert_eq!(frame.checksum,C::Ipv4 { payload_type:2 });
+    assert_eq!(&output[..60],&[0x5a;60]);
+    let state=s.borrow();let events=&state.events;
+    let status=events.iter().position(|e| *e==Event::Read(desc,3)).unwrap();
+    let detail=events.iter().position(|e| *e==Event::Read(desc,1)).unwrap();
+    let rearm=events.iter().position(|e| matches!(e,Event::Word(a,_,_) if *a==desc)).unwrap();
+    assert!(status<detail && detail<rearm);
+    drop(state);
+    // The next slot has no valid metadata: stale word 1 must not be observed.
+    let next=desc+STRIDE as u64;
+    s.borrow_mut().words.insert((next,1),0x12);
+    s.borrow_mut().words.insert((next,3),complete & !(1<<26));
+    s.borrow_mut().events.clear();
+    assert_eq!(r.receive_with_status(&mut output).unwrap().unwrap().checksum,C::Unavailable);
+    assert!(!s.borrow().events.contains(&Event::Read(next,1)));
+}
+
+#[test]
+fn rejected_rx_keeps_error_evidence_without_copying_payload() {
+    let (mut r,s)=started();
+    let desc=layout().rx_descriptors;
+    let status=(1<<29)|(1<<28)|(1<<26)|(1<<15)|64;
+    s.borrow_mut().words.insert((desc,1),0x92);
+    s.borrow_mut().words.insert((desc,3),status|descriptor::OWN);
+    assert_eq!(r.receive_with_status(&mut [0;BUFFER]).unwrap(),None);
+    assert_eq!(r.rx_diagnostics().rejected,0);
+    s.borrow_mut().words.insert((desc,3),status);
+    s.borrow_mut().events.clear();
+    assert_eq!(r.receive_with_status(&mut [0;BUFFER]),Err(Error::Descriptor(descriptor::Error::Hardware)));
+    assert_eq!(r.rx_diagnostics(),RxDiagnostics { rejected:1,last_status:status,last_word1:0x92 });
+    assert!(!s.borrow().events.iter().any(|e| matches!(e,Event::Rx(..))));
+    assert!(s.borrow().events.contains(&Event::Read(desc,1)));
+    assert_eq!(s.borrow().words[&(desc,3)] & descriptor::OWN,descriptor::OWN);
+    let next=desc+STRIDE as u64;
+    s.borrow_mut().words.insert((next,1),0x92);
+    s.borrow_mut().words.insert((next,3),status & !(1<<26));
+    s.borrow_mut().events.clear();
+    assert!(r.receive_with_status(&mut [0;BUFFER]).is_err());
+    assert_eq!(r.rx_diagnostics().rejected,2);
+    assert_eq!(r.rx_diagnostics().last_word1,0);
+    assert!(!s.borrow().events.contains(&Event::Read(next,1)));
+}
+
+#[test]
+fn readonly_recycle_is_after_completion_before_own_and_never_initialization() {
+    let (mut r, state) = model();
+    state.borrow_mut().fast_recycle = true;
+    r.initialize().unwrap();
+    assert!(!state.borrow().events.iter().any(|e| matches!(e, Event::Recycle(..))));
+    assert_eq!(state.borrow().events.iter().filter(|e| matches!(e,
+        Event::Device(_, BUFFER, Direction::FromDevice))).count(), layout().count);
+    for (slot, status, output_len) in [(0, 0x30000040, 64), (1, 0x30008040, 64), (2, 0x30000040, 59)] {
+        let d = layout().rx_descriptors + slot * STRIDE as u64;
+        let b = layout().rx_buffers + slot * BUFFER as u64;
+        state.borrow_mut().events.clear();
+        state.borrow_mut().words.insert((d, 3), status);
+        let _ = r.receive(&mut vec![0; output_len]);
+        let s = state.borrow();
+        let recycle = s.events.iter().position(|e| *e == Event::Recycle(b, BUFFER)).unwrap();
+        let own = s.events.iter().position(|e| matches!(e, Event::Word(a, 3, v) if *a == d && v & descriptor::OWN != 0)).unwrap();
+        assert!(recycle < own);
+        assert!(!s.events.iter().any(|e| matches!(e, Event::Device(_, _, Direction::FromDevice))));
+        if slot == 0 {
+            assert!(s.events.iter().position(|e| *e == Event::Rx(b, 60)).unwrap() < recycle);
+        } else {
+            assert!(!s.events.iter().any(|e| matches!(e, Event::Rx(..))));
+        }
+    }
+    assert!(r.shutdown());
+    state.borrow_mut().events.clear();
+    r.initialize().unwrap();
+    assert!(!state.borrow().events.iter().any(|e| matches!(e, Event::Recycle(..))));
+    assert_eq!(state.borrow().events.iter().filter(|e| matches!(e,
+        Event::Device(_, BUFFER, Direction::FromDevice))).count(), layout().count);
 }

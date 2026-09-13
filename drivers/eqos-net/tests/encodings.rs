@@ -124,3 +124,51 @@ fn cache_line_stride_uses_axi_width_not_word_count() {
         assert_eq!(d::skip_length(stride, axi), Err(d::Error::InvalidLayout));
     }
 }
+
+#[test]
+fn checksum_insertion_changes_only_cic_and_keeps_publication_unowned() {
+    for bytes in [14, 60, 1514, 1518] {
+        let plain = d::tx(0x42000000, bytes).unwrap();
+        for (mode, bits) in [(d::TxChecksum::None, 0), (d::TxChecksum::Ipv4Header, 1), (d::TxChecksum::Full, 3)] {
+            let words = d::tx_with_checksum(0x42000000, bytes, mode).unwrap();
+            assert_eq!(words[..3], plain[..3]);
+            assert_eq!(words[3], plain[3] | bits << 16);
+            assert_eq!(words[3] & d::OWN, 0);
+        }
+    }
+    assert!(d::tx_with_checksum(0xffff_fff0, 60, d::TxChecksum::Full).is_err());
+    assert!(d::tx_with_checksum(0x42000000, 1519, d::TxChecksum::Full).is_err());
+}
+
+#[test]
+fn checksum_capabilities_do_not_confuse_neighbor_feature_bits() {
+    use vibeos_eqos_net::controller::ChecksumCapabilities as C;
+    for raw in [0, 1 << 14, 1 << 16, (1 << 14) | (1 << 16), !(1 << 14 | 1 << 16)] {
+        let c = C::from_feature0(raw);
+        assert_eq!(c.tx, raw & (1 << 14) != 0);
+        assert_eq!(c.rx, raw & (1 << 16) != 0);
+        assert_eq!(c.raw, raw);
+    }
+}
+
+#[test]
+fn rx_checksum_requires_complete_valid_cpu_owned_metadata() {
+    use vibeos_eqos_net::descriptor::{rx_checksum, RxChecksum as C};
+    let complete = (1 << 29) | (1 << 28) | (1 << 26) | 64;
+    for payload in 0..8 {
+        assert_eq!(rx_checksum([0, 0x10 | payload, 0, complete]), C::Ipv4 { payload_type: payload as u8 });
+        assert_eq!(rx_checksum([0, 0x20 | payload, 0, complete]), C::Ipv6 { payload_type: payload as u8 });
+    }
+    for status in [complete | 1 << 31, complete | 1 << 30, complete | 1 << 15,
+        complete & !(1 << 29), complete & !(1 << 28), complete & !(1 << 26),
+        (complete & !0x7fff) | 3, (complete & !0x7fff) | 0x7fff] {
+        assert_eq!(rx_checksum([0,0x12,0,status]),C::Unavailable);
+    }
+    for flags in [0,2,0x32] {
+        assert_eq!(rx_checksum([0,flags,0,complete]),C::Unavailable);
+    }
+    assert_eq!(rx_checksum([0,0x52,0,complete]),C::Bypassed);
+    for flags in [0x1a,0x92,0xda] {
+        assert_eq!(rx_checksum([0,flags,0,complete]),C::Error);
+    }
+}

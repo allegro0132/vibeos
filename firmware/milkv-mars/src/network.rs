@@ -17,6 +17,11 @@ use vibeos_firmware_milkv_mars::packet::{Engine, Error as EngineError};
 use vibeos_hal::network::{Device, Error, Telemetry};
 use vibeos_platform_jh7110::{cache, ethernet};
 
+// Both directions share the current layout count. The experiment increases
+// dedicated DMA storage by 307200 bytes; ownership and cache isolation persist.
+#[cfg(feature = "dma-ring128-experiment")]
+const COUNT: usize = 128;
+#[cfg(not(feature = "dma-ring128-experiment"))]
 const COUNT: usize = 32;
 struct Slot<T>(UnsafeCell<Option<T>>);
 unsafe impl<T> Sync for Slot<T> {} // accesses require the HAL's exclusive invocation
@@ -35,6 +40,8 @@ static CLAIMED: AtomicBool = AtomicBool::new(false);
 static LINK: AtomicBool = AtomicBool::new(false);
 static TX: AtomicU64 = AtomicU64::new(0);
 static RX: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-status-experiment")]
+static mut PROFILE_CHECKSUM_LAST: u64 = 0;
 
 // Serialized diagnostic counters for locating the gigabit bottleneck. Device
 // invocation authority is the sole owner, just as for ENGINE and its DMA ring.
@@ -160,7 +167,7 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         let prepared = ethernet::prepare(&mut platform, mars::GMAC0_TX_DRIVE, hz)
             .map_err(|e| failed("platform-prepare", e, Error::TimedOut))?;
         report(format_args!("MARS_NET_INIT clocks csr={} gtx={} ptp={}\n", prepared.csr_hz, prepared.gtx_hz, prepared.ptp_hz));
-        let controller = Controller::new(
+        let mut controller = Controller::new(
             Lane {
                 base: r.mac.start,
                 mdio: false,
@@ -176,6 +183,13 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             },
         )
         .map_err(|e| failed("controller-config", e, Error::InvalidDescription))?;
+        report(format_args!("MARS_NET_CHECKSUM_CAP {:?}\n", controller.checksum_capabilities()));
+        #[cfg(feature = "rx-status-experiment")]
+        controller.set_rx_checksum(true)
+            .map_err(|e| failed("rx-checksum-mode", e, Error::InvalidDescription))?;
+        #[cfg(feature = "rx-error-forward-experiment")]
+        controller.set_rx_error_forwarding(true)
+            .map_err(|e| failed("rx-error-forward", e, Error::InvalidDescription))?;
         let port = Port::new(
             Lane {
                 base: r.mac.start,
@@ -203,12 +217,14 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         let cache =
             cache::Cache::new(cache::Mmio::new(r.cache).map_err(|e| failed("cache-resources", e, Error::InvalidDescription))?)
                 .map_err(|e| failed("cache-geometry", e, Error::InvalidDescription))?;
+        let cache = cache.with_readonly_recycle(cfg!(feature = "rx-readonly-recycle-experiment"));
         // .dma is NOLOAD; initialize every byte before creating the Rust pool.
         // No ring has started in this claim; earlier claims require proven stop.
         core::ptr::write_bytes(DMA.0.get(), 0, 1);
         let pool = Pool::new(&mut *DMA.0.get(), DMA.0.get() as u64, cache, 8)
             .map_err(|e| failed("dma-pool", e, Error::AddressTooWide))?;
         let layout = pool.layout();
+        report(format_args!("MARS_NET_RING count={} bytes={}\n", COUNT, core::mem::size_of::<Storage<COUNT>>()));
         *POOL.0.get() = Some(pool);
         *HARDWARE.0.get() = Some(Backend::new(controller, (*POOL.0.get()).as_mut().unwrap()));
         *ENGINE.0.get() =
@@ -251,6 +267,10 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     telemetry: || Telemetry {
         phy_link_up: LINK.load(Ordering::Acquire),
         tx_packets: TX.load(Ordering::Relaxed),
+        // This profile requests complete IPv4 checksums. The ring falls back
+        // to software when the feature register lacks TXCOE.
+        tx_checksum_offload: cfg!(feature = "tx-checksum-experiment"),
+        rx_checksum_offload: cfg!(feature = "rx-ipv4-checksum-experiment"),
         rx_packets: RX.load(Ordering::Relaxed),
         ..Telemetry::default()
     },
@@ -264,7 +284,10 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     },
     transmit: |p| unsafe {
         let start = profile_time();
+        #[cfg(not(feature = "tx-checksum-experiment"))]
         let result = engine().transmit(p);
+        #[cfg(feature = "tx-checksum-experiment")]
+        let result = engine().transmit_checksum(p);
         profile_end(1, start);
         snapshot();
         result.map_err(|e| {
@@ -286,6 +309,20 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         let result = engine().poll_link();
         let after = engine().link();
         if before != after { report(format_args!("MARS_NET_LINK {:?}\n", after)); }
+        #[cfg(feature = "rx-status-experiment")]
+        if engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
+            PROFILE_CHECKSUM_LAST = profile_time();
+            report(format_args!("MARS_NET_RX_CHECKSUM {:?}\n", engine().rx_checksum_status));
+            #[cfg(feature = "rx-ipv4-checksum-experiment")]
+            report(format_args!("MARS_NET_RX_VERIFY {:?}\n", engine().rx_verified));
+            if let Some(d) = engine().dma_diagnostics() {
+                report(format_args!("MARS_NET_DMA_STATUS dma={:#010x} mtl_irq={:#010x} mtl_rx={:#010x}\n",
+                    d.dma_status, d.mtl_interrupt, d.mtl_rx_debug));
+            }
+            let drops = engine().rx_diagnostics();
+            report(format_args!("MARS_NET_RX_REJECT count={} status={:#010x} word1={:#010x}\n",
+                drops.rejected, drops.last_status, drops.last_word1));
+        }
         profile_report();
         snapshot();
         result.expect("Mars EQoS PHY fault")

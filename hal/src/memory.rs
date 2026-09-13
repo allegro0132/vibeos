@@ -144,6 +144,16 @@ pub unsafe trait DmaCache {
     fn validate(&self, region: DmaRegion) -> Result<(), MemoryError>;
     fn for_device(&mut self, region: DmaRegion, direction: DmaDirection);
     fn for_cpu(&mut self, region: DmaRegion, direction: DmaDirection);
+    /// Return an already prepared receive buffer after read-only CPU use.
+    /// # Safety
+    /// The entire span was synchronized for DMA before its first use. Since
+    /// then no CPU/alias has written any of its isolated cache lines. DMA has
+    /// completed; every future CPU read must follow for_cpu(FromDevice).
+    /// Implementations may omit cleaning only when clean lines cannot overwrite
+    /// device writes. Descriptor ownership publication remains the caller's job.
+    unsafe fn recycle_readonly(&mut self, region: DmaRegion) {
+        self.for_device(region, DmaDirection::FromDevice);
+    }
     fn barrier(&mut self);
 }
 #[cfg(test)]

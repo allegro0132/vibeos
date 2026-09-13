@@ -199,3 +199,195 @@ Artifacts: `target/mars-boot-20260913-gigabit-cancel-ready/out/`; evidence:
 `target/mars-reference/20260913-cancel-ready-runtime.log`. This validates the
 ready-state test setup; it is not a general proof of all concurrent cancellation
 interleavings or complete Mars hardware qualification.
+
+## Rejected pressure-only TX reap experiment
+
+Moving per-frame TX reclaim to ring-pressure only (while retaining the driver
+batch's before/after reclaim) measured 565.48 / 637.14 Mbps over separate
+60-second runs. This did not improve on driver-speed's 575.53 / 640.17 Mbps.
+The ring change was reverted, preserving earlier per-frame completion/error
+observation. No DMA ownership checks or publication barriers were removed by
+the experiment. The 41 EQoS model tests and 6 firmware engine tests passed;
+pressure reclaim and completion-error admission were exercised. During real
+traffic all tasks remained running, with zero faults/cancellations and no
+quota denials. These tests do not prove physical error recovery for this
+experimental policy, which was not retained.
+
+FIT SHA-256 `17f62f6e150cc6f811f2f100f092be7f7ccda865a93edfca2a0a5f95b0ddbb63`.
+Source patch and results are under
+`target/mars-acceptance/20260913-gigabit/tx-batch-*`.
+
+## TX checksum insertion experiment
+
+The EQoS hardware reports TXCOE; the opt-in `tx-checksum-experiment` composition
+uses Full CIC for ordinary complete IPv4/TCP/UDP and software fallback for
+unsupported packet formats or hardware. DMA was already active before this
+experiment. RX checksum verification remains in software. The default Ethernet
+composition keeps TX software checksums until a faster implementation is
+qualified.
+
+FIT SHA-256 `50f6f370635c114cf0af89e5250d3a68a06cbfe4aeb52c7ebf70257c8822c710`
+booted successfully after a physical power cycle. All 364,377 captured
+board-origin TCP packets have verified Good IPv4 and TCP checksums; maximum IP
+length is 1500, snaplen retains complete packets, and tcpdump reports zero
+kernel drops. This does not qualify UDP, recovery, or long-term stability.
+Separate uncaptured 60-second tests measured **496.81 / 492.01 Mbps**
+(host-to-board / board-to-host). Task health reported zero faults/cancellations;
+software reboot returned to U-Boot. This is functional offload evidence but
+not a performance improvement. The experiment adds a full scratch copy and
+repeated packet preparation, which are candidates for removal before retesting.
+
+Evidence: `target/mars-acceptance/20260913-gigabit/tx-checksum-*`. The board was
+then RAM-booted into the retained `cancel-ready` software-checksum baseline for
+a same-session comparison; SD and SPI contents remain unchanged.
+
+The same-session software-checksum baseline measured **541.99 / 628.96 Mbps**
+over separate 60-second single-stream runs, versus the experiment's
+496.81 / 492.01 Mbps. Both runs used the same board, host, MTU and direct link;
+no capture ran during these measurements. Baseline task health also reported
+zero faults/cancellations. The experiment therefore remains opt-in and the
+board remains on the `cancel-ready` baseline. This pair is a regression signal,
+not a statistical estimate; it does not establish which added operation caused
+the loss. Raw baseline results: `tx-checksum-ab-baseline-60s/summary.json`.
+
+## Borrowed TX request follow-up
+
+The follow-up binds validated header offsets to an immutable packet borrow,
+parses once, and submits ordinary zero-checksum IPv4/TCP/UDP without an extra
+packet copy. Software/nonzero-field fallback retains a separate scratch path.
+DMA payload copy, cache synchronization, OWN publication, completion and queue
+limits remain unchanged. The request cannot be paired with different bytes.
+
+49 EQoS model tests, 6 packet-engine tests, driver-boundary checks and the Mars
+SD/FIT build passed. FIT SHA-256:
+`9e9fb7248d9738a6febf31cefdc309ad206ab41d3678cf1720815706425ab13e`.
+The RAM-booted image established DHCP and a 1000 Mbps full-duplex link. All
+448,319 captured board-origin IPv4/TCP packets have Good checksums, with maximum
+IP length 1500 and zero capture kernel drops. Captured 15-second reverse
+throughput was 633.17 Mbps; do not compare this directly to uncaptured 60-second
+measurements. Evidence prefix is `tx-borrow-*` in the gigabit directory. The
+default Ethernet composition still leaves TX offload disabled.
+
+Uncaptured separate 60-second tests measured **534.50 / 632.39 Mbps**, restoring
+most of the earlier copy regression but not materially improving the
+same-session software-checksum baseline (541.99 / 628.96 Mbps). Task health
+before fault injection reported zero faults/cancellations. The physical system
+selftest passed **395 / 0** on this image. The remaining throughput gap cannot
+be attributed solely to software TX checksum calculation. RX verification,
+cache maintenance and service scheduling remain candidates for profiling.
+This image stays experimental and does not constitute full Mars qualification.
+
+Post-selftest 5-second smoke tests completed both directions (562.15 / 636.36
+Mbps). These confirm fresh connections after deliberate selftest faults, not
+physical cable recovery or long-duration stability. The board remains RAM-booted
+on the borrowed TX experiment; SD is unchanged.
+
+## RX hardware status diagnostic
+
+The opt-in diagnostic enables MAC IPC after RXCOE admission and readback, while
+keeping the stack's RX software checksum checks. It adds a same-frame metadata
+receive path with word-1 validity and OWN gating. Default receive does not read
+that extra word. 53 EQoS tests, 6 firmware tests, boundary checks and the full
+SD/FIT build pass. Physical selftest passed 395 / 0.
+
+Ten-second TCP smoke throughput was 566.35 / 626.90 Mbps. This diagnostic is
+not a speed optimization yet. Normal traffic yielded over 513,000 IPv4 status
+observations with zero reported checksum errors. Twelve injected UDP packets
+cover valid, bad IP, bad UDP and absent IPv4 UDP checksums; full outgoing
+capture verified those values. Six additional IPv4 observations were returned,
+but no checksum-error status. MAC versus descriptor-level dropping of bad
+frames is not yet isolated; software RX verification stays enabled.
+
+FIT SHA-256 `8eeb07c17b2c54c80f262e61e3721816b585e884bac661c9365254044769e512`.
+Details and evidence are in `LINUX-NETWORK-COMPARISON.md` and the
+`rx-status-*` / `rx-checksum-injected*` artifacts. SD/SPI are unchanged; the
+board runs this diagnostic from RAM. Neither experiment is enabled by default.
+
+## RX error-path qualification
+
+Paced valid/bad-IP/bad-UDP/zero-UDP probes with default MAC error dropping
+produced no rejected DMA descriptors. Enabling diagnostic error forwarding
+then produced exactly six checksum-error observations, without descriptor
+error summary. This explains the previous zero-error counter and establishes
+that RX offload must inspect word-1 checksum flags separately.
+
+The firmware now drops such errors before delivering frames; its new model
+test proves both IP and UDP cases plus subsequent good reception. This last
+change is host-tested only (7 engine tests; 56 EQoS tests). No new throughput
+claim is made in this phase and software RX verification remains enabled.
+The controller's default pre-DMA error dropping is restored after diagnostics.
+Details, FIT hashes and packet evidence are in `LINUX-NETWORK-COMPARISON.md`.
+
+## RX verification enabled for the IPv4 experiment
+
+The opt-in complete IPv4 + ARP profile now uses admitted matching TCP/UDP
+hardware metadata and software verification for unverified/unsupported IPv4
+formats. Other EtherTypes and fragments are not admitted by this experimental
+profile; the default Ethernet composition is unchanged. Error observations are
+dropped before delivery even without descriptor ES.
+
+FIT `414e8d843e399dd46d0841dc5e8b58380bbba119ccc1fdfef7529e3a328623d7`
+booted and passed DHCP. Fifteen probes exercised six hardware verifications,
+three IP-options software fallbacks and six bad-checksum drops. No bad-group
+ICMP response was captured. The experiment measured **520.69 / 630.76 Mbps**
+in separate 60-second single-TCP tests, and passed physical selftest **395 / 0**.
+This is functional RX offload evidence, not a demonstrated speed improvement.
+Source now also repairs TX-offloaded ICMP inner IPv4 headers; that last change
+is host-tested only (61 EQoS tests, 8 engine tests for RX integration).
+
+Artifacts are `rx-verify-*` under the gigabit evidence directory. The board
+runs this experimental FIT from RAM, with diagnostic error forwarding and
+explicit software rejection enabled. SD and default build flags are unchanged.
+
+## Executor profiling control and ICMP repair verification
+
+The `no-exec-profile` experiment removes only the kernel executor-profile
+feature while retaining driver profiling and the same TX/RX/error-forwarding
+experiments. FIT SHA-256:
+`a967acc59d165de03544ccc4863d58c9854b1461a4db687e84e3f20c9cdf4142`.
+The payload contains no EXEC_PROFILE marker but retains MARS_NET_PROFILE.
+This image also incorporates the ICMP quoted-header repair. All eight captured
+ICMP responses have valid outer IPv4, quoted inner IPv4 and ICMP checksums.
+No response to either bad-checksum probe group was captured; hardware/software/
+drop counts again reached [8,3,6] from [2,0,0].
+
+A next candidate is RX rearm cache maintenance: the concrete pool copy_rx only
+reads the DMA source, yet arm_rx flushes the entire buffer again. Any optimized
+reuse path must prove initial full preparation, no CPU writes or writable
+aliases, safe handling of speculative clean lines, completion barriers, and
+normal post-DMA invalidation before each later CPU read. Default backends must
+retain conservative synchronization. No cache barrier has been removed yet.
+
+### Patterned payload integrity
+
+`sudo python3 scripts/mars-dma-integrity.py --address <observed-board-ip>
+--output <new-summary.json> --count 4096` sends bounded IPv4 ICMP echo traffic.
+It changes every payload using a sequence-seeded SHAKE-256 stream and alternates
+1 through 1472 payload bytes, including cache-line boundaries and maximum MTU.
+Each reply must match the complete payload and pass the ICMP checksum. Three
+consecutive timeouts or one corruption ends the test; output records partial
+progress. It exercises stack + RX + TX together and cannot attribute an error
+to DMA alone. A pass is not a sustained-load or multi-core coherence proof.
+
+The first probe of the preceding recycle image timed out because smoltcp was
+built without `auto-icmp-echo-reply`; ordinary ping also timed out while UART
+and receive counters continued. The shared protocol composition now enables
+echo replies. A host stack test checks short, boundary and MTU payloads plus
+rejection of invalid ICMP checksums. Rebuild the image before using this test.
+
+The ICMP-enabled RX-recycle image (`a0dd38903173c20a26541cccea2fc6981256c27c8460ec4a3287a1291025255b`) passed the
+4096-packet patterned test in 12.67 seconds with no timeout, corruption or
+unrelated response. Driver software verification increased by exactly 4096.
+Results: `target/mars-acceptance/20260913-gigabit/rx-integrity-4096.json`.
+The original timeout evidence remains preserved separately; it is not counted
+as a successful test or a demonstrated DMA failure.
+
+The same image measured 559.84 / 634.46 Mbps in one uncaptured 60-second
+TCP pair. A separate concurrent TCP + 8192-pattern test did **not** pass:
+8186 payloads matched exactly, six requests timed out and no corruption was
+observed. RX software verification increased by 8186 during that test,
+consistent with missing requests before verification; this does not establish
+whether the host/link, hardware FIFO/ring, or a software queue lost them.
+TCP completed both directions (560.09 / 626.85 Mbps under this mixed workload).
+Kernel selftest passed 395/0. Keep recycle opt-in until the loss path and
+repeat A/B comparison are resolved. See `rx-integrity-concurrent-*` evidence.

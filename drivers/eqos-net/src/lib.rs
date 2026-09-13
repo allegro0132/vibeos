@@ -4,6 +4,7 @@
 //! a permanent DMA pool binds a HAL cache service. Platform admission, PHY setup,
 //! firmware integration and physical DMA/cache qualification remain required.
 pub mod backend;
+pub mod checksum;
 pub mod controller;
 pub mod descriptor;
 pub mod mdio;

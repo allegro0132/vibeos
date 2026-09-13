@@ -21,6 +21,7 @@ struct State {
     mdio_stuck: bool,
     phase_writes: usize,
     tx_copies: usize,
+    rx_data: Option<Vec<u8>>,
     status_reads: usize,
     change_at: usize,
 }
@@ -69,7 +70,12 @@ unsafe impl Memory for Model {
         self.0.borrow_mut().tx_copies += 1;
     }
     fn copy_rx(&mut self, _: u64, out: &mut [u8]) {
-        out.fill(0x5a);
+        if let Some(data) = &self.0.borrow().rx_data {
+            out.copy_from_slice(&data[..out.len()]);
+        } else {
+            out.fill(0x5a);
+            if out.len() >= 14 { out[12..14].copy_from_slice(&[0x08,0x06]); }
+        }
     }
     fn for_device(&mut self, a: u64, n: usize, _: Direction) {
         assert_eq!(a % 64, 0);
@@ -143,6 +149,7 @@ fn engine() -> (E, Model) {
         mdio_stuck: false,
         phase_writes: 0,
         tx_copies: 0,
+        rx_data: None,
         status_reads: 0,
         change_at: usize::MAX,
     })));
@@ -195,7 +202,9 @@ fn link_down_backpressures_then_transfers_and_reconnects_without_replaying_tx() 
     m.0.borrow_mut().csr.insert(0x4200100c, 0x30000040);
     let mut out = [0; 64];
     assert_eq!(e.receive(&mut out), Ok(Some(60)));
-    assert_eq!(&out[..60], &[0x5a; 60]);
+    assert_eq!(&out[..12], &[0x5a; 12]);
+    assert_eq!(&out[12..14], &[0x08,0x06]);
+    assert_eq!(&out[14..60], &[0x5a;46]);
     m.0.borrow_mut().phy[1] = 0;
     e.poll_link().unwrap();
     assert!(!e.tx_owned().unwrap());
@@ -269,4 +278,48 @@ fn malformed_rx_is_rearmed_without_faulting_the_link() {
     assert_eq!(e.receive(&mut [0; 64]), Ok(None));
     assert!(e.link().is_some());
     assert_ne!(m.0.borrow().csr[&0x4200100c] & (1 << 31), 0);
+}
+
+#[cfg(feature = "rx-status-experiment")]
+#[test]
+fn checksum_error_without_descriptor_error_never_reaches_client() {
+    let (mut e,m)=engine();link(&m,0xac00);e.poll_link().unwrap();
+    for (index,word1) in [0x19u32,0x91].into_iter().enumerate() {
+        let desc=0x42001000+index*64;
+        m.0.borrow_mut().csr.insert(desc+4,word1);
+        m.0.borrow_mut().csr.insert(desc+12,0x34000040); // Complete, valid word 1, no ES.
+        assert_eq!(e.receive(&mut [0;64]),Ok(None));
+        assert_ne!(m.0.borrow().csr[&(desc+12)] & (1<<31),0);
+    }
+    assert_eq!(e.rx_packets,0);assert_eq!(e.rx_checksum_status[2],2);
+    assert!(e.link().is_some());
+    // A following good frame is delivered after wrap; no link reset required.
+    m.0.borrow_mut().csr.insert(0x42001004,0x11);
+    m.0.borrow_mut().csr.insert(0x4200100c,0x34000040);
+    assert_eq!(e.receive(&mut [0;64]),Ok(Some(60)));
+    assert_eq!(e.rx_packets,1);
+}
+
+#[cfg(feature = "rx-ipv4-checksum-experiment")]
+#[test]
+fn ipv4_offload_falls_back_and_never_delivers_bad_or_unchecked_ip() {
+    let (mut e,m)=engine();link(&m,0xac00);e.poll_link().unwrap();
+    let mut good=vec![0u8;54];good[12..14].copy_from_slice(&[8,0]);
+    good[14]=0x45;good[16..18].copy_from_slice(&40u16.to_be_bytes());good[23]=6;good[46]=0x50;
+    vibeos_eqos_net::checksum::prepare(&mut good,false).unwrap();
+    let mut bad=good.clone();bad[34]^=1;
+    let mut ipv6=good.clone();ipv6[12..14].copy_from_slice(&[0x86,0xdd]);
+    for (index,(data,word1,valid,delivered)) in [
+        (good.clone(),0,false,true), (bad,0,false,false),
+        (good.clone(),0x12,true,true), (good,0x92,true,false), (ipv6,0,false,false)
+    ].into_iter().enumerate() {
+        let desc=0x42001000+(index%2)*64;
+        m.0.borrow_mut().rx_data=Some(data);
+        m.0.borrow_mut().csr.insert(desc+4,word1);
+        m.0.borrow_mut().csr.insert(desc+12,0x3000003a|if valid {1<<26} else {0});
+        assert_eq!(e.receive(&mut [0;64]),Ok(if delivered {Some(54)} else {None}));
+        assert_ne!(m.0.borrow().csr[&(desc+12)] & (1<<31),0);
+    }
+    assert_eq!(e.rx_packets,2);assert_eq!(e.rx_verified,[1,1,3]);
+    assert!(e.link().is_some());
 }

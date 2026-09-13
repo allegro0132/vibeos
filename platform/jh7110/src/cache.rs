@@ -25,6 +25,7 @@ pub enum Error {
 }
 pub struct Cache<R: Registers> {
     registers: R,
+    readonly_recycle: bool,
 }
 impl<R: Registers> Cache<R> {
     pub fn new(mut registers: R) -> Result<Self, Error> {
@@ -36,7 +37,13 @@ impl<R: Registers> Cache<R> {
         if banks == 0 || ways == 0 || ways > 32 || block != 6 || enabled >= ways {
             return Err(Error::Geometry);
         }
-        Ok(Self { registers })
+        Ok(Self { registers, readonly_recycle: false })
+    }
+    /// Opt-in experiment: retain clean RX lines until post-DMA invalidation.
+    /// The unsafe DmaCache::recycle_readonly caller supplies the clean invariant.
+    pub fn with_readonly_recycle(mut self, enabled: bool) -> Self {
+        self.readonly_recycle = enabled;
+        self
     }
     pub fn validate_region(region: DmaRegion) -> Result<(), MemoryError> {
         DmaConstraints {
@@ -79,6 +86,16 @@ unsafe impl<R: Registers> DmaCache for Cache<R> {
             // A read-only DMA transfer cannot make the CPU copy stale. Match
             // arch/riscv/mm/dma-noncoherent.c; keep admission and ordering.
             Self::validate_region(r).expect("unadmitted JH7110 cache span");
+            self.registers.barrier();
+        } else {
+            self.flush(r).expect("unadmitted JH7110 cache span");
+        }
+    }
+    unsafe fn recycle_readonly(&mut self, r: DmaRegion) {
+        if self.readonly_recycle {
+            Self::validate_region(r).expect("unadmitted JH7110 cache span");
+            // No dirty CPU lines exist. Preserve ordering before OWN; the next
+            // for_cpu still invalidates DMA-written data (including prefetch).
             self.registers.barrier();
         } else {
             self.flush(r).expect("unadmitted JH7110 cache span");

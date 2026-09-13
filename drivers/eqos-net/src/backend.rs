@@ -19,6 +19,13 @@ pub unsafe trait Memory: 'static {
     fn copy_rx(&mut self, address: u64, output: &mut [u8]);
     fn for_device(&mut self, address: u64, bytes: usize, direction: Direction);
     fn for_cpu(&mut self, address: u64, bytes: usize, direction: Direction);
+    /// # Safety
+    /// A previously prepared RX slot is CPU-owned and has never been written
+    /// by CPU since preparation; copy_rx must only read its source. Future
+    /// payload reads must perform for_cpu before accessing the slot.
+    unsafe fn recycle_rx(&mut self, address: u64, bytes: usize) {
+        self.for_device(address, bytes, Direction::FromDevice);
+    }
     fn barrier(&mut self);
 }
 
@@ -26,6 +33,7 @@ pub struct Backend<R: Io, M: Memory> {
     controller: Controller<R>,
     memory: &'static mut M,
     failed: bool,
+    tx_checksum: bool,
 }
 impl<R: Io + 'static, M: Memory> ring::Ring<Backend<R, M>> {
     /// Update software configuration while retaining the ring's ownership even
@@ -48,10 +56,12 @@ impl<R: Io, M: Memory> Backend<R, M> {
     ) -> Result<(), crate::controller::Error> {
         self.controller.set_link(speed, full_duplex)
     }
-    pub fn new(controller: Controller<R>, memory: &'static mut M) -> Self {
+    pub fn new(mut controller: Controller<R>, memory: &'static mut M) -> Self {
+        let tx_checksum = controller.checksum_capabilities().tx;
         Self {
             controller,
             memory,
+            tx_checksum,
             failed: false,
         }
     }
@@ -60,6 +70,10 @@ impl<R: Io, M: Memory> Backend<R, M> {
 // pool admission. Controller config never starts DMA, and reset/stop only succeed
 // after the bounded SWR and disabled-enable readback checks.
 unsafe impl<R: Io, M: Memory> ring::Backend for Backend<R, M> {
+    fn diagnostics(&mut self) -> Option<crate::controller::DmaDiagnostics> {
+        Some(self.controller.diagnostics())
+    }
+    fn tx_checksum_capable(&self) -> bool { self.tx_checksum }
     fn reset(&mut self) -> bool {
         self.failed = self.controller.reset().is_err();
         !self.failed
@@ -100,6 +114,9 @@ unsafe impl<R: Io, M: Memory> ring::Backend for Backend<R, M> {
     }
     fn for_cpu(&mut self, a: u64, n: usize, d: Direction) {
         self.memory.for_cpu(a, n, d)
+    }
+    unsafe fn recycle_rx(&mut self, a: u64, n: usize) {
+        unsafe { self.memory.recycle_rx(a, n) }
     }
     fn barrier(&mut self) {
         self.memory.barrier()

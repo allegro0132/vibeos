@@ -195,6 +195,11 @@ unsafe impl<C: DmaCache + 'static, const N: usize> Memory for Pool<C, N> {
         let r = self.region(a, n, d);
         self.cache.for_cpu(r, direction(d));
     }
+    unsafe fn recycle_rx(&mut self, a: u64, n: usize) {
+        let r = self.region(a, n, Direction::FromDevice);
+        // The private pool never writes RX payloads; copy_rx only reads them.
+        unsafe { self.cache.recycle_readonly(r) };
+    }
     fn barrier(&mut self) {
         self.cache.barrier();
     }

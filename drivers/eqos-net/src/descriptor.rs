@@ -1,4 +1,4 @@
-//! Basic 16-byte EQoS descriptors, with checksum/TSO/context features disabled.
+//! Basic 16-byte EQoS descriptors; default TX has no checksum insertion.
 //! Values are CPU-order snapshots. Live access must be volatile, little-endian,
 //! cache synchronized and publish OWN last before the DMA tail pointer.
 pub const OWN: u32 = 1 << 31;
@@ -33,6 +33,22 @@ fn address32(address: u64, bytes: usize) -> Result<u32, Error> {
 /// Prepared descriptor without OWN. The runtime must sync packet data and all
 /// words, publish OWN in word 3, sync the descriptor, then ring the DMA doorbell.
 pub fn tx(address: u64, bytes: usize) -> Result<[u32; 4], Error> {
+    tx_with_checksum(address, bytes, TxChecksum::None)
+}
+
+/// EQoS CIC encodings (Linux dwmac4_descs.h / descs.h). Full includes the
+/// IP header and transport pseudoheader. This does not enable MAC capabilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TxChecksum {
+    None = 0,
+    Ipv4Header = 1,
+    Full = 3,
+}
+
+/// The caller must admit the hardware capability, MAC mode and packet format
+/// before selecting insertion. OWN remains clear; publication is unchanged.
+pub fn tx_with_checksum(address: u64, bytes: usize, checksum: TxChecksum) -> Result<[u32; 4], Error> {
     if !(14..=MAX_FRAME).contains(&bytes) {
         return Err(Error::InvalidLength);
     }
@@ -40,7 +56,7 @@ pub fn tx(address: u64, bytes: usize) -> Result<[u32; 4], Error> {
         address32(address, bytes)?,
         0,
         bytes as u32,
-        FIRST | LAST | bytes as u32,
+        FIRST | LAST | ((checksum as u32) << 16) | bytes as u32,
     ])
 }
 
@@ -107,4 +123,33 @@ pub fn skip_length(stride: usize, axi_bytes: usize) -> Result<u32, Error> {
         return Err(Error::InvalidLayout);
     }
     Ok((((stride - 16) / axi_bytes) as u32) << 18)
+}
+
+/// RX checksum observation, not permission to skip software verification.
+/// The caller must additionally qualify the enabled MAC mode and match packet
+/// headers to the reported IP version/payload type before trusting this status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxChecksum {
+    Unavailable,
+    Bypassed,
+    Error,
+    Ipv4 { payload_type: u8 },
+    Ipv6 { payload_type: u8 },
+}
+/// Decode only a complete, CPU-owned normal descriptor with valid word 1.
+/// A descriptor without protocol metadata can never mean checksum success.
+pub fn rx_checksum(words: [u32; 4]) -> RxChecksum {
+    if !matches!(rx_complete(words, MAX_FRAME + 4), Ok(Some(_)))
+        || words[3] & (1 << 26) == 0 {
+        return RxChecksum::Unavailable;
+    }
+    let flags = words[1];
+    if flags & ((1 << 3) | (1 << 7)) != 0 { return RxChecksum::Error; }
+    if flags & (1 << 6) != 0 { return RxChecksum::Bypassed; }
+    let payload_type = (flags & 7) as u8;
+    match (flags >> 4) & 3 {
+        1 => RxChecksum::Ipv4 { payload_type },
+        2 => RxChecksum::Ipv6 { payload_type },
+        _ => RxChecksum::Unavailable,
+    }
 }

@@ -7,6 +7,7 @@ use crate::{
 
 const MAC: usize = 0;
 const FILTER: usize = 8;
+const FEATURE0: usize = 0x11c;
 const FEATURE1: usize = 0x120;
 const DMA_MODE: usize = 0x1000;
 const TX: usize = 0x1104;
@@ -47,6 +48,28 @@ pub enum Error {
     NotReady,
 }
 
+/// Capability advertisement only, not proof of packet-level qualification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChecksumCapabilities {
+    pub raw: u32,
+    pub tx: bool,
+    pub rx: bool,
+}
+impl ChecksumCapabilities {
+    pub const fn from_feature0(raw: u32) -> Self {
+        Self { raw, tx: raw & (1 << 14) != 0, rx: raw & (1 << 16) != 0 }
+    }
+}
+
+/// Non-destructive queue-0 snapshots. Status bits are sticky events, not
+/// packet counts; RX debug is instantaneous. Reading does not acknowledge IRQs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DmaDiagnostics {
+    pub dma_status: u32,
+    pub mtl_interrupt: u32,
+    pub mtl_rx_debug: u32,
+}
+
 pub struct Controller<R: Io> {
     io: R,
     config: Config,
@@ -54,6 +77,8 @@ pub struct Controller<R: Io> {
     configured: bool,
     running: bool,
     layout: Option<Layout>,
+    rx_checksum: bool,
+    rx_forward_errors: bool,
 }
 impl<R: Io> Controller<R> {
     pub fn new(io: R, config: Config) -> Result<Self, Error> {
@@ -72,7 +97,31 @@ impl<R: Io> Controller<R> {
             configured: false,
             running: false,
             layout: None,
+            rx_checksum: false,
+            rx_forward_errors: false,
         })
+    }
+    pub fn checksum_capabilities(&mut self) -> ChecksumCapabilities {
+        ChecksumCapabilities::from_feature0(self.io.read(FEATURE0))
+    }
+    /// Select RX checksum observation while stopped. Consumers must still use
+    /// software verification until per-packet metadata and fallback are qualified.
+    pub fn set_rx_checksum(&mut self, enabled: bool) -> Result<(), Error> {
+        if self.running { return Err(Error::NotReady); }
+        if enabled && !self.checksum_capabilities().rx {
+            return Err(Error::ConfigurationRejected);
+        }
+        self.rx_checksum = enabled;
+        self.configured = false;
+        Ok(())
+    }
+    /// Diagnostic mode: forward erroneous frames to DMA for rejection evidence.
+    /// The ring must continue rejecting error-summary descriptors without copy.
+    pub fn set_rx_error_forwarding(&mut self, enabled: bool) -> Result<(), Error> {
+        if self.running { return Err(Error::NotReady); }
+        self.rx_forward_errors = enabled;
+        self.configured = false;
+        Ok(())
     }
     /// Change the next configuration only while the controller is stopped.
     /// Invalidates any prior configuration; start requires configure again.
@@ -140,7 +189,13 @@ impl<R: Io> Controller<R> {
         let rqs = (1u32 << (rx - 1)) - 1;
         self.io.write(0xd00, tqs << 16 | 2 << 2 | 1 << 1);
         self.io.write(0xd18, 0x10);
-        self.io.write(0xd30, rqs << 20 | 1 << 5);
+        // DISTCPEF (6) disables checksum-error dropping; FEP (4) forwards
+        // erroneous packets. Default remains discard-before-DMA.
+        let error_forward = if self.rx_forward_errors { (1 << 6) | (1 << 4) } else { 0 };
+        self.io.write(0xd30, rqs << 20 | 1 << 5 | error_forward);
+        if self.io.read(0xd30) & ((1 << 6) | (1 << 4)) != error_forward {
+            return Err(Error::ConfigurationRejected);
+        }
         self.io.write(0xa0, 2); // RX queue 0 in DCB mode.
         self.io.write(0xa4, 1 << 20); // Multicast/broadcast to queue 0.
         self.io.write(0x98, 0);
@@ -154,9 +209,14 @@ impl<R: Io> Controller<R> {
             Speed::Mbps100 => (1 << 15) | (1 << 14),
             Speed::Mbps1000 => 0,
         };
-        // FCS retained (ACS/CST=0), checksum/TSO/jumbo disabled, MAC still stopped.
+        // FCS retained (ACS/CST=0), TSO/jumbo disabled, MAC still stopped.
+        // IPC only enables hardware observation; software acceptance is separate.
         self.io
-            .write(MAC, speed | if c.full_duplex { 1 << 13 } else { 0 });
+            .write(MAC, speed | if c.full_duplex { 1 << 13 } else { 0 }
+                | if self.rx_checksum { 1 << 27 } else { 0 });
+        if (self.io.read(MAC) & (1 << 27) != 0) != self.rx_checksum {
+            return Err(Error::ConfigurationRejected);
+        }
         self.io.write(0xdc, (c.csr_hz / 1_000_000 - 1) as u32);
         self.io.write(
             0x300,
@@ -229,6 +289,15 @@ impl<R: Io> Controller<R> {
     /// from an empty MTL FIFO. A timeout cannot authorize pool reuse.
     pub fn stop(&mut self) -> Result<(), Error> {
         self.reset()
+    }
+    pub fn diagnostics(&mut self) -> DmaDiagnostics {
+        // Linux stmmac dwmac4: channel-0 status, MTL queue-0 IRQ and RX debug.
+        // Avoid read-to-clear missed-packet counters and all W1C writes.
+        DmaDiagnostics {
+            dma_status: self.io.read(0x1160),
+            mtl_interrupt: self.io.read(0xd2c),
+            mtl_rx_debug: self.io.read(0xd38),
+        }
     }
     pub fn dma_status(&mut self) -> u32 {
         self.io.read(0x1160)

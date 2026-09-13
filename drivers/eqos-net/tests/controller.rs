@@ -156,6 +156,8 @@ struct State {
     sticky_enable: bool,
     drop_start: bool,
     drop_bus_limits: bool,
+    drop_rx_checksum: bool,
+    drop_error_forward: bool,
     ticks: u64,
     step: u64,
     mode_reads: usize,
@@ -175,7 +177,11 @@ impl Registers for Model {
     fn write(&mut self, a: usize, v: u32) {
         let mut s = self.0.borrow_mut();
         s.writes.push((a, v));
-        let value = if a == 0x1004 && s.drop_bus_limits {
+        let value = if a == 0xd30 && s.drop_error_forward {
+            v & !0x50
+        } else if a == 0 && s.drop_rx_checksum {
+            v & !(1 << 27)
+        } else if a == 0x1004 && s.drop_bus_limits {
             v & !0x0f0f_0000
         } else if a == 0x1000 && !s.reset_stuck {
             0
@@ -446,4 +452,74 @@ fn rejected_bus_limits_do_not_authorize_dma_start() {
     assert_eq!(controller.configure(layout()), Err(Error::ConfigurationRejected));
     assert_eq!(controller.start(), Err(Error::NotReady));
     assert!(!state.borrow().registers.contains_key(&0x1114));
+}
+
+#[test]
+fn rx_checksum_mode_requires_capability_stop_and_reconfiguration() {
+    let (mut c,s)=model();
+    assert_eq!(c.set_rx_checksum(true),Err(Error::ConfigurationRejected));
+    s.borrow_mut().registers.insert(0x11c,1<<16);
+    c.set_rx_checksum(true).unwrap();
+    c.reset().unwrap();c.configure(layout()).unwrap();
+    assert_ne!(s.borrow().registers[&0] & (1<<27),0);
+    c.start().unwrap();
+    assert_eq!(c.set_rx_checksum(false),Err(Error::NotReady));
+    c.stop().unwrap();c.set_rx_checksum(false).unwrap();
+    assert_eq!(c.start(),Err(Error::NotReady));
+    c.configure(layout()).unwrap();
+    assert_eq!(s.borrow().registers[&0] & (1<<27),0);
+}
+
+#[test]
+fn rx_checksum_enable_readback_failure_prevents_start() {
+    let (mut c,s)=model();
+    s.borrow_mut().registers.insert(0x11c,1<<16);
+    s.borrow_mut().drop_rx_checksum=true;
+    c.set_rx_checksum(true).unwrap();c.reset().unwrap();
+    assert_eq!(c.configure(layout()),Err(Error::ConfigurationRejected));
+    assert_eq!(c.start(),Err(Error::NotReady));
+}
+
+#[test]
+fn error_forwarding_is_explicit_and_requires_stopped_reconfiguration() {
+    let (mut c,s)=model();c.reset().unwrap();c.configure(layout()).unwrap();
+    assert_eq!(s.borrow().registers[&0xd30] & 0x50,0);
+    c.set_rx_error_forwarding(true).unwrap();
+    assert_eq!(c.start(),Err(Error::NotReady));
+    c.configure(layout()).unwrap();c.start().unwrap();
+    assert_eq!(s.borrow().registers[&0xd30] & 0x50,0x50);
+    assert_eq!(c.set_rx_error_forwarding(false),Err(Error::NotReady));
+    c.stop().unwrap();c.set_rx_error_forwarding(false).unwrap();
+    c.configure(layout()).unwrap();
+    assert_eq!(s.borrow().registers[&0xd30] & 0x50,0);
+}
+
+#[test]
+fn error_forwarding_readback_failure_prevents_dma_start() {
+    let (mut c,s)=model();
+    s.borrow_mut().drop_error_forward=true;
+    c.set_rx_error_forwarding(true).unwrap();c.reset().unwrap();
+    assert_eq!(c.configure(layout()),Err(Error::ConfigurationRejected));
+    assert_eq!(c.start(),Err(Error::NotReady));
+}
+
+#[test]
+fn diagnostics_preserve_sticky_status_and_live_ring_ownership() {
+    let (c, s) = model();
+    let pool = Box::leak(Box::new(Pool { state: s.clone(), admit: true }));
+    let b = Box::leak(Box::new(Backend::new(c, pool)));
+    let mut ring = Ring::new(b, layout()).unwrap();
+    ring.initialize().unwrap();
+    let expected = DmaDiagnostics { dma_status: 0x80, mtl_interrupt: 0x10000, mtl_rx_debug: 0x30 };
+    {
+        let mut s = s.borrow_mut();
+        s.registers.insert(0x1160, expected.dma_status);
+        s.registers.insert(0xd2c, expected.mtl_interrupt);
+        s.registers.insert(0xd38, expected.mtl_rx_debug);
+    }
+    let writes = s.borrow().writes.len();
+    assert_eq!(ring.diagnostics(), Some(expected));
+    assert_eq!(ring.diagnostics(), Some(expected));
+    assert_eq!(s.borrow().writes.len(), writes);
+    assert!(ring.into_stopped_backend().is_err());
 }

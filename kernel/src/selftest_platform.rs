@@ -455,8 +455,8 @@ fn paging(h: &mut Harness) {
         crate::mmu::mapping(0).is_none(),
     );
     h.check(
-        "the OpenSBI firmware prefix is absent from S-mode mappings",
-        crate::mmu::mapping(0x8000_0000).is_none(),
+        "the page below firmware-admitted kernel RAM is absent",
+        crate::mmu::mapping(crate::mmu::kernel_ram_start() - PAGE_SIZE).is_none(),
     );
     h.check(
         "RAM beyond the configured machine is absent",
@@ -481,8 +481,10 @@ fn paging(h: &mut Harness) {
             .all(|address| crate::mmu::mapping(address).is_none()),
     );
     h.check(
-        "the end of the PLIC aperture is absent",
-        crate::mmu::mapping(crate::mmu::plic_end()).is_none(),
+        // The exclusive end may be another device: Mars UART0 immediately
+        // follows the PLIC. Check an unused page inside the PLIC instead.
+        "the unused last page inside the PLIC aperture is absent",
+        crate::mmu::mapping(crate::mmu::plic_end() - PAGE_SIZE).is_none(),
     );
     h.check(
         "unused UART/virtio pages are absent",

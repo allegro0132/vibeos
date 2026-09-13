@@ -2,7 +2,7 @@
 //! operations; telemetry uses only atomics and never borrows mutable engines.
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use vibeos_bsp_milkv_mars as mars;
 use vibeos_eqos_net::{
@@ -35,6 +35,31 @@ static CLAIMED: AtomicBool = AtomicBool::new(false);
 static LINK: AtomicBool = AtomicBool::new(false);
 static TX: AtomicU64 = AtomicU64::new(0);
 static RX: AtomicU64 = AtomicU64::new(0);
+
+// Installed by the boot hart before publishing secondary harts or devices.
+static LOG: AtomicUsize = AtomicUsize::new(0);
+pub fn install_logger(write: fn(&str)) {
+    LOG.store(write as usize, Ordering::Release);
+}
+struct Output(fn(&str));
+impl core::fmt::Write for Output {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        (self.0)(text);
+        Ok(())
+    }
+}
+fn report(args: core::fmt::Arguments<'_>) {
+    let address = LOG.load(Ordering::Acquire);
+    if address != 0 {
+        // Only install_logger writes this slot, and fn pointers live forever.
+        let write: fn(&str) = unsafe { core::mem::transmute(address) };
+        let _ = core::fmt::write(&mut Output(write), args);
+    }
+}
+fn failed(stage: &str, detail: impl core::fmt::Debug, error: Error) -> Error {
+    report(format_args!("MARS_NET_INIT FAIL stage={} detail={:?}\n", stage, detail));
+    error
+}
 
 // Disjoint register views of one firmware-owned controller. The PHY view may
 // touch only MDIO registers; the DMA/MAC view cannot touch them. Neither view
@@ -96,19 +121,20 @@ fn error(e: EngineError) -> Error {
 unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
     CLAIMED
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .map_err(|_| Error::Busy)?;
+        .map_err(|e| failed("ownership", e, Error::Busy))?;
     let result = (|| {
         let r = super::admission()
             .network
-            .ok_or(Error::InvalidDescription)?;
+            .ok_or_else(|| failed("resources", "missing DTB network", Error::InvalidDescription))?;
         let base = super::admission().resources;
         let mut platform = ethernet::Mmio::new(
             [r.sys_crg, base.syscon, r.aon_crg, r.aon_syscon, r.aon_pins],
             time,
         )
-        .map_err(|_| Error::InvalidDescription)?;
+        .map_err(|e| failed("platform-resources", e, Error::InvalidDescription))?;
         let prepared = ethernet::prepare(&mut platform, mars::GMAC0_TX_DRIVE, hz)
-            .map_err(|_| Error::TimedOut)?;
+            .map_err(|e| failed("platform-prepare", e, Error::TimedOut))?;
+        report(format_args!("MARS_NET_INIT clocks csr={} gtx={} ptp={}\n", prepared.csr_hz, prepared.gtx_hz, prepared.ptp_hz));
         let controller = Controller::new(
             Lane {
                 base: r.mac.start,
@@ -124,7 +150,7 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
                 max_polls: 1_000_000,
             },
         )
-        .map_err(|_| Error::InvalidDescription)?;
+        .map_err(|e| failed("controller-config", e, Error::InvalidDescription))?;
         let port = Port::new(
             Lane {
                 base: r.mac.start,
@@ -133,8 +159,9 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             },
             u64::from(prepared.csr_hz),
         )
-        .map_err(|_| Error::InvalidDescription)?;
-        let mut phy = Yt8531::probe(port, u32::MAX, 100_000).map_err(|_| Error::TimedOut)?;
+        .map_err(|e| failed("mdio-config", e, Error::InvalidDescription))?;
+        let mut phy = Yt8531::probe(port, mars::PHY_SCAN_ADDRESSES, 100_000).map_err(|e| failed("phy-probe", e, Error::TimedOut))?;
+        report(format_args!("MARS_NET_INIT phy={:?}\n", phy.identity()));
         let p = r.phy;
         phy.initialize(
             Tuning {
@@ -147,23 +174,24 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             },
             10_000,
         )
-        .map_err(|_| Error::TimedOut)?;
+        .map_err(|e| failed("phy-init", e, Error::TimedOut))?;
         let cache =
-            cache::Cache::new(cache::Mmio::new(r.cache).map_err(|_| Error::InvalidDescription)?)
-                .map_err(|_| Error::InvalidDescription)?;
+            cache::Cache::new(cache::Mmio::new(r.cache).map_err(|e| failed("cache-resources", e, Error::InvalidDescription))?)
+                .map_err(|e| failed("cache-geometry", e, Error::InvalidDescription))?;
         // .dma is NOLOAD; initialize every byte before creating the Rust pool.
         // No ring has started in this claim; earlier claims require proven stop.
         core::ptr::write_bytes(DMA.0.get(), 0, 1);
         let pool = Pool::new(&mut *DMA.0.get(), DMA.0.get() as u64, cache, 8)
-            .map_err(|_| Error::AddressTooWide)?;
+            .map_err(|e| failed("dma-pool", e, Error::AddressTooWide))?;
         let layout = pool.layout();
         *POOL.0.get() = Some(pool);
         *HARDWARE.0.get() = Some(Backend::new(controller, (*POOL.0.get()).as_mut().unwrap()));
         *ENGINE.0.get() =
-            Some(Engine::new((*HARDWARE.0.get()).as_mut().unwrap(), layout, phy).map_err(error)?);
+            Some(Engine::new((*HARDWARE.0.get()).as_mut().unwrap(), layout, phy).map_err(|e| { report(format_args!("MARS_NET_INIT FAIL stage=ring-init detail={:?}\n", e)); error(e) })?);
         LINK.store(false, Ordering::Release);
         TX.store(0, Ordering::Relaxed);
         RX.store(0, Ordering::Relaxed);
+        report(format_args!("MARS_NET_INIT ready\n"));
         Ok(())
     })();
     if result.is_err() {

@@ -68,6 +68,7 @@ git -C "$sdk" checkout --detach "$sdk_commit"
 sh scripts/build-milkv-mars.sh "$@"
 cp firmware/milkv-mars/bootchain/build.sh firmware/milkv-mars/bootchain/package.sh \
     firmware/milkv-mars/bootchain/firmware.its firmware/milkv-mars/bootchain/vibeos.its \
+    firmware/milkv-mars/bootchain/vf2_uEnv.txt \
     scripts/mars-sd-image.py scripts/mars-check-bootchain.py "target/milkv-mars/$payload/vibeos.bin" "$work/input/"
 docker build --tag vibeos-mars-boot-tools:stage25 firmware/milkv-mars/bootchain
 docker run --rm --mount "type=bind,source=$work,target=/work" \

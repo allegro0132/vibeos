@@ -60,6 +60,7 @@ pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     heap_regions: super::BOOT_HEAP_REGIONS,
     rtc: Board::RTC,
     cold_reset: Board::RESET,
+    prepare_reset: Board::PREPARE_RESET,
     early_platform_init: super::platform_init,
     platform_report: super::platform_report,
     ram_page_tables: || PageTableArena {

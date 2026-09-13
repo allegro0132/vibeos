@@ -43,6 +43,31 @@ firmware only exposes partition 4's fixed physical range as logical LBA 0.
 An SD writer must write the whole image, including partitions 1 and 2; copying
 the FIT into an unrelated Linux image does not install this paired boot chain.
 
+The image assembler also reproduces the pinned SDK Makefile's `spl_tool -i`
+postprocessing: little-endian `0x200000` at byte `0x04` and `0x5a5a5a5a` at
+byte `0x290`. The vendor describes this as a ROM fallback to the backup SPL
+address when reading sector zero. These fields do not change GPT CRCs; a GPT
+check alone cannot detect their omission. The image checker requires both.
+Images generated before this fix omitted them. Whether that omission explains
+the observed `dwmci_s: Response Timeout` still requires a board retest.
+
+For the installed Mars SPI U-Boot 2021.10 (2023-07-22), select GPIO1=0,
+GPIO0=0. Its default `bootcmd` reads `vf2_uEnv.txt` from `mmc 1:3`, imports
+text variables and executes `boot2`. Packaging includes this file next to
+`vibeos.itb`; it loads the FIT at `0x46000000` and invokes `bootm`. The
+`VIBEOS_AUTOBOOT sd=1:3` marker identifies this path. This requires no
+`saveenv` or SPI update. Keep the paired SD boot firmware for direct-SD
+investigation; SPI boot instead runs the board's installed SPL/OpenSBI/U-Boot.
+On 2026-09-13 this SPI path was verified on hardware by issuing U-Boot `reset`
+and observing a new SPL/OpenSBI/U-Boot boot followed by automatic VibeOS entry.
+This was a software-reset test, not another verified cold power cycle.
+
+Existing cards need only `vf2_uEnv.txt` and the desired `vibeos.itb` copied to
+the root of partition 3. The boot2 command guards `bootm` with successful FIT
+loading; image integrity is checked by U-Boot. A missing or invalid FIT leaves
+vendor fallback behavior in control. No boot file is written into the VibeOS
+data partition, and this configuration does not enable SSH.
+
 For direct SD boot, first check the board revision. The [Milk-V setup guide](https://milkv.io/ru/docs/mars/getting-started/setup)
 documents the selector on V1.2 and later: GPIO1=0, GPIO0=1 selects SD. Consult
 the guide's diagram for switch orientation. Earlier boards normally use SPI;

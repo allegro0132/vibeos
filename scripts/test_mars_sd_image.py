@@ -41,6 +41,7 @@ class ImageTests(unittest.TestCase):
 
     def test_corruption(self):
         for offset, diagnostic in [
+            (4, "ROM backup SPL"), (0x290, "ROM fallback CRC"),
             (510, "MBR"), (512 + 16, "header CRC"),
             (1024 + 32, "entries CRC"), (sd.IMAGE_BYTES - 512 + 16, "header CRC"),
             (2 * sd.MIB, "payload mismatch"), (128 * sd.MIB, "must be blank"),
@@ -83,7 +84,10 @@ class ImageTests(unittest.TestCase):
             crc = zlib.crc32(entries)
             for current, backup, lba in [(1, end, 2), (end, 1, end - 32)]:
                 f.seek(current * sd.SECTOR)
-                f.write(sd.header(current, backup, lba, crc))
+                h = sd.header(current, backup, lba, crc)
+                if current == 1:
+                    struct.pack_into('<I', h, sd.ROM_CRC_OFFSET - sd.SECTOR, sd.ROM_FAILED_CRC)
+                f.write(h)
                 f.seek(lba * sd.SECTOR)
                 f.write(entries)
         try:

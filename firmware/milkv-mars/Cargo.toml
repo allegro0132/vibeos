@@ -33,6 +33,7 @@ bench = false
 required-features = ["image"]
 
 [dependencies]
+vibeos-driver-dw-i2c = { path = "../../drivers/dw-i2c" }
 vibeos-hal = { path = "../../hal" }
 vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars" }
 vibeos-platform-jh7110 = { path = "../../platform/jh7110" }

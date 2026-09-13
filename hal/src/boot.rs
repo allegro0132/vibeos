@@ -118,6 +118,8 @@ pub struct BootPlatform {
     pub heap_regions: Option<fn() -> &'static [AddressRange]>,
     pub rtc: Option<AddressRange>,
     pub cold_reset: Option<fn() -> !>,
+    /// Run before SBI SRST; false aborts reset while the shell can still report it.
+    pub prepare_reset: Option<fn() -> bool>,
     /// # Safety
     /// Boot-hart-only hook after identity mappings exist, before secondary
     /// harts and services start. No allocation or capability policy is allowed.
@@ -151,7 +153,7 @@ pub const fn ram_page_table_pages(ram: AddressRange) -> usize {
 
 /// Static device mapping capacity shared by BSP admission and the kernel.
 pub const MAX_DEVICE_LEVEL1_TABLES: usize = 2;
-pub const MAX_DEVICE_LEVEL0_TABLES: usize = 8;
+pub const MAX_DEVICE_LEVEL0_TABLES: usize = 9;
 #[cfg(test)]
 mod tests {
     use super::*;

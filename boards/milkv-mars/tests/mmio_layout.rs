@@ -32,7 +32,7 @@ fn exact_page_table_capacity_covers_security_and_all_plic_contexts() {
     let windows: BTreeSet<_> = pages.iter().map(|p| p >> 21).collect();
     assert_eq!(roots.len(), mars::Board::MMU.device_level1_tables);
     assert_eq!(windows.len(), mars::Board::MMU.device_level0_tables);
-    assert_eq!(windows.len(), 8);
+    assert_eq!(windows.len(), 9);
     assert!(windows.len() <= vibeos_hal::boot::MAX_DEVICE_LEVEL0_TABLES);
 }
 

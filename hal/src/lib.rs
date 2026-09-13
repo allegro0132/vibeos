@@ -299,6 +299,8 @@ pub trait Board {
     const MMU: MmuDescription;
     const RTC: Option<AddressRange> = None;
     const RESET: Option<fn() -> !> = None;
+    /// Optional board transport preparation before entering the SBI reset service.
+    const PREPARE_RESET: Option<fn() -> bool> = None;
     const HART_IDS: &'static [usize];
 
     /// Return the supervisor PLIC context for an OpenSBI-visible physical hart.

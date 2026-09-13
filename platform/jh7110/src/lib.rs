@@ -5,3 +5,4 @@ pub mod sd;
 pub mod ethernet;
 pub mod security;
 pub mod clock;
+pub mod reset;

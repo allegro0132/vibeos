@@ -61,3 +61,17 @@ pub fn cold_reset() -> ! {
         .cold_reset
         .expect("firmware did not supply a cold reset"))()
 }
+/// Prepare firmware-owned transport before SBI, since a broken M-mode reset
+/// implementation may hang and never reach a post-SBI hardware fallback.
+pub fn reboot() {
+    if description().prepare_reset.is_some_and(|prepare| !prepare()) {
+        crate::println!("  reboot refused: firmware reset transport is not ready");
+        return;
+    }
+    let error = crate::sbi::request_system_reset(
+        crate::sbi::RESET_TYPE_COLD_REBOOT, crate::sbi::RESET_REASON_NONE);
+    if let Some(reset) = description().cold_reset {
+        reset();
+    }
+    crate::println!("  reboot failed: SBI returned {} and no hardware fallback is available", error);
+}

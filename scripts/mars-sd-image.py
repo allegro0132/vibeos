@@ -16,6 +16,11 @@ import zlib
 SECTOR = 512
 MIB = 1024 * 1024
 IMAGE_BYTES = 641 * MIB
+# Match the pinned Mars SDK's `spl_tool -i` post-genimage operation.
+# These bytes are outside the protective partition entry and GPT header CRC.
+ROM_BACKUP_OFFSET = 0x04
+ROM_CRC_OFFSET = 0x290
+ROM_FAILED_CRC = 0x5A5A5A5A
 PARTITIONS = [
     ("spl", 2 * MIB, 2 * MIB, "2E54B353-1271-4842-806F-E436D6AF6985", "u-boot-spl.bin.normal.out"),
     ("uboot", 4 * MIB, 4 * MIB, "5B193300-FC78-40CD-8002-E86C45580B47", "firmware.itb"),
@@ -59,13 +64,16 @@ def assemble(output, artifacts):
     crc = zlib.crc32(entries)
     end = IMAGE_BYTES // SECTOR - 1
     mbr = bytearray(SECTOR)
+    struct.pack_into("<I", mbr, ROM_BACKUP_OFFSET, PARTITIONS[0][1])
     struct.pack_into("<B3sB3sII", mbr, 446, 0, b"\0\2\0", 0xEE,
                      b"\xff\xff\xff", 1, end)
     mbr[510:] = b"\x55\xaa"
+    primary = header(1, end, 2, crc)
+    struct.pack_into("<I", primary, ROM_CRC_OFFSET - SECTOR, ROM_FAILED_CRC)
     fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "wb") as f:
         f.truncate(IMAGE_BYTES)
-        for offset, blob in [(0, mbr), (SECTOR, header(1, end, 2, crc)),
+        for offset, blob in [(0, mbr), (SECTOR, primary),
                              (2 * SECTOR, entries), ((end - 32) * SECTOR, entries),
                              (end * SECTOR, header(end, 1, end - 32, crc))]:
             f.seek(offset)
@@ -87,6 +95,10 @@ def inspect(path, artifacts=None):
         mbr = f.read(SECTOR)
         require(mbr[510:] == b"\x55\xaa" and mbr[450] == 0xEE, "protective MBR")
         require(struct.unpack_from("<II", mbr, 454) == (1, end), "MBR range")
+        require(struct.unpack_from("<I", mbr, ROM_BACKUP_OFFSET)[0] == PARTITIONS[0][1],
+                "ROM backup SPL address")
+        f.seek(ROM_CRC_OFFSET)
+        require(struct.unpack("<I", f.read(4))[0] == ROM_FAILED_CRC, "ROM fallback CRC marker")
         tables = []
         for current, backup, table_lba in [(1, end, 2), (end, 1, end - 32)]:
             f.seek(current * SECTOR)
@@ -128,6 +140,7 @@ def inspect(path, artifacts=None):
             digest_state.update(chunk)
     digest = digest_state.hexdigest()
     return {"status": "sd-layout-passed", "bytes": IMAGE_BYTES, "sha256": digest,
+            "rom_backup_spl_offset": PARTITIONS[0][1], "rom_fallback_crc": ROM_FAILED_CRC,
             "physical_acceptance": False, "ssh_enabled": False,
             "partitions": [{"name": n, "first_sector": s // SECTOR, "sector_count": z // SECTOR}
                            for n, s, z, _, _ in PARTITIONS]}

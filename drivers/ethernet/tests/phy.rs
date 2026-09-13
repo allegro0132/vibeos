@@ -277,3 +277,23 @@ fn link_write_timeout_quarantines_until_fresh_initialization() {
     phy.initialize(TUNING, 3).unwrap();
     assert!(phy.poll_link().unwrap().is_some());
 }
+
+#[test]
+fn board_mask_excludes_zero_alias_but_keeps_real_collisions_fatal() {
+    let p = Port::new();
+    {
+        let mut s = p.0.borrow_mut();
+        s.regs[0][2] = 0x4f51;
+        s.regs[0][3] = 0xe91b;
+    }
+    assert_eq!(phy::discover(&mut p.clone(), u32::MAX, 4), Err(Error::Ambiguous));
+    let mask = u32::MAX & !1;
+    assert_eq!(phy::discover(&mut p.clone(), mask, 4).unwrap().address, ADDRESS);
+    {
+        let mut s = p.0.borrow_mut();
+        s.regs[3][2] = 0x4f51;
+        s.regs[3][3] = 0xe91b;
+    }
+    assert_eq!(phy::discover(&mut p.clone(), mask, 4), Err(Error::Ambiguous));
+    assert!(p.0.borrow().log.iter().all(|entry| !entry.0));
+}

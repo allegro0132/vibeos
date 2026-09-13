@@ -29,6 +29,11 @@ pub const PLIC: PlicDescription = PlicDescription {
 };
 pub const UART_REGISTERS: AddressRange = AddressRange::new(0x1000_0000, 0x1001_0000);
 pub const UART_IRQ: u32 = 32;
+/// YT8531 A005 bit 6 enables an address-zero alias. Board testing verified
+/// address 1 remains when the alias is disabled. Discover nonzero addresses
+/// strictly; do not confuse the alias with a second PHY or assume an address.
+pub const PHY_SCAN_ADDRESSES: u32 = u32::MAX & !1;
+
 /// Clock must be obtained from the initialized platform clock tree. The BSP
 /// does not infer a clock from the baud rate or borrow the Duo oscillator.
 pub const fn console(clock_hz: u32) -> UartDescription {
@@ -184,8 +189,10 @@ fn validate_board(tree: &Fdt<'_>) -> Result<(), FdtError> {
 /// Static mapping envelope for the console/SD composition. Device resources
 /// must pass `resources::admit` before any service is registered. Standard PTE
 /// attributes rely on JH7110 PMAs; T-Head attributes/instructions are forbidden.
+pub const I2C5_REGISTERS: AddressRange = AddressRange::new(0x12050000, 0x12051000);
 pub struct Board;
 pub const MEMORY_MAP: &[vibeos_hal::MemoryRegion] = &[
+    vibeos_hal::MemoryRegion::mmio("PMIC I2C5", I2C5_REGISTERS.start, I2C5_REGISTERS.end),
     vibeos_hal::MemoryRegion::reserved("boot firmware", RAM.start, KERNEL_LOAD_ADDRESS),
     vibeos_hal::MemoryRegion::ram("kernel RAM", KERNEL_LOAD_ADDRESS, RAM.end),
     vibeos_hal::MemoryRegion::mmio("PLIC", PLIC.registers.start, PLIC.registers.end),
@@ -199,6 +206,7 @@ pub const MEMORY_MAP: &[vibeos_hal::MemoryRegion] = &[
     vibeos_hal::MemoryRegion::mmio("TRNG", TRNG_REGISTERS.start, TRNG_REGISTERS.end),
 ];
 pub const MMIO_MAPPINGS: &[vibeos_hal::IdentityMapping] = &[
+    vibeos_hal::IdentityMapping::pages("PMIC I2C5", I2C5_REGISTERS.start, I2C5_REGISTERS.end),
     vibeos_hal::IdentityMapping::pages("UART0", UART_REGISTERS.start, UART_REGISTERS.end),
     vibeos_hal::IdentityMapping::pages("SYS CRG/SYSCON/pins", SYS_CRG.start, SYS_PINCTRL.end),
     vibeos_hal::IdentityMapping::pages("SDIO1/GMAC0", SD_REGISTERS.start, GMAC0_REGISTERS.end),
@@ -233,8 +241,8 @@ impl vibeos_hal::Board for Board {
         mmio_attributes: vibeos_hal::MemoryAttributes::Standard,
         identity_mappings: MMIO_MAPPINGS,
         device_level1_tables: 1,
-        // UART, SYS, SD/GMAC/TRNG, L2, AON, STG and two sparse PLIC windows.
-        device_level0_tables: 8,
+        // UART, SYS, SD/GMAC/TRNG, L2, AON, STG, I2C5 and two sparse PLIC windows.
+        device_level0_tables: 9,
     };
     const HART_IDS: &'static [usize] = HART_IDS;
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

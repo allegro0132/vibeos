@@ -1621,6 +1621,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-dw-i2c"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-driver-dw-mshc"
 version = "0.1.0"
 dependencies = [
@@ -1782,6 +1786,7 @@ name = "vibeos-firmware-milkv-mars"
 version = "0.1.0"
 dependencies = [
  "vibeos-bsp-milkv-mars",
+ "vibeos-driver-dw-i2c",
  "vibeos-driver-dw-mshc",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",

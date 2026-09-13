@@ -1,0 +1,1 @@
+boot2=echo VIBEOS_AUTOBOOT sd=1:3; if load mmc 1:3 0x46000000 vibeos.itb; then bootm 0x46000000; fi

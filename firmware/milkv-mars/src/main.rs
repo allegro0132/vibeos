@@ -7,7 +7,29 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicU8, Ordering},
 };
-use vibeos_bsp_milkv_mars::Board;
+use vibeos_bsp_milkv_mars::Board as MarsBoard;
+// Firmware assembles the SoC reset resources and independent controller driver.
+struct Board;
+impl vibeos_hal::Board for Board {
+    const INFO: vibeos_hal::BoardInfo = MarsBoard::INFO;
+    const MEMORY_MAP: &'static [vibeos_hal::MemoryRegion] = MarsBoard::MEMORY_MAP;
+    const MMU: vibeos_hal::MmuDescription = MarsBoard::MMU;
+    const HART_IDS: &'static [usize] = MarsBoard::HART_IDS;
+    const PREPARE_RESET: Option<fn() -> bool> = Some(prepare_reset);
+    fn plic_s_context(hart: usize) -> Option<usize> { MarsBoard::plic_s_context(hart) }
+}
+fn prepare_reset() -> bool {
+    use vibeos_bsp_milkv_mars::{SYS_CRG, I2C5_REGISTERS};
+    // Mars I2C5 uses the 24 MHz oscillator. These standard-mode counts are
+    // the vendor U-Boot configuration, also measured on this physical board.
+    let timing = vibeos_driver_dw_i2c::StandardTiming {
+        high_count: 0x20, low_count: 0xb0, sda_hold: 8,
+    };
+    unsafe {
+        vibeos_platform_jh7110::reset::prepare_mmio(SYS_CRG)
+            && vibeos_driver_dw_i2c::prepare_mmio(I2C5_REGISTERS.start, timing)
+    }
+}
 use vibeos_firmware_milkv_mars::{Admission, SbiExtensions};
 use vibeos_hal::{
     boot::{BootError, BootRequest},
@@ -85,6 +107,8 @@ const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
 #[cfg(feature = "ethernet-device")]
 const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
 unsafe fn platform_init(_write: fn(&str)) {
+    #[cfg(feature = "ethernet-device")]
+    network::install_logger(_write);
     #[cfg(feature = "entropy-device")]
     {
         let _parent_hz = entropy_boot::install(_write);

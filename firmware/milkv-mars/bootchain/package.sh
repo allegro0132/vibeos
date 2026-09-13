@@ -17,7 +17,7 @@ out=/work/out/artifacts
 test ! -e "/work/out/$image"
 cd "$out"
 cp /work/input/vibeos.bin .
-cp /work/input/firmware.its /work/input/vibeos.its .
+cp /work/input/firmware.its /work/input/vibeos.its /work/input/vf2_uEnv.txt .
 gcc -E -nostdinc -undef -D__DTS__ -x assembler-with-cpp \
     -I "$sdk/linux/include" -I "$sdk/linux/arch/riscv/boot/dts/starfive" \
     "$sdk/linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts" -o mars.pp.dts
@@ -30,6 +30,7 @@ truncate -s 0 boot.fat
 truncate -s 120M boot.fat
 mkfs.vfat --invariant -F 32 -n VIBEOSBOOT boot.fat
 mcopy -o -i boot.fat vibeos.itb ::vibeos.itb
+mcopy -o -i boot.fat vf2_uEnv.txt ::vf2_uEnv.txt
 mdir -i boot.fat ::
 fsck.vfat -n boot.fat
 python3 /work/input/mars-sd-image.py assemble "/work/out/$image" \

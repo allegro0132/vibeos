@@ -561,8 +561,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "reboot" => {
             println!("  rebooting.");
-            sbi::request_system_reset(sbi::RESET_TYPE_COLD_REBOOT, sbi::RESET_REASON_NONE);
-            crate::platform::cold_reset();
+            crate::platform::reboot();
         }
 
         "halt" => {

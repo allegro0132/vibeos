@@ -10,8 +10,8 @@ const LINE: usize = 64;
 
 /// # Safety
 /// Accesses must faithfully reach the admitted, live cache controller (or its
-/// test model). Each 64-bit command and following full barrier must complete
-/// the SDK-defined flush/invalidate operation before returning. Other cores
+/// test model). The trailing full barrier must complete every preceding 64-bit
+/// flush/invalidate command before CPU/device ownership is transferred. Other cores
 /// must obey the caller's DMA ownership and cache-line isolation protocol.
 pub unsafe trait Registers {
     fn read32(&mut self, offset: usize) -> u32;
@@ -60,12 +60,12 @@ impl<R: Registers> Cache<R> {
         for offset in (0..region.bytes).step_by(LINE) {
             self.registers
                 .write64(FLUSH64, region.physical + offset as u64);
-            self.registers.barrier();
         }
+        self.registers.barrier();
         Ok(())
     }
 }
-// The SDK uses the same clean/invalidate FLUSH64 sequence for both directions.
+// Upstream sifive_ccache batches FLUSH64 commands between two full barriers.
 // It is safe only with dedicated lines and exclusive CPU/device ownership.
 unsafe impl<R: Registers> DmaCache for Cache<R> {
     fn validate(&self, r: DmaRegion) -> Result<(), MemoryError> {
@@ -74,8 +74,15 @@ unsafe impl<R: Registers> DmaCache for Cache<R> {
     fn for_device(&mut self, r: DmaRegion, _: DmaDirection) {
         self.flush(r).expect("unadmitted JH7110 cache span");
     }
-    fn for_cpu(&mut self, r: DmaRegion, _: DmaDirection) {
-        self.flush(r).expect("unadmitted JH7110 cache span");
+    fn for_cpu(&mut self, r: DmaRegion, direction: DmaDirection) {
+        if direction == DmaDirection::ToDevice {
+            // A read-only DMA transfer cannot make the CPU copy stale. Match
+            // arch/riscv/mm/dma-noncoherent.c; keep admission and ordering.
+            Self::validate_region(r).expect("unadmitted JH7110 cache span");
+            self.registers.barrier();
+        } else {
+            self.flush(r).expect("unadmitted JH7110 cache span");
+        }
     }
     fn barrier(&mut self) {
         self.registers.barrier();

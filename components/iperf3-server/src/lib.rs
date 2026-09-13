@@ -67,10 +67,16 @@ type Space = dyn Platform;
 
 pub async fn task(space: &Space, control_listener: Cap, data_listener: Cap) {
     let mut server = Server::new();
+    let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
     loop {
         match server.drive(space, control_listener, data_listener) {
-            Ok(true) => vibeos_core::exec::yield_now().await,
-            Ok(false) => vibeos_core::exec::sleep_ms(IDLE_POLL_MS).await,
+            Ok(worked) => {
+                if poll_budget.runnable(space.now_ms(), worked) {
+                    vibeos_core::exec::yield_now().await;
+                } else {
+                    vibeos_core::exec::sleep_ms(IDLE_POLL_MS).await;
+                }
+            }
             Err(SocketError::AuthorityRevoked) => return,
             Err(SocketError::StaleConnection | SocketError::Failed) => {
                 space.event(server.phase_name());

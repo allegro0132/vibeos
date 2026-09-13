@@ -70,7 +70,10 @@ pub enum Ipv4RuntimeStatus {
 }
 
 /// Bytes reserved in each direction of the single TCP connection.
+#[cfg(not(feature = "tcp-large-window"))]
 pub const TCP_BUFFER_BYTES: usize = 32 * 1024;
+#[cfg(feature = "tcp-large-window")]
+pub const TCP_BUFFER_BYTES: usize = 256 * 1024;
 /// At most this many ingress frames are consumed by one cooperative poll.
 pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 32;
 /// At most this many bounded egress passes are made by one cooperative poll.

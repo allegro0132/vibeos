@@ -36,6 +36,28 @@ static LINK: AtomicBool = AtomicBool::new(false);
 static TX: AtomicU64 = AtomicU64::new(0);
 static RX: AtomicU64 = AtomicU64::new(0);
 
+// Serialized diagnostic counters for locating the gigabit bottleneck. Device
+// invocation authority is the sole owner, just as for ENGINE and its DMA ring.
+struct Profile { ticks: [u64; 3], calls: [u64; 3], last: u64 }
+struct ProfileSlot(UnsafeCell<Profile>);
+unsafe impl Sync for ProfileSlot {}
+static PROFILE: ProfileSlot = ProfileSlot(UnsafeCell::new(Profile { ticks: [0;3], calls: [0;3], last: 0 }));
+fn profile_time() -> u64 { vibeos_runtime_riscv::time() }
+unsafe fn profile_end(kind: usize, start: u64) {
+    let p = &mut *PROFILE.0.get();
+    p.ticks[kind] += profile_time().wrapping_sub(start);
+    p.calls[kind] += 1;
+}
+unsafe fn profile_report() {
+    let now = profile_time();
+    let p = &mut *PROFILE.0.get();
+    if now.wrapping_sub(p.last) >= 20_000_000 {
+        report(format_args!("MARS_NET_PROFILE dt={} owned={}/{} tx={}/{} rx={}/{} packets={}/{}\n",
+            now.wrapping_sub(p.last),p.ticks[0],p.calls[0],p.ticks[1],p.calls[1],p.ticks[2],p.calls[2],TX.load(Ordering::Relaxed),RX.load(Ordering::Relaxed)));
+        p.last=now;p.ticks=[0;3];p.calls=[0;3];
+    }
+}
+
 // Installed by the boot hart before publishing secondary harts or devices.
 static LOG: AtomicUsize = AtomicUsize::new(0);
 pub fn install_logger(write: fn(&str)) {
@@ -231,12 +253,16 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     },
     claim,
     tx_owned: || unsafe {
+        let start = profile_time();
         let result = engine().tx_owned();
+        profile_end(0, start);
         snapshot();
         result.expect("Mars EQoS TX fault")
     },
     transmit: |p| unsafe {
+        let start = profile_time();
         let result = engine().transmit(p);
+        profile_end(1, start);
         snapshot();
         result.map_err(|e| {
             if !matches!(e, EngineError::Ring(ring::Error::Full)) {
@@ -246,12 +272,18 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         })
     },
     receive: |out| unsafe {
+        let start = profile_time();
         let result = engine().receive(out);
+        profile_end(2, start);
         snapshot();
         result.expect("Mars EQoS RX fault")
     },
     poll_link: || unsafe {
+        let before = engine().link();
         let result = engine().poll_link();
+        let after = engine().link();
+        if before != after { report(format_args!("MARS_NET_LINK {:?}\n", after)); }
+        profile_report();
         snapshot();
         result.expect("Mars EQoS PHY fault")
     },

@@ -29,7 +29,12 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+#[cfg(not(feature = "tcp-large-window"))]
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
+#[cfg(feature = "tcp-large-window")]
+// Four 256 KiB socket buffers are charged as four 512 KiB allocator
+// blocks. Keep room for metadata and old/new stacks during session rebinding.
+const NETWORK_STACK_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
 #[cfg(feature = "provisioned-ssh")]

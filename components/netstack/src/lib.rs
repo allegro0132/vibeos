@@ -236,6 +236,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
     if interfaces.is_empty() {
         return;
     }
+    let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
 
     loop {
         #[cfg(feature = "tcp-echo-recovery-test")]
@@ -289,7 +290,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
         if live_interfaces == 0 {
             return;
         }
-        if more_work {
+        if poll_budget.runnable(now_ms, more_work) {
             vibeos_core::exec::yield_now().await;
         } else {
             let delay = next_poll_delay_ms.clamp(1, IDLE_POLL_CEILING_MS);
@@ -408,7 +409,7 @@ impl InterfaceTask {
             active_stack.core.ipv4_status(),
         );
         Ok(InterfacePollReport {
-            more_work: report.more_work || frontend_work,
+            more_work: report.more_work || report.ingress_frames != 0 || frontend_work,
             next_poll_delay_ms: report
                 .next_poll_delay_ms
                 .unwrap_or(IDLE_POLL_CEILING_MS)

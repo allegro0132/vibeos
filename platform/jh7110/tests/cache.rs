@@ -41,7 +41,7 @@ fn cache() -> (Cache<Model>, Rc<RefCell<Vec<Event>>>) {
     (c, events)
 }
 #[test]
-fn every_line_uses_full_physical_address_and_following_barrier() {
+fn all_lines_use_full_physical_addresses_between_batch_barriers() {
     let (mut c, e) = cache();
     c.flush(DmaRegion {
         physical: 0x100000000,
@@ -53,39 +53,30 @@ fn every_line_uses_full_physical_address_and_following_barrier() {
         [
             Event::Barrier,
             Event::Write(0x200, 0x100000000),
-            Event::Barrier,
             Event::Write(0x200, 0x100000040),
             Event::Barrier
         ]
     );
 }
 #[test]
-fn every_direction_uses_sdk_clean_invalidate_sequence() {
+fn direction_and_ownership_determine_required_cache_commands() {
     let (mut c, e) = cache();
-    let r = DmaRegion {
-        physical: 0x42000000,
-        bytes: 64,
-    };
-    for d in [
-        DmaDirection::ToDevice,
-        DmaDirection::FromDevice,
-        DmaDirection::Bidirectional,
-    ] {
+    let r = DmaRegion { physical: 0x42000000, bytes: 64 };
+    let flush = [Event::Barrier, Event::Write(0x200, r.physical), Event::Barrier];
+    for d in [DmaDirection::ToDevice, DmaDirection::FromDevice, DmaDirection::Bidirectional] {
+        e.borrow_mut().clear();
         c.for_device(r, d);
+        assert_eq!(*e.borrow(), flush);
+        e.borrow_mut().clear();
         c.for_cpu(r, d);
-    }
-    assert_eq!(e.borrow().len(), 18);
-    for chunk in e.borrow().chunks(3) {
-        assert_eq!(
-            chunk,
-            [
-                Event::Barrier,
-                Event::Write(0x200, 0x42000000),
-                Event::Barrier
-            ]
-        );
+        if d == DmaDirection::ToDevice {
+            assert_eq!(*e.borrow(), [Event::Barrier]);
+        } else {
+            assert_eq!(*e.borrow(), flush);
+        }
     }
 }
+
 #[test]
 fn invalid_span_does_not_round_into_unowned_lines_or_touch_hardware() {
     let (mut c, e) = cache();

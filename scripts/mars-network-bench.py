@@ -46,6 +46,13 @@ def main():
                     result['receiver_bps'] = received.get('bits_per_second')
                     result['received_bytes'] = received.get('bytes')
                     result['received_seconds'] = received.get('seconds')
+                    start = data.get('start', {})
+                    result['tcp_mss'] = start.get('tcp_mss_default')
+                    result['test_parameters'] = start.get('test_start', {})
+                    sent = data.get('end', {}).get('sum_sent', {})
+                    result['sender_bps'] = sent.get('bits_per_second')
+                    # Some servers do not report retransmits. Missing is not zero.
+                    result['sender_retransmits'] = sent.get('retransmits')
                     if (process.returncode or result['error'] or not result['received_bytes']
                             or received.get('seconds', 0) < args.seconds * 0.9):
                         raise RuntimeError('incomplete TCP test; inspect the saved result')

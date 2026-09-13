@@ -60,3 +60,11 @@ opt-level = 3
 
 [profile.release.package.smoltcp]
 opt-level = 3
+
+# Capability frontends and stream pumping are on the same per-packet path.
+[profile.release.package.vibeos-net-api]
+opt-level = 3
+[profile.release.package.vibeos-netstack]
+opt-level = 3
+[profile.release.package.vibeos-iperf3-server]
+opt-level = 3

@@ -19,5 +19,6 @@ pub mod interrupt;
 pub mod ipi;
 pub mod mmu;
 pub mod net;
+pub mod poll_budget;
 pub mod runqueue;
 pub mod sync;

@@ -384,6 +384,7 @@ pub async fn driver_task(
     let mut pending_tx = None;
     let mut tx_deadline = 0;
     let mut link_poll = None;
+    let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(crate::exec::timebase_hz() / 1000, 64);
     loop {
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
@@ -399,8 +400,13 @@ pub async fn driver_task(
             )
         });
         match turn {
-            Ok(true) => crate::exec::yield_now().await,
-            Ok(false) => crate::exec::sleep_ms(1).await,
+            Ok(worked) => {
+                if poll_budget.runnable(crate::sbi::time(), worked) {
+                    crate::exec::yield_now().await;
+                } else {
+                    crate::exec::sleep_ms(1).await;
+                }
+            }
             Err(error) => {
                 crate::println!("  dwmac net driver stopped: {error:?}");
                 return;

@@ -52,3 +52,11 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.cranelift-codegen]
 opt-level = 3
+
+# Packet parsing/checksums and TCP processing are throughput-critical. Keep the
+# rest of the firmware size-optimized while compiling these hot paths for speed.
+[profile.release.package.vibeos-net-protocol]
+opt-level = 3
+
+[profile.release.package.smoltcp]
+opt-level = 3

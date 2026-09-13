@@ -172,3 +172,15 @@ fn invalid_raw_callbacks_cannot_escape_the_admitted_storage() {
         assert!(result.is_err());
     }
 }
+
+#[test]
+fn partial_sync_stays_within_one_buffer_and_whole_cache_lines() {
+    let (mut p, _, _) = pool();
+    let l = p.layout();
+    p.for_device(l.tx_buffers, 64, Direction::ToDevice);
+    p.for_cpu(l.rx_buffers, 128, Direction::FromDevice);
+    for length in [0, 1, 63, 65, 1600] {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            p.for_device(l.tx_buffers, length, Direction::ToDevice))).is_err());
+    }
+}

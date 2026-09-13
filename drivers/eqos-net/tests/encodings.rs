@@ -109,8 +109,10 @@ fn tx_completion_preserves_errors_and_busy_state() {
         d::tx_complete([0, 0, 0, 0x70000000]),
         Err(d::Error::Context)
     );
-    assert_eq!(d::tx_complete([0, 0, 0, 0]), Err(d::Error::Fragmented));
+    assert_eq!(d::tx_complete([0, 0, 0, 0]), Err(d::Error::TxWriteback(0)));
     assert_eq!(d::tx_complete([0, 0, 0, 0x30000000]), Ok(true));
+    assert_eq!(d::tx_complete([0, 0, 0, 0x10000000]), Ok(true));
+    assert_eq!(d::tx_complete([0, 0, 0, 0x10008000]), Err(d::Error::Hardware));
 }
 
 #[test]

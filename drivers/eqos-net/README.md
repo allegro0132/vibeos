@@ -105,3 +105,37 @@ the SDK FLUSH64 sequence through ordered 64-bit MMIO. Host and RV64 models cover
 CPU/physical translation and cache-command calls, but cannot prove L1/L2 or
 multicore visibility. The production firmware must still reserve/admit the
 actual pool and cache-controller DTB resource before attaching the device.
+
+### Mars TX completion and cache spans (2026-09-13)
+
+On the physical Mars, a full-size reverse TCP transfer exposed a TX write-back
+with the submission FIRST flag cleared. Requiring FIRST and LAST during TX
+completion incorrectly returned `Fragmented` and retired the network component.
+TX now requires LAST, checks OWN before reading completion flags, and preserves
+context/error rejection. Unexpected write-back words remain diagnostic errors.
+RX still requires FIRST and LAST because this backend accepts single-frame RX
+buffers only. This follows the completion/submission distinction in Linux's
+[`dwmac4_wrback_get_tx_status`](https://github.com/torvalds/linux/blob/master/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c).
+
+TX publication and RX copying synchronize only the payload prefix rounded up to
+64-byte cache lines. The pool independently rejects empty, unaligned, oversized
+or wrong-slot spans. RX rearming still synchronizes the entire 1536-byte buffer;
+TX reclaim and descriptor/OWN/tail ordering remain unchanged. Model tests cover
+60-, 65- and 1514-byte boundaries and repeated completion/ring wrap without FIRST.
+
+The workspace release profile compiles smoltcp and the protocol adapter with
+`opt-level=3`; other firmware keeps its existing size policy. Firmware diagnostics
+retain non-backpressure TX errors and packet lengths for physical investigations.
+
+To repeat TCP measurements against an already booted board, first obtain its
+actual address with `vsh ip -4 addr show`, then run:
+
+```sh
+python3 scripts/mars-network-bench.py --address "$MARS_IP" --seconds 60 --rounds 3 --output target/mars-network-run
+```
+
+Use a new output directory each time. The script fails on incomplete transfers,
+preserves raw iperf JSON and a summary, and does not treat TCP success as full
+board qualification. The shared TCP stack uses 10-second keepalive probes so an
+idle control socket survives a 60-second data test; an unresponsive peer retains
+the original 30-second timeout. A paired-stack regression verifies both cases.

@@ -267,7 +267,9 @@ impl<B: Backend> Ring<B> {
             return Err(Error::Full);
         }
         self.backend.copy_tx(buffer, packet);
-        self.backend.for_device(buffer, BUFFER, Direction::ToDevice);
+        // Only the copied prefix can be consumed by DMA. Round to isolated
+        // cache lines; keep descriptor ownership publication after this sync.
+        self.backend.for_device(buffer, packet.len().div_ceil(STRIDE) * STRIDE, Direction::ToDevice);
         self.publish(self.layout.desc(false, self.producer), words);
         self.pending += 1;
         self.producer = (self.producer + 1) % self.layout.count;
@@ -285,9 +287,9 @@ impl<B: Backend> Ring<B> {
             return Ok(None);
         }
         let buffer = self.layout.buffer(true, self.receive);
-        self.backend.for_cpu(buffer, BUFFER, Direction::FromDevice);
         let result = match result {
             Ok(Some(bytes)) if bytes <= output.len() => {
+                self.backend.for_cpu(buffer, bytes.div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
                 self.backend.copy_rx(buffer, &mut output[..bytes]);
                 Ok(Some(bytes))
             }

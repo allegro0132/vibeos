@@ -135,7 +135,7 @@ fn both_rings_wrap_repeatedly_without_changing_slot_to_buffer_mapping() {
                 layout().tx_descriptors + (((slot + 1) % 4) * 64) as u64
             ))
         );
-        s.borrow_mut().words.insert((tx, 3), 0x30000000);
+        s.borrow_mut().words.insert((tx, 3), 0x10000000);
         assert_eq!(r.reap(), Ok(1));
         s.borrow_mut().words.insert((rx, 3), 0x30000040);
         assert_eq!(r.receive(&mut [0; 64]), Ok(Some(60)));
@@ -203,7 +203,7 @@ fn transmit_orders_copy_cache_words_own_cache_tail() {
         s.borrow().events,
         vec![
             Event::Tx(b, 60),
-            Event::Device(b, 1536, Direction::ToDevice),
+            Event::Device(b, 64, Direction::ToDevice),
             Event::Word(d, 0, b as u32),
             Event::Word(d, 1, 0),
             Event::Word(d, 2, 60),
@@ -267,7 +267,7 @@ fn receive_uses_private_buffer_mapping_and_rearms_after_copy() {
             Event::Cpu(d, 64, Direction::Bidirectional),
             Event::Barrier,
             Event::Read(d, 3),
-            Event::Cpu(b, 1536, Direction::FromDevice),
+            Event::Cpu(b, 64, Direction::FromDevice),
             Event::Rx(b, 60)
         ]
     );
@@ -356,4 +356,19 @@ fn failed_start_never_admits_packets_and_live_initialize_is_rejected() {
     s.borrow_mut().events.clear();
     assert_eq!(r.initialize(), Err(Error::Controller));
     assert!(s.borrow().events.is_empty());
+}
+
+#[test]
+fn small_packets_sync_only_complete_cache_lines() {
+    for length in [60usize, 65, 1514] {
+        let (mut r, s) = started();
+        r.transmit(&vec![0; length]).unwrap();
+        let span = length.div_ceil(STRIDE) * STRIDE;
+        assert!(s.borrow().events.contains(&Event::Device(layout().tx_buffers, span, Direction::ToDevice)));
+        s.borrow_mut().words.insert((layout().rx_descriptors, 3), 0x30000000 | (length as u32 + 4));
+        r.receive(&mut [0; BUFFER]).unwrap();
+        assert!(s.borrow().events.contains(&Event::Cpu(layout().rx_buffers, span, Direction::FromDevice)));
+        // Full RX buffer remains prepared before returning ownership to DMA.
+        assert!(s.borrow().events.contains(&Event::Device(layout().rx_buffers, BUFFER, Direction::FromDevice)));
+    }
 }

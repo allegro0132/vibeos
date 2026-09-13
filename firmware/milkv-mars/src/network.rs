@@ -238,7 +238,12 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     transmit: |p| unsafe {
         let result = engine().transmit(p);
         snapshot();
-        result.map_err(error)
+        result.map_err(|e| {
+            if !matches!(e, EngineError::Ring(ring::Error::Full)) {
+                report(format_args!("MARS_NET_TX FAIL bytes={} detail={:?}\n", p.len(), e));
+            }
+            error(e)
+        })
     },
     receive: |out| unsafe {
         let result = engine().receive(out);

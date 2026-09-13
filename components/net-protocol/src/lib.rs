@@ -1565,6 +1565,10 @@ fn passive_socket(port: u16) -> tcp::Socket<'static> {
     // one MSS followed by roughly 20 ms of silence.  ACK immediately so
     // the peer can refill the deliberately bounded receive window.
     socket.set_ack_delay(None);
+    // A control connection may carry no application data while its separate
+    // data connection is busy (e.g. a 60-second iperf test). Probe reachability
+    // before the unchanged dead-peer timeout instead of expiring healthy peers.
+    socket.set_keep_alive(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS / 3)));
     socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
     socket
         .listen(port)

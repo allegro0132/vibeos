@@ -144,11 +144,11 @@ impl<C: DmaCache + 'static, const N: usize> Pool<C, N> {
                 self.descriptor(address, 0);
             }
             Direction::ToDevice => {
-                assert_eq!(bytes, BUFFER);
+                assert!(bytes != 0 && bytes <= BUFFER && bytes % STRIDE == 0);
                 self.buffer(address, bytes, false);
             }
             Direction::FromDevice => {
-                assert_eq!(bytes, BUFFER);
+                assert!(bytes != 0 && bytes <= BUFFER && bytes % STRIDE == 0);
                 self.buffer(address, bytes, true);
             }
         }

@@ -15,6 +15,7 @@ pub enum Error {
     InvalidLayout,
     Hardware,
     Fragmented,
+    TxWriteback(u32),
     Context,
 }
 
@@ -61,8 +62,11 @@ pub fn tx_complete(words: [u32; 4]) -> Result<bool, Error> {
     if status & ERROR != 0 {
         return Err(Error::Hardware);
     }
-    if status & (FIRST | LAST) != FIRST | LAST {
-        return Err(Error::Fragmented);
+    // TX read and write-back formats differ. FIRST is a submission flag,
+    // not required by completion (Linux dwmac4_wrback_get_tx_status).
+    // This ring submits one descriptor per frame, so LAST must be present.
+    if status & LAST == 0 {
+        return Err(Error::TxWriteback(status));
     }
     Ok(true)
 }

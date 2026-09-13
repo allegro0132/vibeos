@@ -1167,3 +1167,21 @@ fn raw_tcp_reset_is_terminal_until_a_network_poll_rearms_the_listener() {
     client.poll(now_ms);
     assert!(!client.socket().may_send());
 }
+
+#[test]
+fn idle_control_connection_survives_long_transfer_but_dead_peer_expires() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let start = connect_raw_pair(&mut server, &mut client);
+    for now in (start..start + 75_000).step_by(100) {
+        server.poll_network(now).unwrap();
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        assert_eq!(server.stream_status().state, TcpStreamState::Established);
+    }
+    // No client polling means no probe acknowledgements: keep the original
+    // bounded expiry rather than making idle connections immortal.
+    for now in (start + 75_000..start + 110_000).step_by(100) {
+        server.poll_network(now).unwrap();
+    }
+    assert_ne!(server.stream_status().state, TcpStreamState::Established);
+}

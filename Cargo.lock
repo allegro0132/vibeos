@@ -3096,6 +3096,7 @@ dependencies = [
  "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-storage-device",
+ "vibeos-tcp-probe",
  "vibeos-virtio-protocol",
  "vibeos-vsh",
  "vibeos-wasi-command",
@@ -3267,6 +3268,14 @@ version = "0.1.0"
 [[package]]
 name = "vibeos-storage-device"
 version = "0.1.0"
+
+[[package]]
+name = "vibeos-tcp-probe"
+version = "0.1.0"
+dependencies = [
+ "vibeos-core",
+ "vibeos-net-api",
+]
 
 [[package]]
 name = "vibeos-virtio-protocol"

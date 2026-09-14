@@ -92,6 +92,42 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        #[cfg(feature = "network-profile")]
+        "nprof" => {
+            use vibeos_core::net_profile as p;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                println!("NPROF_START accepted={} window={:?} hz={}",
+                    p::start(seconds, exec::timebase_hz()), p::window(), exec::timebase_hz());
+            } else {
+                let (start, end, width) = p::window();
+                if start == 0 || sbi::time() <= end {
+                    println!("NPROF not ready; arm once with `nprof 60`, then wait until the window ends");
+                    return;
+                }
+                println!("NPROF window={:?} stages={:?} units=timer_ticks queues=[inbound,outbound]", (start,end,width), p::NAMES);
+                for h in 0..exec::MAX_HARTS {
+                    let b = p::snapshot_hart(h);
+                    println!("NPROF_HART h={} ticks={:?} wait={:?} calls={:?}", h,b.ticks,b.wait,b.calls);
+                }
+                #[cfg(all(feature = "packet-network", not(feature = "universal")))]
+                println!("NPROF_LOCK_NAME address={:#x} name=packet-driver-control", crate::dwmac_net::profile_control_address());
+                for h in 0..exec::MAX_HARTS {
+                    for slot in 0..=p::LOCK_SLOTS {
+                        let (address, wait, calls) = p::lock_snapshot(h, slot);
+                        if calls.iter().any(|n| *n != 0) {
+                            println!("NPROF_LOCK h={} address={:#x} wait={:?} calls={:?}", h,address,wait,calls);
+                        }
+                    }
+                }
+                for i in 0..p::BUCKETS {
+                    if start + i as u64 * width >= end { break; }
+                    let b = p::snapshot(i);
+                    println!("NPROF i={} ticks={:?} wait={:?} calls={:?} high={:?} full={:?} dma={:?}",
+                        i,b.ticks,b.wait,b.calls,b.high,b.full,b.dma);
+                }
+                println!("NPROF_END");
+            }
+        }
         "help" => {
             println!("  ps              component identities, lifecycle, and poll counts");
             println!("  spaces          capability spaces in the system");

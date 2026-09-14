@@ -173,6 +173,14 @@ python3 -B scripts/test-universal.py --image target/universal/DIGEST/vibeos.bin
 # For the minimal preset, add --minimal to the smoke test.
 ```
 
+For an SSH/XHCI configuration, add `--ssh --usb` to verify a real credential-free
+OpenSSH handshake, identical public host keys across boots, client key persistence
+and USB keyboard enumeration. The SSH test binds a localhost-only forwarded port.
+`--jitter` tests SSH without a VirtIO RNG. On a virtual timer where collector
+initialization returns `Offline`, use `--jitter --entropy-unavailable` to verify
+that key generation fails closed instead. This environment's QEMU timer took that
+rejection path; no claim of Mars entropy qualification follows from it.
+
 The QEMU smoke test boots an unchanged raw image at `0x80200000` and `0x80400000`,
 checks four online harts, console output, DHCP and file persistence across both
 boots, and records the same SHA-256. It creates only disposable test storage.

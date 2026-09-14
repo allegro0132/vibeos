@@ -311,6 +311,8 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_fast(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "network-profile")]
+        let mut profile_wait = None;
         let mut contended = false;
         loop {
             match self.fast_locked.compare_exchange_weak(
@@ -322,6 +324,8 @@ impl<T> SpinLock<T> {
                 Ok(_) => break,
                 Err(actual) => {
                     if actual && !contended {
+                        #[cfg(feature = "network-profile")]
+                        { profile_wait = crate::net_profile::lock_start(); }
                         contended = true;
                         if self.stats_enabled.load(Ordering::Relaxed) {
                             self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -331,6 +335,8 @@ impl<T> SpinLock<T> {
                 }
             }
         }
+        #[cfg(feature = "network-profile")]
+        crate::net_profile::lock_end_at(profile_wait, contended, self as *const Self as usize);
         if self.stats_enabled.load(Ordering::Relaxed) {
             self.acquisitions.fetch_add(1, Ordering::Relaxed);
         }
@@ -344,6 +350,8 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_recoverable(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "network-profile")]
+        let mut profile_wait = None;
         let mut contended = false;
         let acquiring_token = loop {
             let observed = self.state.load(Ordering::Relaxed);
@@ -368,6 +376,8 @@ impl<T> SpinLock<T> {
                         // A weak CAS may fail spuriously while the same FREE
                         // token remains. Count only an observed non-free phase.
                         if token_phase(actual) != FREE && !contended {
+                            #[cfg(feature = "network-profile")]
+                            { profile_wait = crate::net_profile::lock_start(); }
                             contended = true;
                             if self.stats_enabled.load(Ordering::Relaxed) {
                                 self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -376,6 +386,8 @@ impl<T> SpinLock<T> {
                     }
                 }
             } else if !contended {
+                #[cfg(feature = "network-profile")]
+                { profile_wait = crate::net_profile::lock_start(); }
                 contended = true;
                 if self.stats_enabled.load(Ordering::Relaxed) {
                     self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -384,6 +396,8 @@ impl<T> SpinLock<T> {
             core::hint::spin_loop();
         };
 
+        #[cfg(feature = "network-profile")]
+        crate::net_profile::lock_end_at(profile_wait, contended, self as *const Self as usize);
         let acquisition_hart = current_hart_id();
         let domain = heap::current_domain();
         self.owner.store(domain.owner.get(), Ordering::Relaxed);

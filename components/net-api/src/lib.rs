@@ -278,6 +278,7 @@ impl TcpListener {
         connection: TcpConnectionToken,
         output: &mut [u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         if output.is_empty() {
@@ -315,12 +316,13 @@ impl TcpListener {
         connection: TcpConnectionToken,
         input: &[u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         if input.is_empty() {
             return Ok(TcpIoResult::Progress(0));
         }
-        if !matches!(
+        if inner.close_request.is_some() || !matches!(
             inner.state,
             TcpStreamState::Established | TcpStreamState::PeerClosed
         ) {

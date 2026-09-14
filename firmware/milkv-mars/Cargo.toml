@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+tcp-throughput-probe = ["dep:vibeos-kernel", "vibeos-kernel/tcp-throughput-probe"]
+network-profile = ["dep:vibeos-kernel", "vibeos-kernel/network-profile"]
 # Suppress legacy exports when these source modules are embedded by universal firmware.
 universal = []
 # Qualification experiment: complete IPv4 TX requests; RX stays in software.

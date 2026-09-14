@@ -31,10 +31,15 @@ use crate::{exec, HEAP};
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 #[cfg(not(feature = "tcp-large-window"))]
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
-#[cfg(feature = "tcp-large-window")]
+#[cfg(all(feature = "tcp-large-window", not(feature = "tcp-throughput-probe")))]
 // Four 256 KiB socket buffers are charged as four 512 KiB allocator
 // blocks. Keep room for metadata and old/new stacks during session rebinding.
 const NETWORK_STACK_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
+// Two shared-port sockets plus four exclusive listeners with pending sockets
+// allocate twenty large buffers; rebinding briefly retains both generations.
+// This diagnostic-only budget leaves default images unchanged.
+#[cfg(feature = "tcp-throughput-probe")]
+const NETWORK_STACK_MEMORY_BUDGET: usize = 24 * 1024 * 1024;
 #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
 #[cfg(feature = "provisioned-ssh")]
@@ -159,6 +164,8 @@ enum ComponentTemplate {
     TcpEcho,
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     Iperf3Server,
+    #[cfg(feature = "tcp-throughput-probe")]
+    TcpProbe,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -229,6 +236,8 @@ enum ComponentGrants {
         control: Cap,
         data: Cap,
     },
+    #[cfg(feature = "tcp-throughput-probe")]
+    TcpProbe([Cap; 4]),
     StoreFaultProbe(Cap),
     FaultProbe,
 }
@@ -575,6 +584,8 @@ pub struct World {
     tcp_listener_root: Option<Cap>,
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     iperf_data_listener_root: Option<Cap>,
+    #[cfg(feature = "tcp-throughput-probe")]
+    tcp_probe_roots: Option<[Cap; 4]>,
     #[cfg(any(
         feature = "queued-entropy",
         feature = "milkv-ssh-acceptance",
@@ -1159,6 +1170,16 @@ impl World {
             };
         }
 
+        #[cfg(feature = "tcp-throughput-probe")]
+        if template == ComponentTemplate::TcpProbe {
+            let policy = self.listener_policy().expect("probe policy exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            let rights = Rights::READ.union(Rights::WRITE).union(Rights::RECV).union(Rights::INVOKE);
+            return ComponentGrants::TcpProbe(self.tcp_probe_roots.expect("probe roots exist")
+                .map(|root| cap::grant(&policy, root, rights, &mut target).unwrap()));
+        }
+
         let init = self.spaces["init"].clone();
         let init = init.0.lock();
         let mut target = space.0.lock();
@@ -1219,6 +1240,8 @@ impl World {
             ComponentTemplate::Iperf3Server => {
                 unreachable!("iperf3 grants come from the private policy CSpace")
             }
+            #[cfg(feature = "tcp-throughput-probe")]
+            ComponentTemplate::TcpProbe => unreachable!("probe grants come from private policy"),
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
                     &init,
@@ -1377,6 +1400,11 @@ impl World {
                     &component.name,
                     crate::iperf3_platform::task(space.get(), control, data),
                 )
+            },
+            #[cfg(feature = "tcp-throughput-probe")]
+            ComponentGrants::TcpProbe(listeners) => unsafe {
+                exec::spawn_reclaimable_owned(domain, &component.name,
+                    crate::tcp_probe_platform::task(space.get(), listeners))
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -2084,6 +2112,8 @@ pub fn build() {
         .map(|_| Space::new("tcp-echo-service"));
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf3_app_space = service_policy.as_ref().map(|_| Space::new("iperf3-server"));
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_space = service_policy.as_ref().map(|_| Space::new("tcp-probe"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -2623,6 +2653,18 @@ pub fn build() {
         .expect("the iperf3 data listener policy is valid");
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_roots = service_policy.as_ref().map(|policy_space| {
+        let mut policy = policy_space.0.lock();
+        core::array::from_fn(|index| {
+            let listener = vibeos_net_api::TcpListener::new("tcp-probe",
+                vibeos_net_api::TcpListenerId::new(3 + index as u64).unwrap(),
+                vibeos_tcp_probe::FIRST_PORT + index as u16,
+                vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+                vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES).unwrap();
+            policy.mint(listener, Rights::ALL_VOLATILE)
+        })
+    });
     #[cfg(feature = "queued-entropy")]
     let (rng_mmio_root, rng_dma_root, rng_source_root, rng_grants) =
         match (rng_resources, rng_space.as_ref(), rng_policy.as_ref()) {
@@ -2873,6 +2915,14 @@ pub fn build() {
             Some(listener) => vibeos_netstack::one_tcp_listener(listener),
             None => vibeos_netstack::no_tcp_listeners(),
         };
+        #[cfg(feature = "tcp-throughput-probe")]
+        let listeners = {
+            let mut listeners = listeners;
+            for (slot, root) in listeners[2..6].iter_mut().zip(tcp_probe_roots.expect("probe roots")) {
+                *slot = Some(root);
+            }
+            listeners
+        };
         network_stack_roots.push(NetworkStackRoot {
             location,
             driver: vibeos_hal::boot::platform().network_driver_name,
@@ -3006,6 +3056,13 @@ pub fn build() {
         (None, None, None, None) => None,
         _ => unreachable!("iperf3 app grants exist exactly with both listeners"),
     };
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_grants = tcp_probe_space.as_ref().map(|space| {
+        let policy = service_policy.as_ref().unwrap().0.lock();
+        let mut target = space.0.lock();
+        let rights = Rights::READ.union(Rights::WRITE).union(Rights::RECV).union(Rights::INVOKE);
+        tcp_probe_roots.unwrap().map(|root| cap::grant(&policy, root, rights, &mut target).unwrap())
+    });
     let (
         store_root,
         durable_cspace_root,
@@ -3171,6 +3228,10 @@ pub fn build() {
     if let Some(space) = iperf3_app_space.as_ref() {
         spaces.insert("iperf3-server", space.clone());
     }
+    #[cfg(feature = "tcp-throughput-probe")]
+    if let Some(space) = tcp_probe_space.as_ref() {
+        spaces.insert("tcp-probe", space.clone());
+    }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
     }
@@ -3207,6 +3268,8 @@ pub fn build() {
     let expected_boot_components = expected_boot_components + usize::from(tcp_echo_app_space.is_some());
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let expected_boot_components = expected_boot_components + usize::from(iperf3_app_space.is_some());
+    #[cfg(feature = "tcp-throughput-probe")]
+    let expected_boot_components = expected_boot_components + usize::from(tcp_probe_space.is_some());
     let world = Arc::new(World {
         expected_boot_components,
         spaces,
@@ -3276,6 +3339,8 @@ pub fn build() {
         tcp_listener_root,
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         iperf_data_listener_root,
+        #[cfg(feature = "tcp-throughput-probe")]
+        tcp_probe_roots,
         #[cfg(any(
             feature = "queued-entropy",
             feature = "milkv-ssh-acceptance",
@@ -3483,6 +3548,13 @@ pub fn build() {
             Some(ComponentTemplate::Iperf3Server),
             crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
         );
+    }
+
+    #[cfg(feature = "tcp-throughput-probe")]
+    if let (Some(space), Some(listeners)) = (tcp_probe_space, tcp_probe_grants) {
+        world.spawn_component_inner("tcp-probe", space.clone(), 512 * 1024,
+            Some(ComponentTemplate::TcpProbe),
+            crate::tcp_probe_platform::task(SpaceRef::new(&space).get(), listeners));
     }
 
     *WORLD.lock() = Some(world.clone());

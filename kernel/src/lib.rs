@@ -1010,6 +1010,8 @@ compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-m
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
+#[cfg(feature = "network-profile")]
+pub use vibeos_core::net_profile;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
 #[cfg(any(feature = "queued-block", feature = "queued-network"))]
 pub use vibeos_virtio_protocol as virtio;
@@ -1046,6 +1048,8 @@ mod dev;
 mod durable_cspace;
 #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 mod iperf3_platform;
+#[cfg(feature = "tcp-throughput-probe")]
+mod tcp_probe_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
@@ -1475,7 +1479,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             feature = "wasm-c810-s5-simd-qemu-qualification"
         ))
     ))]
-    match dwc2_host::init() {
+    if platform::info().dwc2.is_some() { match dwc2_host::init() {
         Ok(info) => println!(
             "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
             info.release,
@@ -1489,7 +1493,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             },
         ),
         Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
-    }
+    } }
     #[cfg(all(
         any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(

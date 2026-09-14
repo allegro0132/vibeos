@@ -58,7 +58,9 @@ def analyze(lines):
                 windows[key] = window
         if v[10]:
             d['ack_rtt_ms'].append(float(v[10]) * 1000)
-        if v[11] == '1':
+        syn = (v[11].lower() == 'true' if v[11].lower() in ('true', 'false')
+               else bool(int(v[11] or '0', 0)))
+        if syn:
             d['syn_seen'] = True
         if v[12]:
             d['scale_shifts'].append(int(v[12]))
@@ -83,7 +85,7 @@ def analyze(lines):
                 d['flights'].append(flight)
                 if windows.get(peer, 0) > 0:
                     d['utilization'].append(flight / windows[peer])
-        elif v[11] != '1':
+        elif not syn:
             # Includes FIN/RST/control ACKs; use data-stream directions and
             # inspect raw trace before interpreting this as delayed-ACK time.
             if d['last_ack'] is not None:

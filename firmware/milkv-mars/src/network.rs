@@ -68,7 +68,7 @@ unsafe fn profile_end(kind: usize, start: u64) {
 unsafe fn profile_report() {
     let now = profile_time();
     let p = &mut *PROFILE.0.get();
-    if now.wrapping_sub(p.last) >= 20_000_000 {
+    if !cfg!(feature = "network-profile") && now.wrapping_sub(p.last) >= 20_000_000 {
         report(format_args!(
             "MARS_NET_PROFILE dt={} owned={}/{} tx={}/{} rx={}/{} packets={}/{}\n",
             now.wrapping_sub(p.last),
@@ -100,6 +100,8 @@ impl core::fmt::Write for Output {
     }
 }
 fn report(args: core::fmt::Arguments<'_>) {
+    #[cfg(feature = "network-profile")]
+    if vibeos_kernel::net_profile::active() { return; }
     let address = LOG.load(Ordering::Acquire);
     if address != 0 {
         // Only install_logger writes this slot, and fn pointers live forever.
@@ -364,6 +366,10 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         result.expect("Mars EQoS RX fault")
     },
     poll_link: || unsafe {
+        #[cfg(feature = "network-profile")]
+        if let Some(d) = engine().dma_diagnostics() {
+            vibeos_kernel::net_profile::dma_status(d.dma_status, d.mtl_interrupt);
+        }
         let before = engine().link();
         let result = engine().poll_link();
         let after = engine().link();
@@ -371,7 +377,7 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
             report(format_args!("MARS_NET_LINK {:?}\n", after));
         }
         #[cfg(feature = "rx-status-experiment")]
-        if engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
+        if !cfg!(feature = "network-profile") && engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
             PROFILE_CHECKSUM_LAST = profile_time();
             report(format_args!(
                 "MARS_NET_RX_CHECKSUM {:?}\n",

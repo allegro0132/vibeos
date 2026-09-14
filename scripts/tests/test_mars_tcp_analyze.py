@@ -46,6 +46,21 @@ class TcpAnalysisTests(unittest.TestCase):
         self.assertEqual(result['ack_rtt_ms']['max'], 2)
         self.assertFalse(result['syn_seen'])
 
+    def test_tshark_hex_syn_is_recognized(self):
+        result = module.analyze([row(**{'frame.time_epoch': 1, 'tcp.stream': 0,
+            'ip.src': 'a', 'tcp.srcport': 1, 'ip.dst': 'b', 'tcp.dstport': 2,
+            'tcp.flags.syn': '0x00000001', 'tcp.options.wscale.shift': 3})])[0]
+        self.assertTrue(result['syn_seen'])
+        self.assertEqual(result['scale_shifts'], [3])
+        self.assertIsNone(result['last_ack'])
+
+    def test_tshark_boolean_syn_is_recognized(self):
+        for value, expected in [('True', True), ('False', False)]:
+            result = module.analyze([row(**{'frame.time_epoch': 1, 'tcp.stream': 0,
+                'ip.src': 'a', 'tcp.srcport': 1, 'ip.dst': 'b', 'tcp.dstport': 2,
+                'tcp.flags.syn': value})])[0]
+            self.assertEqual(result['syn_seen'], expected)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -6,18 +6,20 @@ import subprocess
 from universal_artifacts import load_manifest
 
 
-def command(manifest, image):
+def command(manifest, image, prepare_disk=True):
     features = set(manifest['features'])
     args = ['qemu-system-riscv64', '-machine', 'virt', '-cpu', 'rv64', '-smp', '4', '-m', '128M',
             '-nographic', '-bios', 'default', '-kernel', str(image), '-global', 'virtio-mmio.force-legacy=false']
     if 'driver-virtio-blk' in features:
         disk = image.parent / 'qemu-data.raw'
-        try:
-            with disk.open('xb') as stream:
-                stream.truncate(128 * 1024 * 1024)
-        except FileExistsError:
-            if disk.stat().st_size != 128 * 1024 * 1024:
-                raise ValueError('existing QEMU data disk must be 128 MiB')
+        if prepare_disk:
+            try:
+                with disk.open('xb') as stream:
+                    stream.truncate(128 * 1024 * 1024)
+            except FileExistsError:
+                pass
+        if disk.exists() and disk.stat().st_size != 128 * 1024 * 1024:
+            raise ValueError('existing QEMU data disk must be 128 MiB')
         args += ['-drive', f'if=none,id=data,format=raw,file={disk}', '-device',
                  'virtio-blk-device,drive=data,bus=virtio-mmio-bus.0,queue-size=8']
     if 'driver-virtio-net' in features:
@@ -35,7 +37,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     manifest, image = load_manifest(args.manifest, 'qemu-virt')
-    qemu = command(manifest, image)
+    qemu = command(manifest, image, prepare_disk=not args.dry_run)
     if args.dry_run:
         import shlex
         print(shlex.join(qemu))

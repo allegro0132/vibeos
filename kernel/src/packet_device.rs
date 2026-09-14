@@ -22,9 +22,11 @@ impl Engine {
         unsafe { (device().tx_owned)() }
     }
     pub fn transmit(&mut self, packet: &[u8]) -> Result<(), Error> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Tx);
         unsafe { (device().transmit)(packet) }
     }
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Rx);
         unsafe { (device().receive)(output) }
     }
     pub fn poll_link(&mut self) {

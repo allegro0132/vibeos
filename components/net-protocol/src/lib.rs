@@ -876,6 +876,7 @@ impl SharedIpv4TcpStack {
         listener: TcpListenerHandle,
         frontend: &TcpListener,
     ) -> Result<TcpFrontendDriveReport, TcpFrontendDriveError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         if self.tcp_listener_port(listener)? != frontend.port() {
             return Err(TcpFrontendDriveError::QueueInvariant);
         }
@@ -938,15 +939,22 @@ impl SharedIpv4TcpStack {
         if let Some(request) = frontend.close_request() {
             match request {
                 TcpCloseRequest::Close => {
+                    // A socket close drains only its own TX ring. The capability
+                    // frontend can still hold bytes behind transport backpressure.
+                    if frontend.snapshot().queued_send_bytes != 0 {
+                        return Ok(report);
+                    }
                     self.tcp_close(listener)?;
                 }
                 TcpCloseRequest::Reset => {
                     self.tcp_reset(listener)?;
                 }
             }
+            // Publish the non-writable state before lifting the pending-close
+            // barrier, so another hart cannot append bytes in that interval.
+            frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
             frontend.clear_close_request(request);
             report.close_applied = Some(request);
-            frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
         }
 
         Ok(report)

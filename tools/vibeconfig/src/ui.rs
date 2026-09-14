@@ -252,7 +252,14 @@ pub fn run(root: &Path, c: &Catalog, config: Config, path: &Path) -> Result<()> 
 fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path) {
     let area = f.area();
     if area.width < 60 || area.height < 15 {
-        f.render_widget(Paragraph::new("VibeOS Configurator\nResize the terminal to at least 60 x 15.\nSelection preserved; Ctrl-S saves, q quits.").wrap(Wrap { trim: false }), area);
+        let message = if app.confirm_exit {
+            "VibeOS Configurator\nDiscard unsaved changes? y discard / n return"
+        } else if app.confirm_preset.is_some() {
+            "VibeOS Configurator\nReplace selection with preset? y load / n return"
+        } else {
+            "VibeOS Configurator\nResize the terminal to at least 60 x 15.\nSelection preserved; Ctrl-S saves, q quits."
+        };
+        f.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
         return;
     }
     let rows = Layout::default()

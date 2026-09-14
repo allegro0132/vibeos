@@ -63,9 +63,11 @@ impl<T: Send + 'static> Endpoint<T> {
     pub fn try_send(&self, msg: T) -> Result<(), T> {
         let mut i = self.inner.lock();
         if i.queue.len() >= self.bound {
+            crate::net_profile::queue(&self.name, i.queue.len(), true);
             return Err(msg);
         }
         i.queue.push_back(msg);
+        crate::net_profile::queue(&self.name, i.queue.len(), false);
         i.sent += 1;
         drop(i);
         self.on_message.wake_all();

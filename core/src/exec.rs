@@ -6385,6 +6385,7 @@ impl Drop for ProfileTurn {
     }
 }
 fn poll_once_on(hart: HartId) -> bool {
+    let _network_executor = crate::net_profile::Scope::enter(crate::net_profile::Stage::Executor);
     #[cfg(feature = "executor-profile")]
     let _profile = ProfileTurn { hart, start: arch::time() };
     debug_assert_eq!(
@@ -6551,6 +6552,7 @@ fn poll_once_on(hart: HartId) -> bool {
     check_active_poll!(id, task.domain, &status);
     #[cfg(feature = "executor-profile")]
     let profile_start = arch::time();
+    let network_task = crate::net_profile::Scope::task(&task.name);
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -6570,6 +6572,7 @@ fn poll_once_on(hart: HartId) -> bool {
             false
         }
     };
+    drop(network_task);
     #[cfg(feature = "executor-profile")]
     status.poll_ticks.fetch_add(arch::time().wrapping_sub(profile_start), Ordering::Relaxed);
     // `run_guarded` may have returned through a longjmp, which bypasses Drop

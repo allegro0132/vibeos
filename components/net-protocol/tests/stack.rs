@@ -1309,3 +1309,123 @@ fn icmp_echo_preserves_changing_payloads_and_rejects_bad_checksums() {
         assert!(outbound.try_recv().is_none());
     }
 }
+
+#[test]
+fn graceful_frontend_close_drains_bytes_behind_full_transport() {
+    frontend_shutdown_behind_full_transport(false);
+}
+
+#[test]
+fn frontend_reset_does_not_wait_for_queued_payload() {
+    frontend_shutdown_behind_full_transport(true);
+}
+
+fn frontend_shutdown_behind_full_transport(reset: bool) {
+    let to_server = Endpoint::new("close-in", 128);
+    let to_client = Endpoint::new("close-out", 128);
+    let mut space = CSpace::new("close-drain");
+    let (_, server_in) = authority(&mut space, &to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &to_server, Rights::SEND);
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server = SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let socket = server.add_tcp_listener(SERVER_PORT).unwrap();
+    let frontend = TcpListener::new("close", TcpListenerId::new(1).unwrap(), SERVER_PORT, 65536, 65536).unwrap();
+    let mut client = TestClient::new(client_in, client_out);
+    let mut connection = None;
+    let mut now = 0;
+    while connection.is_none() && now < 1000 {
+        client.poll(now); server.poll_network(now).unwrap();
+        server.drive_tcp_frontend(socket, &frontend).unwrap();
+        connection = frontend.try_accept(); now += 1;
+    }
+    let connection = connection.expect("connected");
+    let expected: Vec<u8> = (0..TCP_BUFFER_BYTES + 10037).map(|i| (i * 37 + i / 251) as u8).collect();
+    let mut queued = 0;
+    while queued < TCP_BUFFER_BYTES {
+        match server.tcp_try_send(socket, &expected[queued..TCP_BUFFER_BYTES]).unwrap() {
+            TcpIoResult::Progress(n) if n > 0 => queued += n,
+            other => panic!("could not fill socket: {other:?}"),
+        }
+    }
+    assert_eq!(frontend.try_send(connection, &expected[queued..]).unwrap(), TcpIoResult::Progress(10037));
+    if reset {
+        frontend.request_reset(connection).unwrap();
+        let report = server.drive_tcp_frontend(socket, &frontend).unwrap();
+        assert_eq!(report.close_applied, Some(vibeos_net_api::TcpCloseRequest::Reset));
+        assert_eq!(frontend.snapshot().queued_send_bytes, 0);
+        return;
+    }
+    frontend.request_close(connection).unwrap();
+    let report = server.drive_tcp_frontend(socket, &frontend).unwrap();
+    assert_eq!(report.close_applied, None, "close must wait for frontend bytes behind a full socket");
+    assert_eq!(frontend.try_send(connection, b"late"), Ok(TcpIoResult::Closed));
+    let mut received = Vec::new();
+    let mut scratch = [0; 997];
+    for tick in now..now + 10000 {
+        client.poll(tick); server.poll_network(tick).unwrap();
+        server.drive_tcp_frontend(socket, &frontend).unwrap();
+        if client.socket().can_recv() {
+            let n = client.socket().recv_slice(&mut scratch).unwrap();
+            received.extend_from_slice(&scratch[..n]);
+        }
+        if !client.socket().may_recv() && !client.socket().can_recv() { break; }
+    }
+    assert_eq!(received, expected);
+    assert!(!client.socket().may_recv(), "FIN must follow all payload bytes");
+}
+
+// Characterizes why a successful TCP connect is not a service-ready timestamp.
+// Keep old and new tuples separate while the active closer retains TIME-WAIT.
+#[test]
+fn pending_handshake_can_precede_application_admission_during_time_wait() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now = connect_raw_pair(&mut server, &mut client);
+    server.close().unwrap();
+    for _ in 0..200 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+        if client.socket().state() == tcp::State::CloseWait { break; }
+    }
+    assert_eq!(client.socket().state(), tcp::State::CloseWait);
+    client.socket().close();
+    for _ in 0..200 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::Closing);
+    let prior = now;
+    now += 2000; // same inter-test pause used by the physical probe
+    let next = client.open_connection(49_153);
+    let opened = now;
+    for _ in 0..200 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+        if client.socket_by_handle(next).may_send() { break; }
+    }
+    assert!(client.socket_by_handle(next).may_send());
+    assert_eq!(server.stream_status().state, TcpStreamState::Closing);
+    client.socket_by_handle(next).send_slice(b"next request").unwrap();
+    let handshake = now;
+    let mut admitted = None;
+    for _ in 0..12000 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+        if server.stream_status().state == TcpStreamState::Established {
+            admitted = Some(now);
+            break;
+        }
+    }
+    let admitted = admitted.expect("successor eventually admitted");
+    let mut payload = [0; 64];
+    assert_eq!(server.try_recv(&mut payload).unwrap(), TcpIoResult::Progress(12));
+    assert_eq!(&payload[..12], b"next request");
+    assert!(admitted > handshake, "wire handshake and application admission are separate events");
+    println!("pending admission model: handshake={} ms, application wait={} ms, since prior-close observation={} ms",
+        handshake-opened, admitted-handshake, admitted-prior);
+}

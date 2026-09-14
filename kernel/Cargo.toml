@@ -5,6 +5,7 @@ edition = "2021"
 autobins = false
 
 [features]
+network-profile = ["vibeos-core/network-profile"]
 universal-pci-usb = ["vibeos-vsh/pci-usb-help"]
 universal-dwc2 = []
 universal-python = ["python-command", "vibeos-wasi-runtime/python-duo"]
@@ -96,6 +97,7 @@ iperf3-server = [
     "vibeos-vsh/network",
 ]
 # Reusable iperf3 TCP server with DHCP configuration.
+tcp-throughput-probe = ["dhcp-iperf3-server", "tcp-large-window", "dep:vibeos-tcp-probe"]
 dhcp-iperf3-server = [
     "dep:vibeos-iperf3-server",
     "dep:vibeos-net-api",
@@ -579,6 +581,7 @@ vibeos-storage-device = { path = "../storage-device" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-file-store = { path = "../services/file-store", optional = true }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
+vibeos-tcp-probe = { path = "../components/tcp-probe", optional = true }
 vibeos-iperf3-server = { path = "../components/iperf3-server", optional = true }
 vibeos-net-api = { path = "../components/net-api", optional = true }
 vibeos-net-echo = { path = "../components/net-echo", optional = true }

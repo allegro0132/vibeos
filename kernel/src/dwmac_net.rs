@@ -338,6 +338,9 @@ static CONTROL: SpinLock<Control> = SpinLock::new_recoverable(Control {
     active_stack_domain: None,
     tx_inflight: false,
 });
+#[cfg(feature = "network-profile")]
+pub fn profile_control_address() -> usize { &CONTROL as *const _ as usize }
+
 static STALE_INGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
 static STALE_EGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
 static STALE_EGRESS_DEVICE_EPOCH_DROPS: AtomicU64 = AtomicU64::new(0);

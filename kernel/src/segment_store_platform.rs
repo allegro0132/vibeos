@@ -1228,6 +1228,18 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 ) => FileError::Conflict,
                 _ => FileError::ServiceUnavailable,
             });
+            if result.is_ok() {
+                // File-tree root publication relocates the authority snapshot
+                // without changing its logical journal. Keep the object-store
+                // facade on that exact checkpoint before releasing the epoch.
+                let view = poll_as_system(recover_recognized_persistent_authority(
+                    operation.store(),
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                .map_err(|_| FileError::ServiceUnavailable)?;
+                self.runtime.publish_authority(view);
+            }
             operation.finish();
             result
         })
@@ -2288,6 +2300,18 @@ impl StorageV2Runtime {
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
                 .map_err(|_| V2RuntimeError::Corrupt)?;
+            // Growth advances the physical checkpoint even though the logical
+            // authority stream is unchanged. Publish a fresh generation witness
+            // before an ordinary object append captures its predecessor.
+            if self.authority_view().is_some() {
+                let view = poll_as_system(recover_recognized_persistent_authority(
+                    operation.store(),
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                .map_err(|_| V2RuntimeError::Corrupt)?;
+                self.publish_authority(view);
+            }
         } else {
             // Growth is exhausted: reclaim dead space now, while enough free
             // segments remain for the collector's relocation targets. Each

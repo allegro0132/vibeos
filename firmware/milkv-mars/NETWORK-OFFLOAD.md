@@ -492,3 +492,43 @@ The remaining runtime connection is firmware policy creation/grants plus the
 hardware consumer's pending-ticket handling, session-barrier checks, success-only
 release, and recovery/normal teardown hooks. No new firmware was booted and no new
 physical throughput is claimed. The running board remains the previous baseline.
+
+
+## Direct TSO runtime and main-based submodule (2026-09-14)
+
+The runtime integration supersedes the incomplete producer checkpoints above.
+The firmware now creates the opt-in pooled FIFO; the hardware consumer validates
+session stamps, retains whole requests under backpressure, releases slots only
+after copying into driver-owned DMA buffers, and retires slots on teardown/recovery.
+
+On the earlier 0.13.1 baseline, FIT SHA-256
+`9c30117067db63acede5954952d3ad1ccaf3c355697e2780d87c46a5e8f7f46a`
+achieved 920.18 and 925.13 Mbps TX and 603.09 and 603.60 Mbps RX in two
+20-second rounds at MTU 1500. A separate 64 MiB constant-byte transfer verified
+all bytes and full TCP sequence coverage, with no bad IP/TCP checksums or oversized
+wire frames. This is limited integrity evidence, not a long-duration qualification.
+TX profiling still recorded about 4.86 seconds of packet-driver-control lock wait.
+Two high-load cores remain an efficiency problem; elapsed timer ticks are not CPU
+cycles. The status-snapshot follow-up image was built but not booted in this step.
+
+`vendor/smoltcp` is now a submodule of
+https://github.com/allegro0132/smoltcp, branch `codex/vibeos-tcp-segmentation`,
+based directly on main `efcba2efc87b6dcc8a2953de5768dbcc83b8fac6`.
+The gitlink pins the exact patch commit. Initialize it after checkout with:
+
+```sh
+git submodule update --init --recursive
+```
+
+This updates the dependency to smoltcp 0.14.0. The port retains upstream generic
+segmentation offload and congestion-window accounting. Validation: 381 IPv4
+smoltcp tests, 34 VibeOS protocol tests and 3 bounded-GRO tests pass; the Mars
+RISC-V check with direct TSO, status snapshots and bounded GRO also passes.
+Enabling upstream generic segmentation, IPv6, multicast and Reno together yields
+482 passes and one failure in `test_segmentation_offload`; that failure reproduces
+on unmodified main. Minimal generic-offload feature combinations also expose
+upstream IPv6/multicast test gating issues. These are not reported as passing.
+Evidence is under `target/mars-reference/20260914-smoltcp-main-*.log`.
+
+The main-based port has not yet been physically benchmarked. The preceding
+920–925 Mbps measurements must not be attributed to this new submodule revision.

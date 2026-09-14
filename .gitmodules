@@ -6,3 +6,7 @@
 	path = vendor/jitterentropy-rs
 	url = https://github.com/qnfm/jitterentropy-rs.git
 	ignore = dirty
+[submodule "vendor/smoltcp"]
+	path = vendor/smoltcp
+	url = https://github.com/allegro0132/smoltcp
+	branch = codex/vibeos-tcp-segmentation

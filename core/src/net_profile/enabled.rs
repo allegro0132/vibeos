@@ -1,9 +1,9 @@
-use super::Stage;
+use super::{Stage, STAGE_COUNT};
 use crate::{arch, exec::MAX_HARTS};
 use core::{marker::PhantomData, sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*}};
 
 pub const BUCKETS: usize = 600;
-const OFF: usize = 8;
+const OFF: usize = STAGE_COUNT;
 static START: AtomicU64 = AtomicU64::new(0);
 static END: AtomicU64 = AtomicU64::new(0);
 static WIDTH: AtomicU64 = AtomicU64::new(0);
@@ -16,15 +16,15 @@ static LOCAL: [Local; MAX_HARTS] = [const { Local {
 
 #[repr(align(64))]
 struct Bucket {
-    ticks: [AtomicU64; 8], wait: [AtomicU64; 8], calls: [AtomicU64; 8],
+    ticks: [AtomicU64; STAGE_COUNT], wait: [AtomicU64; STAGE_COUNT], calls: [AtomicU64; STAGE_COUNT],
     high: [AtomicU64; 2], full: [AtomicU64; 2],
     dma: [AtomicU64; 3],
 }
 impl Bucket {
     const fn new() -> Self { Self {
-        ticks: [const { AtomicU64::new(0) }; 8],
-        wait: [const { AtomicU64::new(0) }; 8],
-        calls: [const { AtomicU64::new(0) }; 8],
+        ticks: [const { AtomicU64::new(0) }; STAGE_COUNT],
+        wait: [const { AtomicU64::new(0) }; STAGE_COUNT],
+        calls: [const { AtomicU64::new(0) }; STAGE_COUNT],
         high: [const { AtomicU64::new(0) }; 2],
         full: [const { AtomicU64::new(0) }; 2],
         dma: [const { AtomicU64::new(0) }; 3],
@@ -151,7 +151,7 @@ pub fn queue(name: &str, depth: usize, full: bool) {
     }
 }
 pub struct Snapshot {
-    pub ticks: [u64; 8], pub wait: [u64; 8], pub calls: [u64; 8],
+    pub ticks: [u64; STAGE_COUNT], pub wait: [u64; STAGE_COUNT], pub calls: [u64; STAGE_COUNT],
     pub high: [u64; 2], pub full: [u64; 2],
     pub dma: [u64; 3],
 }
@@ -166,10 +166,10 @@ pub fn snapshot_hart(index: usize) -> Snapshot {
     total
 }
 fn empty_snapshot() -> Snapshot {
-    Snapshot { ticks: [0;8], wait: [0;8], calls: [0;8], high: [0;2], full: [0;2], dma: [0;3] }
+    Snapshot { ticks: [0; STAGE_COUNT], wait: [0; STAGE_COUNT], calls: [0; STAGE_COUNT], high: [0;2], full: [0;2], dma: [0;3] }
 }
 fn merge(total: &mut Snapshot, b: Snapshot) {
-    for i in 0..8 { total.ticks[i] += b.ticks[i]; total.wait[i] += b.wait[i]; total.calls[i] += b.calls[i]; }
+    for i in 0..STAGE_COUNT { total.ticks[i] += b.ticks[i]; total.wait[i] += b.wait[i]; total.calls[i] += b.calls[i]; }
     for i in 0..2 { total.high[i] = total.high[i].max(b.high[i]); total.full[i] += b.full[i]; }
     total.dma[0] += b.dma[0]; total.dma[1] |= b.dma[1]; total.dma[2] |= b.dma[2];
 }
@@ -190,10 +190,10 @@ fn read_bucket(b: &Bucket) -> Snapshot {
 // aggregate by address; do not interpret them as permanent resource identities.
 pub const LOCK_SLOTS: usize = 64;
 #[repr(align(64))]
-struct LockRecord { address: AtomicUsize, wait: [AtomicU64; 8], calls: [AtomicU64; 8] }
+struct LockRecord { address: AtomicUsize, wait: [AtomicU64; STAGE_COUNT], calls: [AtomicU64; STAGE_COUNT] }
 impl LockRecord { const fn new() -> Self { Self {
-    address: AtomicUsize::new(0), wait: [const {AtomicU64::new(0)};8],
-    calls: [const {AtomicU64::new(0)};8],
+    address: AtomicUsize::new(0), wait: [const {AtomicU64::new(0)}; STAGE_COUNT],
+    calls: [const {AtomicU64::new(0)}; STAGE_COUNT],
 } } }
 static LOCKS: [[LockRecord; LOCK_SLOTS + 1]; MAX_HARTS] =
     [const { [const {LockRecord::new()}; LOCK_SLOTS + 1] }; MAX_HARTS];
@@ -212,7 +212,7 @@ fn record_lock(h: usize, stage: usize, address: usize, ticks: u64) {
     LOCKS[h][slot].wait[stage].fetch_add(ticks, Relaxed);
     LOCKS[h][slot].calls[stage].fetch_add(1, Relaxed);
 }
-pub fn lock_snapshot(hart: usize, slot: usize) -> (usize, [u64;8], [u64;8]) {
+pub fn lock_snapshot(hart: usize, slot: usize) -> (usize, [u64; STAGE_COUNT], [u64; STAGE_COUNT]) {
     let entry = &LOCKS[hart][slot];
     (entry.address.load(Relaxed), core::array::from_fn(|i| entry.wait[i].load(Relaxed)),
      core::array::from_fn(|i| entry.calls[i].load(Relaxed)))

@@ -139,3 +139,13 @@ preserves raw iperf JSON and a summary, and does not treat TCP success as full
 board qualification. The shared TCP stack uses 10-second keepalive probes so an
 idle control socket survives a 60-second data test; an unresponsive peer retains
 the original 30-second timeout. A paired-stack regression verifies both cases.
+
+### Experimental segmentation path
+
+`Ring::transmit_tso(tso::Request)` submits a bounded logical IPv4/TCP data packet
+as an atomically reserved context/header/payload group. `set_tso(true)` is only
+allowed while stopped and requires capability/configuration/readback admission.
+It is off by default and is not yet connected to VibeOS packet capabilities.
+The header has its own descriptor; address word 1 remains zero. Partial group
+completion never releases payload storage. See the Mars `NETWORK-OFFLOAD.md`
+checkpoint for qualification gaps; host models do not establish working TSO DMA.

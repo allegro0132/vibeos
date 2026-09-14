@@ -140,6 +140,11 @@ impl<P: MdioPort> Yt8531<P> {
     /// Advertise full-duplex 10/100/1000 only, with pause disabled to match the
     /// first EQoS datapath. Negotiation is asynchronous, observed by poll_link.
     pub fn initialize(&mut self, tuning: Tuning, reset_reads: u32) -> Result<(), Error> {
+        self.initialize_with_symmetric_pause(tuning, reset_reads, false)
+    }
+    /// MAC must be stopped. Symmetric pause is advertised only when the caller
+    /// can configure both MAC directions after negotiation. Legacy default is off.
+    pub fn initialize_with_symmetric_pause(&mut self, tuning: Tuning, reset_reads: u32, pause: bool) -> Result<(), Error> {
         if !tuning.valid() || reset_reads == 0 || reset_reads > 10_000 {
             return Err(Error::InvalidConfig);
         }
@@ -175,9 +180,10 @@ impl<P: MdioPort> Yt8531<P> {
                 | u16::from(tuning.tx_delay_fe) << 4
                 | u16::from(tuning.tx_delay),
         )?;
-        self.write(4, 0x0141)?;
+        let advertisement = 0x0141 | if pause { 1 << 10 } else { 0 };
+        self.write(4, advertisement)?;
         self.write(9, 0x0200)?;
-        if self.read(4)? != 0x0141 || self.read(9)? != 0x0200 {
+        if self.read(4)? != advertisement || self.read(9)? != 0x0200 {
             return Err(Error::Readback);
         }
         self.write(0, 0x1200)?;
@@ -196,6 +202,12 @@ impl<P: MdioPort> Yt8531<P> {
             self.last_link = None;
         }
         result
+    }
+    /// Read local/partner Clause-22 advertisements without restarting
+    /// negotiation or changing the PHY's configured pause policy.
+    pub fn advertisements(&mut self) -> Result<(u16, u16), Error> {
+        self.tuning.ok_or(Error::NotReady)?;
+        Ok((self.read(4)?, self.read(5)?))
     }
     /// MAC/DMA must be stopped by the caller. Confirm the candidate still holds,
     /// program the speed-specific TX inversion, then recheck before returning

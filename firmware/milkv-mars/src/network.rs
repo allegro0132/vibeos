@@ -173,6 +173,25 @@ unsafe fn snapshot() {
         LINK.store(false, Ordering::Release);
     }
 }
+
+#[cfg(feature = "network-tx-audit")]
+unsafe fn service_tx_audit() {
+    use vibeos_kernel::net_tx_audit as a;
+    let Some(request) = a::pending_hardware_request() else { return; };
+    // Called under exclusive HAL engine ownership, immediately after reaping
+    // TX descriptors. MMC access stays inside the controller driver.
+    let e = engine();
+    let mut values = [0, e.tx_packets, e.pending_tx() as u64, 0, 0, 0, 0, 0, 0, 65536, 65536];
+    if let Some(m) = e.mmc_tx_counters() {
+        values = [1, e.tx_packets, e.pending_tx() as u64, m.control as u64,
+            m.frames_good_bad as u64, m.frames_good as u64, m.underflow as u64,
+            m.carrier_error as u64, m.pause as u64, 65536, 65536];
+    }
+    if let Ok((local, partner)) = e.advertisements() {
+        values[9] = local as u64; values[10] = partner as u64;
+    }
+    a::publish_hardware(request, values);
+}
 fn error(e: EngineError) -> Error {
     match e {
         EngineError::Ring(ring::Error::Full) => Error::QueueFull,
@@ -181,6 +200,8 @@ fn error(e: EngineError) -> Error {
     }
 }
 unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
+    #[cfg(feature = "tso-experiment")]
+    vibeos_kernel::net_tso_probe::invalidate();
     CLAIMED
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .map_err(|e| failed("ownership", e, Error::Busy))?;
@@ -245,7 +266,7 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             .map_err(|e| failed("phy-probe", e, Error::TimedOut))?;
         report(format_args!("MARS_NET_INIT phy={:?}\n", phy.identity()));
         let p = r.phy;
-        phy.initialize(
+        phy.initialize_with_symmetric_pause(
             Tuning {
                 drive: [p.drive[0] as u8, p.drive[1] as u8, p.drive[2] as u8],
                 rxc_delay_enabled: p.rxc_delay_enabled,
@@ -255,6 +276,7 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
                 tx_inverted: p.tx_inverted,
             },
             10_000,
+            cfg!(feature = "symmetric-pause-experiment"),
         )
         .map_err(|e| failed("phy-init", e, Error::TimedOut))?;
         let cache = cache::Cache::new(
@@ -314,6 +336,35 @@ unsafe fn retire() -> bool {
     }
     stopped
 }
+// Only the exclusively authorized driver borrows this fixed diagnostic scratch.
+// It is never handed directly to DMA and consumes no component heap quota.
+#[cfg(feature = "tso-experiment")]
+struct ProbeBuffer(UnsafeCell<[u8;32768]>);
+#[cfg(feature = "tso-experiment")]
+unsafe impl Sync for ProbeBuffer {}
+#[cfg(feature = "tso-experiment")]
+static PROBE_BUFFER:ProbeBuffer=ProbeBuffer(UnsafeCell::new([0;32768]));
+#[cfg(feature = "tso-experiment")]
+unsafe fn service_tso_probe() {
+    use vibeos_kernel::net_tso_probe as probe;
+    if probe::state()==6 {probe::finish(true);return;}
+    let Some(r)=probe::take() else {return;};
+    let buffer = &mut *PROBE_BUFFER.0.get();
+    let p = &mut buffer[..54+r.payload];
+    p.fill(0);
+    p[..6].copy_from_slice(&r.dst_mac);p[6..12].copy_from_slice(&r.src_mac);
+    p[12..14].copy_from_slice(&[8,0]);p[14]=0x45;
+    p[16..18].copy_from_slice(&((40+r.payload) as u16).to_be_bytes());
+    p[18..20].copy_from_slice(&0x6000u16.to_be_bytes());p[20]=0x40;p[22]=64;p[23]=6;
+    p[26..30].copy_from_slice(&r.src_ip);p[30..34].copy_from_slice(&r.dst_ip);
+    p[34..36].copy_from_slice(&5304u16.to_be_bytes());p[36..38].copy_from_slice(&5305u16.to_be_bytes());
+    p[38..42].copy_from_slice(&0x1000_0000u32.to_be_bytes());p[46]=0x50;p[47]=0x18;p[48]=0x7f;
+    for (i,b) in p[54..].iter_mut().enumerate(){*b=((i*17+i/251)%253) as u8;}
+    let request=vibeos_hal::tcp_segmentation::TcpSegments::new(&p,r.mss).unwrap();
+    if let Err(error)=engine().transmit_segments(request) {
+        report(format_args!("NTSO_DRIVER_FAIL {:?}\n",error));probe::finish(false);
+    } else {probe::submitted();}
+}
 #[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
     present: true,
@@ -335,6 +386,10 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     tx_owned: || unsafe {
         let start = profile_time();
         let result = engine().tx_owned();
+        #[cfg(feature = "tso-experiment")]
+        if matches!(result,Ok(false)) { service_tso_probe(); }
+        #[cfg(feature = "network-tx-audit")]
+        service_tx_audit();
         profile_end(0, start);
         snapshot();
         result.expect("Mars EQoS TX fault")
@@ -358,6 +413,19 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
             error(e)
         })
     },
+    segmentation: {
+        #[cfg(feature = "tso-experiment")]
+        { Some(vibeos_hal::network::Segmentation {
+            max_packet_bytes: vibeos_hal::tcp_segmentation::MAX_LOGICAL_PACKET,
+            min_mss: 64,
+            transmit: |request| unsafe {
+                let result=engine().transmit_segments(request);
+                snapshot();result.map_err(error)
+            },
+        }) }
+        #[cfg(not(feature = "tso-experiment"))]
+        { None }
+    },
     receive: |out| unsafe {
         let start = profile_time();
         let result = engine().receive(out);
@@ -375,6 +443,8 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         let after = engine().link();
         if before != after {
             report(format_args!("MARS_NET_LINK {:?}\n", after));
+            #[cfg(feature = "symmetric-pause-experiment")]
+            report(format_args!("MARS_FLOW_CONFIG {:?}\n", engine().flow_diagnostics()));
         }
         #[cfg(feature = "rx-status-experiment")]
         if !cfg!(feature = "network-profile") && engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
@@ -402,6 +472,8 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         }
         profile_report();
         snapshot();
+        #[cfg(feature = "symmetric-pause-experiment")]
+        if result.is_err() { report(format_args!("MARS_FLOW_REJECT {:?}\n", engine().flow_diagnostics())); }
         result.expect("Mars EQoS PHY fault")
     },
     shutdown: retire,

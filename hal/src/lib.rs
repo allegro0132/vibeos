@@ -337,3 +337,5 @@ pub mod usb_polling;
 pub mod device_transport;
 
 pub mod runtime_platform;
+
+pub mod tcp_segmentation;

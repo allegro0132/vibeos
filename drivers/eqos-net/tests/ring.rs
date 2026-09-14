@@ -27,11 +27,14 @@ struct State {
     configure: bool,
     fast_recycle: bool,
     tx_checksum: bool,
+    tso: bool,
+    tx_packets: BTreeMap<u64, Vec<u8>>,
     tx_data: Vec<u8>,
     tx_source: usize,
 }
 struct Model(Rc<RefCell<State>>);
 unsafe impl Backend for Model {
+    fn tso_capable(&self) -> bool { self.0.borrow().tso }
     fn tx_checksum_capable(&self) -> bool { self.0.borrow().tx_checksum }
     fn reset(&mut self) -> bool {
         let mut s = self.0.borrow_mut();
@@ -66,6 +69,7 @@ unsafe impl Backend for Model {
     fn copy_tx(&mut self, a: u64, p: &[u8]) {
         let mut s = self.0.borrow_mut();
         s.events.push(Event::Tx(a, p.len()));
+        s.tx_packets.insert(a,p.to_vec());
         s.tx_data = p.to_vec();
         s.tx_source = p.as_ptr() as usize;
     }
@@ -104,7 +108,8 @@ fn layout() -> Layout {
         axi_bytes: 8,
     }
 }
-fn model() -> (Ring<Model>, Rc<RefCell<State>>) {
+fn model() -> (Ring<Model>, Rc<RefCell<State>>) { model_layout(layout()) }
+fn model_layout(l: Layout) -> (Ring<Model>, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State {
         events: vec![],
         words: BTreeMap::new(),
@@ -114,11 +119,13 @@ fn model() -> (Ring<Model>, Rc<RefCell<State>>) {
         configure: true,
         fast_recycle: false,
         tx_checksum: false,
+        tso: false,
+        tx_packets: BTreeMap::new(),
         tx_data: Vec::new(),
         tx_source: 0,
     }));
     let backend = Box::leak(Box::new(Model(state.clone())));
-    (Ring::new(backend, layout()).unwrap(), state)
+    (Ring::new(backend, l).unwrap(), state)
 }
 fn started() -> (Ring<Model>, Rc<RefCell<State>>) {
     let (mut r, s) = model();
@@ -559,4 +566,82 @@ fn single_tx_sync_orders_payload_fields_own_flush_and_tail() {
     assert_eq!(r.set_single_tx_sync(false), Err(Error::Controller));
     assert!(r.shutdown());
     r.set_single_tx_sync(false).unwrap();
+}
+
+fn tso_packet() -> Vec<u8> {
+    let mut p=vec![0;2054];p[12..14].copy_from_slice(&[8,0]);p[14]=0x45;
+    p[16..18].copy_from_slice(&2040u16.to_be_bytes());p[20]=0x40;p[23]=6;
+    p[46]=0x50;p[47]=0x18;
+    for (i,v) in p[54..].iter_mut().enumerate() {*v=(i%251) as u8;}
+    p
+}
+
+fn tso_model() -> (Ring<Model>,Rc<RefCell<State>>,Layout) {
+    let l=Layout { count:8,rx_buffers:0x42008000,..layout() };
+    let (mut r,s)=model_layout(l);r.initialize().unwrap();s.borrow_mut().events.clear();(r,s,l)
+}
+#[test]
+fn tso_group_wraps_publishes_context_last_and_retains_prefix_buffers() {
+    let (mut r,s,l)=tso_model();
+    for i in 0..7 {
+        r.transmit(&[0;60]).unwrap();
+        s.borrow_mut().words.insert((l.tx_descriptors+i*64,3),0x1000_0000);
+        assert_eq!(r.reap(),Ok(1));
+    }
+    s.borrow_mut().tso=true;s.borrow_mut().events.clear();
+    let p=tso_packet();let q=vibeos_eqos_net::tso::Request::new(&p,1460).unwrap();
+    assert_eq!(q.wire_segments(),2);r.transmit_tso(q).unwrap();assert_eq!(r.pending(),4);
+    let head=l.tx_descriptors+7*64;let first=l.tx_descriptors;let last=first+128;
+    let own: Vec<_>=s.borrow().events.iter().filter_map(|e|match e {
+        Event::Word(a,3,v) if v&descriptor::OWN!=0=>Some(*a),_=>None }).collect();
+    assert_eq!(own,[last,first+64,first,head]);
+    assert_eq!(s.borrow().events.last(),Some(&Event::Tail(false,first+192)));
+    assert_eq!(s.borrow().tx_packets[&l.tx_buffers],p[..54]);
+    assert_eq!(s.borrow().tx_packets[&(l.tx_buffers+1536)],p[54..1590]);
+    assert_eq!(s.borrow().tx_packets[&(l.tx_buffers+3072)],p[1590..]);
+    s.borrow_mut().words.insert((last,3),0x1000_0000);
+    assert_eq!(r.reap(),Ok(0));assert_eq!(r.pending(),4);
+    s.borrow_mut().words.insert((last,3),descriptor::OWN|0x1000_0000);
+    for (addr,status) in [(head,0x4400_0000),(first,0),(first+64,0)] {
+        s.borrow_mut().words.insert((addr,3),status);
+    }
+    s.borrow_mut().events.clear();
+    assert_eq!(r.reap(),Ok(0));assert_eq!(r.pending(),4);
+    assert!(!s.borrow().events.iter().any(|e|matches!(e,Event::Cpu(_,_,Direction::ToDevice))));
+    assert_eq!(r.transmit_tso(q),Err(Error::Full));
+    s.borrow_mut().words.insert((last,3),0x1000_0000);
+    assert_eq!(r.reap(),Ok(4));assert_eq!(r.pending(),0);
+    r.transmit(&[0;60]).unwrap();
+}
+
+#[test]
+fn tso_rejection_is_atomic_and_final_error_quarantines_the_whole_group() {
+    let (mut r,s,l)=tso_model();let p=tso_packet();
+    let q=vibeos_eqos_net::tso::Request::new(&p,1460).unwrap();
+    assert_eq!(r.transmit_tso(q),Err(Error::Controller));assert!(s.borrow().events.is_empty());
+    s.borrow_mut().tso=true;for _ in 0..5 {r.transmit(&[0;60]).unwrap();}
+    s.borrow_mut().events.clear();
+    assert_eq!(r.transmit_tso(q),Err(Error::Full));assert_eq!(r.pending(),5);
+    assert!(!s.borrow().events.iter().any(|e|matches!(e,Event::Tx(..)|Event::Word(..)|Event::Tail(..))));
+    for i in 0..5 {s.borrow_mut().words.insert((l.tx_descriptors+i*64,3),0x1000_0000);}
+    r.reap().unwrap();r.transmit_tso(q).unwrap();
+    for (slot,status) in [(5,0x4400_0000),(6,0),(7,0),(0,0x1000_8000)] {
+        s.borrow_mut().words.insert((l.tx_descriptors+slot*64,3),status);
+    }
+    assert_eq!(r.reap(),Err(Error::Descriptor(descriptor::Error::Hardware)));
+    assert!(r.quarantined());assert_eq!(r.pending(),4);
+    s.borrow_mut().stop=false;assert!(!r.shutdown());assert_eq!(r.pending(),4);
+    s.borrow_mut().stop=true;assert!(r.shutdown());r.initialize().unwrap();
+    r.transmit_tso(q).unwrap();assert_eq!(r.pending(),4);
+}
+
+#[test]
+fn tso_normalizes_checksum_placeholders_without_mutating_caller() {
+    let (mut r,s,l)=tso_model();s.borrow_mut().tso=true;
+    let mut p=tso_packet();p[24..26].copy_from_slice(&[0x12,0x34]);p[50..52].copy_from_slice(&[0x56,0x78]);
+    let original=p.clone();
+    r.transmit_tso(vibeos_eqos_net::tso::Request::new(&p,1460).unwrap()).unwrap();
+    let copied=s.borrow().tx_packets[&(l.tx_buffers+1536)].clone();
+    assert_eq!(&copied[24..26],&[0,0]);assert_eq!(&copied[50..52],&[0,0]);
+    assert_eq!(p,original);
 }

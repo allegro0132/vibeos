@@ -20,6 +20,18 @@ pub mod ipi;
 pub mod mmu;
 pub mod net;
 pub mod net_profile;
+pub mod net_tx_audit;
 pub mod poll_budget;
 pub mod runqueue;
 pub mod sync;
+
+pub mod net_segmentation;
+
+#[cfg(feature = "network-tso-probe")]
+pub mod net_tso_probe;
+
+pub mod net_tx_coalesce;
+
+pub mod net_segment_pool;
+
+pub mod net_transmit;

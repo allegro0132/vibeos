@@ -36,6 +36,16 @@ pub struct Backend<R: Io, M: Memory> {
     tx_checksum: bool,
 }
 impl<R: Io + 'static, M: Memory> ring::Ring<Backend<R, M>> {
+    pub fn set_tso(&mut self, enabled: bool) -> Result<(), crate::controller::Error> {
+        self.stopped_backend().ok_or(crate::controller::Error::NotReady)?
+            .controller.set_tso(enabled)
+    }
+    pub fn set_symmetric_pause(&mut self, enabled: bool) -> Result<(), crate::controller::Error> {
+        self.stopped_backend()
+            .ok_or(crate::controller::Error::NotReady)?
+            .controller.set_symmetric_pause(enabled)
+    }
+
     /// Update software configuration while retaining the ring's ownership even
     /// if the caller faults mid-operation. No DMA may be running at this point.
     pub fn set_link(
@@ -70,10 +80,15 @@ impl<R: Io, M: Memory> Backend<R, M> {
 // pool admission. Controller config never starts DMA, and reset/stop only succeed
 // after the bounded SWR and disabled-enable readback checks.
 unsafe impl<R: Io, M: Memory> ring::Backend for Backend<R, M> {
+    fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { Some(self.controller.flow_diagnostics()) }
+    fn mmc_tx_counters(&mut self) -> Option<crate::controller::MmcTxCounters> {
+        self.controller.mmc_tx_counters()
+    }
     fn diagnostics(&mut self) -> Option<crate::controller::DmaDiagnostics> {
         Some(self.controller.diagnostics())
     }
     fn tx_checksum_capable(&self) -> bool { self.tx_checksum }
+    fn tso_capable(&self) -> bool { !self.failed && self.controller.tso_active() }
     fn reset(&mut self) -> bool {
         self.failed = self.controller.reset().is_err();
         !self.failed

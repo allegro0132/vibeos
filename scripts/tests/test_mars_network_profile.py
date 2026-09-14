@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import re
 from pathlib import Path
 import unittest
 
@@ -32,6 +34,19 @@ class ProfileTests(unittest.TestCase):
         for bad in [text + row, text.replace('wait=[0, 1', 'wait=[0, 2', 1)]:
             with self.assertRaises(ValueError):
                 m.analyze(bad)
+
+    def test_extended_schema_preserves_legacy_and_checks_new_stage_lengths(self):
+        text = self.fixture().replace('window=(100, 200, 100)',
+            'window=(100, 200, 100) stages=' + json.dumps(m.EXTENDED_STAGES))
+        text = re.sub(r'(ticks|wait|calls)=(\[[^\]]*\])',
+            lambda x: x[1] + '=' + json.dumps(json.loads(x[2]) + [7, 0, 0, 0]), text)
+        d = m.analyze(text)
+        self.assertEqual(d['phases']['packet_queue']['exclusive_ticks'], 7)
+        self.assertEqual(len(d['stages']), 12)
+        with self.assertRaises(ValueError):
+            m.analyze(text.replace('"completion"', '"unexpected"'))
+        with self.assertRaises(ValueError):
+            m.analyze(text.replace(', 7, 0, 0, 0]', ']', 1))
 
     def test_incomplete_or_inconsistent_dump_is_not_success(self):
         for text in [self.fixture().replace('NPROF_END', ''),

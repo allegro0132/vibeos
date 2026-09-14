@@ -16,6 +16,10 @@
 extern crate alloc;
 
 pub mod command;
+mod transmit;
+pub use transmit::PacketTransmit;
+#[cfg(feature = "bounded-gro")]
+mod gro;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -244,11 +248,14 @@ impl fmt::Display for StackError {
 pub struct PacketDeviceStats {
     pub rx_frames: u64,
     pub tx_frames: u64,
+    pub tx_segmented_requests: u64,
     pub rejected_ingress_frames: u64,
     pub rejected_device_epoch_frames: u64,
     pub rejected_stack_generation_frames: u64,
     pub tx_backpressure_events: u64,
     pub pending_egress: bool,
+    pub gro_merged_segments: u64,
+    pub gro_aggregates: u64,
 }
 
 /// A lossless-at-the-endpoint-boundary smoltcp device adapter.
@@ -261,29 +268,49 @@ pub struct PacketDeviceStats {
 pub struct PacketDevice {
     stamp: PacketStamp,
     inbound: Revocable<Endpoint<StampedPacket>>,
-    outbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: PacketTransmit,
     pending_egress: Option<StampedPacket>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_segments: Option<vibeos_core::net_segmentation::SoftwareTransmit>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_pooled: Option<transmit::Reservation>,
     stats: PacketDeviceStats,
     authority_revoked: bool,
     tx_checksum_offload: bool,
     rx_checksum_offload: bool,
+    #[cfg(feature = "bounded-gro")]
+    gro: gro::Buffer,
+    #[cfg(feature = "bounded-gro")]
+    pending_ingress: Option<Packet>,
+    #[cfg(feature = "bounded-gro")]
+    ingress_remaining: usize,
 }
 
 impl PacketDevice {
     pub fn new(
         stamp: PacketStamp,
         inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Self {
         Self {
             stamp,
             inbound,
-            outbound,
+            outbound: outbound.into(),
             pending_egress: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_segments: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_pooled: None,
             stats: PacketDeviceStats::default(),
             authority_revoked: false,
             tx_checksum_offload: false,
             rx_checksum_offload: false,
+            #[cfg(feature = "bounded-gro")]
+            gro: gro::Buffer::new(),
+            #[cfg(feature = "bounded-gro")]
+            pending_ingress: None,
+            #[cfg(feature = "bounded-gro")]
+            ingress_remaining: usize::MAX,
         }
     }
 
@@ -303,7 +330,7 @@ impl PacketDevice {
     pub fn revalidate_authority(&mut self) -> Result<(), StackError> {
         if self.authority_revoked
             || self.inbound.try_with(|_| ()).is_err()
-            || self.outbound.try_with(|_| ()).is_err()
+            || self.outbound.revalidate().is_err()
         {
             self.authority_revoked = true;
             return Err(StackError::AuthorityRevoked);
@@ -314,11 +341,69 @@ impl PacketDevice {
     /// Try once to publish a frame retained after endpoint backpressure.
     pub fn flush_egress(&mut self) -> Result<bool, StackError> {
         self.authority_result()?;
+        #[cfg(feature = "native-tcp-segmentation")]
+        if let Some(pending) = self.pending_pooled.as_mut() {
+            match pending.publish() {
+                Ok(true) => {
+                    self.stats.tx_frames = self.stats.tx_frames.saturating_add(pending.frames);
+                    self.pending_pooled = None;
+                    self.stats.pending_egress = false;
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                    return Ok(false);
+                }
+                Err(_) => {
+                    self.pending_pooled = None;
+                    self.authority_revoked = true;
+                    return Err(StackError::AuthorityRevoked);
+                }
+            }
+        }
+        #[cfg(feature = "native-tcp-segmentation")]
+        if self.pending_segments.is_some() {
+            // One logical request owns its bytes until every software segment
+            // has entered the existing queue. No successor may overtake it.
+            for _ in 0..32 {
+                let pending = self.pending_segments.as_mut().unwrap();
+                let request = pending.request(self.stamp).expect("immutable adapter session");
+                let index = pending.next_segment();
+                let length = request.header_bytes()
+                    + (request.payload_bytes() - index * request.mss()).min(request.mss());
+                let (frame, _) = Packet::write_with(length, |out| request.write_segment(index, out).unwrap())
+                    .expect("bounded software segment");
+                let packet = StampedPacket::new(frame, self.stamp);
+                match self.outbound.send_frame(packet) {
+                    Ok(Ok(())) => {
+                        pending.accepted().unwrap();
+                        self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
+                        if pending.is_complete() {
+                            self.pending_segments = None;
+                            self.stats.pending_egress = false;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                        self.stats.pending_egress = true;
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        self.pending_segments = None;
+                        self.authority_revoked = true;
+                        self.stats.pending_egress = false;
+                        return Err(StackError::AuthorityRevoked);
+                    }
+                }
+            }
+            return Ok(false);
+        }
         let Some(packet) = self.pending_egress.take() else {
             self.stats.pending_egress = false;
             return Ok(true);
         };
-        match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
+        match self.outbound.send_frame(packet) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
                 self.stats.pending_egress = false;
@@ -344,6 +429,10 @@ impl PacketDevice {
         if self.pending_egress.is_some() {
             return Ok(true);
         }
+        #[cfg(feature = "native-tcp-segmentation")]
+        if self.pending_segments.is_some() || self.pending_pooled.is_some() { return Ok(true); }
+        #[cfg(feature = "bounded-gro")]
+        if self.pending_ingress.is_some() { return Ok(true); }
         match self.inbound.try_with(|endpoint| endpoint.stats().2 != 0) {
             Ok(has_ingress) => Ok(has_ingress),
             Err(_) => {
@@ -356,7 +445,59 @@ impl PacketDevice {
     pub fn stats(&self) -> PacketDeviceStats {
         let mut stats = self.stats;
         stats.pending_egress = self.pending_egress.is_some();
+        #[cfg(feature = "native-tcp-segmentation")]
+        { stats.pending_egress |= self.pending_segments.is_some() || self.pending_pooled.is_some(); }
+        #[cfg(feature = "bounded-gro")]
+        {
+            stats.gro_merged_segments = self.gro.merged_segments;
+            stats.gro_aggregates = self.gro.aggregates;
+        }
         stats
+    }
+
+    #[cfg(feature = "native-tcp-segmentation")]
+    fn reserve_transmit(&mut self) -> Option<Option<transmit::Reservation>> {
+        match self.outbound.reserve(self.stamp) {
+            Ok(reservation) => Some(reservation),
+            Err(transmit::ReserveError::Pool(vibeos_core::net_segment_pool::Error::Full)) => {
+                self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                None
+            }
+            Err(_) => { self.authority_revoked = true; None }
+        }
+    }
+
+    fn receive_packet(&mut self) -> Option<Packet> {
+        #[cfg(feature = "bounded-gro")]
+        if self.ingress_remaining == 0 { return None; }
+        let packet = match self.inbound.try_with(|endpoint| endpoint.try_recv()) {
+            Ok(packet) => packet?,
+            Err(_) => {
+                self.authority_revoked = true;
+                return None;
+            }
+        };
+        #[cfg(feature = "bounded-gro")]
+        { self.ingress_remaining -= 1; }
+        let packet = match packet.into_packet(self.stamp) {
+            Ok(packet) => packet,
+            Err(mismatch) => {
+                self.stats.rejected_ingress_frames =
+                    self.stats.rejected_ingress_frames.saturating_add(1);
+                if mismatch.device_epoch_changed() {
+                    self.stats.rejected_device_epoch_frames =
+                        self.stats.rejected_device_epoch_frames.saturating_add(1);
+                } else if mismatch.stack_generation_changed() {
+                    self.stats.rejected_stack_generation_frames = self
+                        .stats
+                        .rejected_stack_generation_frames
+                        .saturating_add(1);
+                }
+                return None;
+            }
+        };
+        self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
+        Some(packet)
     }
 
     fn authority_result(&self) -> Result<(), StackError> {
@@ -368,32 +509,104 @@ impl PacketDevice {
     }
 }
 
-/// An owned receive token; it never borrows the DMA or endpoint queue.
-pub struct PacketRxToken(Packet);
+/// A receive token owning one frame or borrowing the protocol aggregation
+/// buffer. It never borrows DMA memory or holds an endpoint queue lock.
+pub struct PacketRxToken<'a>(RxBytes<'a>);
 
-impl phy::RxToken for PacketRxToken {
+enum RxBytes<'a> {
+    Single(Packet, core::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "bounded-gro")]
+    Coalesced(&'a [u8]),
+}
+
+impl phy::RxToken for PacketRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.0.as_bytes())
+        match self.0 {
+            RxBytes::Single(packet, _) => f(packet.as_bytes()),
+            #[cfg(feature = "bounded-gro")]
+            RxBytes::Coalesced(bytes) => f(bytes),
+        }
     }
 }
 
 /// A transmit token borrowing only the adapter's one-packet pending slot.
 pub struct PacketTxToken<'a> {
     stamp: PacketStamp,
-    outbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: PacketTransmit,
     pending_egress: &'a mut Option<StampedPacket>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_segments: &'a mut Option<vibeos_core::net_segmentation::SoftwareTransmit>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    segment_size: Option<u16>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    reservation: Option<transmit::Reservation>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_pooled: &'a mut Option<transmit::Reservation>,
     stats: &'a mut PacketDeviceStats,
     authority_revoked: &'a mut bool,
 }
 
 impl phy::TxToken for PacketTxToken<'_> {
+    #[cfg(feature = "native-tcp-segmentation")]
+    fn set_meta(&mut self, meta: phy::PacketMeta) { self.segment_size = meta.tcp_segment_size; }
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        #[cfg(feature = "native-tcp-segmentation")]
+        if let Some(mss) = self.segment_size {
+            if let Some(mut reservation) = self.reservation {
+                let ticket = reservation.ticket.unwrap();
+                let mut fill = Some(f);
+                let written = reservation.authority.try_with(|q| {
+                    q.pool().write(ticket, self.stamp, len, mss as usize, fill.take().unwrap())
+                        .expect("valid native TCP serialization")
+                });
+                let result = match written {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // TxToken requires the serializer's return value even
+                        // after revocation. Use task-local scratch only here.
+                        assert!(len <= vibeos_core::net_segmentation::MAX_LOGICAL_PACKET);
+                        let mut scratch = vec![0; len];
+                        *self.authority_revoked = true;
+                        return fill.take().unwrap()(&mut scratch);
+                    }
+                };
+                #[cfg(feature = "network-tx-audit")]
+                let _ = reservation.authority.try_with(|q| q.pool().try_consume(ticket, self.stamp, |request| {
+                    vibeos_core::net_tx_audit::record_segments(0, request);
+                    Err::<(), ()>(()) // Inspection does not release the pending request.
+                }));
+                reservation.frames = (len - 54).div_ceil(mss as usize) as u64;
+                self.stats.tx_segmented_requests = self.stats.tx_segmented_requests.saturating_add(1);
+                match reservation.publish() {
+                    Ok(true) => self.stats.tx_frames = self.stats.tx_frames.saturating_add(reservation.frames),
+                    Ok(false) => { *self.pending_pooled = Some(reservation); self.stats.pending_egress = true; }
+                    Err(_) => { *self.authority_revoked = true; }
+                }
+                return result;
+            }
+            use vibeos_core::net_segmentation::{StampedSegments, SoftwareTransmit};
+            assert!(self.pending_egress.is_none() && self.pending_segments.is_none());
+            let (message, result) = StampedSegments::write_with(len, mss as usize, self.stamp, f)
+                .expect("stack supplied a supported TCP segmentation request");
+            vibeos_core::net_tx_audit::record_segments(0, message.request(self.stamp).unwrap());
+            if self.outbound.revalidate().is_err() {
+                *self.authority_revoked = true;
+                self.stats.pending_egress = false;
+            } else {
+                *self.pending_segments = Some(SoftwareTransmit::new(message));
+                self.stats.tx_segmented_requests = self.stats.tx_segmented_requests.saturating_add(1);
+                self.stats.pending_egress = true;
+            }
+            return result;
+        }
+        #[cfg(feature = "native-tcp-segmentation")]
+        drop(self.reservation);
         assert!(
             len <= MAX_PACKET_LEN,
             "smoltcp emitted a frame larger than the advertised Ethernet MTU"
@@ -402,8 +615,9 @@ impl phy::TxToken for PacketTxToken<'_> {
 
         let (frame, result) = Packet::write_with(len, f)
             .expect("smoltcp emitted an empty or oversized Ethernet frame");
+        vibeos_core::net_tx_audit::record(0, frame.as_bytes());
         let packet = StampedPacket::new(frame, self.stamp);
-        match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
+        match self.outbound.send_frame(packet) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
             }
@@ -424,7 +638,7 @@ impl phy::TxToken for PacketTxToken<'_> {
 
 impl phy::Device for PacketDevice {
     type RxToken<'a>
-        = PacketRxToken
+        = PacketRxToken<'a>
     where
         Self: 'a;
     type TxToken<'a>
@@ -433,40 +647,48 @@ impl phy::Device for PacketDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        #[cfg(feature = "bounded-gro")]
+        if self.revalidate_authority().is_err() { return None; }
         if self.flush_egress() != Ok(true) {
             return None;
         }
-        let packet = match self.inbound.try_with(|endpoint| endpoint.try_recv()) {
-            Ok(packet) => packet?,
-            Err(_) => {
-                self.authority_revoked = true;
-                return None;
-            }
-        };
-        let packet = match packet.into_packet(self.stamp) {
-            Ok(packet) => packet,
-            Err(mismatch) => {
-                self.stats.rejected_ingress_frames =
-                    self.stats.rejected_ingress_frames.saturating_add(1);
-                if mismatch.device_epoch_changed() {
-                    self.stats.rejected_device_epoch_frames =
-                        self.stats.rejected_device_epoch_frames.saturating_add(1);
-                } else if mismatch.stack_generation_changed() {
-                    self.stats.rejected_stack_generation_frames = self
-                        .stats
-                        .rejected_stack_generation_frames
-                        .saturating_add(1);
+        #[cfg(feature = "native-tcp-segmentation")]
+        let reservation = self.reserve_transmit()?;
+        #[cfg(feature = "bounded-gro")]
+        let packet = self.pending_ingress.take().or_else(|| self.receive_packet())?;
+        #[cfg(not(feature = "bounded-gro"))]
+        let packet = self.receive_packet()?;
+        #[cfg(feature = "bounded-gro")]
+        let bytes = if self.gro.begin(packet.as_bytes(), self.rx_checksum_offload) {
+            for _ in 1..gro::MAX_SEGMENTS {
+                if self.gro.finished() { break; }
+                let Some(next) = self.receive_packet() else { break; };
+                if !self.gro.append(next.as_bytes(), self.rx_checksum_offload) {
+                    self.pending_ingress = Some(next);
+                    break;
                 }
-                return None;
             }
-        };
-        self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
+            // Revocation observed while gathering invalidates the whole token.
+            if self.authority_revoked { return None; }
+            self.gro.finish(self.rx_checksum_offload);
+            RxBytes::Coalesced(self.gro.bytes())
+        } else { RxBytes::Single(packet, core::marker::PhantomData) };
+        #[cfg(not(feature = "bounded-gro"))]
+        let bytes = RxBytes::Single(packet, core::marker::PhantomData);
         Some((
-            PacketRxToken(packet),
+            PacketRxToken(bytes),
             PacketTxToken {
                 stamp: self.stamp,
                 outbound: self.outbound.clone(),
                 pending_egress: &mut self.pending_egress,
+                #[cfg(feature = "native-tcp-segmentation")]
+                pending_segments: &mut self.pending_segments,
+                #[cfg(feature = "native-tcp-segmentation")]
+                segment_size: None,
+                #[cfg(feature = "native-tcp-segmentation")]
+                reservation,
+                #[cfg(feature = "native-tcp-segmentation")]
+                pending_pooled: &mut self.pending_pooled,
                 stats: &mut self.stats,
                 authority_revoked: &mut self.authority_revoked,
             },
@@ -477,10 +699,20 @@ impl phy::Device for PacketDevice {
         if self.flush_egress() != Ok(true) {
             return None;
         }
+        #[cfg(feature = "native-tcp-segmentation")]
+        let reservation = self.reserve_transmit()?;
         Some(PacketTxToken {
             stamp: self.stamp,
             outbound: self.outbound.clone(),
             pending_egress: &mut self.pending_egress,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_segments: &mut self.pending_segments,
+            #[cfg(feature = "native-tcp-segmentation")]
+            segment_size: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            reservation,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_pooled: &mut self.pending_pooled,
             stats: &mut self.stats,
             authority_revoked: &mut self.authority_revoked,
         })
@@ -490,6 +722,8 @@ impl phy::Device for PacketDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ethernet;
         capabilities.max_transmission_unit = MAX_PACKET_LEN;
+        #[cfg(feature = "native-tcp-segmentation")]
+        { capabilities.tcp_max_segmented_len = Some(vibeos_core::net_segmentation::MAX_LOGICAL_PACKET); }
         // Bound the advertised TCP window to the number of frames the physical
         // DWMAC RX ring can absorb before software runs again. The image packet
         // endpoints use the same or greater depth, and QEMU can safely honor
@@ -630,7 +864,7 @@ impl SharedIpv4TcpStack {
         config: Ipv4StackConfig,
         stamp: PacketStamp,
         inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_stack_config(config)?;
 
@@ -1001,6 +1235,7 @@ impl SharedIpv4TcpStack {
     }
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<SharedTcpPollReport, StackError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
         let work = self.poll_with_application(now_ms, |_, _| 0)?;
         Ok(SharedTcpPollReport {
             ingress_frames: work.ingress_frames,
@@ -1029,6 +1264,8 @@ impl SharedIpv4TcpStack {
         self.interface.poll_maintenance(now);
         self.ensure_listening(false);
 
+        #[cfg(feature = "bounded-gro")]
+        { self.device.ingress_remaining = MAX_INGRESS_FRAMES_PER_POLL; }
         for _ in 0..MAX_INGRESS_FRAMES_PER_POLL {
             let ingress_result =
                 self.interface
@@ -1037,6 +1274,8 @@ impl SharedIpv4TcpStack {
             match ingress_result {
                 PollIngressSingleResult::None => {
                     ingress_budget_exhausted = false;
+                    #[cfg(feature = "bounded-gro")]
+                    { ingress_budget_exhausted = self.device.ingress_remaining == 0; }
                     break;
                 }
                 PollIngressSingleResult::PacketProcessed
@@ -1263,7 +1502,7 @@ impl StaticIpv4TcpStack {
         config: StaticIpv4Config,
         stamp: PacketStamp,
         inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_config(config)?;
         let mut shared = SharedIpv4TcpStack::new(config.into(), stamp, inbound, outbound)?;
@@ -1338,6 +1577,7 @@ impl StaticIpv4TcpStack {
     }
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
         let work = self.poll_with_application(now_ms, |_| 0)?;
         Ok(TcpPollReport {
             ingress_frames: work.ingress_frames,
@@ -1455,7 +1695,7 @@ impl StaticIpv4EchoStack {
         config: StaticIpv4Config,
         stamp: PacketStamp,
         inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         Ok(Self {
             tcp: StaticIpv4TcpStack::new(config, stamp, inbound, outbound)?,

@@ -47,6 +47,7 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     },
     tx_owned: || unsafe { engine().tx_owned() },
     transmit: |packet| unsafe { engine().transmit(packet) },
+    segmentation: None,
     receive: |output| unsafe { engine().receive(output) },
     poll_link: || unsafe { engine().poll_link() },
     shutdown: || unsafe {

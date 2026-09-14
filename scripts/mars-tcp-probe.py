@@ -2,7 +2,9 @@
 """Independent byte-count TCP benchmark; no iperf control/data implementation.
 
 Modes are relative to the board: sink=host->board, source=board->host.
-Header: 8-byte VBENCH01, mode byte, 7 reserved zero bytes, BE u64 byte count.
+Header: 8-byte VBENCH02, mode byte, 7 reserved zero bytes, BE u64 byte count.
+V2: board replies R when application-ready; host sends G after all flows ready.
+Legacy VBENCH01 is available through --protocol 1 without the ready/GO exchange.
 Response after payload: BE u64 completed bytes, BE u64 board elapsed ms.
 Source result time measures enqueue completion, NOT delivery; host measures RX.
 Use --loopback to calibrate the same Python client against a local model server.
@@ -32,14 +34,20 @@ def read_exact(sock, size):
     return data
 
 
-def transfer(address, port, size, mode, barrier, timeout):
+def transfer(address, port, size, mode, barrier, timeout, protocol):
+    setup_start = time.monotonic_ns()
     with socket.create_connection((address, port), timeout) as sock:
         sock.settimeout(timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        # All handshakes finish before payload starts. Headers go after barrier.
+        header = (b"VBENCH02" if protocol == 2 else b"VBENCH01") + bytes([mode == "source"]) + bytes(7) + struct.pack("!Q", size)
+        if protocol == 2:
+            sock.sendall(header)
+            if read_exact(sock, 1) != b"R":
+                raise RuntimeError("invalid service readiness response")
+        ready = time.monotonic_ns()
         barrier.wait(timeout=timeout)
         start = time.monotonic_ns()
-        sock.sendall(b"VBENCH01" + bytes([mode == "source"]) + bytes(7) + struct.pack("!Q", size))
+        sock.sendall(b"G" if protocol == 2 else header)
         done = 0
         first_payload_ns = None
         first_payload_bytes = 0
@@ -67,7 +75,7 @@ def transfer(address, port, size, mode, barrier, timeout):
         if sock.recv(1):
             raise RuntimeError("unexpected trailing data")
         end = confirmed if mode == "sink" else payload_end
-        return dict(port=port, bytes=done, start_ns=start, end_ns=end,
+        return dict(port=port, setup_ms=(ready-setup_start)/1e6, service_ready_ns=ready, barrier_wait_ms=(start-ready)/1e6, protocol=protocol, bytes=done, start_ns=start, end_ns=end,
                     seconds=(end-start)/1e9, board_elapsed_ms=board_ms,
                     receiver_mbps=size*8000/(end-start), board_count=board_bytes,
                     first_payload_delay_ms=(first_payload_ns-start)/1e6,
@@ -85,11 +93,15 @@ def model_server(listener):
         with connection as sock:
             sock.settimeout(120)
             h = read_exact(sock, 24)
-            if h[:8] != b"VBENCH01" or h[8] > 1 or any(h[9:16]):
+            if h[:8] not in (b"VBENCH01", b"VBENCH02") or h[8] > 1 or any(h[9:16]):
                 raise RuntimeError("invalid header")
             size = struct.unpack("!Q", h[16:])[0]
             if not 0 < size <= MAX_BYTES:
                 raise RuntimeError("invalid size")
+            if h[:8] == b"VBENCH02":
+                sock.sendall(b"R")
+                if read_exact(sock, 1) != b"G":
+                    raise RuntimeError("invalid GO")
             buffer = bytearray(b"\xa5" * CHUNK)
             view = memoryview(buffer)
             start = time.monotonic_ns()
@@ -106,7 +118,7 @@ def model_server(listener):
             sock.sendall(struct.pack("!QQ", done, (time.monotonic_ns()-start)//1000000))
 
 
-def run(address, ports, size, mode, timeout, loopback=False):
+def run(address, ports, size, mode, timeout, loopback=False, protocol=2):
     listeners = []
     server_pool = None
     try:
@@ -122,7 +134,7 @@ def run(address, ports, size, mode, timeout, loopback=False):
             servers = [server_pool.submit(model_server, s) for s in listeners]
         barrier = threading.Barrier(len(ports))
         with concurrent.futures.ThreadPoolExecutor(len(ports)) as pool:
-            futures = [pool.submit(transfer, address, port, size, mode, barrier, timeout) for port in ports]
+            futures = [pool.submit(transfer, address, port, size, mode, barrier, timeout, protocol) for port in ports]
             rows = [f.result() for f in futures]
         if server_pool:
             for f in servers:
@@ -156,6 +168,7 @@ def summarize(mode, rows, size):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--address")
+    p.add_argument("--protocol", type=int, choices=[1, 2], default=2, help="2 synchronizes application readiness; 1 supports legacy probe images")
     p.add_argument("--first-port", type=int, default=5300)
     p.add_argument("--bytes", type=int, default=1024**3)
     p.add_argument("--flows", type=int, nargs="+", choices=[1, 4], default=[1, 4])
@@ -171,13 +184,13 @@ def main():
     modes = ["sink", "source"] if args.mode == "both" else [args.mode]
     # Reserve path before opening sockets, preserving failed-run evidence.
     with args.output.open("x") as out:
-        result = dict(address=args.address, loopback=args.loopback, started_unix=time.time(),
+        result = dict(address=args.address, protocol=args.protocol, loopback=args.loopback, started_unix=time.time(),
                       io_chunk_bytes=CHUNK, results=[],
                       timing="host monotonic; sink ends at board byte-count confirmation; source ends at final payload receive")
         try:
             for flows in args.flows:
                 for mode in modes:
-                    row = run(args.address, list(range(args.first_port, args.first_port+flows)), args.bytes, mode, args.timeout, args.loopback)
+                    row = run(args.address, list(range(args.first_port, args.first_port+flows)), args.bytes, mode, args.timeout, args.loopback, args.protocol)
                     result["results"].append(row)
                     print(f'{mode} flows={flows}: {row["aggregate_receiver_mbps"]:.2f} Mbps', flush=True)
                     time.sleep(2)

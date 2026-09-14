@@ -444,6 +444,7 @@ impl Packet {
         len: usize,
         write: impl FnOnce(&mut [u8]) -> R,
     ) -> Result<(Self, R), PacketError> {
+        let _scope = crate::net_profile::Scope::enter(crate::net_profile::Stage::PacketBuild);
         if len == 0 {
             return Err(PacketError::Empty);
         }
@@ -469,6 +470,7 @@ impl Packet {
     pub fn receive_with(
         receive: impl FnOnce(&mut [u8]) -> Option<usize>,
     ) -> Result<Option<Self>, PacketError> {
+        let _scope = crate::net_profile::Scope::enter(crate::net_profile::Stage::PacketBuild);
         let mut packet = Self { bytes: [0; MAX_PACKET_LEN], len: 0 };
         let Some(len) = receive(&mut packet.bytes) else { return Ok(None); };
         if len == 0 { return Err(PacketError::Empty); }

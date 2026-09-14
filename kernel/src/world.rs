@@ -29,6 +29,11 @@ use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+// One reusable 32 KiB TSO staging buffer, including allocator size-class overhead.
+#[cfg(feature = "network-tso-coalesce")]
+const NETWORK_DRIVER_MEMORY_BUDGET: usize = 128 * 1024;
+#[cfg(not(feature = "network-tso-coalesce"))]
+const NETWORK_DRIVER_MEMORY_BUDGET: usize = BACKGROUND_MEMORY_BUDGET;
 #[cfg(not(feature = "tcp-large-window"))]
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
 #[cfg(all(feature = "tcp-large-window", not(feature = "tcp-throughput-probe")))]
@@ -2447,6 +2452,9 @@ pub fn build() {
         net_grants,
     ) = match (net_resources, net_space.as_ref(), net_policy.as_ref()) {
         (Some(resources), Some(driver_space), Some(policy_space)) => {
+            #[cfg(feature = "direct-tcp-segmentation")]
+            let outbound = crate::segmented_tx::create(crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(not(feature = "direct-tcp-segmentation"))]
             let outbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-outbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
             let inbound: Arc<NetEndpoint<StampedPacket>> =
@@ -3415,7 +3423,7 @@ pub fn build() {
         world.spawn_component_inner(
             "virtio-net",
             space.clone(),
-            BACKGROUND_MEMORY_BUDGET,
+            NETWORK_DRIVER_MEMORY_BUDGET,
             Some(ComponentTemplate::NetDriver),
             net_device::driver_task(
                 SpaceRef::new(&space).get(),

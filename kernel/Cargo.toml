@@ -5,7 +5,15 @@ edition = "2021"
 autobins = false
 
 [features]
+direct-tcp-segmentation = ["native-tcp-segmentation"]
+native-tcp-segmentation = ["vibeos-netstack?/native-tcp-segmentation"]
+network-tso-coalesce = []
+network-tso-probe = ["vibeos-core/network-tso-probe"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = ["vibeos-netstack?/bounded-gro"]
 network-profile = ["vibeos-core/network-profile"]
+network-tx-audit = ["vibeos-core/network-tx-audit", "vibeos-netstack?/network-tx-audit"]
+network-status-snapshot = []
 universal-pci-usb = ["vibeos-vsh/pci-usb-help"]
 universal-dwc2 = []
 universal-python = ["python-command", "vibeos-wasi-runtime/python-duo"]

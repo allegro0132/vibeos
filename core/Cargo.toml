@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+network-tso-probe = []
 network-profile = []
+network-tx-audit = []
 # Diagnostic execution timing; excludes sleeping/WFI time.
 executor-profile = []
 # Target-only fault-gate corruption/probe hooks used by the C4.8 QEMU

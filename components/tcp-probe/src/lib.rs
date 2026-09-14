@@ -42,7 +42,7 @@ pub trait Platform: Sync {
 /// Header: VBENCH01, mode (0 sink/1 source), seven zero bytes, u64 BE count.
 fn request(header: &[u8; 24]) -> Result<(bool, u64), SocketError> {
     let size = u64::from_be_bytes(header[16..24].try_into().unwrap());
-    if &header[..8] != b"VBENCH01"
+    if (&header[..8] != b"VBENCH01" && &header[..8] != b"VBENCH02")
         || header[8] > 1
         || header[9..16] != [0; 7]
         || size == 0
@@ -58,6 +58,8 @@ struct Flow {
     header: [u8; 24],
     header_used: usize,
     source: bool,
+    ready_sent: bool,
+    go_received: bool,
     size: u64,
     done: u64,
     accepted_ms: u64,
@@ -73,6 +75,8 @@ impl Flow {
             header: [0; 24],
             header_used: 0,
             source: false,
+            ready_sent: false,
+            go_received: false,
             size: 0,
             done: 0,
             accepted_ms: 0,
@@ -85,6 +89,8 @@ impl Flow {
     fn clear(&mut self) {
         self.connection = None;
         self.header_used = 0;
+        self.ready_sent = false;
+        self.go_received = false;
         self.size = 0;
         self.done = 0;
         self.started_ms = None;
@@ -113,6 +119,29 @@ impl Flow {
                 }
                 TcpIoResult::WouldBlock => return Ok(false),
                 TcpIoResult::Closed => return Err(SocketError::Failed),
+            }
+        }
+        // V2 makes application admission explicit before a host-wide GO.
+        // V1 remains accepted for existing captures and clients.
+        if self.header[7] == b'2' && !self.ready_sent {
+            match p.tcp_send(listener, connection, b"R")? {
+                TcpIoResult::Progress(1) => {
+                    self.ready_sent = true;
+                    return Ok(true);
+                }
+                TcpIoResult::WouldBlock | TcpIoResult::Progress(0) => return Ok(false),
+                _ => return Err(SocketError::Failed),
+            }
+        }
+        if self.header[7] == b'2' && !self.go_received {
+            let mut signal = [0];
+            match p.tcp_recv(listener, connection, &mut signal)? {
+                TcpIoResult::Progress(1) if signal[0] == b'G' => {
+                    self.go_received = true;
+                    return Ok(true);
+                }
+                TcpIoResult::WouldBlock | TcpIoResult::Progress(0) => return Ok(false),
+                _ => return Err(SocketError::Failed),
             }
         }
         if self.done < self.size {
@@ -336,5 +365,38 @@ mod tests {
             .network_update_state(TcpStreamState::Established)
             .unwrap();
         assert_eq!(f.drive(&p, cap), Err(SocketError::StaleConnection));
+    }
+    #[test]
+    fn v2_waits_for_application_go_and_rejects_invalid_signal() {
+        for source in [false, true] {
+            for valid in [false, true] {
+                let (p, cap) = Model::new();
+                let mut f = Flow::new();
+                let mut h = header(source, 101);
+                h[7] = b'2';
+                p.listener.network_receive(&h);
+                assert!(f.drive(&p, cap).unwrap());
+                assert!(f.drive(&p, cap).unwrap());
+                let mut ready = [0; 1];
+                assert_eq!(p.listener.network_transmit(&mut ready), 1);
+                assert_eq!(ready, [b'R']);
+                assert!(!f.drive(&p, cap).unwrap());
+                assert_eq!(f.done, 0);
+                assert!(f.started_ms.is_none());
+                p.listener.network_receive(if valid { b"G" } else { b"X" });
+                if valid {
+                    assert!(f.drive(&p, cap).unwrap());
+                    if !source {
+                        p.listener.network_receive(b"payload");
+                    }
+                    assert!(f.drive(&p, cap).unwrap());
+                    assert_eq!(f.done, 7);
+                } else {
+                    assert_eq!(f.drive(&p, cap), Err(SocketError::Failed));
+                }
+                f.clear();
+                assert!(!f.ready_sent && !f.go_received);
+            }
+        }
     }
 }

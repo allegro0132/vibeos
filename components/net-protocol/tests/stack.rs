@@ -1241,6 +1241,9 @@ fn frontend_direct_transfer_preserves_bytes_across_wrap_and_backpressure() {
     }
     assert_eq!(received_request, request);
     assert_eq!(received_response, response);
+    #[cfg(feature = "native-tcp-segmentation")]
+    assert!(client.device.stats().tx_segmented_requests > 0,
+        "the real TCP transfer must exercise native large-send generation");
     space.revoke(server_in_root).unwrap();
     assert_eq!(
         server.drive_tcp_frontend(socket, &frontend),
@@ -1428,4 +1431,339 @@ fn pending_handshake_can_precede_application_admission_during_time_wait() {
     assert!(admitted > handshake, "wire handshake and application admission are separate events");
     println!("pending admission model: handshake={} ms, application wait={} ms, since prior-close observation={} ms",
         handshake-opened, admitted-handshake, admitted-prior);
+}
+
+#[cfg(feature = "bounded-gro")]
+fn gro_test_data(seq: u32) -> Vec<u8> {
+        let mut b=vec![0u8;154];
+        b[12..14].copy_from_slice(&[8,0]); b[14]=0x45;
+        b[16..18].copy_from_slice(&140u16.to_be_bytes());
+        b[20]=0x40; b[22]=64; b[23]=6;
+        b[38..42].copy_from_slice(&seq.to_be_bytes()); b[46]=0x50;b[47]=0x10;
+        b[54..].fill(seq as u8); b
+    }
+
+#[cfg(feature = "bounded-gro")]
+#[test]
+fn gro_preserves_order_stamp_checks_and_pending_packet_revocation() {
+    let inbound=Endpoint::new("gro-in",16); let outbound=Endpoint::new("gro-out",16);
+    let mut space=CSpace::new("gro"); let stamp=session_stamp();
+    let (root,ia)=authority(&mut space,&inbound,Rights::RECV);
+    let (_,oa)=authority(&mut space,&outbound,Rights::SEND);
+    let mut d=PacketDevice::new(stamp,ia,oa);
+    // Synthetic frames use the already-verified ingress contract.
+    d.set_rx_checksum_offload(true);
+    for seq in [0,100,500] {
+        inbound.try_send(StampedPacket::copy_from(&gro_test_data(seq),stamp).unwrap()).unwrap();
+    }
+    let (rx,tx)=d.receive(Instant::ZERO).unwrap(); drop(tx);
+    rx.consume(|b| {assert_eq!(b.len(),254);assert_eq!(&b[54..154],&[0;100]);assert_eq!(&b[154..],&[100;100]);});
+    assert_eq!(d.stats().gro_merged_segments,1);
+    assert_eq!(d.stats().gro_aggregates,1);
+    assert!(d.has_immediate_work().unwrap());
+    let (rx,tx)=d.receive(Instant::ZERO).unwrap();drop(tx);
+    rx.consume(|b|assert_eq!(b,gro_test_data(500)));
+    let stale=stamp.next_stack_generation().unwrap();
+    inbound.try_send(StampedPacket::copy_from(&gro_test_data(600),stale).unwrap()).unwrap();
+    assert!(d.receive(Instant::ZERO).is_none());
+    assert_eq!(d.stats().rejected_stack_generation_frames,1);
+    for seq in [700,1000] {
+        inbound.try_send(StampedPacket::copy_from(&gro_test_data(seq),stamp).unwrap()).unwrap();
+    }
+    drop(d.receive(Instant::ZERO).unwrap()); // 1000 retained behind a sequence gap.
+    space.revoke(root).unwrap();
+    assert!(d.receive(Instant::ZERO).is_none());
+    assert_eq!(d.revalidate_authority(),Err(StackError::AuthorityRevoked));
+}
+
+#[cfg(feature = "bounded-gro")]
+#[test]
+fn gro_keeps_wire_frame_budget_and_requests_another_poll() {
+    let inbound=Endpoint::new("gro-budget-in",64);
+    let outbound=Endpoint::new("gro-budget-out",64);
+    let mut space=CSpace::new("gro-budget"); let stamp=session_stamp();
+    let (_,ia)=authority(&mut space,&inbound,Rights::RECV);
+    let (_,oa)=authority(&mut space,&outbound,Rights::SEND);
+    let config=Ipv4StackConfig::from(server_config()).with_rx_checksum_offload(true);
+    let mut stack=SharedIpv4TcpStack::new(config,stamp,ia,oa).unwrap();
+    for i in 0..64 {
+        inbound.try_send(StampedPacket::copy_from(&gro_test_data(i*100),stamp).unwrap()).unwrap();
+    }
+    stack.poll_network(0).unwrap();
+    assert_eq!(stack.device_stats().rx_frames,32);
+    assert_eq!(inbound.stats().2,32);
+    assert_eq!(stack.device_stats().gro_aggregates,2);
+    stack.poll_network(1).unwrap();
+    assert_eq!(stack.device_stats().rx_frames,64);
+    assert_eq!(inbound.stats().2,0);
+}
+
+#[cfg(feature = "bounded-gro")]
+#[test]
+fn gro_delivers_changing_tcp_payload_through_real_socket() {
+    let (mut server,mut client)=raw_tcp_pair();
+    let mut now=connect_raw_pair(&mut server,&mut client);
+    let expected: Vec<u8>=(0..96_731).map(|i| ((i*17+i/251)%253) as u8).collect();
+    let mut sent=0; let mut received=Vec::new();
+    for _ in 0..10_000 {
+        if sent<expected.len() && client.socket().can_send() {
+            sent+=client.socket().send_slice(&expected[sent..]).unwrap();
+        }
+        client.poll(now); server.poll_network(now).unwrap();
+        let mut bytes=[0u8;4096];
+        if let TcpIoResult::Progress(n)=server.try_recv(&mut bytes).unwrap() {
+            received.extend_from_slice(&bytes[..n]);
+        }
+        now+=1;
+        if received.len()==expected.len() {break;}
+    }
+    assert_eq!(received,expected);
+    assert!(server.device_stats().gro_merged_segments>0,"test must exercise actual coalescing");
+}
+
+#[cfg(feature = "native-tcp-segmentation")]
+fn logical_tcp_payload(n: usize) -> Vec<u8> {
+    let mut p = vec![0; n + 54];
+    p[0] = 2; p[6] = 2; p[12..14].copy_from_slice(&[8, 0]);
+    p[14] = 0x45; p[16..18].copy_from_slice(&((n+40) as u16).to_be_bytes());
+    p[20] = 0x40; p[22] = 64; p[23] = 6;
+    p[26..30].copy_from_slice(&SERVER_IP); p[30..34].copy_from_slice(&CLIENT_IP);
+    p[38..42].copy_from_slice(&0xfffffff0u32.to_be_bytes());
+    p[46] = 0x50; p[47] = 0x18; p[48] = 0x7f;
+    for (i,b) in p[54..].iter_mut().enumerate() { *b = (i % 251) as u8; }
+    p
+}
+
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn native_software_fallback_retains_order_through_one_slot_queue() {
+    use smoltcp::wire::{Ipv4Packet, TcpPacket};
+    let inbound = Endpoint::new("native-in", 1);
+    let outbound = Endpoint::new("native-out", 1);
+    let mut space = CSpace::new("native-test");
+    let (_, ia) = authority(&mut space, &inbound, Rights::RECV);
+    let (_, oa) = authority(&mut space, &outbound, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), ia, oa);
+    let original = logical_tcp_payload(4097);
+    let mut token = device.transmit(Instant::ZERO).unwrap();
+    let mut meta = smoltcp::phy::PacketMeta::default(); meta.tcp_segment_size = Some(64);
+    token.set_meta(meta);
+    token.consume(original.len(), |out| out.copy_from_slice(&original));
+    let mut payload = Vec::new(); let mut frames = 0;
+    while device.stats().pending_egress {
+        let complete = device.flush_egress().unwrap();
+        if !complete { assert!(device.transmit(Instant::ZERO).is_none()); }
+        let packet = outbound.try_recv().unwrap().into_packet(session_stamp()).unwrap();
+        let bytes = packet.as_bytes();
+        let ip = Ipv4Packet::new_checked(&bytes[14..]).unwrap();
+        assert!(ip.verify_checksum()); assert!(ip.total_len() <= 1500);
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        assert!(tcp.verify_checksum(&IpAddress::v4(192,0,2,1), &IpAddress::v4(192,0,2,2)));
+        assert_eq!(u32::from_be_bytes(bytes[38..42].try_into().unwrap()),
+            0xfffffff0u32.wrapping_add(payload.len() as u32));
+        assert_eq!(bytes[47] & 8 != 0, payload.len() + tcp.payload().len() == 4097);
+        payload.extend_from_slice(tcp.payload()); frames += 1;
+        assert!(frames <= 65);
+    }
+    assert_eq!(payload, &original[54..]);
+    assert_eq!(device.stats().tx_frames, 65);
+    assert_eq!(device.stats().tx_segmented_requests, 1);
+    assert_eq!(device.capabilities().max_transmission_unit, 1514);
+}
+
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn native_pending_send_stops_on_revocation() {
+    let inbound = Endpoint::new("native-revoke-in", 1);
+    let outbound = Endpoint::new("native-revoke-out", 1);
+    let mut space = CSpace::new("native-revoke");
+    let (_, ia) = authority(&mut space, &inbound, Rights::RECV);
+    let (root, oa) = authority(&mut space, &outbound, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), ia, oa);
+    let original = logical_tcp_payload(4097);
+    let mut token = device.transmit(Instant::ZERO).unwrap();
+    let mut meta = smoltcp::phy::PacketMeta::default(); meta.tcp_segment_size = Some(1460);
+    token.set_meta(meta); token.consume(original.len(), |out| out.copy_from_slice(&original));
+    assert_eq!(device.flush_egress(), Ok(false));
+    space.revoke(root).unwrap();
+    assert_eq!(device.flush_egress(), Err(StackError::AuthorityRevoked));
+    assert_eq!(outbound.stats().2, 1); // Only the already-admitted first segment.
+    assert!(!device.stats().pending_egress);
+}
+
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn native_transmit_token_cannot_outlive_revocation() {
+    let inbound = Endpoint::new("native-token-in", 1);
+    let outbound = Endpoint::new("native-token-out", 1);
+    let mut space = CSpace::new("native-token");
+    let (_, ia) = authority(&mut space, &inbound, Rights::RECV);
+    let (root, oa) = authority(&mut space, &outbound, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), ia, oa);
+    let original = logical_tcp_payload(4097);
+    let mut token = device.transmit(Instant::ZERO).unwrap();
+    let mut meta = smoltcp::phy::PacketMeta::default(); meta.tcp_segment_size = Some(1460);
+    token.set_meta(meta);
+    space.revoke(root).unwrap();
+    token.consume(original.len(), |out| out.copy_from_slice(&original));
+    assert_eq!(device.flush_egress(), Err(StackError::AuthorityRevoked));
+    assert_eq!(outbound.stats().2, 0);
+    assert!(!device.stats().pending_egress);
+}
+
+#[cfg(feature = "native-tcp-segmentation")]
+fn pooled_device(depth:usize, slots:usize) -> (PacketDevice, Arc<vibeos_core::net_transmit::TransmitEndpoint>, CSpace, Cap) {
+    use vibeos_core::{heap::{AllocationDomain,OwnerId,ArenaId},net_transmit::TransmitEndpoint};
+    let inbound=Endpoint::new("pooled-in",1);let q=TransmitEndpoint::new("pooled-out",depth,slots).unwrap();
+    let mut space=CSpace::new("pooled-producer");
+    let (_,ia)=authority(&mut space,&inbound,Rights::RECV);
+    let root=space.mint(q.clone(),Rights::SEND.union(Rights::REVOKE));
+    let authority=space.lookup_revocable::<TransmitEndpoint>(root,Rights::SEND).unwrap();
+    let outbound=vibeos_net_protocol::PacketTransmit::Pooled {authority,
+        domain:AllocationDomain::new(OwnerId::new(17),ArenaId::new(1))};
+    (PacketDevice::new(session_stamp(),ia,outbound),q,space,root)
+}
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn pooled_token_reserves_before_serialization_and_returns_unused_slot() {
+    let (mut device,q,_,_)=pooled_device(2,1);
+    let token=device.transmit(Instant::ZERO).unwrap();assert_eq!(q.pool().in_use(),1);
+    drop(token);assert_eq!(q.pool().in_use(),0);
+    let original=logical_tcp_payload(32714);
+    let mut token=device.transmit(Instant::ZERO).unwrap();
+    let mut meta=smoltcp::phy::PacketMeta::default();meta.tcp_segment_size=Some(1460);
+    token.set_meta(meta);assert_eq!(token.consume(original.len(),|p|{p.copy_from_slice(&original);42}),42);
+    assert!(device.transmit(Instant::ZERO).is_none()); // Pool full, despite queue space.
+    let Some(vibeos_core::net_transmit::Transmit::Segments(ticket))=q.try_recv() else {panic!("large send was split into frames")};
+    assert_eq!(q.pool().try_consume(ticket,session_stamp(),|r|{
+        assert_eq!(r.bytes(),original);Ok::<_,()>(r.wire_segments())
+    }),Ok(Ok(23)));
+    assert!(q.try_recv().is_none());
+    assert_eq!(device.stats().tx_segmented_requests,1);
+    assert_eq!(device.stats().tx_frames,23);
+    assert!(device.transmit(Instant::ZERO).is_some());
+}
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn pooled_large_send_keeps_order_and_ownership_when_queue_is_full() {
+    use vibeos_core::net_transmit::Transmit;
+    let (mut device,q,_,_)=pooled_device(1,1);
+    q.try_send(Transmit::Frame(StampedPacket::copy_from(&[1;60],session_stamp()).unwrap())).unwrap();
+    let original=logical_tcp_payload(4097);
+    let mut token=device.transmit(Instant::ZERO).unwrap();
+    let mut meta=smoltcp::phy::PacketMeta::default();meta.tcp_segment_size=Some(1460);
+    token.set_meta(meta);token.consume(original.len(),|p|p.copy_from_slice(&original));
+    assert!(device.stats().pending_egress);
+    for _ in 0..3 {assert!(device.transmit(Instant::ZERO).is_none());}
+    assert!(matches!(q.try_recv(),Some(Transmit::Frame(_))));
+    assert_eq!(device.flush_egress(),Ok(true));
+    let Some(Transmit::Segments(ticket))=q.try_recv() else {panic!()};
+    assert_eq!(q.pool().try_consume(ticket,session_stamp(),|r| {assert_eq!(r.bytes(),original);Ok::<_,()>(())}),Ok(Ok(())));
+    assert!(q.try_recv().is_none());assert_eq!(q.pool().in_use(),0);
+}
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn pooled_token_revocation_never_publishes_and_supervisor_retires_lease() {
+    use vibeos_core::heap::{AllocationDomain,OwnerId,ArenaId};
+    let (mut device,q,mut space,root)=pooled_device(1,1);
+    let original=logical_tcp_payload(4097);
+    let mut token=device.transmit(Instant::ZERO).unwrap();
+    let mut meta=smoltcp::phy::PacketMeta::default();meta.tcp_segment_size=Some(1460);token.set_meta(meta);
+    space.revoke(root).unwrap();
+    assert_eq!(token.consume(original.len(),|p|{p.copy_from_slice(&original);42}),42);
+    assert!(q.try_recv().is_none());assert_eq!(device.flush_egress(),Err(StackError::AuthorityRevoked));
+    // Revoked component code cannot cancel through the resource. Trusted policy
+    // retirement, required before rebinding, releases its outstanding reservation.
+    assert_eq!(q.pool().invalidate_domain(AllocationDomain::new(OwnerId::new(17),ArenaId::new(1))),1);
+    assert_eq!(q.pool().in_use(),0);
+}
+
+#[test]
+#[cfg(feature = "native-tcp-segmentation")]
+fn real_tcp_pooled_producer_preserves_changing_payloads() {
+    let to_server = Endpoint::new("direct-to-server", 128);
+    let to_client = Endpoint::new("direct-to-client", 128);
+    let mut space = CSpace::new("direct-transfer");
+    let (server_in_root, server_in) = authority(&mut space, &to_server, Rights::RECV);
+    let pooled = vibeos_core::net_transmit::TransmitEndpoint::new("tcp-pooled", 128, 8).unwrap();
+    let pool_root = space.mint(pooled.clone(), Rights::SEND.union(Rights::REVOKE));
+    let server_out = vibeos_net_protocol::PacketTransmit::Pooled {
+        authority: space.lookup_revocable(pool_root, Rights::SEND).unwrap(),
+        domain: vibeos_core::heap::AllocationDomain::new(vibeos_core::heap::OwnerId::new(17), vibeos_core::heap::ArenaId::new(1)),
+    };
+    let mut observed_large = 0;
+    let (_, client_in) = authority(&mut space, &to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &to_server, Rights::SEND);
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server = SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let socket = server.add_tcp_listener(SERVER_PORT).unwrap();
+    // Odd, small capacities force wrapped frontend storage and partial writes.
+    let frontend = TcpListener::new("direct", TcpListenerId::new(1).unwrap(), SERVER_PORT, 32768, 32768).unwrap();
+    let mut client = TestClient::new(client_in, client_out);
+    // Exceeds both the default and large TCP windows to wrap transport storage.
+    let request: Vec<u8> = (0..600_007).map(|i| (i * 37 + i / 251) as u8).collect();
+    let response: Vec<u8> = request.iter().map(|b| b ^ 0xa5).collect();
+    let (mut request_sent, mut response_sent) = (0, 0);
+    let (mut received_request, mut received_response) = (Vec::new(), Vec::new());
+    let mut connection = None;
+    let mut scratch = [0u8; 997];
+    for now in 0..100_000 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        while let Some(message) = pooled.try_recv() {
+            match message {
+                vibeos_core::net_transmit::Transmit::Frame(frame) => to_client.try_send(frame).unwrap(),
+                vibeos_core::net_transmit::Transmit::Segments(ticket) => {
+                    observed_large += 1;
+                    pooled.pool().try_consume(ticket, session_stamp(), |request| {
+                        let mut wire = [0; 1514];
+                        for index in 0..request.wire_segments() {
+                            let length = request.write_segment(index, &mut wire).unwrap();
+                            to_client.try_send(StampedPacket::copy_from(&wire[..length], session_stamp()).unwrap()).unwrap();
+                        }
+                        Ok::<_, ()>(())
+                    }).unwrap().unwrap();
+                }
+            }
+        }
+        let report = server.drive_tcp_frontend(socket, &frontend).unwrap();
+        assert!(report.received_bytes <= 4 * 32768);
+        assert!(report.transmitted_bytes <= 4 * 32768);
+        connection = connection.or_else(|| frontend.try_accept());
+        if client.socket().can_send() && request_sent < request.len() {
+            request_sent += client.socket().send_slice(&request[request_sent..]).unwrap();
+        }
+        if let Some(peer) = connection {
+            // Leave receive queues full on alternate turns to exercise backpressure.
+            if now % 2 == 0 {
+                if let TcpIoResult::Progress(n) = frontend.try_recv(peer, &mut scratch[..61]).unwrap() {
+                    received_request.extend_from_slice(&scratch[..n]);
+                }
+            }
+            if response_sent < response.len() {
+                if let TcpIoResult::Progress(n) = frontend.try_send(peer, &response[response_sent..]).unwrap() {
+                    response_sent += n;
+                }
+            }
+        }
+        if now % 5 == 0 && client.socket().can_recv() {
+            let n = client.socket().recv_slice(&mut scratch).unwrap();
+            received_response.extend_from_slice(&scratch[..n]);
+        }
+        if received_request.len() == request.len() && received_response.len() == response.len() {
+            break;
+        }
+    }
+    assert!(observed_large > 0, "real TCP must use pooled requests");
+    assert_eq!(pooled.pool().in_use(), 0);
+    assert_eq!(received_request, request);
+    assert_eq!(received_response, response);
+    #[cfg(feature = "native-tcp-segmentation")]
+    assert!(client.device.stats().tx_segmented_requests > 0,
+        "the real TCP transfer must exercise native large-send generation");
+    space.revoke(server_in_root).unwrap();
+    assert_eq!(
+        server.drive_tcp_frontend(socket, &frontend),
+        Err(vibeos_net_protocol::TcpFrontendDriveError::Stack(StackError::AuthorityRevoked))
+    );
 }

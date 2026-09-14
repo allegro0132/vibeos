@@ -16,6 +16,19 @@ use core::fmt::Write as _;
 /// backend's hardware descriptor-ring depth.
 pub const FRONTEND_QUEUE_DEPTH: usize = crate::platform::NETWORK_FRONTEND.queue_depth;
 
+/// Runtime control-plane observation, separate from controller diagnostics.
+#[cfg(feature = "network-status-snapshot")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeInfo {
+    pub online: bool,
+    pub quarantined: bool,
+    pub session_epoch: u64,
+    pub phy_link_up: bool,
+    pub ethernet_address: [u8; 6],
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
+}
+
 /// Stable physical attachment identity used only to order discovered NICs.
 /// Interface names are assigned after sorting these keys; no `netN` value is
 /// coupled to a driver kind or discovery order.
@@ -97,6 +110,9 @@ pub use crate::dwmac_net::{
     MmioWindow, NetDevice, NetError, NetInfo, NetResources, GUEST_MAC, HANDSHAKE_ETHERTYPE,
     HANDSHAKE_FRAME_LEN, PEER_MAC,
 };
+
+#[cfg(all(feature = "network-status-snapshot", feature = "packet-network", not(feature = "universal")))]
+pub(crate) use crate::dwmac_net::runtime_info_with;
 
 #[cfg(all(feature = "queued-network", not(feature = "universal")))]
 #[allow(unused_imports)]

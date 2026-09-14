@@ -18,8 +18,32 @@ use crate::net::{
 use crate::sync::SpinLock;
 use crate::world::Space;
 
+#[cfg(feature = "direct-tcp-segmentation")]
+type OutboundResource = vibeos_core::net_transmit::TransmitEndpoint;
+#[cfg(not(feature = "direct-tcp-segmentation"))]
+type OutboundResource = Endpoint<StampedPacket>;
+#[cfg(not(feature = "direct-tcp-segmentation"))]
+type PendingTx = Packet;
+#[cfg(feature = "direct-tcp-segmentation")]
+enum PendingTx { Frame(Packet), Segments(vibeos_core::net_segment_pool::Ticket) }
+#[cfg(feature = "direct-tcp-segmentation")]
+impl PendingTx {
+    fn as_bytes(&self) -> &[u8] {
+        match self { Self::Frame(packet) => packet.as_bytes(), Self::Segments(_) => unreachable!("large send handled first") }
+    }
+}
+
 const TX_TIMEOUT_MS: u64 = 2_000;
 const DRIVER_BATCH_PACKETS: usize = 32;
+
+#[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
+static TSO_GROUPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
+static TSO_FRAMES: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
+pub fn tso_counts() -> (u64,u64) {
+    (TSO_GROUPS.load(Ordering::Relaxed), TSO_FRAMES.load(Ordering::Relaxed))
+}
 
 fn description() -> &'static vibeos_hal::network::Device { device() }
 
@@ -282,6 +306,26 @@ pub fn info_with(lease: &InvocationLease<NetDevice>) -> Result<NetInfo, NetError
     Ok(lease.with(NetDevice::info))
 }
 
+// Admission policy is published separately from the DMA batch lock. Hardware
+// telemetry uses the HAL's explicitly concurrent-safe operation contract.
+#[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
+pub(crate) fn runtime_info_with(lease: &InvocationLease<NetDevice>) -> Result<crate::net_device::RuntimeInfo, NetError> {
+    if !lease.authorizes(Rights::READ) { return Err(NetError::PermissionDenied); }
+    Ok(lease.with(|_| {
+        let (online, quarantined, session_epoch) = *RUNTIME_INFO.lock();
+        // SAFETY: Device::telemetry must permit concurrent engine operations;
+        // it may not borrow mutable engine state. The invocation remains pinned.
+        let hardware = unsafe { (device().telemetry)() };
+        crate::net_device::RuntimeInfo {
+            online, quarantined, session_epoch,
+            phy_link_up: hardware.phy_link_up,
+            ethernet_address: GUEST_MAC,
+            tx_checksum_offload: hardware.tx_checksum_offload,
+            rx_checksum_offload: hardware.rx_checksum_offload,
+        }
+    }))
+}
+
 pub fn inject_fault_with(lease: &InvocationLease<NetDevice>) -> Result<(), NetError> {
     if !lease.authorizes(Rights::WRITE) {
         return Err(NetError::PermissionDenied);
@@ -303,8 +347,10 @@ pub fn bind_stack_with(lease: &InvocationLease<NetDevice>) -> Result<PacketStamp
             return Err(NetError::Offline);
         }
         let tx_inflight = usize::from(state.tx_inflight);
+        #[cfg(feature = "direct-tcp-segmentation")]
+        if let Some(old) = state.active_stack_domain { crate::segmented_tx::retire(old); }
         state.active_stack_domain = None;
-        match state.sessions.bind_stack(tx_inflight) {
+        let result = match state.sessions.bind_stack(tx_inflight) {
             Ok(stamp) => {
                 state.active_stack_domain = Some(crate::heap::current_domain());
                 Ok(stamp)
@@ -320,7 +366,9 @@ pub fn bind_stack_with(lease: &InvocationLease<NetDevice>) -> Result<PacketStamp
                 Err(NetError::IdentityExhausted)
             }
             Err(PacketSessionError::StampMismatch(_)) => unreachable!(),
-        }
+        };
+        publish_runtime_info(&state);
+        result
     })
 }
 
@@ -340,6 +388,23 @@ static CONTROL: SpinLock<Control> = SpinLock::new_recoverable(Control {
 });
 #[cfg(feature = "network-profile")]
 pub fn profile_control_address() -> usize { &CONTROL as *const _ as usize }
+#[cfg(all(feature = "network-profile", feature = "network-status-snapshot", not(feature = "universal")))]
+pub fn profile_runtime_info_address() -> usize { &RUNTIME_INFO as *const _ as usize }
+
+
+#[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
+static RUNTIME_INFO: SpinLock<(bool, bool, u64)> = SpinLock::new_recoverable((false, false, 0));
+
+// Writers hold CONTROL and publish before lifecycle operations complete.
+// Only policy fields live here; no timeout, cached counters, link sampling,
+// or packet-admission decision is moved into this reader snapshot.
+#[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
+fn publish_runtime_info(state: &Control) {
+    *RUNTIME_INFO.lock() = (state.online, state.quarantined, state.sessions.device_epoch());
+}
+#[cfg(not(all(feature = "network-status-snapshot", not(feature = "universal"))))]
+#[inline(always)]
+fn publish_runtime_info(_: &Control) {}
 
 static STALE_INGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
 static STALE_EGRESS_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -363,7 +428,7 @@ pub async fn driver_task(
         (
             cspace.lookup_revocable::<MmioWindow>(mmio, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<DmaRegion>(dma, Rights::READ.union(Rights::WRITE)),
-            cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::RECV),
+            cspace.lookup_revocable::<OutboundResource>(outbound, Rights::RECV),
             cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::SEND),
             cspace.lookup_revocable::<NetDevice>(control, Rights::READ),
         )
@@ -408,12 +473,14 @@ pub async fn driver_task(
         if state.sessions.attach_device().is_err() {
             state.online = false;
             state.quarantined = true;
+            publish_runtime_info(&state);
             return Err(NetError::IdentityExhausted);
         }
         state.active_stack_domain = None;
         state.tx_inflight = false;
         state.online = true;
         state.quarantined = false;
+        publish_runtime_info(&state);
         Ok(())
     })
     .is_err()
@@ -435,6 +502,8 @@ pub async fn driver_task(
         engine: Some(engine),
     };
 
+    #[cfg(feature = "network-tso-coalesce")]
+    let mut tx_batch = vibeos_core::net_tx_coalesce::TxCoalescer::new();
     let mut pending_tx = None;
     let mut pending_rx = None;
     let mut tx_deadline = 0;
@@ -450,6 +519,8 @@ pub async fn driver_task(
                 &outbound,
                 &inbound,
                 &mut pending_tx,
+                #[cfg(feature = "network-tso-coalesce")]
+                &mut tx_batch,
                 &mut pending_rx,
                 &mut tx_deadline,
                 &mut link_poll,
@@ -505,9 +576,11 @@ fn with_device_authority<R>(
 
 fn driver_turn(
     engine: &mut Engine,
-    outbound: &Revocable<Endpoint<StampedPacket>>,
+    outbound: &Revocable<OutboundResource>,
     inbound: &Revocable<Endpoint<StampedPacket>>,
-    pending_tx: &mut Option<Packet>,
+    pending_tx: &mut Option<PendingTx>,
+    #[cfg(feature = "network-tso-coalesce")]
+    tx_batch: &mut vibeos_core::net_tx_coalesce::TxCoalescer,
     pending_rx: &mut Option<StampedPacket>,
     tx_deadline: &mut u64,
     link_poll: &mut Option<u64>,
@@ -532,15 +605,118 @@ fn driver_turn(
             TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             panic!("CV1800B DWMAC TX descriptor ring timed out");
         }
+        #[cfg(feature = "network-tso-coalesce")]
+        let mut dequeues_left = DRIVER_BATCH_PACKETS;
+        #[cfg(feature = "direct-tcp-segmentation")]
+        let mut wire_budget = DRIVER_BATCH_PACKETS;
         for _ in 0..DRIVER_BATCH_PACKETS {
+            #[cfg(feature = "direct-tcp-segmentation")]
+            if wire_budget == 0 { break; }
+            #[cfg(feature = "network-tso-coalesce")]
+            if tx_batch.frames() != 0 {
+                // Preserve the group on QueueFull: successors cannot overtake it.
+                let stamp = state.sessions.active_stamp().ok_or(NetError::Protocol)?;
+                let request = tx_batch.request(stamp).map_err(|_| NetError::Protocol)?;
+                let result = outbound.try_with(|_| {
+                    if tx_batch.frames() == 1 { engine.transmit(request.bytes()) }
+                    else { engine.transmit_segments(request) }
+                }).map_err(|_| NetError::AuthorityRevoked)?;
+                match result {
+                    Ok(()) => {
+                        #[cfg(feature = "network-tx-audit")]
+                        {
+                            let mut wire = [0; vibeos_core::net::MAX_PACKET_LEN];
+                            for index in 0..request.wire_segments() {
+                                let length = request.write_segment(index, &mut wire).unwrap();
+                                vibeos_core::net_tx_audit::record(1, &wire[..length]);
+                            }
+                        }
+                        if tx_batch.frames() > 1 {
+                            TSO_GROUPS.fetch_add(1, Ordering::Relaxed);
+                            TSO_FRAMES.fetch_add(tx_batch.frames() as u64, Ordering::Relaxed);
+                        }
+                        tx_batch.clear();
+                        *tx_deadline = now.saturating_add(tx_timeout_ticks());
+                        immediate_work = true;
+                    }
+                    Err(HardwareError::QueueFull) => break,
+                    Err(_) => return Err(NetError::DriverFault),
+                }
+            }
             if pending_tx.is_none() {
+                #[cfg(feature = "network-tso-coalesce")]
+                {
+                    if dequeues_left == 0 { break; }
+                    dequeues_left -= 1;
+                }
                 *pending_tx = take_admitted_outbound(outbound, &state.sessions)?;
+            }
+            #[cfg(feature = "direct-tcp-segmentation")]
+            if let Some(PendingTx::Segments(ticket)) = pending_tx.as_ref() {
+                let ticket = *ticket;
+                let expected = state.sessions.active_stamp();
+                if expected != Some(ticket.stamp()) {
+                    let _ = outbound.try_with(|q| q.pool().cancel(ticket, ticket.stamp()));
+                    *pending_tx = None;
+                    STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let result = outbound.try_with(|q| q.pool().try_consume(ticket, ticket.stamp(), |request| {
+                    let frames = request.wire_segments();
+                    // Bound a turn by wire work, not 32 large requests. Permit
+                    // one oversized group for small-MSS peers to make progress.
+                    if frames > wire_budget && wire_budget != DRIVER_BATCH_PACKETS {
+                        return Err(HardwareError::QueueFull);
+                    }
+                    let result = engine.transmit_segments(request);
+                    if result.is_ok() { vibeos_core::net_tx_audit::record_segments(1, request); }
+                    result.map(|()| frames)
+                })).map_err(|_| NetError::AuthorityRevoked)?;
+                match result {
+                    Ok(Ok(frames)) => {
+                        wire_budget = wire_budget.saturating_sub(frames);
+                        TSO_GROUPS.fetch_add(1, Ordering::Relaxed);
+                        TSO_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+                        *pending_tx = None;
+                        *tx_deadline = now.saturating_add(tx_timeout_ticks());
+                        immediate_work = true;
+                    }
+                    Ok(Err(HardwareError::QueueFull)) => break,
+                    Ok(Err(_)) => return Err(NetError::DriverFault),
+                    Err(vibeos_core::net_segment_pool::Error::Stale) => {
+                        *pending_tx = None;
+                        STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => return Err(NetError::Protocol),
+                }
+                continue;
             }
             let Some(packet) = pending_tx.as_ref() else {
                 break;
             };
+            #[cfg(feature = "network-tso-coalesce")]
+            if engine.segmentation_limits().is_some_and(|(max, min)| max >= 32768 && min <= 64) {
+                let stamp = state.sessions.active_stamp().ok_or(NetError::Protocol)?;
+                if tx_batch.push(packet.as_bytes(), stamp) {
+                    *pending_tx = None;
+                    while dequeues_left != 0 && tx_batch.frames() < 16 {
+                        dequeues_left -= 1;
+                        *pending_tx = take_admitted_outbound(outbound, &state.sessions)?;
+                        let Some(next) = pending_tx.as_ref() else { break; };
+                        if !tx_batch.push(next.as_bytes(), stamp) { break; }
+                        *pending_tx = None;
+                    }
+                    // Flush without waiting for future packets. A lone frame
+                    // keeps the ordinary transmit path.
+                    immediate_work = true;
+                    continue;
+                }
+            }
             match engine.transmit(packet.as_bytes()) {
                 Ok(()) => {
+                    vibeos_core::net_tx_audit::record(1, packet.as_bytes());
+                    #[cfg(feature = "direct-tcp-segmentation")]
+                    { wire_budget = wire_budget.saturating_sub(1); }
                     *pending_tx = None;
                     *tx_deadline = now.saturating_add(tx_timeout_ticks());
                     immediate_work = true;
@@ -551,6 +727,7 @@ fn driver_turn(
                 Err(HardwareError::PacketTooLarge) => {
                     // A safely constructed Packet always fits the DMA buffer.
                     state.online = false;
+                    publish_runtime_info(&state);
                     return Err(NetError::Protocol);
                 }
                 Err(_) => return Err(NetError::DriverFault),
@@ -558,6 +735,8 @@ fn driver_turn(
         }
         let descriptor_busy = engine.tx_owned();
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
+        #[cfg(feature = "network-tso-coalesce")]
+        { state.tx_inflight |= tx_batch.frames() != 0; }
         immediate_work |= descriptor_busy;
         if state.tx_inflight && *tx_deadline == 0 {
             *tx_deadline = now.saturating_add(tx_timeout_ticks());
@@ -604,18 +783,21 @@ fn tx_timeout_ticks() -> u64 {
     TX_TIMEOUT_MS.saturating_mul(crate::exec::timebase_hz()) / 1_000
 }
 
+#[cfg(not(feature = "direct-tcp-segmentation"))]
 fn take_outbound(
-    outbound: &Revocable<Endpoint<StampedPacket>>,
+    outbound: &Revocable<OutboundResource>,
 ) -> Result<Option<StampedPacket>, NetError> {
     outbound
         .try_with(Endpoint::try_recv)
         .map_err(|_| NetError::AuthorityRevoked)
 }
 
+#[cfg(not(feature = "direct-tcp-segmentation"))]
 fn take_admitted_outbound(
-    outbound: &Revocable<Endpoint<StampedPacket>>,
+    outbound: &Revocable<OutboundResource>,
     sessions: &PacketSessionFence,
 ) -> Result<Option<Packet>, NetError> {
+    let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::PacketQueue);
     for _ in 0..crate::net_device::FRONTEND_QUEUE_DEPTH {
         let Some(packet) = take_outbound(outbound)? else {
             return Ok(None);
@@ -635,6 +817,24 @@ fn take_admitted_outbound(
             }
             Err(_) => unreachable!(),
         }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "direct-tcp-segmentation")]
+fn take_admitted_outbound(outbound: &Revocable<OutboundResource>, sessions: &PacketSessionFence)
+    -> Result<Option<PendingTx>, NetError> {
+    use vibeos_core::net_transmit::Transmit;
+    for _ in 0..crate::net_device::FRONTEND_QUEUE_DEPTH {
+        let Some(message) = outbound.try_with(|q| q.try_recv()).map_err(|_|NetError::AuthorityRevoked)? else { return Ok(None); };
+        match message {
+            Transmit::Frame(frame) => if let Ok(packet) = sessions.accept_egress(frame) { return Ok(Some(PendingTx::Frame(packet))); },
+            Transmit::Segments(ticket) => {
+                if sessions.active_stamp() == Some(ticket.stamp()) { return Ok(Some(PendingTx::Segments(ticket))); }
+                let _ = outbound.try_with(|q| q.pool().cancel(ticket, ticket.stamp()));
+            }
+        }
+        STALE_EGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
     }
     Ok(None)
 }
@@ -666,8 +866,11 @@ fn shutdown_driver_policy(reset: bool) {
     state.online = false;
     state.quarantined |= !reset;
     state.sessions.detach_device();
+    #[cfg(feature = "direct-tcp-segmentation")]
+    crate::segmented_tx::retire_all();
     state.active_stack_domain = None;
     state.tx_inflight = false;
+    publish_runtime_info(&state);
     DRIVER_OWNER.store(OwnerId::SYSTEM.get(), Ordering::Release);
     DRIVER_ARENA.store(ArenaId::UNTRACKED.get(), Ordering::Release);
 }
@@ -675,12 +878,19 @@ fn shutdown_driver_policy(reset: bool) {
 /// # Safety
 /// The executor guarantees that the faulting domain can never resume.
 pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
+    // Release any abandoned pool guard before waiting on CONTROL: another hart
+    // can hold CONTROL while waiting for that same slot.
+    #[cfg(feature = "direct-tcp-segmentation")]
+    unsafe { crate::segmented_tx::recover(domain); }
+    #[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
+    let _ = unsafe { RUNTIME_INFO.recover_after_fault(domain) };
     let _ = unsafe { CONTROL.recover_after_fault(domain) };
     {
         let mut state = CONTROL.lock();
         if state.active_stack_domain == Some(domain) {
             state.sessions.unbind_stack();
             state.active_stack_domain = None;
+            publish_runtime_info(&state);
         }
     }
     if DRIVER_OWNER.load(Ordering::Acquire) != domain.owner.get()

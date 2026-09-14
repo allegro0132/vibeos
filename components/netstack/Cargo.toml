@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+network-tx-audit = ["vibeos-net-protocol/network-tx-audit"]
+native-tcp-segmentation = ["vibeos-net-protocol/native-tcp-segmentation"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = ["vibeos-net-protocol/bounded-gro"]
 tcp-large-window = ["vibeos-net-protocol/tcp-large-window"]
 default = ["tcp-echo"]
 static-service = []

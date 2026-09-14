@@ -3,8 +3,9 @@
 //! allocation, locks, or reset; one capture window is permitted per boot.
 #[derive(Clone, Copy)]
 #[repr(usize)]
-pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend }
-pub const NAMES: [&str; 8] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend"];
+pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend, PacketQueue, Completion, PacketBuild, ProtocolPoll }
+pub const STAGE_COUNT: usize = 12;
+pub const NAMES: [&str; STAGE_COUNT] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend", "packet_queue", "completion", "packet_build", "protocol_poll"];
 
 #[cfg(feature = "network-profile")]
 mod enabled;

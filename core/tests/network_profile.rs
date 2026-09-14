@@ -12,13 +12,15 @@ fn nested_scopes_waits_boundaries_and_abandoned_children() {
     assert!(!p::start(1, 1000));
     let parent = Scope::enter(Stage::Driver);
     arch::advance_time(10);
+    let build = Scope::enter(Stage::PacketBuild);
+    arch::advance_time(7);
     let child = Scope::enter(Stage::Rx);
     arch::advance_time(20);
     let wait = p::lock_start();
     arch::advance_time(5);
     p::lock_end_at(wait, true, 0x12340);
     drop(child);
-    arch::advance_time(7);
+    drop(build);
     p::queue("net-inbound", 12, false);
     p::queue("net-inbound", 32, true);
     p::queue("net-inbound", 1, false);
@@ -26,8 +28,9 @@ fn nested_scopes_waits_boundaries_and_abandoned_children() {
     p::queue("unrelated", 999, true);
     drop(parent);
     let b = p::snapshot(0);
-    assert_eq!(b.ticks[Stage::Driver as usize], 17);
+    assert_eq!(b.ticks[Stage::Driver as usize], 10);
     assert_eq!(b.ticks[Stage::Rx as usize], 20);
+    assert_eq!(b.ticks[Stage::PacketBuild as usize], 7);
     assert_eq!(b.wait[Stage::Rx as usize], 5);
     let rows: Vec<_> = (0..=p::LOCK_SLOTS).map(|i| p::lock_snapshot(0, i)).collect();
     let exact = rows.iter().find(|r| r.0 == 0x12340).unwrap();
@@ -35,8 +38,8 @@ fn nested_scopes_waits_boundaries_and_abandoned_children() {
     assert_eq!(exact.2[Stage::Rx as usize], 1);
     assert_eq!(b.high, [32, 7]);
     assert_eq!(b.full, [1, 0]);
-    assert_eq!(p::snapshot_hart(0).ticks[Stage::Driver as usize], 17);
-    assert_eq!(p::snapshot_hart(1).ticks, [0; 8]);
+    assert_eq!(p::snapshot_hart(0).ticks[Stage::Driver as usize], 10);
+    assert_eq!(p::snapshot_hart(1).ticks, [0; p::STAGE_COUNT]);
     assert!(p::lock_start().is_none());
 
     // Model a fault landing pad skipping the inner scope's Drop. The outer

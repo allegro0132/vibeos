@@ -153,3 +153,42 @@ pub fn rx_checksum(words: [u32; 4]) -> RxChecksum {
         _ => RxChecksum::Unavailable,
     }
 }
+
+/// Header-only first TSO descriptor. Word 1 stays zero, compatible with
+/// controllers implementing extended DMA address widths even for low addresses.
+/// Runtime must reserve context, header and all payload descriptors before OWN.
+pub fn tso_ipv4_first(
+    header_address: u64,
+    tcp_header_bytes: usize,
+    total_payload_bytes: usize,
+) -> Result<[u32; 4], Error> {
+    if !(20..=60).contains(&tcp_header_bytes)
+        || tcp_header_bytes % 4 != 0
+        || !(1..=0x3ffff).contains(&total_payload_bytes) {
+        return Err(Error::InvalidLength);
+    }
+    let header_bytes = 14 + 20 + tcp_header_bytes;
+    Ok([
+        address32(header_address, header_bytes)?, 0, header_bytes as u32,
+        FIRST | (1 << 18) | (((tcp_header_bytes / 4) as u32) << 19)
+            | total_payload_bytes as u32,
+    ])
+}
+
+/// Continuation of an already prepared TSO packet. Context and total length
+/// belong only to the first descriptor. Payload storage remains owned until
+/// the final descriptor of the entire logical packet completes.
+pub fn tso_continuation(address: u64, bytes: usize, last: bool) -> Result<[u32; 4], Error> {
+    if !(1..=0x3fff).contains(&bytes) { return Err(Error::InvalidLength); }
+    Ok([address32(address, bytes)?, 0, bytes as u32, if last { LAST } else { 0 }])
+}
+
+/// MSS context for IP MTU 1500, IPv4 without options. A TCP option changes the
+/// maximum MSS, not the wire MTU. No cached MSS state is retained by this codec.
+pub fn tso_mss(mss: usize, tcp_header_bytes: usize) -> Result<[u32; 4], Error> {
+    if !(20..=60).contains(&tcp_header_bytes) || tcp_header_bytes % 4 != 0
+        || mss < 64 || mss > 1500 - 20 - tcp_header_bytes {
+        return Err(Error::InvalidLength);
+    }
+    Ok([0, 0, mss as u32, CONTEXT | (1 << 26)])
+}

@@ -5,12 +5,16 @@ The image keeps iperf3 on 5201 for same-image comparison and adds four separate
 capability-confined listeners on 5300–5303. One supervised task serves them
 round-robin, with independent connection state. The default image is unchanged.
 
-Each connection sends a 24-byte request: ASCII `VBENCH01`, one mode byte
+Each connection sends a 24-byte request: ASCII `VBENCH02` (or legacy `VBENCH01`), one mode byte
 (0 = board receives, 1 = board sends), seven zero bytes, and an unsigned 64-bit
 big-endian payload byte count (1..16 GiB). Mode 0 sends the requested payload
 after the request; mode 1 receives that many bytes. The board then sends a
 16-byte result: completed payload bytes followed by elapsed milliseconds,
 both unsigned 64-bit big-endian, and closes after draining queued output.
+V2 sends a one-byte `R` readiness response after parsing the header and waits
+for a one-byte `G` before transferring payload. The host waits for all flows
+to become ready, then releases their GO barrier and starts timing. V1 skips
+this handshake and remains available with client `--protocol 1`.
 Invalid requests, premature close and the 300-second connection deadline abort
 the connection. Capability checks and stale-generation rejection remain in the
 kernel adapter on every operation. A revoked listener terminates the component.

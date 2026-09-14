@@ -19,11 +19,23 @@ impl Engine {
         unsafe { (device().telemetry)().rx_checksum_offload }
     }
     pub fn tx_owned(&mut self) -> bool {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Completion);
         unsafe { (device().tx_owned)() }
     }
     pub fn transmit(&mut self, packet: &[u8]) -> Result<(), Error> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Tx);
         unsafe { (device().transmit)(packet) }
+    }
+    pub fn segmentation_limits(&self) -> Option<(usize,usize)> {
+        device().segmentation.as_ref().map(|s|(s.max_packet_bytes,s.min_mss))
+    }
+    pub fn transmit_segments(&mut self, request: vibeos_hal::tcp_segmentation::TcpSegments<'_>) -> Result<(),Error> {
+        let operation=device().segmentation.as_ref().ok_or(Error::InvalidDescription)?;
+        if request.bytes().len()>operation.max_packet_bytes || request.mss()<operation.min_mss {
+            return Err(Error::InvalidDescription);
+        }
+        let _scope=vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Tx);
+        unsafe {(operation.transmit)(request)}
     }
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Rx);

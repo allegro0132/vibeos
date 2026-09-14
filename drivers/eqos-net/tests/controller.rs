@@ -151,12 +151,14 @@ fn backend_rejects_unowned_pool_before_dma_programming() {
 #[derive(Default)]
 struct State {
     registers: BTreeMap<usize, u32>,
+    reads: Vec<usize>,
     writes: Vec<(usize, u32)>,
     reset_stuck: bool,
     sticky_enable: bool,
     drop_start: bool,
     drop_bus_limits: bool,
     drop_rx_checksum: bool,
+    drop_tso: bool,
     drop_error_forward: bool,
     ticks: u64,
     step: u64,
@@ -166,6 +168,7 @@ struct Model(Rc<RefCell<State>>);
 impl Registers for Model {
     fn read(&mut self, a: usize) -> u32 {
         let mut s = self.0.borrow_mut();
+        s.reads.push(a);
         if a == 0x1000 {
             s.mode_reads += 1;
         }
@@ -177,7 +180,9 @@ impl Registers for Model {
     fn write(&mut self, a: usize, v: u32) {
         let mut s = self.0.borrow_mut();
         s.writes.push((a, v));
-        let value = if a == 0xd30 && s.drop_error_forward {
+        let value = if a == 0x1104 && s.drop_tso {
+            v & !(1 << 12)
+        } else if a == 0xd30 && s.drop_error_forward {
             v & !0x50
         } else if a == 0 && s.drop_rx_checksum {
             v & !(1 << 27)
@@ -225,6 +230,37 @@ fn model() -> (Controller<Model>, Rc<RefCell<State>>) {
     let s = Rc::new(RefCell::new(State::default()));
     s.borrow_mut().registers.insert(0x120, 5 << 6 | 5);
     (Controller::new(Model(s.clone()), config()).unwrap(), s)
+}
+
+#[test]
+fn mmc_snapshot_does_not_touch_counters_in_destructive_or_frozen_modes() {
+    for mode in [1, 4, 8, 16, 32] {
+        let (mut c, s) = model();
+        s.borrow_mut().registers.insert(0x11c, 1 << 8);
+        s.borrow_mut().registers.insert(0x700, mode);
+        s.borrow_mut().reads.clear();
+        assert_eq!(c.mmc_tx_counters(), None);
+        assert_eq!(s.borrow().reads, [0x11c, 0x700]);
+        assert!(s.borrow().writes.is_empty());
+    }
+    let (mut c, s) = model();
+    s.borrow_mut().reads.clear();
+    assert_eq!(c.mmc_tx_counters(), None);
+    assert_eq!(s.borrow().reads, [0x11c]);
+}
+
+#[test]
+fn mmc_snapshot_reads_good_and_bad_frames_without_reset() {
+    let (mut c, s) = model();
+    for (address, value) in [(0x11c, 1 << 8), (0x700, 2), (0x718, 100),
+        (0x768, 97), (0x748, 2), (0x760, 1), (0x770, 4)] {
+        s.borrow_mut().registers.insert(address, value);
+    }
+    let expected = MmcTxCounters { control: 2, frames_good_bad: 100,
+        frames_good: 97, underflow: 2, carrier_error: 1, pause: 4 };
+    assert_eq!(c.mmc_tx_counters(), Some(expected));
+    assert_eq!(c.mmc_tx_counters(), Some(expected));
+    assert!(s.borrow().writes.is_empty());
 }
 
 #[test]
@@ -522,4 +558,56 @@ fn diagnostics_preserve_sticky_status_and_live_ring_ownership() {
     assert_eq!(ring.diagnostics(), Some(expected));
     assert_eq!(s.borrow().writes.len(), writes);
     assert!(ring.into_stopped_backend().is_err());
+}
+
+#[test]
+fn negotiated_pause_requires_stop_and_full_duplex_with_fifo_headroom() {
+    for (rx, threshold) in [(4, 0), (5, 1 << 7 | 1 << 8 | 3 << 14), (6, 1 << 7 | 4 << 8 | 7 << 14)] {
+        let (mut c, s) = model();
+        s.borrow_mut().registers.insert(0x120, 5 << 6 | rx);
+        c.reset().unwrap();
+        c.set_symmetric_pause(true).unwrap();
+        c.configure(layout()).unwrap();
+        assert_eq!(s.borrow().registers[&0xd30] & 0x000f_ff80, threshold);
+        assert_eq!(s.borrow().registers[&0x70], 0xffff_0002);
+        assert_eq!(s.borrow().registers[&0x90], 1);
+        c.start().unwrap();
+        assert_eq!(c.set_symmetric_pause(false), Err(Error::NotReady));
+        c.stop().unwrap();
+        c.set_symmetric_pause(false).unwrap();
+        assert_eq!(c.start(), Err(Error::NotReady));
+        c.configure(layout()).unwrap();
+        assert_eq!(s.borrow().registers[&0xd30] & 0x000f_ff80, 0);
+        assert_eq!(s.borrow().registers[&0x70], 0);
+        assert_eq!(s.borrow().registers[&0x90], 0);
+    }
+    for (rx, duplex) in [(4, false), (5, false)] {
+        let (mut c, s) = model();
+        s.borrow_mut().registers.insert(0x120, 5 << 6 | rx);
+        c.reset().unwrap();
+        c.set_link(Speed::Mbps1000, duplex).unwrap();
+        c.set_symmetric_pause(true).unwrap();
+        assert_eq!(c.configure(layout()), Err(Error::ConfigurationRejected));
+        assert_eq!(c.start(), Err(Error::NotReady));
+    }
+}
+
+#[test]
+fn tso_requires_capabilities_readback_and_stopped_configuration() {
+    let (mut c,s)=model();
+    assert_eq!(c.set_tso(true),Err(Error::ConfigurationRejected));
+    s.borrow_mut().registers.insert(0x120,0x09845904);
+    assert_eq!(c.set_tso(true),Err(Error::ConfigurationRejected));
+    s.borrow_mut().registers.insert(0x11c,1<<14);
+    c.set_tso(true).unwrap();assert!(!c.tso_active());
+    c.reset().unwrap();s.borrow_mut().drop_tso=true;
+    assert_eq!(c.configure(layout()),Err(Error::ConfigurationRejected));
+    assert_eq!(c.start(),Err(Error::NotReady));assert!(!c.tso_active());
+    s.borrow_mut().drop_tso=false;
+    c.configure(layout()).unwrap();assert!(!c.tso_active());c.start().unwrap();
+    assert!(c.tso_active());assert_eq!(s.borrow().registers[&0x1104]&(1<<12),1<<12);
+    assert_eq!(c.set_tso(false),Err(Error::NotReady));
+    c.stop().unwrap();assert!(!c.tso_active());c.set_tso(false).unwrap();
+    c.configure(layout()).unwrap();c.start().unwrap();assert!(!c.tso_active());
+    assert_eq!(s.borrow().registers[&0x1104]&(1<<12),0);
 }

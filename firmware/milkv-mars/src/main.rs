@@ -133,6 +133,7 @@ pub static VIBEOS_PACKET_DEVICE: vibeos_hal::network::Device = vibeos_hal::netwo
     claim: |_, _, _| Err(vibeos_hal::network::Error::InvalidDescription),
     tx_owned: || false,
     transmit: |_| Err(vibeos_hal::network::Error::InvalidDescription),
+    segmentation: None,
     receive: |_| None,
     poll_link: || {},
     shutdown: || true,

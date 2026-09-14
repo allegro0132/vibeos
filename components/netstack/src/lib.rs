@@ -29,9 +29,20 @@ use vibeos_net_protocol::{
 };
 
 pub use vibeos_net_protocol::command::NetworkInterfaceId;
+pub use vibeos_net_protocol::PacketTransmit;
 
 pub mod command;
 pub mod config;
+
+/// Approximate once-per-second totals for live stack instances; no hot-path
+/// atomic increments. Diagnostic only, not a lifetime delivery guarantee.
+#[cfg(feature = "bounded-gro")]
+static GRO_STATS: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+#[cfg(feature = "bounded-gro")]
+pub fn gro_stats() -> [u64; 3] {
+    core::array::from_fn(|i| GRO_STATS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkInfo {
@@ -53,7 +64,7 @@ pub enum NetworkBindError {
 }
 
 pub type PacketEndpoints = (
-    Revocable<Endpoint<StampedPacket>>,
+    PacketTransmit,
     Revocable<Endpoint<StampedPacket>>,
 );
 
@@ -238,6 +249,8 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
     }
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
 
+    #[cfg(feature = "bounded-gro")]
+    let mut gro_last_ms = 0;
     loop {
         #[cfg(feature = "tcp-echo-recovery-test")]
         if FAULT_REQUESTED.swap(false, Ordering::AcqRel) {
@@ -287,6 +300,23 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                 .store(rejected_stack_generation_ingress, Ordering::Release);
         }
 
+        #[cfg(feature = "bounded-gro")]
+        if now_ms.saturating_sub(gro_last_ms) >= 1000 {
+            let mut totals = [0u64; 3];
+            for interface in &interfaces {
+                if let Some(active) = interface.stack.as_ref() {
+                    let stats = active.core.device_stats();
+                    totals[0] += stats.rx_frames;
+                    totals[1] += stats.gro_merged_segments;
+                    totals[2] += stats.gro_aggregates;
+                }
+            }
+            for (slot, value) in GRO_STATS.iter().zip(totals) {
+                slot.store(value, core::sync::atomic::Ordering::Relaxed);
+            }
+            gro_last_ms = now_ms;
+        }
+
         if live_interfaces == 0 {
             return;
         }
@@ -301,7 +331,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
 
 struct InterfaceTask {
     interface: NetworkInterfaceId,
-    outbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: PacketTransmit,
     inbound: Revocable<Endpoint<StampedPacket>>,
     control: Cap,
     listeners: Vec<Revocable<TcpListener>>,

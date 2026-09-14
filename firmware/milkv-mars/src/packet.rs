@@ -101,6 +101,15 @@ impl<R: Io + 'static, M: Memory, P: MdioPort> Engine<R, M, P> {
         self.ring()
             .set_link(link.speed, link.full_duplex)
             .map_err(|_| Error::Ring(ring::Error::Controller))?;
+        #[cfg(feature = "symmetric-pause-experiment")]
+        {
+            let (local, partner) = self.phy.advertisements()?;
+            let pause = link.full_duplex && local & partner & (1 << 10) != 0;
+            self.ring().set_symmetric_pause(pause)
+                .map_err(|_| Error::Ring(ring::Error::Controller))?;
+        }
+        #[cfg(feature = "tso-experiment")]
+        self.ring().set_tso(true).map_err(|_| Error::Ring(ring::Error::Controller))?;
         self.ring().initialize()?;
         self.link = Some(link);
         Ok(())
@@ -154,6 +163,18 @@ impl<R: Io + 'static, M: Memory, P: MdioPort> Engine<R, M, P> {
             Ok(()) => { self.tx_packets = self.tx_packets.saturating_add(1); Ok(()) }
             Err(e @ (ring::Error::Full | ring::Error::Packet)) => Err(e.into()),
             Err(e) => { self.fail(); Err(e.into()) }
+        }
+    }
+    #[cfg(feature = "tso-experiment")]
+    pub fn transmit_segments(&mut self, segments: vibeos_hal::tcp_segmentation::TcpSegments<'_>) -> Result<(),Error> {
+        if self.faulted {return Err(Error::Faulted);}
+        if self.link.is_none() {return Err(Error::Ring(ring::Error::Full));}
+        let request=vibeos_eqos_net::tso::Request::from_segments(segments)
+            .map_err(|_|Error::Ring(ring::Error::Packet))?;
+        match self.ring().transmit_tso(request) {
+            Ok(())=>{self.tx_packets=self.tx_packets.saturating_add(segments.wire_segments() as u64);Ok(())},
+            Err(e @ (ring::Error::Full | ring::Error::Packet))=>Err(e.into()),
+            Err(e)=>{self.fail();Err(e.into())}
         }
     }
     /// A malformed/oversized RX frame has already been dropped and rearmed by
@@ -218,6 +239,14 @@ impl<R: Io + 'static, M: Memory, P: MdioPort> Engine<R, M, P> {
         self.ring.diagnostics()
     }
     pub fn rx_diagnostics(&self) -> ring::RxDiagnostics { self.ring.rx_diagnostics() }
+    pub fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { self.ring.flow_diagnostics() }
+    pub fn pending_tx(&self) -> usize { self.ring.pending() }
+    pub fn advertisements(&mut self) -> Result<(u16, u16), Error> {
+        self.phy.advertisements().map_err(Error::Phy)
+    }
+    pub fn mmc_tx_counters(&mut self) -> Option<vibeos_eqos_net::controller::MmcTxCounters> {
+        self.ring.mmc_tx_counters()
+    }
     pub fn shutdown(&mut self) -> bool {
         self.link = None;
         let stopped = self.ring().shutdown();

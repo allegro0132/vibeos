@@ -92,17 +92,22 @@ pub enum Direction {
 /// it must reject layouts outside the backend's actual dedicated pool before
 /// returning true. Arithmetic validation alone never authorizes a DMA address.
 /// `start` uses the prepared rings with FCS retention, configured RX checksum
-/// observation, and TSO disabled.
+/// observation, and TSO disabled unless `tso_capable` explicitly admits it.
 /// TX checksum insertion is selected per descriptor only when supported.
 /// Errors may leave DMA active and must not release storage. Tail pointers use
 /// the same 32-bit address domain as Layout; RX tail names the last returned slot.
 pub unsafe trait Backend {
     /// Read-only diagnostics; implementations must not acknowledge or reset DMA.
     fn diagnostics(&mut self) -> Option<crate::controller::DmaDiagnostics> { None }
+    fn mmc_tx_counters(&mut self) -> Option<crate::controller::MmcTxCounters> { None }
     /// True only with hardware TXCOE and a compatible store-and-forward mode.
     fn tx_checksum_capable(&self) -> bool { false }
+    /// True only when hardware TSO is admitted and the channel is configured
+    /// for header-only first TSO descriptors. Default backends remain off.
+    fn tso_capable(&self) -> bool { false }
     fn reset(&mut self) -> bool;
     fn configure(&mut self, layout: Layout) -> bool;
+    fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { None }
     fn start(&mut self) -> bool;
     fn stop(&mut self) -> bool;
     fn read_word(&mut self, address: u64, word: usize) -> u32;
@@ -139,6 +144,8 @@ pub struct Ring<B: Backend + 'static> {
     receive: usize,
     rx_diagnostics: RxDiagnostics,
     single_tx_sync: bool,
+    // Descriptor groups are released atomically. Non-head entries are ignored.
+    tx_groups: [u16; 1024],
 }
 
 impl<B: Backend> Ring<B> {
@@ -156,6 +163,7 @@ impl<B: Backend> Ring<B> {
             receive: 0,
             rx_diagnostics: RxDiagnostics::default(),
             single_tx_sync: false,
+            tx_groups: [0; 1024],
         })
     }
     /// Opt-in TX publication experiment; select only while proven offline.
@@ -182,6 +190,7 @@ impl<B: Backend> Ring<B> {
             None
         }
     }
+    pub fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { self.backend.flow_diagnostics() }
     pub fn initialize(&mut self) -> Result<(), Error> {
         if self.state == State::Running {
             return Err(Error::Controller);
@@ -193,6 +202,7 @@ impl<B: Backend> Ring<B> {
         self.producer = 0;
         self.consumer = 0;
         self.pending = 0;
+        self.tx_groups.fill(0);
         self.receive = 0;
         for i in 0..self.layout.count {
             let tx = self.layout.desc(false, i);
@@ -273,6 +283,30 @@ impl<B: Backend> Ring<B> {
         self.running()?;
         let mut completed = 0;
         while self.pending != 0 {
+            let group = self.tx_groups[self.consumer] as usize;
+            if group > 1 {
+                // Completion of a prefix does not release any group buffer.
+                for offset in 0..group {
+                    let index = (self.consumer + offset) % self.layout.count;
+                    let words = self.snapshot(false, index);
+                    if words[3] & OWN != 0 { return Ok(completed); }
+                    if offset == group - 1 {
+                        if let Err(error) = descriptor::tx_complete(words) {
+                            self.state = State::Quarantined;
+                            return Err(Error::Descriptor(error));
+                        }
+                    }
+                }
+                for offset in 0..group {
+                    self.backend.for_cpu(
+                        self.layout.buffer(false, (self.consumer + offset) % self.layout.count),
+                        BUFFER, Direction::ToDevice);
+                }
+                self.pending -= group;
+                self.consumer = (self.consumer + group) % self.layout.count;
+                completed += group;
+                continue;
+            }
             let words = self.snapshot(false, self.consumer);
             match descriptor::tx_complete(words) {
                 Ok(false) => break,
@@ -328,10 +362,65 @@ impl<B: Backend> Ring<B> {
         // cache lines; keep descriptor ownership publication after this sync.
         self.backend.for_device(buffer, packet.len().div_ceil(STRIDE) * STRIDE, Direction::ToDevice);
         self.publish(self.layout.desc(false, self.producer), words, !self.single_tx_sync);
+        self.tx_groups[self.producer] = 1;
         self.pending += 1;
         self.producer = (self.producer + 1) % self.layout.count;
         self.backend
             .tail(false, self.layout.desc(false, self.producer));
+        Ok(())
+    }
+    /// Copy and submit a logical TCP packet as context plus data descriptors.
+    /// Reserves the complete group, publishes its head last and rings one tail.
+    /// `pending`/`reap` count descriptor slots, not on-wire segments.
+    pub fn transmit_tso(&mut self, request: crate::tso::Request<'_>) -> Result<(), Error> {
+        self.running()?;
+        if !self.backend.tso_capable() { return Err(Error::Controller); }
+        let bytes = request.bytes();
+        let payload = &bytes[request.header_bytes()..];
+        let payload_slots = payload.len().div_ceil(BUFFER);
+        let data_slots = 1 + payload_slots;
+        let needed = 1 + data_slots;
+        if needed >= self.layout.count { return Err(Error::Full); }
+        let head = self.producer;
+        let mut prepared = [[0u32; 4]; 1 + crate::tso::MAX_PACKET.div_ceil(BUFFER)];
+        // Validate every address/encoding before touching DMA state. Headers
+        // use their own descriptor; word 1 always remains an upper address (0).
+        prepared[0] = descriptor::tso_ipv4_first(
+            self.layout.buffer(false,(head+1)%self.layout.count),
+            request.header_bytes()-34,request.payload_bytes()).map_err(Error::Descriptor)?;
+        for part in 0..payload_slots {
+            let index = (head + 2 + part) % self.layout.count;
+            prepared[part+1] = descriptor::tso_continuation(
+                self.layout.buffer(false,index),(payload.len()-part*BUFFER).min(BUFFER),
+                part == payload_slots-1).map_err(Error::Descriptor)?;
+        }
+        let context = descriptor::tso_mss(request.mss(),request.header_bytes()-34)
+            .map_err(Error::Descriptor)?;
+        self.reap()?;
+        if self.pending + needed >= self.layout.count { return Err(Error::Full); }
+        // Qualify a single checksum convention: TSO computes both checksums.
+        // Clear only our header scratch, never the caller's immutable bytes.
+        let mut header = [0u8; 94];
+        header[..request.header_bytes()].copy_from_slice(&bytes[..request.header_bytes()]);
+        header[24..26].fill(0);
+        header[50..52].fill(0);
+        // The exclusive tail and unowned context gate the prepared group.
+        for part in (0..data_slots).rev() {
+            let index = (head + 1 + part) % self.layout.count;
+            let buffer = self.layout.buffer(false,index);
+            let chunk = if part == 0 { &header[..request.header_bytes()] } else {
+                let start = (part-1)*BUFFER;
+                &payload[start..payload.len().min(start+BUFFER)]
+            };
+            self.backend.copy_tx(buffer,chunk);
+            self.backend.for_device(buffer,chunk.len().div_ceil(STRIDE)*STRIDE,Direction::ToDevice);
+            self.publish(self.layout.desc(false,index),prepared[part],true);
+        }
+        self.publish(self.layout.desc(false,head),context,true);
+        self.tx_groups[head] = needed as u16;
+        self.pending += needed;
+        self.producer = (head + needed) % self.layout.count;
+        self.backend.tail(false,self.layout.desc(false,self.producer));
         Ok(())
     }
     /// At most one descriptor is consumed per call, including malformed frames.
@@ -384,6 +473,9 @@ impl<B: Backend> Ring<B> {
     /// Retain exclusive backend ownership while sampling read-only status.
     pub fn diagnostics(&mut self) -> Option<crate::controller::DmaDiagnostics> {
         self.backend.diagnostics()
+    }
+    pub fn mmc_tx_counters(&mut self) -> Option<crate::controller::MmcTxCounters> {
+        self.backend.mmc_tx_counters()
     }
     /// Cumulative observations from receive_with_status, retained across reset.
     pub fn rx_diagnostics(&self) -> RxDiagnostics { self.rx_diagnostics }

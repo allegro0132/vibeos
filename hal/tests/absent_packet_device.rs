@@ -1,3 +1,6 @@
+extern crate self as vibeos_core;
+#[path = "../../core/src/net_profile.rs"]
+pub mod net_profile;
 #[path = "../../kernel/src/packet_device.rs"]
 mod adapter;
 use vibeos_hal::{network::*, AddressRange};
@@ -12,6 +15,7 @@ static VIBEOS_PACKET_DEVICE: Device = Device {
     claim: |_, _, _| panic!("absent device claimed"),
     tx_owned: || panic!(),
     transmit: |_| panic!(),
+    segmentation: None,
     receive: |_| panic!(),
     poll_link: || panic!(),
     shutdown: || panic!(),

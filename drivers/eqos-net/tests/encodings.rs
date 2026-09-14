@@ -172,3 +172,28 @@ fn rx_checksum_requires_complete_valid_cpu_owned_metadata() {
         assert_eq!(rx_checksum([0,flags,0,complete]),C::Error);
     }
 }
+
+#[test]
+fn tso_context_header_and_payload_have_distinct_fields_and_no_ownership() {
+    assert_eq!(d::tso_mss(1448,32),Ok([0,0,1448,0x4400_0000]));
+    let first=d::tso_ipv4_first(0x4200_0000,32,4096).unwrap();
+    assert_eq!(first,[0x4200_0000,0,66,0x2044_1000]);
+    assert_eq!(d::tso_continuation(0x4200_1000,1536,false),Ok([0x4200_1000,0,1536,0]));
+    assert_eq!(d::tso_continuation(0x4200_2000,1024,true),Ok([0x4200_2000,0,1024,0x1000_0000]));
+    assert_eq!(first[3]&d::OWN,0);
+    assert_eq!(d::tx(0x4200_0000,8192),Err(d::Error::InvalidLength));
+}
+
+#[test]
+fn tso_rejects_bad_mss_headers_lengths_and_dma_spans() {
+    for h in [0,19,21,61,usize::MAX] {
+        assert!(d::tso_mss(64,h).is_err());assert!(d::tso_ipv4_first(0,h,1).is_err());
+    }
+    for mss in [0,1,63,1449,usize::MAX] {assert!(d::tso_mss(mss,32).is_err());}
+    assert!(d::tso_mss(64,20).is_ok());assert!(d::tso_mss(1460,20).is_ok());
+    for len in [0,16384,usize::MAX] {assert!(d::tso_continuation(0,len,true).is_err());}
+    for len in [0,0x40000,usize::MAX] {assert!(d::tso_ipv4_first(0,20,len).is_err());}
+    assert_eq!(d::tso_ipv4_first(u32::MAX as u64-52,20,10),Err(d::Error::AddressTooWide));
+    assert!(d::tso_continuation(u32::MAX as u64-9,10,true).is_ok());
+    assert!(d::tso_continuation(u64::MAX,10,true).is_err());
+}

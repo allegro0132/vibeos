@@ -7,6 +7,7 @@ import re
 
 STAGES = ['executor', 'driver', 'stack', 'application', 'other', 'rx', 'tx', 'frontend']
 
+EXTENDED_STAGES = STAGES + ['packet_queue', 'completion', 'packet_build', 'protocol_poll']
 
 def arrays(line):
     return {key: json.loads(value) for key, value in
@@ -18,6 +19,11 @@ def analyze(text):
     if not header or 'NPROF_END' not in text:
         raise ValueError('missing complete NPROF header/end marker')
     start, end, width = map(int, header.groups())
+    names = re.search(r'NPROF window=[^\n]* stages=(\[[^\]]*\])', text)
+    stages = json.loads(names[1]) if names else STAGES
+    if stages not in (STAGES, EXTENDED_STAGES):
+        raise ValueError('unsupported stage schema')
+    count = len(stages)
     if not (width > 0 and end > start):
         raise ValueError('invalid measurement interval')
     expected = min(600, (end-start+width-1)//width)
@@ -29,7 +35,7 @@ def analyze(text):
             continue
         index = int((match or hart)[1])
         values = arrays(line)
-        required = {'ticks': 8, 'wait': 8, 'calls': 8}
+        required = {'ticks': count, 'wait': count, 'calls': count}
         if match:
             required.update(high=2, full=2, dma=3)
         for name, length in required.items():
@@ -42,10 +48,10 @@ def analyze(text):
         target[index] = values
     if set(buckets) != set(range(expected)) or not harts:
         raise ValueError('missing buckets or hart summaries')
-    work = [sum(b['ticks'][i] for b in buckets.values()) for i in range(8)]
-    wait = [sum(b['wait'][i] for b in buckets.values()) for i in range(8)]
+    work = [sum(b['ticks'][i] for b in buckets.values()) for i in range(count)]
+    wait = [sum(b['wait'][i] for b in buckets.values()) for i in range(count)]
     for key, total in [('ticks', work), ('wait', wait)]:
-        if total != [sum(h[key][i] for h in harts.values()) for i in range(8)]:
+        if total != [sum(h[key][i] for h in harts.values()) for i in range(count)]:
             raise ValueError('hart and timeline totals disagree; capture may not be quiescent')
     locks = []
     names = dict(re.findall(r'NPROF_LOCK_NAME address=(0x[0-9a-f]+) name=(\S+)', text))
@@ -58,18 +64,18 @@ def analyze(text):
             raise ValueError('duplicate or unknown lock hart/address')
         identities.add(key)
         for name in ['wait', 'calls']:
-            if len(values.get(name, [])) != 8 or any(type(n) is not int or n < 0 for n in values[name]):
+            if len(values.get(name, [])) != count or any(type(n) is not int or n < 0 for n in values[name]):
                 raise ValueError('invalid lock counters')
         locks.append(dict(hart=int(h), address=address, name=names.get(address), **values))
     if locks:
         for h, totals in harts.items():
-            if totals['wait'] != [sum(r['wait'][i] for r in locks if r['hart'] == h) for i in range(8)]:
+            if totals['wait'] != [sum(r['wait'][i] for r in locks if r['hart'] == h) for i in range(count)]:
                 raise ValueError('lock identities and hart wait totals disagree')
     active = sum(work) + sum(wait)
     phases = {name: dict(exclusive_ticks=work[i], contended_wait_ticks=wait[i],
                         percent_active_work=100*work[i]/max(1, active),
                         percent_active_wait=100*wait[i]/max(1, active))
-              for i, name in enumerate(STAGES)}
+              for i, name in enumerate(stages)}
     queues = {}
     for i, name in enumerate(['inbound', 'outbound']):
         queues[name] = dict(high_water=max(b['high'][i] for b in buckets.values()),
@@ -78,7 +84,7 @@ def analyze(text):
     dma = [dict(bucket=i, ticks=start+i*width, observations=b['dma'][0],
                 status=b['dma'][1], mtl=b['dma'][2])
            for i, b in buckets.items() if b['dma'][0]]
-    return dict(start=start, end=end, width=width, phases=phases, harts=harts,
+    return dict(start=start, end=end, width=width, stages=stages, phases=phases, harts=harts,
                 queues=queues, dma_observations=dma, buckets=buckets, locks=locks,
                 limitations=['Elapsed 4 MHz timer ticks on Mars, not CPU cycles.',
                     'Work includes interrupts, MMIO polling, and instrumentation overhead.',

@@ -92,6 +92,65 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        #[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
+        "ntsoq" => {
+            let (groups, frames) = crate::dwmac_net::tso_counts();
+            println!("TSO_QUEUE groups={} wire_frames={}", groups, frames);
+        }
+        #[cfg(feature = "network-tso-probe")]
+        "ntso" => {
+            fn mac(s:&str)->Option<[u8;6]>{
+                let v:Vec<_>=s.split(':').map(|n|u8::from_str_radix(n,16).ok()).collect();
+                if v.len()!=6{return None;}Some([v[0]?,v[1]?,v[2]?,v[3]?,v[4]?,v[5]?])
+            }
+            let parsed=(||{
+                if rest.len()!=6{return None;}
+                Some(vibeos_core::net_tso_probe::Request {
+                    src_mac:mac(rest[0])?,dst_mac:mac(rest[1])?,
+                    src_ip:rest[2].parse::<core::net::Ipv4Addr>().ok()?.octets(),
+                    dst_ip:rest[3].parse::<core::net::Ipv4Addr>().ok()?.octets(),
+                    payload:rest[4].parse().ok()?,mss:rest[5].parse().ok()?,
+                })
+            })();
+            let Some(request)=parsed else {println!("usage: ntso SRC_MAC DST_MAC SRC_IP DST_IP PAYLOAD MSS");return;};
+            let accepted=vibeos_core::net_tso_probe::start(request);
+            println!("NTSO_START accepted={}",accepted);
+            if accepted {
+                for _ in 0..2000 {
+                    if matches!(vibeos_core::net_tso_probe::state(),3|4){break;}
+                    exec::sleep_ms(1).await;
+                }
+            }
+            println!("NTSO_END state={} (3=DMA-complete,4=failed)",vibeos_core::net_tso_probe::state());
+        }
+
+        #[cfg(feature = "network-tx-audit")]
+        "ntxaudit" => {
+            use vibeos_core::net_tx_audit as a;
+            if rest.first() == Some(&"start") {
+                if !tx_audit_hardware("start").await { return; }
+                println!("NTXAUDIT_START accepted={}", a::start());
+            } else if rest.first() == Some(&"stop") {
+                match a::seal() {
+                    Some(rows) => {
+                        if !tx_audit_hardware("stop").await { return; }
+                        println!("NTXAUDIT fields=[frames,payload_bytes,hash_sum,hash_xor,syn,fin] stages=[protocol_generated,driver_accepted]");
+                        for (stage, row) in rows.iter().enumerate() {
+                            println!("NTXAUDIT stage={} values={:?}", stage, row);
+                        }
+                        println!("NTXAUDIT_END");
+                    }
+                    None => println!("NTXAUDIT not ready; if a writer is finishing, retry stop"),
+                }
+            } else {
+                println!("  usage: ntxaudit start|stop (one capture per boot, TCP source 192.168.77.10:5300 -> 192.168.77.1)");
+            }
+        }
+        #[cfg(all(feature = "bounded-gro", feature = "dhcp-iperf3-server"))]
+        "ngro" => {
+            println!("NGRO fields=[rx_frames,merged_segments,aggregates] values={:?} approximate=true",
+                vibeos_netstack::gro_stats());
+        }
         #[cfg(feature = "network-profile")]
         "nprof" => {
             use vibeos_core::net_profile as p;
@@ -111,6 +170,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 }
                 #[cfg(all(feature = "packet-network", not(feature = "universal")))]
                 println!("NPROF_LOCK_NAME address={:#x} name=packet-driver-control", crate::dwmac_net::profile_control_address());
+                #[cfg(all(feature = "packet-network", feature = "network-status-snapshot", not(feature = "universal")))]
+                println!("NPROF_LOCK_NAME address={:#x} name=packet-runtime-info", crate::dwmac_net::profile_runtime_info_address());
                 for h in 0..exec::MAX_HARTS {
                     for slot in 0..=p::LOCK_SLOTS {
                         let (address, wait, calls) = p::lock_snapshot(h, slot);
@@ -1662,6 +1723,21 @@ fn durable_demo() {
     println!("  authority result: stable IDs only; no path or object pointer was persisted");
 }
 
+#[cfg(feature = "network-tx-audit")]
+async fn tx_audit_hardware(phase: &str) -> bool {
+    use vibeos_core::net_tx_audit as a;
+    let request = a::request_hardware();
+    for _ in 0..1_000 {
+        if let Some(values) = a::hardware_snapshot(request) {
+            println!("NTXAUDIT_HW phase={} values={:?}", phase, values);
+            return true;
+        }
+        exec::sleep_ms(1).await;
+    }
+    println!("NTXAUDIT_HW timeout phase={}", phase);
+    false
+}
+
 const NET_COMMAND_TIMEOUT_MS: usize = 2_000;
 
 async fn net_command(args: &[&str]) {
@@ -1669,7 +1745,7 @@ async fn net_command(args: &[&str]) {
     let (Some(outbound), Some(inbound), Some(control)) =
         (w.net_outbound, w.net_inbound, w.net_control)
     else {
-        println!("  virtio-net: offline (no modern network transport discovered)");
+        println!("  raw network diagnostics unavailable: this session has no endpoint/control grants (not a link-status result)");
         return;
     };
     let init = w.spaces["init"].clone();

@@ -1012,6 +1012,8 @@ pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 #[cfg(feature = "network-profile")]
 pub use vibeos_core::net_profile;
+#[cfg(feature = "network-tx-audit")]
+pub use vibeos_core::net_tx_audit;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
 #[cfg(any(feature = "queued-block", feature = "queued-network"))]
 pub use vibeos_virtio_protocol as virtio;
@@ -1129,6 +1131,10 @@ mod block_device;
 mod dwc2_host;
 #[cfg(feature = "packet-network")]
 mod packet_device;
+#[cfg(feature = "direct-tcp-segmentation")]
+mod segmented_tx;
+#[cfg(all(feature = "direct-tcp-segmentation", any(feature = "universal", feature = "network-tso-coalesce")))]
+compile_error!("direct TCP segmentation currently requires the single packet frontend and excludes queue coalescing");
 #[cfg(feature = "packet-network")]
 mod dwmac_net;
 #[cfg(feature = "packet-network")]
@@ -2380,3 +2386,6 @@ mod wasmtime_platform;
 mod universal_block;
 #[cfg(feature = "universal")]
 mod universal_net;
+
+#[cfg(feature = "network-tso-probe")]
+pub use vibeos_core::net_tso_probe;

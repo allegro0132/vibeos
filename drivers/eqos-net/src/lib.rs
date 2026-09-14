@@ -10,3 +10,5 @@ pub mod descriptor;
 pub mod mdio;
 pub mod pool;
 pub mod ring;
+
+pub mod tso;

@@ -25,6 +25,14 @@ pub struct Telemetry {
     pub tx_checksum_offload: bool,
     pub rx_checksum_offload: bool,
 }
+/// Optional logical TCP transmit operation. Success admits the whole request;
+/// QueueFull admits none. Caller bytes cannot be retained after return. The
+/// backend owns all submitted DMA storage through final group completion.
+pub struct Segmentation {
+    pub max_packet_bytes: usize,
+    pub min_mss: usize,
+    pub transmit: unsafe fn(crate::tcp_segmentation::TcpSegments<'_>) -> Result<(),Error>,
+}
 /// # Safety
 /// Claim requires live authority over the device and its fixed DMA pool.
 /// Engine operations are serialized by the consumer. Telemetry must be safe
@@ -44,6 +52,7 @@ pub struct Device {
     pub claim: unsafe fn([u8; 6], fn() -> u64, u64) -> Result<(), Error>,
     pub tx_owned: unsafe fn() -> bool,
     pub transmit: unsafe fn(&[u8]) -> Result<(), Error>,
+    pub segmentation: Option<Segmentation>,
     pub receive: unsafe fn(&mut [u8]) -> Option<usize>,
     pub poll_link: unsafe fn(),
     pub shutdown: unsafe fn() -> bool,

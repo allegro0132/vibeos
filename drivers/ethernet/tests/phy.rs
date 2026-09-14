@@ -16,6 +16,18 @@ const TUNING: Tuning = Tuning {
     tx_delay: 10,
     tx_inverted: [true, false, true],
 };
+
+#[test]
+fn advertisement_observation_requires_initialization_and_never_writes() {
+    let port = Port::new();
+    let mut phy = port.phy();
+    assert_eq!(phy.advertisements(), Err(Error::NotReady));
+    phy.initialize(TUNING, 4).unwrap();
+    port.0.borrow_mut().regs[ADDRESS as usize][5] = 0x0d41;
+    port.0.borrow_mut().log.clear();
+    assert_eq!(phy.advertisements(), Ok((0x0141, 0x0d41)));
+    assert!(port.0.borrow().log.iter().all(|(write, _, _, _)| !write));
+}
 struct State {
     regs: [[u16; 32]; 32],
     ext: BTreeMap<u16, u16>,
@@ -296,4 +308,14 @@ fn board_mask_excludes_zero_alias_but_keeps_real_collisions_fatal() {
     }
     assert_eq!(phy::discover(&mut p.clone(), mask, 4), Err(Error::Ambiguous));
     assert!(p.0.borrow().log.iter().all(|entry| !entry.0));
+}
+
+#[test]
+fn symmetric_pause_is_opt_in_and_reset_restores_legacy_advertisement() {
+    let port = Port::new();
+    let mut phy = port.phy();
+    phy.initialize_with_symmetric_pause(TUNING, 4, true).unwrap();
+    assert_eq!(phy.advertisements().unwrap().0, 0x0541);
+    phy.initialize(TUNING, 4).unwrap();
+    assert_eq!(phy.advertisements().unwrap().0, 0x0141);
 }

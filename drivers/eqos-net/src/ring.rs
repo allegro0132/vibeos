@@ -76,7 +76,8 @@ pub enum Direction {
 /// # Safety
 /// All admitted layout regions must refer to dedicated, permanently allocated,
 /// CPU-accessible DMA memory. No other CPU may access or reuse that storage or
-/// controller, even if the Ring is dropped while running/quarantined. Dropping
+/// controller, except immutable detached RX slots protected by the pool borrow
+/// protocol. This holds even if the Ring is dropped while running/quarantined. Dropping
 /// the borrowed handle never frees that memory. Descriptor accesses are volatile
 /// little-endian words; buffer copies access exactly the requested bytes.
 /// Caller packet/output slices are never retained after a copy returns.
@@ -108,6 +109,8 @@ pub unsafe trait Backend {
     fn reset(&mut self) -> bool;
     fn configure(&mut self, layout: Layout) -> bool;
     fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { None }
+    /// Explicit admission for detached RX buffers beyond the legacy ring count.
+    fn admit_rx_buffers(&self, _layout: Layout, _count: usize) -> bool { false }
     fn start(&mut self) -> bool;
     fn stop(&mut self) -> bool;
     fn read_word(&mut self, address: u64, word: usize) -> u32;
@@ -144,6 +147,7 @@ pub struct Ring<B: Backend + 'static> {
     receive: usize,
     rx_diagnostics: RxDiagnostics,
     single_tx_sync: bool,
+    rx_pool: Option<u64>,
     // Descriptor groups are released atomically. Non-head entries are ignored.
     tx_groups: [u16; 1024],
 }
@@ -163,6 +167,7 @@ impl<B: Backend> Ring<B> {
             receive: 0,
             rx_diagnostics: RxDiagnostics::default(),
             single_tx_sync: false,
+            rx_pool: None,
             tx_groups: [0; 1024],
         })
     }
@@ -177,7 +182,7 @@ impl<B: Backend> Ring<B> {
     /// Release the backend only before first DMA start or after a successful
     /// shutdown. A running/quarantined ring retains exclusive pool ownership.
     pub fn into_stopped_backend(self) -> Result<&'static mut B, Self> {
-        if self.state == State::Offline {
+        if self.state == State::Offline && self.rx_pool.is_none() {
             Ok(self.backend)
         } else {
             Err(self)
@@ -192,7 +197,7 @@ impl<B: Backend> Ring<B> {
     }
     pub fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { self.backend.flow_diagnostics() }
     pub fn initialize(&mut self) -> Result<(), Error> {
-        if self.state == State::Running {
+        if self.state == State::Running || self.rx_pool.is_some() {
             return Err(Error::Controller);
         }
         self.state = State::Quarantined;
@@ -223,6 +228,93 @@ impl<B: Backend> Ring<B> {
         self.state = State::Running;
         Ok(())
     }
+    /// Initialize a ring using an independently sized, permanent RX pool.
+    /// The adapter serializes this metadata with consumer borrow/release calls.
+    /// Reset retains live CPU borrows; legacy receive/initialize are then disabled.
+    pub fn initialize_pooled<const D: usize, const N: usize>(
+        &mut self, buffers: &mut crate::rx_buffers::Buffers<D, N>,
+    ) -> Result<(), Error> {
+        if self.state == State::Running || D != self.layout.count
+            || self.rx_pool.is_some_and(|id| id != buffers.identity())
+            || !self.backend.admit_rx_buffers(self.layout, N) {
+            return Err(Error::Controller);
+        }
+        buffers.bind(self.layout.rx_descriptors, self.layout.rx_buffers).map_err(|_| Error::Controller)?;
+        self.state = State::Quarantined;
+        if !self.backend.reset() || !self.backend.configure(self.layout) {
+            return Err(Error::Controller);
+        }
+        // Backend reset has proven no old DMA can resume. Only CPU borrows
+        // survive this transition, and attach cannot select those slots.
+        unsafe { buffers.reset_after_dma_stop(); }
+        self.rx_pool = Some(buffers.identity());
+        self.producer = 0; self.consumer = 0; self.pending = 0;
+        self.tx_groups.fill(0); self.receive = 0;
+        for descriptor in 0..D {
+            let slot = buffers.attach(descriptor).map_err(|_| Error::Full)?;
+            let tx = self.layout.desc(false, descriptor);
+            for word in 0..4 { self.backend.write_word(tx, word, 0); }
+            self.backend.for_device(tx, STRIDE, Direction::Bidirectional);
+            self.arm_rx_buffer(descriptor, self.layout.buffer(true, slot), buffers.reused(slot));
+            buffers.mark_prepared(slot);
+        }
+        self.backend.barrier();
+        self.backend.tail(false, self.layout.tx_descriptors);
+        self.backend.tail(true, self.layout.desc(true, D - 1));
+        if !self.backend.start() { return Err(Error::Controller); }
+        self.state = State::Running;
+        Ok(())
+    }
+    /// Synchronize a completed frame, replace its buffer, then return a ticket.
+    /// No payload copy occurs. Pool pressure retains the completed descriptor
+    /// unchanged until a released buffer permits replacement. Invalid frames
+    /// are rearmed in place and never yield a ticket.
+    pub fn receive_detached<const D: usize, const N: usize>(
+        &mut self, buffers: &mut crate::rx_buffers::Buffers<D, N>,
+    ) -> Result<Option<Detached>, Error> {
+        self.running()?;
+        if self.rx_pool != Some(buffers.identity()) || D != self.layout.count {
+            return Err(Error::Controller);
+        }
+        let mut words = self.snapshot(true, self.receive);
+        let result = descriptor::rx_complete(words, BUFFER);
+        if result == Ok(None) { return Ok(None); }
+        let normal_complete = (1 << 29) | (1 << 28) | (1 << 26);
+        if words[3] & (descriptor::OWN | (1 << 30) | normal_complete) == normal_complete {
+            self.backend.barrier();
+            words[1] = self.backend.read_word(self.layout.desc(true, self.receive), 1);
+        }
+        let slot = buffers.descriptor_buffer(self.receive).ok_or(Error::Controller)?;
+        let address = self.layout.buffer(true, slot);
+        let result = match result {
+            Ok(Some(bytes)) => {
+                self.backend.for_cpu(address, bytes.div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
+                // OWN was clear and payload visibility completed. A failed
+                // reservation has not altered the original descriptor mapping.
+                let prepared = unsafe { buffers.prepare(self.receive) }.map_err(|e| match e {
+                    crate::rx_buffers::Error::Full => Error::Full, _ => Error::Controller,
+                })?;
+                let replacement = prepared.replacement();
+                self.arm_rx_buffer(self.receive, self.layout.buffer(true, replacement), buffers.reused(replacement));
+                buffers.mark_prepared(replacement);
+                self.backend.tail(true, self.layout.desc(true, self.receive));
+                // The old buffer is unreachable by DMA before its ticket escapes.
+                let ticket = unsafe { buffers.publish(prepared) }.map_err(|_| Error::Controller)?;
+                Ok(Some(Detached { ticket, bytes, checksum: descriptor::rx_checksum(words) }))
+            }
+            Err(error) => {
+                self.rx_diagnostics.rejected = self.rx_diagnostics.rejected.saturating_add(1);
+                self.rx_diagnostics.last_status = words[3];
+                self.rx_diagnostics.last_word1 = words[1];
+                self.arm_rx_buffer(self.receive, address, true);
+                self.backend.tail(true, self.layout.desc(true, self.receive));
+                Err(Error::Descriptor(error))
+            }
+            Ok(None) => unreachable!(),
+        };
+        self.receive = (self.receive + 1) % D;
+        result
+    }
     fn publish(&mut self, address: u64, words: [u32; 4], prepare_visibility: bool) {
         for (index, value) in words.into_iter().enumerate() {
             self.backend.write_word(address, index, value);
@@ -240,7 +332,9 @@ impl<B: Backend> Ring<B> {
         self.backend.barrier();
     }
     fn arm_rx(&mut self, index: usize, recycle: bool) {
-        let buffer = self.layout.buffer(true, index);
+        self.arm_rx_buffer(index, self.layout.buffer(true, index), recycle);
+    }
+    fn arm_rx_buffer(&mut self, index: usize, buffer: u64, recycle: bool) {
         if recycle {
             // Initialization prepared every byte; receive only reads payloads.
             // Descriptor completion proves DMA relinquished this slot, even
@@ -423,6 +517,12 @@ impl<B: Backend> Ring<B> {
         self.backend.tail(false,self.layout.desc(false,self.producer));
         Ok(())
     }
+    /// Check completion after arming an IRQ without consuming/rearming a slot.
+    /// Includes malformed completions so they cannot strand the receive ring.
+    pub fn receive_pending(&mut self) -> Result<bool, Error> {
+        self.running()?;
+        Ok(self.snapshot(true, self.receive)[3] & descriptor::OWN == 0)
+    }
     /// At most one descriptor is consumed per call, including malformed frames.
     /// A small output drops that frame and returns its slot to DMA without a copy.
     pub fn receive(&mut self, output: &mut [u8]) -> Result<Option<usize>, Error> {
@@ -435,6 +535,7 @@ impl<B: Backend> Ring<B> {
     }
     fn receive_inner(&mut self, output: &mut [u8], metadata: bool) -> Result<Option<Received>, Error> {
         self.running()?;
+        if self.rx_pool.is_some() { return Err(Error::Controller); }
         let mut words = self.snapshot(true, self.receive);
         let result = descriptor::rx_complete(words, BUFFER);
         if result == Ok(None) {
@@ -512,4 +613,13 @@ pub struct RxDiagnostics {
     pub rejected: u64,
     pub last_status: u32,
     pub last_word1: u32,
+}
+
+/// Validated metadata for a CPU-owned frame detached from all DMA descriptors.
+/// Byte access still requires the pool's unique borrow and session admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Detached {
+    pub ticket: crate::rx_buffers::Ticket,
+    pub bytes: usize,
+    pub checksum: descriptor::RxChecksum,
 }

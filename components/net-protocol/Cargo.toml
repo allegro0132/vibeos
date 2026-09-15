@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+# DMA loans through the capability-addressed detached receive transport.
+pooled-rx = []
 network-tx-audit = ["vibeos-core/network-tx-audit"]
 native-tcp-segmentation = ["smoltcp/tcp-segmentation"]
 # Experimental bounded IPv4/TCP receive coalescing; disabled by default.

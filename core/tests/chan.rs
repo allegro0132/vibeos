@@ -79,3 +79,17 @@ fn an_endpoint_describes_itself_for_the_caps_listing() {
     assert!(desc.contains("telemetry"), "{desc}");
     assert!(desc.contains("sent=1"), "{desc}");
 }
+
+#[test]
+fn message_notification_covers_send_before_first_poll_without_consuming() {
+    use std::{future::Future, pin::pin, task::{Context, Waker}};
+    let ep = Endpoint::new("notification", 2);
+    let notification = ep.message_event();
+    let mut listener = pin!(notification.wait());
+    assert!(!ep.has_message());
+    ep.try_send(7u32).unwrap();
+    assert!(listener.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready());
+    assert!(ep.has_message());
+    assert_eq!(ep.try_recv(), Some(7));
+    assert!(!ep.has_message());
+}

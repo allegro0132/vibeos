@@ -26,6 +26,7 @@ struct State {
     start: bool,
     configure: bool,
     fast_recycle: bool,
+    rx_pool_slots: usize,
     tx_checksum: bool,
     tso: bool,
     tx_packets: BTreeMap<u64, Vec<u8>>,
@@ -34,6 +35,7 @@ struct State {
 }
 struct Model(Rc<RefCell<State>>);
 unsafe impl Backend for Model {
+    fn admit_rx_buffers(&self, _: Layout, n: usize) -> bool { self.0.borrow().rx_pool_slots == n }
     fn tso_capable(&self) -> bool { self.0.borrow().tso }
     fn tx_checksum_capable(&self) -> bool { self.0.borrow().tx_checksum }
     fn reset(&mut self) -> bool {
@@ -118,6 +120,7 @@ fn model_layout(l: Layout) -> (Ring<Model>, Rc<RefCell<State>>) {
         start: true,
         configure: true,
         fast_recycle: false,
+        rx_pool_slots: 0,
         tx_checksum: false,
         tso: false,
         tx_packets: BTreeMap::new(),
@@ -644,4 +647,123 @@ fn tso_normalizes_checksum_placeholders_without_mutating_caller() {
     let copied=s.borrow().tx_packets[&(l.tx_buffers+1536)].clone();
     assert_eq!(&copied[24..26],&[0,0]);assert_eq!(&copied[50..52],&[0,0]);
     assert_eq!(p,original);
+}
+
+#[test]
+fn idle_recheck_synchronizes_own_without_consuming_or_rearming() {
+    let (mut r, s) = started();
+    let rx = layout().rx_descriptors;
+    assert_eq!(r.receive_pending(), Ok(false));
+    s.borrow_mut().words.insert((rx, 3), 0x30000040);
+    for _ in 0..2 {
+        s.borrow_mut().events.clear();
+        assert_eq!(r.receive_pending(), Ok(true));
+        assert_eq!(s.borrow().events, vec![
+            Event::Cpu(rx, 64, Direction::Bidirectional),
+            Event::Barrier, Event::Read(rx, 3),
+        ]);
+    }
+    assert_eq!(r.receive(&mut [0; 64]), Ok(Some(60)));
+    assert_eq!(r.receive_pending(), Ok(false));
+    // Malformed completions must also prevent sleeping before being drained.
+    s.borrow_mut().words.insert((rx + 64, 3), 0);
+    assert_eq!(r.receive_pending(), Ok(true));
+}
+
+fn pooled<const N: usize>() -> (Ring<Model>, Rc<RefCell<State>>, vibeos_eqos_net::rx_buffers::Buffers<4, N>) {
+    let (mut r, s) = model();
+    s.borrow_mut().rx_pool_slots = N;
+    let mut buffers = vibeos_eqos_net::rx_buffers::Buffers::new().unwrap();
+    r.initialize_pooled(&mut buffers).unwrap();
+    s.borrow_mut().events.clear();
+    (r, s, buffers)
+}
+#[test]
+fn detached_receive_synchronizes_and_replaces_without_a_payload_copy() {
+    let (mut r, s, mut buffers) = pooled::<6>();
+    let old = buffers.descriptor_buffer(0).unwrap();
+    s.borrow_mut().words.insert((layout().rx_descriptors, 3), 0x30000040);
+    let frame = r.receive_detached(&mut buffers).unwrap().unwrap();
+    assert_eq!(frame.bytes, 60); assert_eq!(frame.ticket.index(), old);
+    let new = buffers.descriptor_buffer(0).unwrap(); assert_ne!(new, old);
+    let old_address = layout().rx_buffers + (old * BUFFER) as u64;
+    let new_address = layout().rx_buffers + (new * BUFFER) as u64;
+    let events = &s.borrow().events;
+    let sync = events.iter().position(|e| *e == Event::Cpu(old_address, 64, Direction::FromDevice)).unwrap();
+    let replace = events.iter().position(|e| *e == Event::Word(layout().rx_descriptors, 0, new_address as u32)).unwrap();
+    assert!(sync < replace);
+    assert!(matches!(events.last(), Some(Event::Tail(true, _))));
+    assert!(!events.iter().any(|e| matches!(e, Event::Rx(..))));
+    let borrow = buffers.borrow(frame.ticket, 1).unwrap();
+    assert_eq!(borrow.index(), old);
+    buffers.release(borrow).unwrap();
+}
+#[test]
+fn detached_ring_pressure_leaves_completion_intact_until_release() {
+    let (mut r, s, mut buffers) = pooled::<5>();
+    let base = layout().rx_descriptors;
+    s.borrow_mut().words.insert((base, 3), 0x30000040);
+    let f = r.receive_detached(&mut buffers).unwrap().unwrap();
+    let borrow = buffers.borrow(f.ticket, 1).unwrap();
+    s.borrow_mut().words.insert((base + 64, 3), 0x30000040);
+    let old = buffers.descriptor_buffer(1);
+    s.borrow_mut().events.clear();
+    assert_eq!(r.receive_detached(&mut buffers), Err(Error::Full));
+    assert_eq!(buffers.descriptor_buffer(1), old);
+    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Word(..) | Event::Rx(..) | Event::Tail(..))));
+    buffers.release(borrow).unwrap();
+    let next = r.receive_detached(&mut buffers).unwrap().unwrap();
+    assert_eq!(Some(next.ticket.index()), old);
+    buffers.discard(next.ticket).unwrap();
+}
+#[test]
+fn pooled_reset_retains_borrows_and_rejects_legacy_receive_or_reinitialization() {
+    let (mut r, s, mut buffers) = pooled::<6>();
+    s.borrow_mut().words.insert((layout().rx_descriptors, 3), 0x30000040);
+    let frame = r.receive_detached(&mut buffers).unwrap().unwrap();
+    let borrow = buffers.borrow(frame.ticket, 1).unwrap();
+    assert!(r.shutdown()); r.initialize_pooled(&mut buffers).unwrap();
+    for d in 0..4 { assert_ne!(buffers.descriptor_buffer(d), Some(borrow.index())); }
+    assert_eq!(r.receive(&mut [0; 64]), Err(Error::Controller));
+    assert!(r.shutdown()); assert_eq!(r.initialize(), Err(Error::Controller));
+    buffers.release(borrow).unwrap();
+    assert!(r.into_stopped_backend().is_err());
+}
+#[test]
+fn rejected_pooled_frame_reuses_its_slot_without_exposing_payload() {
+    let (mut r, s, mut buffers) = pooled::<6>();
+    let old = buffers.descriptor_buffer(0); let stats = buffers.stats();
+    s.borrow_mut().words.insert((layout().rx_descriptors, 3), 0);
+    assert!(matches!(r.receive_detached(&mut buffers), Err(Error::Descriptor(_))));
+    assert_eq!(buffers.descriptor_buffer(0), old); assert_eq!(buffers.stats(), stats);
+    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Rx(..) | Event::Cpu(_, _, Direction::FromDevice))));
+}
+#[test]
+fn failed_reset_does_not_reclaim_live_borrows_or_buffer_mappings() {
+    let (mut r, s, mut buffers) = pooled::<6>();
+    s.borrow_mut().words.insert((layout().rx_descriptors, 3), 0x30000040);
+    let frame = r.receive_detached(&mut buffers).unwrap().unwrap();
+    let borrow = buffers.borrow(frame.ticket, 7).unwrap();
+    s.borrow_mut().stop = false; assert!(!r.shutdown()); s.borrow_mut().reset = false;
+    let stats = buffers.stats();
+    assert_eq!(r.initialize_pooled(&mut buffers), Err(Error::Controller));
+    assert_eq!(buffers.stats(), stats);
+    buffers.release(borrow).unwrap();
+}
+#[test]
+fn pool_admission_and_identity_are_checked_before_dma_access() {
+    let (mut r, s) = model();
+    let mut buffers = vibeos_eqos_net::rx_buffers::Buffers::<4, 6>::new().unwrap();
+    assert_eq!(r.initialize_pooled(&mut buffers), Err(Error::Controller));
+    assert!(s.borrow().events.is_empty());
+    s.borrow_mut().rx_pool_slots = 6; r.initialize_pooled(&mut buffers).unwrap();
+    let mut foreign = vibeos_eqos_net::rx_buffers::Buffers::<4, 6>::new().unwrap();
+    s.borrow_mut().events.clear();
+    assert_eq!(r.receive_detached(&mut foreign), Err(Error::Controller));
+    assert!(s.borrow().events.is_empty());
+    assert!(r.shutdown());
+    let (mut other, state) = model_layout(Layout { rx_buffers: 0x43000000, ..layout() });
+    state.borrow_mut().rx_pool_slots = 6;
+    assert_eq!(other.initialize_pooled(&mut buffers), Err(Error::Controller));
+    assert!(state.borrow().events.is_empty());
 }

@@ -39,11 +39,12 @@ pub trait Platform: Sync {
     fn now_ms(&self) -> u64;
 }
 
-/// Header: VBENCH01, mode (0 sink/1 source), seven zero bytes, u64 BE count.
+/// Header: VBENCH01, mode (0 sink/1 source/2 V2 verified sink), seven zero bytes, u64 BE count.
 fn request(header: &[u8; 24]) -> Result<(bool, u64), SocketError> {
     let size = u64::from_be_bytes(header[16..24].try_into().unwrap());
     if (&header[..8] != b"VBENCH01" && &header[..8] != b"VBENCH02")
-        || header[8] > 1
+        || header[8] > 2
+        || (header[8] == 2 && header[7] != b'2')
         || header[9..16] != [0; 7]
         || size == 0
         || size > LIMIT
@@ -154,6 +155,18 @@ impl Flow {
             };
             match io {
                 TcpIoResult::Progress(n) => {
+                    // Diagnostic mode verifies application-visible bytes, after
+                    // DMA, GRO, TCP reassembly and frontend queue delivery. It
+                    // is deliberately separate from throughput-only mode 0.
+                    if self.header[8] == 2 {
+                        let mut expected = (self.done % 251) as u8;
+                        for byte in &self.buffer[..n] {
+                            if *byte != expected {
+                                return Err(SocketError::Failed);
+                            }
+                            expected = if expected == 250 { 0 } else { expected + 1 };
+                        }
+                    }
                     if n != 0 {
                         self.started_ms.get_or_insert(now);
                     }
@@ -396,6 +409,73 @@ mod tests {
                 }
                 f.clear();
                 assert!(!f.ready_sent && !f.go_received);
+            }
+        }
+    }
+    #[test]
+    fn verified_sink_checks_pattern_across_reads_and_rejects_corruption() {
+        for corrupt in [false, true] {
+            let (p, cap) = Model::new();
+            let mut f = Flow::new();
+            let mut h = header(false, 1003);
+            h[8] = 2;
+            assert!(request(&h).is_err()); // V1 has no verification mode.
+            h[7] = b'2';
+            assert_eq!(p.listener.network_receive(&h), h.len());
+            f.drive(&p, cap).unwrap();
+            f.drive(&p, cap).unwrap();
+            let mut result = Vec::new();
+            let mut output = [0; 3];
+            assert_eq!(p.listener.network_transmit(&mut output), 1);
+            assert_eq!(output[0], b'R');
+            p.listener.network_receive(b"G");
+            f.drive(&p, cap).unwrap();
+            let mut supplied = 0;
+            let mut rejected = false;
+            for _ in 0..2000 {
+                if supplied < 1003 {
+                    let bytes: Vec<u8> = (supplied..(supplied + 11).min(1003))
+                        .map(|i| {
+                            if corrupt && i == 257 {
+                                255
+                            } else {
+                                (i % 251) as u8
+                            }
+                        })
+                        .collect();
+                    supplied += p.listener.network_receive(&bytes);
+                }
+                match f.drive(&p, cap) {
+                    Err(SocketError::Failed) => {
+                        rejected = true;
+                        break;
+                    }
+                    result => {
+                        result.unwrap();
+                    }
+                }
+                let n = p.listener.network_transmit(&mut output);
+                result.extend_from_slice(&output[..n]);
+                if f.connection.is_none() {
+                    loop {
+                        let n = p.listener.network_transmit(&mut output);
+                        if n == 0 {
+                            break;
+                        }
+                        result.extend_from_slice(&output[..n]);
+                    }
+                    break;
+                }
+            }
+            assert_eq!(rejected, corrupt);
+            if corrupt {
+                assert!(result.is_empty());
+                assert!(f.done <= 257);
+                assert!(p.listener.close_request().is_none());
+            } else {
+                assert!(f.connection.is_none());
+                assert_eq!(result.len(), 16);
+                assert_eq!(u64::from_be_bytes(result[..8].try_into().unwrap()), 1003);
             }
         }
     }

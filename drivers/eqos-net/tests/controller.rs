@@ -611,3 +611,20 @@ fn tso_requires_capabilities_readback_and_stopped_configuration() {
     c.configure(layout()).unwrap();c.start().unwrap();assert!(!c.tso_active());
     assert_eq!(s.borrow().registers[&0x1104]&(1<<12),0);
 }
+
+#[test]
+fn watchdog_configuration_requires_stopped_controller_and_keeps_irq_masked() {
+    let (mut c, s) = model();
+    c.reset().unwrap();
+    c.set_rx_watchdog(100).unwrap();
+    c.configure(layout()).unwrap();
+    assert!(s.borrow().registers[&0x1138] > 0);
+    assert_eq!(s.borrow().registers[&0x1134], 0);
+    c.start().unwrap();
+    assert_eq!(c.set_rx_watchdog(0), Err(Error::NotReady));
+    c.stop().unwrap();
+    c.set_rx_watchdog(0).unwrap();
+    c.configure(layout()).unwrap();
+    assert_eq!(s.borrow().registers[&0x1138], 0);
+    assert_eq!(c.set_rx_watchdog(u32::MAX), Err(Error::InvalidConfig));
+}

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize,Ordering::SeqCst};
 static STAGE:AtomicUsize=AtomicUsize::new(0);
 #[no_mangle]
 static VIBEOS_PACKET_DEVICE:Device=Device{
+    receive_buffers: None,
     present:true,
     registers:AddressRange::new(0x1000,0x2000),irq:31,rx_queue_size:32,
     dma_base:||0x90000000,
@@ -15,6 +16,7 @@ static VIBEOS_PACKET_DEVICE:Device=Device{
     claim:|mac,time,hz|{assert_eq!(mac,[2,0,0,0,0,1]);assert_eq!((time(),hz),(7,25000000));STAGE.store(1,SeqCst);Ok(())},
     tx_owned:||STAGE.load(SeqCst)==2,
     transmit:|packet|{if packet.len()>1500{return Err(Error::PacketTooLarge);}assert_eq!(packet,&[1,2,3]);STAGE.store(2,SeqCst);Ok(())},
+    rx_interrupts:None,
     segmentation:Some(Segmentation {
         max_packet_bytes:4096,min_mss:64,
         transmit:|request|{

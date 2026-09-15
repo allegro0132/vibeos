@@ -82,15 +82,17 @@ def inspect(data, ethernet=False):
         if any(name not in symbols for name in names):
             raise ValueError('missing Ethernet composition symbols')
         base, size = symbols['VIBEOS_MARS_EQOS_DMA'], symbol_sizes['VIBEOS_MARS_EQOS_DMA']
-        slot_bytes = 2 * 64 + 2 * 1536
-        # Explicitly admitted firmware profiles, not arbitrary symbol sizes.
-        if base % 64 or size not in (32 * slot_bytes, 128 * slot_bytes):
+        # Storage<N, RX>: two descriptor arrays, N TX buffers and RX RX buffers.
+        # Admit only the supported ring profiles and their optional spare RX pool.
+        layouts = {n * (2 * 64 + 1536) + rx * 1536: (n, rx)
+                   for n in (32, 128) for rx in (n, 2 * n)}
+        if base % 64 or size not in layouts:
             raise ValueError('invalid EQoS DMA slab geometry')
         if not LOAD <= symbols['__dma_start'] <= base < base + size <= symbols['__dma_end'] <= min(heap, 1 << 32):
             raise ValueError('EQoS DMA slab is outside its permanent 32-bit region')
         if not any(p['flags'] & 2 and p['address'] <= base and base + size <= p['address'] + p['memory_bytes'] for p in loads):
             raise ValueError('EQoS DMA slab is not in writable loaded RAM')
-        dma = {'base': base, 'bytes': size, 'address_bits': 32, 'cache_line_bytes': 64, 'ring_slots': size // slot_bytes}
+        dma = {'base': base, 'bytes': size, 'address_bits': 32, 'cache_line_bytes': 64, 'ring_slots': layouts[size][0], 'rx_buffers': layouts[size][1]}
     result = {'status': 'elf-contract-passed', 'entry': LOAD, 'heap_start': heap, 'heap_end': RAM_END,
             'elf_sha256': hashlib.sha256(data).hexdigest(), 'loads': loads,
             'physical_acceptance': False, 'flashable_sd_image': False}

@@ -33,6 +33,17 @@ pub struct Segmentation {
     pub min_mss: usize,
     pub transmit: unsafe fn(crate::tcp_segmentation::TcpSegments<'_>) -> Result<(),Error>,
 }
+/// Optional RX-only interrupt scheduling. Static MMIO operations never borrow
+/// the mutable engine and remain valid through unregister/recovery. The adapter
+/// serializes arm/mask against its ISR on the dispatch hart. `pending` instead
+/// requires exclusive engine invocation and checks synchronized descriptor OWN.
+pub struct RxInterrupts {
+    pub mask: unsafe fn(),
+    /// Mask and acknowledge RX causes; false reports a fatal controller fault.
+    pub acknowledge: unsafe fn() -> bool,
+    pub arm: unsafe fn() -> bool,
+    pub pending: unsafe fn() -> bool,
+}
 /// # Safety
 /// Claim requires live authority over the device and its fixed DMA pool.
 /// Engine operations are serialized by the consumer. Telemetry must be safe
@@ -53,6 +64,8 @@ pub struct Device {
     pub tx_owned: unsafe fn() -> bool,
     pub transmit: unsafe fn(&[u8]) -> Result<(), Error>,
     pub segmentation: Option<Segmentation>,
+    pub rx_interrupts: Option<RxInterrupts>,
+    pub receive_buffers: Option<crate::network_rx::Operations>,
     pub receive: unsafe fn(&mut [u8]) -> Option<usize>,
     pub poll_link: unsafe fn(),
     pub shutdown: unsafe fn() -> bool,

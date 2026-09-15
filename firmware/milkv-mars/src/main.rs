@@ -124,6 +124,8 @@ unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
 #[cfg(not(feature = "ethernet-device"))]
 #[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: vibeos_hal::network::Device = vibeos_hal::network::Device {
+    receive_buffers: None,
+    rx_interrupts: None,
     present: false,
     registers: vibeos_hal::AddressRange::new(0, 0),
     irq: 0,

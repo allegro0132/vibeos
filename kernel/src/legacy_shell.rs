@@ -92,6 +92,13 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        #[cfg(feature = "pooled-rx")]
+        "nrpool" => if let Some(ops) = &vibeos_hal::network::device().receive_buffers {
+            println!("RX_POOL {:?}", (ops.stats)());
+        },
+        #[cfg(feature = "rx-interrupt-poll")]
+        "nrxirq" => println!("RX_IRQ fields=[interrupts,arms,busy_rechecks,timers,tx_wakes] values={:?}",
+            crate::dwmac_net::rx_irq_stats()),
         #[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
         "ntsoq" => {
             let (groups, frames) = crate::dwmac_net::tso_counts();

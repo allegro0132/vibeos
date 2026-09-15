@@ -8,11 +8,15 @@ use crate::{
 /// Successful admission proves the complete layout belongs to this exclusive,
 /// permanent pool with 64-byte independent synchronization. Operations must obey
 /// ring::Backend's volatile access, cache, ordering and slice-lifetime rules.
+/// Independently borrowed detached RX slots may be read through a separate view;
+/// callbacks must never access/recycle those slots while their borrow is live.
 /// The pool remains allocated and unavailable to others even after a dropped
 /// backend or a failed controller stop/reset. Cache operations are visibility
 /// operations; descriptor ownership is transferred by the OWN protocol.
 pub unsafe trait Memory: 'static {
     fn admit(&self, layout: Layout) -> bool;
+    /// Prove the extra RX slots belong to this permanent DMA allocation.
+    fn admit_rx_buffers(&self, _layout: Layout, _count: usize) -> bool { false }
     fn read_word(&mut self, address: u64, word: usize) -> u32;
     fn write_word(&mut self, address: u64, word: usize, value: u32);
     fn copy_tx(&mut self, address: u64, packet: &[u8]);
@@ -100,6 +104,9 @@ unsafe impl<R: Io, M: Memory> ring::Backend for Backend<R, M> {
         }
         self.failed = self.controller.configure(layout).is_err();
         !self.failed
+    }
+    fn admit_rx_buffers(&self, layout: Layout, count: usize) -> bool {
+        self.memory.admit_rx_buffers(layout, count)
     }
     fn start(&mut self) -> bool {
         if self.failed {

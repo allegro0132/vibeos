@@ -32,7 +32,7 @@ pub struct Endpoint<T: Send + 'static> {
     name: String,
     bound: usize,
     inner: SpinLock<Inner<T>>,
-    on_message: WaitQueue,
+    on_message: Arc<WaitQueue>,
     on_space: WaitQueue,
 }
 
@@ -53,12 +53,17 @@ impl<T: Send + 'static> Endpoint<T> {
                 sent: 0,
                 received: 0,
             }),
-            on_message: WaitQueue::new(),
+            on_message: Arc::new(WaitQueue::new()),
             on_space: WaitQueue::new(),
         });
         system.restore();
         endpoint
     }
+
+    /// Notification only; this handle cannot read messages or bypass authority.
+    /// Construct its listener before checking has_message under live authority.
+    pub fn message_event(&self) -> MessageEvent { MessageEvent(self.on_message.clone()) }
+    pub fn has_message(&self) -> bool { !self.inner.lock().queue.is_empty() }
 
     pub fn try_send(&self, msg: T) -> Result<(), T> {
         let mut i = self.inner.lock();
@@ -132,4 +137,11 @@ impl<T: Send + 'static> Resource for Endpoint<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Owned notification lifetime for selecting queue input alongside an IRQ.
+/// A wake is only a hint: revalidate authority and retry the queue operation.
+pub struct MessageEvent(Arc<WaitQueue>);
+impl MessageEvent {
+    pub fn wait(&self) -> crate::exec::WaitFuture<'_> { self.0.wait() }
 }

@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+rx-pool-experiment = ["ethernet-device", "dep:vibeos-core", "vibeos-kernel?/pooled-rx"]
+rx-interrupt-experiment = ["vibeos-kernel?/rx-interrupt-poll"]
 direct-tcp-segmentation = ["tso-experiment", "vibeos-kernel?/direct-tcp-segmentation"]
 native-tcp-segmentation = ["vibeos-kernel?/native-tcp-segmentation"]
 tso-coalesce-experiment = ["tso-experiment", "vibeos-kernel?/network-tso-coalesce"]
@@ -61,6 +63,7 @@ bench = false
 required-features = ["image"]
 
 [dependencies]
+vibeos-core = { path = "../../core", optional = true }
 vibeos-driver-dw-i2c = { path = "../../drivers/dw-i2c" }
 vibeos-hal = { path = "../../hal" }
 vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars" }

@@ -52,3 +52,15 @@ payload timing. The protocol model shows why this matters: an exclusive
 listener's pending socket may complete the next handshake while the previous
 connection remains in TIME-WAIT, before the service can accept that successor.
 This measurement split does not remove TCP waiting or raise network throughput.
+
+V2 mode 2 is a verified sink: byte at absolute payload offset `i` must equal
+`i % 251`. Verification spans receive calls and reports the usual completed
+count only if every application-visible byte matches. A mismatch resets the
+connection without a success result. V1 mode 2 is rejected. This checks the
+receive path after GRO/TCP/frontend delivery; its extra work is not a throughput
+benchmark. Modes 0 and 1 keep their existing behavior.
+
+Run `python3 scripts/mars-tcp-verify.py --address ADDRESS --output NEW.json`
+for a 64 MiB verified receive. `--corrupt-at OFFSET` deliberately injects one
+invalid byte and expects a connection reset after admission; bracket that test
+with successful valid transfers to exclude an unrelated connectivity failure.

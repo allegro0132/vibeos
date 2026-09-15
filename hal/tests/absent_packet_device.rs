@@ -6,6 +6,8 @@ mod adapter;
 use vibeos_hal::{network::*, AddressRange};
 #[no_mangle]
 static VIBEOS_PACKET_DEVICE: Device = Device {
+    receive_buffers: None,
+    rx_interrupts: None,
     present: false,
     registers: AddressRange::new(0, 0),
     irq: 0,

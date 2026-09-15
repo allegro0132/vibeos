@@ -532,3 +532,166 @@ Evidence is under `target/mars-reference/20260914-smoltcp-main-*.log`.
 
 The main-based port has not yet been physically benchmarked. The preceding
 920–925 Mbps measurements must not be attributed to this new submodule revision.
+
+
+## Main-port physical regression and status-snapshot comparison
+
+The main-port FIT `dbe2f27db8c09e0108f6445c4d06ebbfb4ec0c7e1c672700ab0d15e41490871c`
+was RAM-booted with hash verification. The same 64 MiB payload/sequence/checksum/
+MTU checks passed (892.59 Mbps with capture). Two 20-second rounds measured
+RX 609.25/611.21 Mbps and TX 928.46/874.48 Mbps. The second TX run contains a
+one-second interval at 48.3 Mbps; most other intervals remain near 920 Mbps.
+This pause is unresolved and prevents a stability claim.
+
+The matched TX profile measured 885.33 Mbps with 4.74 seconds of stack waiting on
+packet-driver-control. Across a 30-second window containing 20 seconds of load,
+harts 0/1 accumulated 20.74/20.44 seconds of activity. These are elapsed timer
+measurements, not hardware CPU-cycle counters or load-only utilization.
+
+An image changing only network-status-snapshot was also RAM-booted:
+`71db7b8a4f19048e89aa16fe2d03aaf165519ac11c39d6e007fcca0ec16787cf`.
+Its first profile used verbose background output, so it is not a controlled CPU
+comparison: TX 690.21 Mbps, 36.82 aggregate hart activity seconds. Driver calls
+rose from 78,508 to 170,845 despite lower throughput; this motivates investigating
+polling/scheduling behavior rather than assuming lock removal is sufficient.
+Unprofiled TX was 699.08/650.03 Mbps, RX 612.08/612.25 Mbps. After explicitly
+setting quiet as in the baseline, a fresh 20-second TX test still measured only
+666.94 Mbps. Its 64 MiB captured transfer passed full integrity/coverage at
+775.53 Mbps. The feature remains disabled; it is a measured regression, not a
+successful optimization. The faster main-port baseline was restored with FIT hash verification; a fresh
+10-second TX check measured 923.23 Mbps with quiet enabled.
+
+Evidence: `target/mars-reference/20260914-main-direct-tso*-*.log`,
+`target/mars-reference/20260914-main-direct-tso*-source.json`, and
+`target/mars-acceptance/20260913-gigabit/20260914-main-direct-tso*`.
+Next priorities remain the intermittent TX stall, excessive polling/CPU overhead,
+RX processing and GRO integration, lifecycle recovery and sustained load testing.
+
+
+## One-minute TX capture and normal driver recovery (2026-09-14)
+
+On the restored main-based direct TSO image, one continuous 60-second reverse
+iperf3 transfer measured 929.72 Mbps. All one-second intervals exceeded 900 Mbps.
+The host captured 5,422,875 packets with a 128-byte snaplen and zero kernel drops.
+Streaming header analysis of the bulk data flow observed 6,973,149,124 bytes,
+4,925,271 data packets, no sequence-forward holes or overlaps, no host zero
+windows, and no data gap over 100 ms. Sequence comparisons account for 32-bit
+wrap. This was a host NIC capture, not a wire tap; truncated headers cannot
+validate payload or TCP checksums. The earlier isolated stall was not reproduced,
+so this run does not explain or close that issue.
+
+Normal driver cancellation/restart was tested twice via the shell. An idle cancel
+followed by restart advanced component generation 1 -> 2 and device epoch 1 -> 2,
+retiring five old capabilities. The running netstack and services recovered
+without restarting the board: 10-second RX/TX measured 609.96/922.02 Mbps.
+
+A second cancel occurred during a live reverse TCP transfer whose initial three
+intervals measured 915/916/906 Mbps. Restart advanced generation/epoch to 3.
+The interrupted connection returned a broken-pipe error without host-forced
+termination. A fresh independent TCP connection then verified every byte of a
+64 MiB constant-byte transfer, complete sequence coverage, valid IPv4/TCP
+checksums and MTU compliance, with zero capture-kernel drops. This exercises
+normal cancellation and TSO queue retirement. Fresh 10-second iperf3 sessions
+then measured RX 610.39 Mbps and TX 924.31 Mbps. It does not qualify panic recovery,
+abandoned locks, PHY unplug/replug or long-duration stability.
+
+Evidence:
+- `target/mars-reference/20260914-main-tx-stall.log`
+- `target/mars-reference/20260914-main-tx-stall-headers.json`
+- `target/mars-reference/20260914-main-active-recovery.log`
+- `target/mars-reference/20260914-main-after-active-recovery-test.log`
+- `target/mars-acceptance/20260913-gigabit/20260914-main-active-recovery/`
+- `target/mars-acceptance/20260913-gigabit/20260914-main-after-active-recovery/`
+
+
+## GRO comparison and verified ingress (2026-09-14)
+
+Enabling only bounded-gro on the main direct-TSO baseline produced FIT
+`cd0eadd8237d325a7182b81010ef628852ac152970afc4e22b5d6f59543660ba`.
+The quiet 20-second RX profile measured 536.34 Mbps versus 519.77 Mbps without
+GRO, but aggregate core activity remained about 41.25 versus 41.24 core-seconds
+in the 30-second sampling window. GRO recorded 264,602 merged segments and
+129,963 aggregates from 918,782 RX frames. Unprofiled RX was 609.17/609.05 Mbps,
+TX 904.32/870.83 Mbps. This does not establish a useful throughput improvement;
+GRO remains disabled in the compatibility profile. Eligible singleton packets
+currently still copy into the aggregation buffer; any optimization of that cost
+must retain ordering, checksum checks, revocation behavior and bounded work.
+
+The independent TCP probe now supports V2 mode 2: the application verifies byte
+`i` equals `i % 251` across all receive calls before returning a successful count.
+Mismatch resets the connection. V1 mode 2 is rejected, and existing byte-count
+modes remain unchanged. Five component tests pass, including fragmented reads,
+pattern wrap, corruption rejection without success output and V2 admission.
+`scripts/mars-tcp-verify.py` supplies valid or deliberately corrupted streams and
+writes a new JSON result. Verification cost is not reported as network throughput.
+
+The GRO + verified-sink FIT
+`def17838b8c0e06938efb8bb093bf2824f5ea81041ac52967bf7e3299eea82e3`
+was hash-verified and RAM-booted. Physical sequence: 64 MiB valid input confirmed
+in full; a 1 MiB request with byte 34,567 changed to 255 was rejected after
+admission (BrokenPipeError); a fresh 4 MiB valid transfer passed afterward.
+Approximate GRO counters advanced from [13,0,0] to [45999,38377,7106]. Thus the
+valid byte checks exercised real GRO delivery rather than only its feature flag.
+This is bounded integrity evidence, not a long-duration qualification.
+
+Evidence: `target/mars-reference/20260914-main-tso-gro*`,
+`target/mars-reference/20260914-gro-verify-*.json`,
+`target/mars-reference/20260914-gro-verified-sink.log`, and
+`target/mars-reference/20260914-verified-sink-tests.log`.
+The board currently runs the verified-sink diagnostic image. The production
+compatibility profile is restored, with GRO and status snapshots disabled.
+
+
+## 2026-09-15 Linux RX comparison and IRQ integration
+
+See [RX-LINUX-COMPARISON.md](RX-LINUX-COMPARISON.md) for source references,
+ownership gaps, implementation details, evidence and current test status.
+Added optional RX watchdog/IRQ scheduling, descriptor OWN recheck, static HAL
+IRQ operations independent of the mutable engine, and outbound queue wakeup.
+The experiment remains off by default. The first integration regressed RX to
+~563 Mbps with outbound notification missing from its wait; the corrected path
+measured ~598 Mbps RX and 915–924 Mbps TX. This is not a demonstrated RX
+throughput gain over the prior ~610 Mbps polling baseline, nor page-pool RX.
+
+Both experimental images passed valid/corrupt/valid TCP ingress checks.
+The corrected image also passed driver cancellation/restart during RX load,
+then a fresh 64 MiB integrity check and RX/TX 597/922 Mbps recovery tests.
+These are bounded tests, not the outstanding full Mars qualification.
+No SPI or SD writes were performed. Experimental FITs were hash-checked and
+RAM-booted. Same-source polling control measured RX 609.63 / 609.33 Mbps, versus
+597.83 / 597.66 Mbps with corrected IRQ scheduling. IRQ stays disabled by
+default; this stage did not improve saturated RX throughput.
+
+
+### 2026-09-15 detached RX driver foundation
+
+Added independent RX buffer counts, O(1) slot recycling, generation-checked
+handoff/borrow tickets, ring replacement before publication, and a read view
+which does not borrow ENGINE. The detached ring path performs no payload copy.
+Live consumer borrows survive DMA reset; stale queues and abandoned exchanges
+cannot free newly allocated generations. Raw permanent-storage reattachment
+avoids aliasing live payload readers with a whole-storage mutable reference.
+98 EQoS model tests and the Mars compile check pass. This path is not yet wired
+through firmware/HAL, the capability receive queue or smoltcp. The board is
+unchanged, still running the polling control; no new throughput claim is made.
+See RX-LINUX-COMPARISON.md for remaining integration and exact test logs.
+
+
+### RX pool firmware integration and physical testing
+
+The subsequent `rx-pool-experiment` connects the detached ring to static HAL
+loans, stamped capability transport and borrowing smoltcp tokens. The default
+profile remains unchanged. The first physical experiment passed patterned TCP
+receive validation and active-driver cancellation/restart followed by another
+64 MiB validation, with all 4,981,154 loans returned and 128 spare buffers free.
+Initial two-round results were RX 882.08/883.26 Mbps and TX 830.29/835.11 Mbps.
+The TX regression prevents treating this experiment as a production replacement.
+See RX-LINUX-COMPARISON.md for the same-source control and remaining bottlenecks.
+
+
+The next revision avoids the RX_META lock on empty descriptor polls. Matching
+ELF attribution confirms this lock's measured wait fell from 2.38 to 0.55 s.
+Two 20 s tests measured RX 892.44/892.47 and TX 898.24/901.75 Mbps. A subsequent
+60 s per-direction test measured RX 893.58 and TX 909.36 Mbps. All 9,904,794
+loans were returned. The feature remains opt-in pending broader qualification;
+the previously observed boot-time TRNG failure is still unresolved.

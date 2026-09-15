@@ -1767,3 +1767,117 @@ fn real_tcp_pooled_producer_preserves_changing_payloads() {
         Err(vibeos_net_protocol::TcpFrontendDriveError::Stack(StackError::AuthorityRevoked))
     );
 }
+
+
+#[cfg(feature = "pooled-rx")]
+mod pooled_receive {
+    use super::*;
+    use std::{collections::BTreeMap, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
+    use vibeos_core::{heap::{AllocationDomain, OwnerId, ArenaId}, net_receive::*};
+    use vibeos_net_protocol::{PacketReceive, PacketRxToken};
+    struct Record { bytes: &'static [u8], borrower: Option<Owner>, released: bool }
+    fn records() -> &'static Mutex<BTreeMap<u64, Record>> {
+        static R: OnceLock<Mutex<BTreeMap<u64, Record>>> = OnceLock::new();
+        R.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+    unsafe fn release(borrow: Borrow) {
+        let mut records = records().lock().unwrap();
+        let record = records.get_mut(&borrow.ticket().pool()).unwrap();
+        assert_eq!(record.borrower, Some(borrow.owner()));
+        record.borrower = None; record.released = true;
+    }
+    static OPS: Operations = Operations {
+        stats: Default::default,
+        poll: || Ok(None),
+        acquire: |ticket, owner| {
+            let mut records = records().lock().unwrap();
+            let r = records.get_mut(&ticket.pool()).ok_or(DeviceError::InvalidDescription)?;
+            if ticket.index() != 0 || ticket.generation() != 1 || r.released || r.borrower.is_some() {
+                return Err(DeviceError::Busy);
+            }
+            r.borrower = Some(owner);
+            Ok(unsafe { Loan::new(Borrow::from_owned(ticket, owner), r.bytes.as_ptr(), r.bytes.len(), release).unwrap() })
+        },
+        discard: |ticket| {
+            let mut records = records().lock().unwrap();
+            let Some(r) = records.get_mut(&ticket.pool()) else { return false; };
+            if r.borrower.is_some() || r.released { return false; }
+            r.released = true; true
+        },
+        recover: |_| panic!("this test uses normal loan release"),
+    };
+    fn inject(q: &ReceiveEndpoint, bytes: &[u8]) -> Ticket {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        // Synthetic DMA reception happens here; no copy is allowed after acquire.
+        let bytes = Box::leak(bytes.to_vec().into_boxed_slice());
+        records().lock().unwrap().insert(id, Record { bytes, borrower: None, released: false });
+        let ticket = Ticket::from_parts(id, 0, 1);
+        q.try_send(Stamped::new(ticket, session_stamp())).unwrap(); ticket
+    }
+    fn receive(space: &mut CSpace, q: Arc<ReceiveEndpoint>) -> (Cap, PacketReceive) {
+        let cap = space.mint(q, Rights::ALL);
+        let authority = space.lookup_revocable::<ReceiveEndpoint>(cap, Rights::RECV).unwrap();
+        (cap, PacketReceive::Pooled { authority,
+            domain: AllocationDomain::new(OwnerId::new(33), ArenaId::new(44)) })
+    }
+    #[test]
+    fn pooled_token_is_a_slice_of_original_storage_and_revocation_releases_it() {
+        assert_eq!(core::mem::size_of::<PacketRxToken<'_>>(), 2 * core::mem::size_of::<usize>());
+        let q = unsafe { ReceiveEndpoint::new("loan-token", 4, &OPS).unwrap() };
+        let out = Endpoint::new("loan-out", 4); let mut cs = CSpace::new("loan-test");
+        let (cap, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let mut device = PacketDevice::new(session_stamp(), rx, tx);
+        let ticket = inject(&q, &[0x39; 64]);
+        let original = records().lock().unwrap()[&ticket.pool()].bytes.as_ptr();
+        let (rx, tx) = device.receive(Instant::ZERO).unwrap();
+        rx.consume(|bytes| { assert_eq!(bytes.as_ptr(), original); assert_eq!(bytes, &[0x39; 64]); });
+        drop(tx);
+        cs.revoke(cap).unwrap();
+        assert!(device.receive(Instant::from_millis(1)).is_none());
+        assert!(records().lock().unwrap()[&ticket.pool()].released);
+    }
+    #[test]
+    fn real_arp_tcp_and_changing_payloads_flow_through_dma_loans() {
+        let to_server = Endpoint::new("client-wire", 128);
+        let to_client = Endpoint::new("server-wire", 128);
+        let q = unsafe { ReceiveEndpoint::new("server-loans", 128, &OPS).unwrap() };
+        let mut cs = CSpace::new("pooled-tcp");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, server_tx) = authority(&mut cs, &to_client, Rights::SEND);
+        let (_, client_rx) = authority(&mut cs, &to_client, Rights::RECV);
+        let (_, client_tx) = authority(&mut cs, &to_server, Rights::SEND);
+        let mut server = StaticIpv4TcpStack::new(server_config(), session_stamp(), rx, server_tx).unwrap();
+        let mut client = TestClient::new(client_rx, client_tx);
+        let payload: Vec<u8> = (0..65537).map(|i| (i % 251) as u8).collect();
+        let mut sent = 0; let mut received = Vec::new(); let mut echoed = 0; let mut replies = Vec::new();
+        let mut tickets = Vec::new();
+        for now in 0..20000 {
+            client.poll(now);
+            while let Some(frame) = to_server.try_recv() {
+                let packet = frame.into_packet(session_stamp()).unwrap();
+                tickets.push(inject(&q, packet.as_bytes()));
+            }
+            server.poll_network(now).unwrap();
+            if client.socket().can_send() && sent < payload.len() {
+                sent += client.socket().send_slice(&payload[sent..]).unwrap();
+            }
+            let mut scratch = [0; 257];
+            if let TcpIoResult::Progress(n) = server.try_recv(&mut scratch).unwrap() { received.extend_from_slice(&scratch[..n]); }
+            if echoed < received.len() {
+                if let TcpIoResult::Progress(n) = server.try_send(&received[echoed..]).unwrap() { echoed += n; }
+            }
+            client.poll(now);
+            if client.socket().can_recv() {
+                let n = client.socket().recv_slice(&mut scratch).unwrap(); replies.extend_from_slice(&scratch[..n]);
+            }
+            if replies.len() == payload.len() { break; }
+        }
+        assert_eq!(received, payload); assert_eq!(replies, payload);
+        assert!(tickets.len() > 40, "must cover ARP, TCP setup, ACKs and many payload frames");
+        drop(server); q.retire_queued();
+        let records = records().lock().unwrap();
+        for ticket in tickets { assert!(records[&ticket.pool()].released); }
+    }
+}

@@ -92,6 +92,7 @@ pub struct Controller<R: Io> {
     rx_forward_errors: bool,
     symmetric_pause: bool,
     tso: bool,
+    rx_watchdog: u8,
 }
 impl<R: Io> Controller<R> {
     /// Read counters only when the hardware advertises MMC and reads are
@@ -131,7 +132,17 @@ impl<R: Io> Controller<R> {
             rx_forward_errors: false,
             symmetric_pause: false,
             tso: false,
+            rx_watchdog: 0,
         })
+    }
+    /// Select the watchdog interval while stopped. Does not enable interrupts;
+    /// handler registration and budgeted poll scheduling belong to the adapter.
+    pub fn set_rx_watchdog(&mut self, microseconds: u32) -> Result<(), Error> {
+        if self.running { return Err(Error::NotReady); }
+        self.rx_watchdog = crate::rx_irq::watchdog_ticks(self.config.csr_hz, microseconds)
+            .ok_or(Error::InvalidConfig)?;
+        self.configured = false;
+        Ok(())
     }
     pub fn checksum_capabilities(&mut self) -> ChecksumCapabilities {
         ChecksumCapabilities::from_feature0(self.io.read(FEATURE0))
@@ -329,6 +340,10 @@ impl<R: Io> Controller<R> {
         self.io.write(0x112c, (layout.count - 1) as u32);
         self.io.write(0x1130, (layout.count - 1) as u32);
         self.io.write(IRQ_ENABLE, 0); // Polled frontend; interrupt policy added separately.
+        self.io.write(crate::rx_irq::WATCHDOG, u32::from(self.rx_watchdog));
+        if self.io.read(crate::rx_irq::WATCHDOG) & 0xff != u32::from(self.rx_watchdog) {
+            return Err(Error::ConfigurationRejected);
+        }
         self.layout = Some(layout);
         self.configured = true;
         Ok(())

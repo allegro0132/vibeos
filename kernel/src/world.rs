@@ -2457,6 +2457,9 @@ pub fn build() {
             #[cfg(not(feature = "direct-tcp-segmentation"))]
             let outbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-outbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(feature = "pooled-rx")]
+            let inbound = crate::detached_rx::create(crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(not(feature = "pooled-rx"))]
             let inbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-inbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
             let mut policy = policy_space.0.lock();

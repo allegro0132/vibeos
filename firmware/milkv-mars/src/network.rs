@@ -23,14 +23,20 @@ use vibeos_platform_jh7110::{cache, ethernet};
 const COUNT: usize = 128;
 #[cfg(not(feature = "dma-ring128-experiment"))]
 const COUNT: usize = 32;
+#[cfg(feature = "rx-pool-experiment")]
+const RX_COUNT: usize = COUNT * 2;
+#[cfg(not(feature = "rx-pool-experiment"))]
+const RX_COUNT: usize = COUNT;
+#[cfg(feature = "rx-pool-experiment")]
+static DMA_INITIALIZED: AtomicBool = AtomicBool::new(false);
 struct Slot<T>(UnsafeCell<Option<T>>);
 unsafe impl<T> Sync for Slot<T> {} // accesses require the HAL's exclusive invocation
-struct Dma(UnsafeCell<Storage<COUNT>>);
+struct Dma(UnsafeCell<Storage<COUNT, RX_COUNT>>);
 unsafe impl Sync for Dma {}
 #[link_section = ".dma"]
 #[export_name = "VIBEOS_MARS_EQOS_DMA"]
 static DMA: Dma = Dma(UnsafeCell::new(Storage::new()));
-type Memory = Pool<cache::Cache<cache::Mmio>, COUNT>;
+type Memory = Pool<cache::Cache<cache::Mmio>, COUNT, RX_COUNT>;
 type Hardware = Backend<Lane, Memory>;
 type PacketEngine = Engine<Lane, Memory, Port<Lane>>;
 static POOL: Slot<Memory> = Slot(UnsafeCell::new(None));
@@ -253,6 +259,9 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         controller
             .set_rx_error_forwarding(true)
             .map_err(|e| failed("rx-error-forward", e, Error::InvalidDescription))?;
+        #[cfg(feature = "rx-interrupt-experiment")]
+        controller.set_rx_watchdog(100)
+            .map_err(|e| failed("rx-watchdog", e, Error::InvalidDescription))?;
         let port = Port::new(
             Lane {
                 base: r.mac.start,
@@ -287,14 +296,22 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         let cache = cache.with_readonly_recycle(cfg!(feature = "rx-readonly-recycle-experiment"));
         // .dma is NOLOAD; initialize every byte before creating the Rust pool.
         // No ring has started in this claim; earlier claims require proven stop.
+        #[cfg(feature = "rx-pool-experiment")]
+        if !DMA_INITIALIZED.load(Ordering::Acquire) {
+            core::ptr::write_bytes(DMA.0.get(), 0, 1);
+            DMA_INITIALIZED.store(true, Ordering::Release);
+        }
+        #[cfg(not(feature = "rx-pool-experiment"))]
         core::ptr::write_bytes(DMA.0.get(), 0, 1);
-        let pool = Pool::new(&mut *DMA.0.get(), DMA.0.get() as u64, cache, 8)
+        let pool = Pool::from_raw(DMA.0.get(), DMA.0.get() as u64, cache, 8)
             .map_err(|e| failed("dma-pool", e, Error::AddressTooWide))?;
         let layout = pool.layout();
+        #[cfg(feature = "rx-pool-experiment")]
+        { RX_META.lock().view = Some(pool.rx_view()); }
         report(format_args!(
             "MARS_NET_RING count={} bytes={} tx_single_sync={}\n",
             COUNT,
-            core::mem::size_of::<Storage<COUNT>>(),
+            core::mem::size_of::<Storage<COUNT, RX_COUNT>>(),
             cfg!(feature = "tx-single-sync-experiment")
         ));
         *POOL.0.get() = Some(pool);
@@ -308,6 +325,8 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
                 error(e)
             })?,
         );
+        #[cfg(feature = "rx-pool-experiment")]
+        engine().set_rx_initializer(initialize_rx_pool);
         LINK.store(false, Ordering::Release);
         TX.store(0, Ordering::Relaxed);
         RX.store(0, Ordering::Relaxed);
@@ -365,8 +384,32 @@ unsafe fn service_tso_probe() {
         report(format_args!("NTSO_DRIVER_FAIL {:?}\n",error));probe::finish(false);
     } else {probe::submitted();}
 }
+// A fresh register view has no reference to ENGINE/POOL. Its IRQ-register
+// writes are serialized with task-side arm by the boot-hart adapter.
+#[cfg(feature = "rx-interrupt-experiment")]
+fn irq_lane() -> Lane {
+    Lane { base: mars::GMAC0_REGISTERS.start, mdio: false, time: profile_time }
+}
 #[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
+    #[cfg(feature = "rx-pool-experiment")]
+    receive_buffers: Some(vibeos_hal::network_rx::Operations {
+        stats: rx_pool_stats,
+        poll: poll_rx_ticket, acquire: acquire_rx_loan, discard: discard_rx_ticket, recover: recover_rx_borrower,
+    }),
+    #[cfg(not(feature = "rx-pool-experiment"))]
+    receive_buffers: None,
+    #[cfg(feature = "rx-interrupt-experiment")]
+    rx_interrupts: Some(vibeos_hal::network::RxInterrupts {
+        mask: || vibeos_eqos_net::rx_irq::mask(&mut irq_lane()),
+        acknowledge: || vibeos_eqos_net::rx_irq::mask_and_acknowledge(&mut irq_lane())
+            & vibeos_eqos_net::rx_irq::FATAL_EVENTS == 0,
+        arm: || vibeos_eqos_net::rx_irq::arm_and_check(&mut irq_lane(),
+            vibeos_eqos_net::rx_irq::Revision::Gmac410OrLater),
+        pending: || unsafe { engine().receive_pending() },
+    }),
+    #[cfg(not(feature = "rx-interrupt-experiment"))]
+    rx_interrupts: None,
     present: true,
     registers: mars::GMAC0_REGISTERS,
     irq: mars::GMAC0_IRQ,
@@ -481,3 +524,95 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     // ring for reset proof; never overwrite it merely because a task faulted.
     recover: retire,
 };
+
+
+#[cfg(feature = "rx-pool-experiment")]
+struct RxMetadata {
+    buffers: Option<vibeos_eqos_net::rx_buffers::Buffers<COUNT, RX_COUNT>>,
+    lengths: [usize; RX_COUNT],
+    counts: [u64; 5],
+    view: Option<vibeos_eqos_net::pool::RxView>,
+}
+#[cfg(feature = "rx-pool-experiment")]
+static RX_META: vibeos_core::sync::SpinLock<RxMetadata> = vibeos_core::sync::SpinLock::new_recoverable(
+    RxMetadata { buffers: None, lengths: [0; RX_COUNT], counts: [0; 5], view: None });
+#[cfg(feature = "rx-pool-experiment")]
+fn initialize_rx_pool(ring: &mut ring::Ring<Hardware>) -> Result<(), ring::Error> {
+    let mut metadata = RX_META.lock();
+    if metadata.buffers.is_none() {
+        metadata.buffers = Some(vibeos_eqos_net::rx_buffers::Buffers::new().map_err(|_| ring::Error::Controller)?);
+    }
+    ring.initialize_pooled(metadata.buffers.as_mut().unwrap())
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn poll_rx_ticket() -> Result<Option<vibeos_hal::network_rx::Ticket>, Error> {
+    // Only the driver touches descriptor ownership. Empty polling needs no
+    // allocator metadata and must not delay stack-side acquire/release.
+    // Fault/invalid-ring states return true and take the normal error path.
+    if !engine().receive_pending() { return Ok(None); }
+    let mut metadata = RX_META.lock(); let metadata = &mut *metadata;
+    // Before the first resolved PHY link there is no initialized RX ring.
+    let Some(buffers) = metadata.buffers.as_mut() else { return Ok(None); };
+    let frame = match engine().receive_detached(buffers) {
+        Ok(Some(frame)) => frame, Ok(None) => return Ok(None),
+        Err(EngineError::Ring(ring::Error::Full)) => { metadata.counts[3] += 1; return Ok(None); }
+        Err(e) => return Err(error(e)),
+    };
+    let view = metadata.view.expect("admitted permanent RX view");
+    // The Ready ticket is private to this invocation until its return. The
+    // metadata guard excludes acquisition/reset throughout checksum admission.
+    let accepted = view.read(frame.ticket.index(), frame.bytes,
+        |bytes| engine().validate_rx_frame(bytes, frame.checksum)).expect("validated RX span");
+    if !accepted { metadata.counts[4] += 1; let _ = buffers.discard(frame.ticket); return Ok(None); }
+    metadata.counts[0] += 1;
+    metadata.lengths[frame.ticket.index()] = frame.bytes;
+    let engine = engine(); engine.rx_packets = engine.rx_packets.saturating_add(1);
+    snapshot();
+    Ok(Some(frame.ticket))
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn release_rx_borrow(borrow: vibeos_hal::network_rx::Borrow) {
+    let mut metadata = RX_META.lock();
+    if metadata.buffers.as_mut().is_some_and(|buffers| buffers.release(borrow).is_ok()) {
+        metadata.counts[2] += 1;
+    }
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn acquire_rx_loan(ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_hal::network_rx::Owner)
+    -> Result<vibeos_hal::network_rx::Loan, Error>
+{
+    let mut metadata = RX_META.lock(); let metadata = &mut *metadata;
+    let view = metadata.view.ok_or(Error::InvalidDescription)?;
+    let bytes = *metadata.lengths.get(ticket.index()).ok_or(Error::InvalidDescription)?;
+    let buffers = metadata.buffers.as_mut().ok_or(Error::InvalidDescription)?;
+    let borrow = buffers.borrow(ticket, owner.key()).map_err(|_| Error::Busy)?;
+    let pointer = match view.read(borrow.index(), bytes, |bytes| bytes.as_ptr()) {
+        Ok(pointer) => pointer,
+        Err(_) => { let _ = buffers.release(borrow); return Err(Error::InvalidDescription); }
+    };
+    match vibeos_hal::network_rx::Loan::new(borrow, pointer, bytes, release_rx_borrow) {
+        Ok(loan) => { metadata.counts[1] += 1; Ok(loan) },
+        Err(borrow) => { let _ = buffers.release(borrow); Err(Error::InvalidDescription) }
+    }
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn discard_rx_ticket(ticket: vibeos_hal::network_rx::Ticket) -> bool {
+    RX_META.lock().buffers.as_mut().is_some_and(|buffers| buffers.discard(ticket).is_ok())
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn recover_rx_borrower(owner: vibeos_hal::network_rx::Owner) -> usize {
+    let key = owner.key();
+    let domain = vibeos_core::heap::AllocationDomain::new(
+        vibeos_core::heap::OwnerId::new((key >> 64) as u64), vibeos_core::heap::ArenaId::new(key as u64));
+    let _ = RX_META.recover_after_fault(domain);
+    RX_META.lock().buffers.as_mut().map_or(0, |buffers| buffers.recover_borrower(key))
+}
+
+#[cfg(feature = "rx-pool-experiment")]
+fn rx_pool_stats() -> vibeos_hal::network_rx::Stats {
+    let metadata = RX_META.lock();
+    let slots = metadata.buffers.as_ref().map(|b| b.stats()).unwrap_or_default();
+    vibeos_hal::network_rx::Stats { received: metadata.counts[0], acquired: metadata.counts[1],
+        released: metadata.counts[2], full: metadata.counts[3], dropped: metadata.counts[4],
+        free: slots.free, ready: slots.ready, borrowed: slots.borrowed }
+}

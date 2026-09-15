@@ -60,7 +60,6 @@ impl Buffer {
         self.data.clear();
         let Some((header, end)) = eligible(b, trusted) else { return false; };
         if end > MAX_BYTES { return false; }
-        self.data.extend_from_slice(&b[..end]);
         self.header = header;
         self.mss = end - header;
         self.next_seq = u32_at(b, 38).wrapping_add(self.mss as u32);
@@ -69,11 +68,16 @@ impl Buffer {
         self.segments = 1;
         true
     }
-    pub fn append(&mut self, b: &[u8], trusted: bool) -> bool {
+    /// `original` is the same immutable frame passed to begin, still owned by
+    /// the receive token builder. Materialize it only on the first actual merge.
+    pub fn append(&mut self, original: &[u8], b: &[u8], trusted: bool) -> bool {
         if self.done || self.segments >= MAX_SEGMENTS { return false; }
         let Some((header, end)) = eligible(b, trusted) else { return false; };
         let payload = end - header;
-        let first = &self.data;
+        let first = if self.segments == 1 {
+            let Some(first) = original.get(..self.header + self.mss) else { return false; };
+            first
+        } else { &self.data };
         let id = u16_at(b, 18);
         if header != self.header || payload > self.mss
             || first.len() + payload > MAX_BYTES || u32_at(b, 38) != self.next_seq
@@ -82,6 +86,9 @@ impl Buffer {
             || b[54..header] != first[54..header]
             || (id != self.last_id && id != self.last_id.wrapping_add(1)) {
             return false;
+        }
+        if self.segments == 1 {
+            self.data.extend_from_slice(&original[..self.header + self.mss]);
         }
         self.data.extend_from_slice(&b[header..end]);
         self.data[47] = b[47];
@@ -92,6 +99,7 @@ impl Buffer {
         self.merged_segments += 1;
         true
     }
+    pub fn has_aggregate(&self) -> bool { self.segments >= 2 }
     pub fn finished(&self) -> bool { self.done }
     pub fn finish(&mut self, trusted: bool) {
         if self.segments < 2 { return; }
@@ -135,7 +143,7 @@ mod tests {
     fn coalesces_payload_and_preserves_checksums_across_sequence_wrap() {
         let a=frame(u32::MAX-999,1448); let mut b=frame(448,713);
         b[18..20].copy_from_slice(&1u16.to_be_bytes()); b[47]|=8; checksums(&mut b);
-        let mut g=Buffer::new(); assert!(g.begin(&a,false)); assert!(g.append(&b,false));
+        let mut g=Buffer::new(); assert!(g.begin(&a,false)); assert!(g.append(&a,&b,false));
         assert!(g.finished()); g.finish(false);
         assert_eq!(g.bytes().len(),66+1448+713);
         assert_eq!(&g.bytes()[66..1514],&a[66..]);
@@ -152,22 +160,44 @@ mod tests {
         for offset in [0,6,15,20,22,23,26,30,34,36,38,42,46,47,48,52,61] {
             let mut other=b.clone(); other[offset]^=1; checksums(&mut other);
             let mut g=Buffer::new(); assert!(g.begin(&a,false));
-            assert!(!g.append(&other,false),"offset {offset}"); assert_eq!(g.bytes(),a);
+            assert!(!g.append(&a,&other,false),"offset {offset}"); assert!(g.bytes().is_empty());
         }
         let mut bad=b.clone(); bad[70]^=1;
-        let mut g=Buffer::new(); assert!(g.begin(&a,false)); assert!(!g.append(&bad,false));
+        let mut g=Buffer::new(); assert!(g.begin(&a,false)); assert!(!g.append(&a,&bad,false));
         assert!(!g.begin(&bad,false));
         for len in 0..b.len() { assert!(!g.begin(&b[..len],false)); }
     }
     #[test]
     fn poll_budget_and_allocation_are_bounded() {
         let mut g=Buffer::new(); let capacity=g.data.capacity();
-        assert!(g.begin(&frame(0,1448),false));
-        for i in 1..MAX_SEGMENTS { assert!(g.append(&frame((i*1448) as u32,1448),false)); }
-        assert!(!g.append(&frame((MAX_SEGMENTS*1448) as u32,1448),false));
+        let a=frame(0,1448); assert!(g.begin(&a,false));
+        for i in 1..MAX_SEGMENTS { assert!(g.append(&a,&frame((i*1448) as u32,1448),false)); }
+        assert!(!g.append(&a,&frame((MAX_SEGMENTS*1448) as u32,1448),false));
         g.finish(false); assert_eq!(g.data.capacity(),capacity);
         assert_eq!(g.merged_segments,15); assert!(g.data.len()<=MAX_BYTES);
-        assert!(g.begin(&frame(0,10),false)); assert!(!g.append(&frame(10,11),false));
-        assert!(g.append(&frame(10,5),false)); assert!(g.finished());
+        let a=frame(0,10); assert!(g.begin(&a,false)); assert!(!g.append(&a,&frame(10,11),false));
+        assert!(g.append(&a,&frame(10,5),false)); assert!(g.finished());
     }
+    #[test]
+    fn singleton_and_rejected_successor_do_not_copy_payload() {
+        let a = frame(0, 1448);
+        let mut g = Buffer::new();
+        assert!(g.begin(&a, false));
+        g.finish(false);
+        assert!(!g.has_aggregate());
+        assert!(g.bytes().is_empty());
+        assert!(!g.append(&a, &frame(3000, 1448), false));
+        assert!(g.bytes().is_empty());
+        assert!(g.append(&a, &frame(1448, 1448), false));
+        assert!(g.has_aggregate());
+        assert_eq!(&g.bytes()[66..1514], &a[66..]);
+        let mut psh = frame(2896, 1448);
+        psh[47] |= 8;
+        checksums(&mut psh);
+        assert!(g.begin(&psh, false));
+        assert!(g.finished());
+        assert!(g.bytes().is_empty());
+        assert!(!g.has_aggregate());
+    }
+
 }

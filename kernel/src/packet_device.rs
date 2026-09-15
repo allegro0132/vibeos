@@ -37,6 +37,16 @@ impl Engine {
         let _scope=vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Tx);
         unsafe {(operation.transmit)(request)}
     }
+    #[cfg(feature = "pooled-rx")]
+    pub fn receive_ticket(&mut self) -> Result<Option<vibeos_hal::network_rx::Ticket>, Error> {
+        let operations = device().receive_buffers.as_ref().ok_or(Error::InvalidDescription)?;
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Rx);
+        unsafe { (operations.poll)() }
+    }
+    #[cfg(feature = "pooled-rx")]
+    pub fn discard_ticket(&mut self, ticket: vibeos_hal::network_rx::Ticket) {
+        if let Some(operations) = &device().receive_buffers { unsafe { (operations.discard)(ticket); } }
+    }
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Rx);
         unsafe { (device().receive)(output) }

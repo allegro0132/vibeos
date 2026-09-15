@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+pooled-rx = ["vibeos-net-protocol/pooled-rx"]
 network-tx-audit = ["vibeos-net-protocol/network-tx-audit"]
 native-tcp-segmentation = ["vibeos-net-protocol/native-tcp-segmentation"]
 # Experimental bounded IPv4/TCP receive coalescing; disabled by default.

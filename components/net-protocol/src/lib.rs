@@ -3,7 +3,7 @@
 //! This module is the first protocol layer above the raw Ethernet contract in
 //! [`vibeos_core::net`]. It deliberately exposes neither file descriptors nor an
 //! ambient NIC. A supervisor resolves two directional packet capabilities as
-//! operation-time [`Revocable`] tokens and hands them to
+//! operation-time [`vibeos_core::cap::Revocable`] tokens and hands them to
 //! [`StaticIpv4TcpStack`]. Calling [`StaticIpv4TcpStack::poll_network`] with a
 //! monotonic millisecond timestamp advances ARP, IPv4, and one passive TCP
 //! connection by a bounded amount. Application byte-stream work is explicit
@@ -17,6 +17,8 @@ extern crate alloc;
 
 pub mod command;
 mod transmit;
+mod receive;
+pub use receive::PacketReceive;
 pub use transmit::PacketTransmit;
 #[cfg(feature = "bounded-gro")]
 mod gro;
@@ -35,8 +37,6 @@ use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
-use vibeos_core::cap::Revocable;
-use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
 use vibeos_net_api::{TcpCloseRequest, TcpFrontendError, TcpListener};
 pub use vibeos_net_api::{TcpIoResult, TcpStreamState, TcpStreamStatus};
@@ -267,7 +267,10 @@ pub struct PacketDeviceStats {
 /// without growing an unbounded second queue.
 pub struct PacketDevice {
     stamp: PacketStamp,
-    inbound: Revocable<Endpoint<StampedPacket>>,
+    inbound: PacketReceive,
+    rx_packet: Option<Packet>,
+    #[cfg(feature = "pooled-rx")]
+    rx_loan: Option<vibeos_core::net_receive::Loan>,
     outbound: PacketTransmit,
     pending_egress: Option<StampedPacket>,
     #[cfg(feature = "native-tcp-segmentation")]
@@ -289,12 +292,15 @@ pub struct PacketDevice {
 impl PacketDevice {
     pub fn new(
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
         outbound: impl Into<PacketTransmit>,
     ) -> Self {
         Self {
             stamp,
-            inbound,
+            inbound: inbound.into(),
+            rx_packet: None,
+            #[cfg(feature = "pooled-rx")]
+            rx_loan: None,
             outbound: outbound.into(),
             pending_egress: None,
             #[cfg(feature = "native-tcp-segmentation")]
@@ -329,7 +335,7 @@ impl PacketDevice {
     /// Revalidate both directional authorities at a cooperative-call boundary.
     pub fn revalidate_authority(&mut self) -> Result<(), StackError> {
         if self.authority_revoked
-            || self.inbound.try_with(|_| ()).is_err()
+            || self.inbound.revalidate().is_err()
             || self.outbound.revalidate().is_err()
         {
             self.authority_revoked = true;
@@ -433,7 +439,7 @@ impl PacketDevice {
         if self.pending_segments.is_some() || self.pending_pooled.is_some() { return Ok(true); }
         #[cfg(feature = "bounded-gro")]
         if self.pending_ingress.is_some() { return Ok(true); }
-        match self.inbound.try_with(|endpoint| endpoint.stats().2 != 0) {
+        match self.inbound.has_message() {
             Ok(has_ingress) => Ok(has_ingress),
             Err(_) => {
                 self.authority_revoked = true;
@@ -470,7 +476,7 @@ impl PacketDevice {
     fn receive_packet(&mut self) -> Option<Packet> {
         #[cfg(feature = "bounded-gro")]
         if self.ingress_remaining == 0 { return None; }
-        let packet = match self.inbound.try_with(|endpoint| endpoint.try_recv()) {
+        let packet = match self.inbound.raw_receive() {
             Ok(packet) => packet?,
             Err(_) => {
                 self.authority_revoked = true;
@@ -509,26 +515,42 @@ impl PacketDevice {
     }
 }
 
-/// A receive token owning one frame or borrowing the protocol aggregation
-/// buffer. It never borrows DMA memory or holds an endpoint queue lock.
-pub struct PacketRxToken<'a>(RxBytes<'a>);
-
+/// Pooled builds borrow pinned storage; legacy builds retain the original
+/// owning token so moving into a second inline frame does not add a packet copy.
+#[cfg(feature = "pooled-rx")]
+type RxBytes<'a> = &'a [u8];
+#[cfg(not(feature = "pooled-rx"))]
 enum RxBytes<'a> {
     Single(Packet, core::marker::PhantomData<&'a ()>),
     #[cfg(feature = "bounded-gro")]
     Coalesced(&'a [u8]),
 }
-
+#[inline]
+fn single_rx(packet: Packet, storage: &mut Option<Packet>) -> RxBytes<'_> {
+    #[cfg(feature = "pooled-rx")]
+    { *storage = Some(packet); storage.as_ref().unwrap().as_bytes() }
+    #[cfg(not(feature = "pooled-rx"))]
+    { let _ = storage; RxBytes::Single(packet, core::marker::PhantomData) }
+}
+#[cfg(feature = "bounded-gro")]
+#[inline]
+fn coalesced_rx(bytes: &[u8]) -> RxBytes<'_> {
+    #[cfg(feature = "pooled-rx")]
+    { bytes }
+    #[cfg(not(feature = "pooled-rx"))]
+    { RxBytes::Coalesced(bytes) }
+}
+pub struct PacketRxToken<'a>(RxBytes<'a>);
 impl phy::RxToken for PacketRxToken<'_> {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        match self.0 {
+    fn consume<R, F>(self, f: F) -> R where F: FnOnce(&[u8]) -> R {
+        #[cfg(feature = "pooled-rx")]
+        { f(self.0) }
+        #[cfg(not(feature = "pooled-rx"))]
+        { match self.0 {
             RxBytes::Single(packet, _) => f(packet.as_bytes()),
             #[cfg(feature = "bounded-gro")]
             RxBytes::Coalesced(bytes) => f(bytes),
-        }
+        } }
     }
 }
 
@@ -647,6 +669,10 @@ impl phy::Device for PacketDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Previous tokens cannot coexist with this mutable device invocation.
+        // Dropping an admitted loan releases storage even after revocation.
+        #[cfg(feature = "pooled-rx")]
+        { self.rx_loan = None; }
         #[cfg(feature = "bounded-gro")]
         if self.revalidate_authority().is_err() { return None; }
         if self.flush_egress() != Ok(true) {
@@ -654,6 +680,46 @@ impl phy::Device for PacketDevice {
         }
         #[cfg(feature = "native-tcp-segmentation")]
         let reservation = self.reserve_transmit()?;
+        #[cfg(feature = "pooled-rx")]
+        if let Some(result) = self.inbound.receive_loan(self.stamp) {
+            self.rx_loan = match result {
+                Ok(Ok(loan)) => loan,
+                Err(_) => { self.authority_revoked = true; return None; }
+                Ok(Err(error)) => {
+                    self.stats.rejected_ingress_frames = self.stats.rejected_ingress_frames.saturating_add(1);
+                    if let vibeos_core::net_receive::Error::Session(mismatch) = error {
+                        if mismatch.device_epoch_changed() {
+                            self.stats.rejected_device_epoch_frames = self.stats.rejected_device_epoch_frames.saturating_add(1);
+                        } else {
+                            self.stats.rejected_stack_generation_frames = self.stats.rejected_stack_generation_frames.saturating_add(1);
+                        }
+                    }
+                    return None;
+                }
+            };
+            let bytes = self.rx_loan.as_ref()?.as_bytes();
+            self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
+            // Pooled frames bypass contiguous-copy GRO for now. Enabling GRO
+            // still coalesces legacy frames, never silently copies a DMA loan.
+            return Some((
+                PacketRxToken(bytes),
+                PacketTxToken {
+                    stamp: self.stamp,
+                    outbound: self.outbound.clone(),
+                    pending_egress: &mut self.pending_egress,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_segments: &mut self.pending_segments,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    segment_size: None,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    reservation,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_pooled: &mut self.pending_pooled,
+                    stats: &mut self.stats,
+                    authority_revoked: &mut self.authority_revoked,
+                },
+            ));
+        }
         #[cfg(feature = "bounded-gro")]
         let packet = self.pending_ingress.take().or_else(|| self.receive_packet())?;
         #[cfg(not(feature = "bounded-gro"))]
@@ -663,18 +729,22 @@ impl phy::Device for PacketDevice {
             for _ in 1..gro::MAX_SEGMENTS {
                 if self.gro.finished() { break; }
                 let Some(next) = self.receive_packet() else { break; };
-                if !self.gro.append(next.as_bytes(), self.rx_checksum_offload) {
+                if !self.gro.append(packet.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
                     self.pending_ingress = Some(next);
                     break;
                 }
             }
             // Revocation observed while gathering invalidates the whole token.
             if self.authority_revoked { return None; }
-            self.gro.finish(self.rx_checksum_offload);
-            RxBytes::Coalesced(self.gro.bytes())
-        } else { RxBytes::Single(packet, core::marker::PhantomData) };
+            if self.gro.has_aggregate() {
+                self.gro.finish(self.rx_checksum_offload);
+                coalesced_rx(self.gro.bytes())
+            } else {
+                single_rx(packet, &mut self.rx_packet)
+            }
+        } else { single_rx(packet, &mut self.rx_packet) };
         #[cfg(not(feature = "bounded-gro"))]
-        let bytes = RxBytes::Single(packet, core::marker::PhantomData);
+        let bytes = { single_rx(packet, &mut self.rx_packet) };
         Some((
             PacketRxToken(bytes),
             PacketTxToken {
@@ -863,7 +933,7 @@ impl SharedIpv4TcpStack {
     pub fn new(
         config: Ipv4StackConfig,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
         outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_stack_config(config)?;
@@ -1501,7 +1571,7 @@ impl StaticIpv4TcpStack {
     pub fn new(
         config: StaticIpv4Config,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
         outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_config(config)?;
@@ -1694,7 +1764,7 @@ impl StaticIpv4EchoStack {
     pub fn new(
         config: StaticIpv4Config,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
         outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         Ok(Self {

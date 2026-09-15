@@ -2930,6 +2930,7 @@ name = "vibeos-firmware-milkv-mars"
 version = "0.1.0"
 dependencies = [
  "vibeos-bsp-milkv-mars",
+ "vibeos-core",
  "vibeos-driver-dw-i2c",
  "vibeos-driver-dw-mshc",
  "vibeos-driver-plic",

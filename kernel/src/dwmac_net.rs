@@ -33,6 +33,15 @@ impl PendingTx {
     }
 }
 
+#[cfg(feature = "pooled-rx")]
+type InboundResource = vibeos_core::net_receive::ReceiveEndpoint;
+#[cfg(not(feature = "pooled-rx"))]
+type InboundResource = Endpoint<StampedPacket>;
+#[cfg(feature = "pooled-rx")]
+type PendingRx = vibeos_core::net_receive::Stamped;
+#[cfg(not(feature = "pooled-rx"))]
+type PendingRx = StampedPacket;
+
 const TX_TIMEOUT_MS: u64 = 2_000;
 const DRIVER_BATCH_PACKETS: usize = 32;
 
@@ -352,6 +361,8 @@ pub fn bind_stack_with(lease: &InvocationLease<NetDevice>) -> Result<PacketStamp
         state.active_stack_domain = None;
         let result = match state.sessions.bind_stack(tx_inflight) {
             Ok(stamp) => {
+                #[cfg(feature = "pooled-rx")]
+                crate::detached_rx::retire_queued();
                 state.active_stack_domain = Some(crate::heap::current_domain());
                 Ok(stamp)
             }
@@ -429,7 +440,7 @@ pub async fn driver_task(
             cspace.lookup_revocable::<MmioWindow>(mmio, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<DmaRegion>(dma, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<OutboundResource>(outbound, Rights::RECV),
-            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::SEND),
+            cspace.lookup_revocable::<InboundResource>(inbound, Rights::SEND),
             cspace.lookup_revocable::<NetDevice>(control, Rights::READ),
         )
     };
@@ -504,12 +515,29 @@ pub async fn driver_task(
 
     #[cfg(feature = "network-tso-coalesce")]
     let mut tx_batch = vibeos_core::net_tx_coalesce::TxCoalescer::new();
+    #[cfg(feature = "rx-interrupt-poll")]
+    if device().rx_interrupts.is_some() {
+        if !crate::plic::is_dispatch_hart()
+            || crate::plic::register(device().irq, rx_top_half, 0).is_err()
+            {
+            crate::println!("RX IRQ admission failed (requires dispatch-hart affinity)");
+            return;
+        }
+        RX_REGISTERED.store(true, Ordering::Release);
+        RX_IRQ_FAULT.store(false, Ordering::Release);
+        if crate::plic::enable(device().irq).is_err() { return; }
+    }
     let mut pending_tx = None;
     let mut pending_rx = None;
     let mut tx_deadline = 0;
     let mut link_poll = None;
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(crate::exec::timebase_hz() / 1000, 64);
     loop {
+        #[cfg(feature = "rx-interrupt-poll")]
+        if RX_IRQ_FAULT.swap(false, Ordering::AcqRel) {
+            crate::println!("RX IRQ fatal controller fault");
+            return;
+        }
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
@@ -528,6 +556,15 @@ pub async fn driver_task(
         });
         match turn {
             Ok(worked) => {
+                #[cfg(feature = "rx-interrupt-poll")]
+                if device().rx_interrupts.is_some() {
+                    if worked {
+                        crate::exec::yield_now().await;
+                    } else if wait_rx_work(&mmio, &dma, &control, &outbound).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if poll_budget.runnable(crate::sbi::time(), worked) {
                     crate::exec::yield_now().await;
                 } else {
@@ -542,6 +579,99 @@ pub async fn driver_task(
     }
 }
 
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_REGISTERED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_IRQ_FAULT: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_WAIT: crate::exec::WaitQueue = crate::exec::WaitQueue::new();
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_ARMS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_BUSY_RECHECKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_TIMERS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-interrupt-poll")]
+static RX_TX_WAKES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "rx-interrupt-poll")]
+pub fn rx_irq_stats() -> [u64; 5] {
+    [&RX_INTERRUPTS, &RX_ARMS, &RX_BUSY_RECHECKS, &RX_TIMERS, &RX_TX_WAKES]
+        .map(|v| v.load(Ordering::Relaxed))
+}
+#[cfg(feature = "rx-interrupt-poll")]
+fn rx_top_half(_: usize, _: u64) {
+    if let Some(irq) = &device().rx_interrupts {
+        // Firmware provides a static register-only operation, never ENGINE.
+        if !unsafe { (irq.acknowledge)() } {
+            RX_IRQ_FAULT.store(true, Ordering::Release);
+        }
+        RX_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        RX_WAIT.wake_all();
+    }
+}
+#[cfg(feature = "rx-interrupt-poll")]
+fn stop_rx_interrupts() {
+    if let Some(irq) = &device().rx_interrupts {
+        unsafe { (irq.mask)(); }
+        if RX_REGISTERED.swap(false, Ordering::AcqRel) {
+            crate::plic::unregister(device().irq);
+        }
+    }
+}
+#[cfg(feature = "rx-interrupt-poll")]
+async fn wait_rx_work(
+    mmio: &Revocable<MmioWindow>, dma: &Revocable<DmaRegion>,
+    control: &Revocable<NetDevice>, outbound: &Revocable<OutboundResource>,
+) -> Result<(), NetError> {
+    use core::{future::{poll_fn, Future}, pin::pin, task::Poll};
+    let irq = device().rx_interrupts.as_ref().expect("admitted RX interrupts");
+    // Capturing the wait-queue epoch precedes every condition check. Register
+    // the waiter before arming; an ISR in either gap remains observable.
+    let tx_notification = outbound.try_with(|q| q.message_event())
+        .map_err(|_| NetError::AuthorityRevoked)?;
+    let mut tx_event = pin!(tx_notification.wait());
+    let mut event = pin!(RX_WAIT.wait());
+    let mut timer = pin!(crate::exec::sleep_ms(1));
+    poll_fn(|cx| {
+        let event_ready = event.as_mut().poll(cx).is_ready();
+        let tx_ready = tx_event.as_mut().poll(cx).is_ready();
+        let timer_ready = timer.as_mut().poll(cx).is_ready();
+        if event_ready || tx_ready || timer_ready {
+            unsafe { (irq.mask)(); }
+            if timer_ready { RX_TIMERS.fetch_add(1, Ordering::Relaxed); }
+            if tx_ready { RX_TX_WAKES.fetch_add(1, Ordering::Relaxed); }
+            return Poll::Ready(Ok(()));
+        }
+        let result = with_device_authority(mmio, dma, control, || {
+            // Driver runs on the PLIC dispatch hart. This IRQ-masking guard
+            // serializes register writers against its top half and pins policy.
+            let _state = CONTROL.lock();
+            if outbound.try_with(|q| q.has_message()).map_err(|_| NetError::AuthorityRevoked)? {
+                unsafe { (irq.mask)(); }
+                RX_TX_WAKES.fetch_add(1, Ordering::Relaxed);
+                return Ok(false);
+            }
+            // Clear causes accumulated while polling with interrupts masked.
+            // The subsequent OWN recheck catches arrivals covered by this ACK.
+            if !unsafe { (irq.acknowledge)() } { return Err(NetError::DriverFault); }
+            RX_ARMS.fetch_add(1, Ordering::Relaxed);
+            let idle = unsafe { (irq.arm)() && !(irq.pending)() };
+            if !idle {
+                unsafe { (irq.mask)(); }
+                RX_BUSY_RECHECKS.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(idle)
+        });
+        match result {
+            Ok(true) => Poll::Pending,
+            Ok(false) => Poll::Ready(Ok(())),
+            Err(e) => { unsafe { (irq.mask)(); } Poll::Ready(Err(e)) }
+        }
+    }).await
+}
+
 struct DriverSession {
     engine: Option<Engine>,
 }
@@ -554,6 +684,8 @@ impl DriverSession {
 
 impl Drop for DriverSession {
     fn drop(&mut self) {
+        #[cfg(feature = "rx-interrupt-poll")]
+        stop_rx_interrupts();
         let reset = self
             .engine
             .take()
@@ -577,11 +709,11 @@ fn with_device_authority<R>(
 fn driver_turn(
     engine: &mut Engine,
     outbound: &Revocable<OutboundResource>,
-    inbound: &Revocable<Endpoint<StampedPacket>>,
+    inbound: &Revocable<InboundResource>,
     pending_tx: &mut Option<PendingTx>,
     #[cfg(feature = "network-tso-coalesce")]
     tx_batch: &mut vibeos_core::net_tx_coalesce::TxCoalescer,
-    pending_rx: &mut Option<StampedPacket>,
+    pending_rx: &mut Option<PendingRx>,
     tx_deadline: &mut u64,
     link_poll: &mut Option<u64>,
 ) -> Result<bool, NetError> {
@@ -746,6 +878,33 @@ fn driver_turn(
 
     }
 
+    #[cfg(feature = "pooled-rx")]
+    for _ in 0..DRIVER_BATCH_PACKETS {
+        let state = CONTROL.lock();
+        let frame = if let Some(frame) = pending_rx.take() {
+            frame
+        } else {
+            let Some(ticket) = engine.receive_ticket().map_err(|_| NetError::DriverFault)? else { break; };
+            immediate_work = true;
+            let Some(stamp) = state.sessions.active_stamp() else {
+                engine.discard_ticket(ticket);
+                STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            PendingRx::new(ticket, stamp)
+        };
+        if state.sessions.active_stamp() != Some(frame.stamp()) {
+            engine.discard_ticket(frame.ticket());
+            STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        match inbound.try_with(|q| q.try_send(frame)) {
+            Ok(Ok(())) => immediate_work = true,
+            Ok(Err(frame)) => { *pending_rx = Some(frame); immediate_work = true; break; }
+            Err(_) => { engine.discard_ticket(frame.ticket()); return Err(NetError::AuthorityRevoked); }
+        }
+    }
+    #[cfg(not(feature = "pooled-rx"))]
     for _ in 0..DRIVER_BATCH_PACKETS {
         // Consume, stamp, publish and rearm one RX frame under the same
         // barrier. Rebinding between frames cannot relabel a consumed frame.
@@ -866,6 +1025,8 @@ fn shutdown_driver_policy(reset: bool) {
     state.online = false;
     state.quarantined |= !reset;
     state.sessions.detach_device();
+    #[cfg(feature = "pooled-rx")]
+    crate::detached_rx::retire_queued();
     #[cfg(feature = "direct-tcp-segmentation")]
     crate::segmented_tx::retire_all();
     state.active_stack_domain = None;
@@ -880,6 +1041,8 @@ fn shutdown_driver_policy(reset: bool) {
 pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     // Release any abandoned pool guard before waiting on CONTROL: another hart
     // can hold CONTROL while waiting for that same slot.
+    #[cfg(feature = "pooled-rx")]
+    unsafe { crate::detached_rx::recover(domain); }
     #[cfg(feature = "direct-tcp-segmentation")]
     unsafe { crate::segmented_tx::recover(domain); }
     #[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
@@ -889,6 +1052,8 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
         let mut state = CONTROL.lock();
         if state.active_stack_domain == Some(domain) {
             state.sessions.unbind_stack();
+            #[cfg(feature = "pooled-rx")]
+            crate::detached_rx::retire_queued();
             state.active_stack_domain = None;
             publish_runtime_info(&state);
         }
@@ -898,6 +1063,8 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
+    #[cfg(feature = "rx-interrupt-poll")]
+    stop_rx_interrupts();
     let reset = unsafe { (device().recover)() };
     shutdown_driver_policy(reset);
 }

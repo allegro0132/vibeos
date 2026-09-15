@@ -21,15 +21,14 @@ compile_error!("select a netstack address policy");
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_core::cap::{Cap, Revocable};
-use vibeos_core::chan::Endpoint;
-use vibeos_core::net::{PacketStamp, StampedPacket};
+use vibeos_core::net::PacketStamp;
 use vibeos_net_api::TcpListener;
 use vibeos_net_protocol::{
     Ipv4StackConfig, SharedIpv4TcpStack, TcpListenerHandle, MAX_TCP_LISTENERS,
 };
 
 pub use vibeos_net_protocol::command::NetworkInterfaceId;
-pub use vibeos_net_protocol::PacketTransmit;
+pub use vibeos_net_protocol::{PacketTransmit, PacketReceive};
 
 pub mod command;
 pub mod config;
@@ -65,7 +64,7 @@ pub enum NetworkBindError {
 
 pub type PacketEndpoints = (
     PacketTransmit,
-    Revocable<Endpoint<StampedPacket>>,
+    PacketReceive,
 );
 
 /// Privileged packet and network-control operations consumed by this component.
@@ -332,7 +331,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
 struct InterfaceTask {
     interface: NetworkInterfaceId,
     outbound: PacketTransmit,
-    inbound: Revocable<Endpoint<StampedPacket>>,
+    inbound: PacketReceive,
     control: Cap,
     listeners: Vec<Revocable<TcpListener>>,
     observed_epoch: Option<u64>,

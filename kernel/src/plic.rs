@@ -175,3 +175,8 @@ pub fn claim() -> Option<u32> {
 pub fn complete(irq: u32) {
     (hardware().complete)(boot_context(), irq);
 }
+
+/// Task-side affinity check for register sequences serialized against this PLIC.
+pub(crate) fn is_dispatch_hart() -> bool {
+    (hardware().supervisor_context)(crate::sbi::current_hart_id()) == Some(boot_context())
+}

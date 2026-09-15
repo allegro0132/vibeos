@@ -1133,6 +1133,8 @@ mod dwc2_host;
 mod packet_device;
 #[cfg(feature = "direct-tcp-segmentation")]
 mod segmented_tx;
+#[cfg(feature = "pooled-rx")]
+mod detached_rx;
 #[cfg(all(feature = "direct-tcp-segmentation", any(feature = "universal", feature = "network-tso-coalesce")))]
 compile_error!("direct TCP segmentation currently requires the single packet frontend and excludes queue coalescing");
 #[cfg(feature = "packet-network")]

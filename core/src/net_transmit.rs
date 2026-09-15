@@ -24,6 +24,8 @@ impl TransmitEndpoint {
     }
     pub fn pool(&self) -> &SegmentPool { &self.pool }
     pub fn try_send(&self, message: Transmit) -> Result<(), Transmit> { self.queue.try_send(message) }
+    pub fn message_event(&self) -> crate::chan::MessageEvent { self.queue.message_event() }
+    pub fn has_message(&self) -> bool { self.queue.has_message() }
     pub fn try_recv(&self) -> Option<Transmit> { self.queue.try_recv() }
     /// Validate a reservation before placing its allocation-free ticket on the
     /// ordered queue. Full returns the same ticket; the sender retains ownership.

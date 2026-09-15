@@ -184,3 +184,61 @@ fn partial_sync_stays_within_one_buffer_and_whole_cache_lines() {
             p.for_device(l.tx_buffers, length, Direction::ToDevice))).is_err());
     }
 }
+
+#[test]
+fn larger_rx_pool_validates_all_spares_without_expanding_descriptor_rings() {
+    let storage = Box::leak(Box::new(Storage::<4, 9>::new()));
+    let events = Rc::new(RefCell::new(vec![]));
+    let cache = Cache { events: events.clone(), reject: u64::MAX };
+    let mut pool = unsafe { Pool::new(storage, 0x42000000, cache, 8).unwrap() };
+    let layout = pool.layout();
+    assert_eq!(layout.count, 4);
+    assert_eq!(core::mem::size_of::<Storage<4, 9>>(), 12800 + 5 * 1536);
+    assert!(pool.admit_rx_buffers(layout, 9)); assert!(!pool.admit_rx_buffers(layout, 8));
+    let last = layout.rx_buffers + 8 * 1536;
+    assert!(events.borrow().contains(&Event::Validate(DmaRegion { physical: last, bytes: 1536 })));
+    pool.for_device(last, 1536, Direction::FromDevice);
+    pool.for_cpu(last, 64, Direction::FromDevice);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        pool.for_cpu(last + 1536, 64, Direction::FromDevice))).is_err());
+}
+
+#[test]
+fn detached_read_view_uses_original_bytes_and_does_not_borrow_the_engine() {
+    let storage = Box::leak(Box::new(Storage::<4, 8>::new()));
+    let cpu = storage as *mut Storage<4, 8> as *mut u8;
+    let cache = Cache { events: Rc::new(RefCell::new(vec![])), reject: u64::MAX };
+    let mut pool = unsafe { Pool::new(storage, 0x42000000, cache, 8).unwrap() };
+    let layout = pool.layout();
+    let offset = (layout.rx_buffers - 0x42000000) as usize + 6 * 1536;
+    // Simulate completed DMA before taking an immutable read borrow.
+    unsafe { core::ptr::write_bytes(cpu.add(offset), 0x6b, 60); }
+    pool.for_cpu(layout.rx_buffers + 6 * 1536, 64, Direction::FromDevice);
+    let view = pool.rx_view();
+    let same_address = unsafe { view.read(6, 60, |data| {
+        assert_eq!(data, &[0x6b; 60]);
+        // Concurrent controller/descriptor work touches a disjoint region.
+        pool.write_word(layout.tx_descriptors, 0, 123);
+        data.as_ptr() == cpu.add(offset).cast_const()
+    }).unwrap() };
+    assert!(same_address, "read must expose the detached DMA bytes, not scratch storage");
+    assert_eq!(unsafe { view.read(8, 60, |_| ()) }, Err(Error::Layout));
+    assert_eq!(unsafe { view.read(6, 1537, |_| ()) }, Err(Error::Layout));
+}
+
+#[test]
+fn raw_reattach_preserves_a_detached_read_without_a_whole_storage_mutable_borrow() {
+    let storage = Box::leak(Box::new(Storage::<4, 8>::new()));
+    let raw = storage as *mut Storage<4, 8>;
+    let make_cache = || Cache { events: Rc::new(RefCell::new(vec![])), reject: u64::MAX };
+    let pool = unsafe { Pool::new(storage, 0x42000000, make_cache(), 8).unwrap() };
+    let layout = pool.layout(); let offset = (layout.rx_buffers - 0x42000000) as usize + 7 * 1536;
+    unsafe { core::ptr::write_bytes(raw.cast::<u8>().add(offset), 0x39, 64); }
+    let view = pool.rx_view();
+    drop(pool); // The previous engine is quiescent; the permanent bytes remain.
+    unsafe { view.read(7, 64, |data| {
+        let mut next = Pool::from_raw(raw, 0x42000000, make_cache(), 8).unwrap();
+        next.write_word(layout.rx_descriptors, 0, 0x1234);
+        assert_eq!(data, &[0x39; 64]);
+    }).unwrap(); }
+}

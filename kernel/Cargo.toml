@@ -5,6 +5,8 @@ edition = "2021"
 autobins = false
 
 [features]
+pooled-rx = ["vibeos-netstack?/pooled-rx"]
+rx-interrupt-poll = []
 direct-tcp-segmentation = ["native-tcp-segmentation"]
 native-tcp-segmentation = ["vibeos-netstack?/native-tcp-segmentation"]
 network-tso-coalesce = []

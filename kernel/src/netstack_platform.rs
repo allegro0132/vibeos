@@ -34,20 +34,22 @@ impl Platform for NetstackPlatform {
         inbound: Cap,
     ) -> Option<vibeos_netstack::PacketEndpoints> {
         let cspace = self.space.0.lock();
+        #[cfg(feature = "pooled-rx")]
+        let receive = if let Ok(authority) = cspace.lookup_revocable::<vibeos_core::net_receive::ReceiveEndpoint>(inbound, Rights::RECV) {
+            vibeos_netstack::PacketReceive::Pooled { authority, domain: crate::heap::current_domain() }
+        } else {
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV).ok()?.into()
+        };
+        #[cfg(not(feature = "pooled-rx"))]
+        let receive = cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV).ok()?.into();
         #[cfg(feature = "native-tcp-segmentation")]
         if let Ok(authority) = cspace.lookup_revocable::<vibeos_core::net_transmit::TransmitEndpoint>(outbound, Rights::SEND) {
-            let inbound = cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV).ok()?;
             return Some((vibeos_netstack::PacketTransmit::Pooled {
                 authority, domain: crate::heap::current_domain(),
-            }, inbound));
+            }, receive));
         }
-        let outbound = cspace
-            .lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
-            .ok()?;
-        let inbound = cspace
-            .lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
-            .ok()?;
-        Some((outbound.into(), inbound))
+        let outbound = cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND).ok()?;
+        Some((outbound.into(), receive))
     }
 
     fn bind_stack(&self, control: Cap) -> Result<vibeos_core::net::PacketStamp, NetworkBindError> {

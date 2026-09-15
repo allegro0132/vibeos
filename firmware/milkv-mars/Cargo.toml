@@ -5,7 +5,11 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# GMAC front-port coherency experiment; other devices keep cache maintenance.
+gmac-coherent-experiment = ["ethernet-device"]
 rx-batch-experiment = ["rx-pool-experiment"]
+# On-demand occupancy counters; no periodic logging or per-packet clock reads.
+rx-batch-profile = ["rx-batch-experiment"]
 # Explicit controller timing and periodic register/checksum reports.
 controller-profile = ["ethernet-device"]
 driver-stage-profile = ["dep:vibeos-kernel", "vibeos-kernel/driver-stage-profile", "rx-pool-experiment"]

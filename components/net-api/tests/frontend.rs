@@ -271,3 +271,28 @@ fn network_notification_allows_reentrant_application_reads() {
     assert!(wait.as_mut().poll(&mut cx).is_ready());
     assert_eq!(listener.snapshot().readable_bytes, 0);
 }
+
+#[test]
+fn drive_snapshot_is_conservative_and_rechecked_after_application_progress() {
+    let f = listener("drive", 51, 5151, 8);
+    let initial = f.network_begin_drive(TcpStreamState::Established).unwrap();
+    let token = f.try_accept().unwrap();
+    assert_eq!((initial.receive_capacity, initial.queued_send_bytes), (8, 0));
+    assert_eq!(f.network_receive(b"abcdefgh"), 8);
+    let full = f.network_begin_drive(TcpStreamState::Established).unwrap();
+    assert_eq!(full.receive_capacity, 0);
+    let mut bytes = [0; 3];
+    assert_eq!(f.try_recv(token, &mut bytes), Ok(TcpIoResult::Progress(3)));
+    assert_eq!(&bytes, b"abc");
+    assert_eq!(f.try_send(token, b"reply"), Ok(TcpIoResult::Progress(5)));
+    // An old hint does not become authority over new data. A subsequent drive
+    // sees both newly freed RX capacity and newly queued TX bytes.
+    assert_eq!((full.receive_capacity, full.queued_send_bytes), (0, 0));
+    let next = f.network_begin_drive(TcpStreamState::Established).unwrap();
+    assert_eq!((next.receive_capacity, next.queued_send_bytes), (3, 5));
+    assert_eq!(f.network_receive(b"ijklmn"), 3);
+    let reset = f.network_begin_drive(TcpStreamState::Reset).unwrap();
+    assert_eq!((reset.receive_capacity, reset.queued_send_bytes), (8, 0));
+    f.network_begin_drive(TcpStreamState::Established).unwrap();
+    assert_eq!(f.try_recv(token, &mut bytes), Err(TcpFrontendError::StaleConnection));
+}

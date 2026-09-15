@@ -36,7 +36,11 @@ unsafe impl Sync for Dma {}
 #[link_section = ".dma"]
 #[export_name = "VIBEOS_MARS_EQOS_DMA"]
 static DMA: Dma = Dma(UnsafeCell::new(Storage::new()));
-type Memory = Pool<cache::Cache<cache::Mmio>, COUNT, RX_COUNT>;
+#[cfg(feature = "gmac-coherent-experiment")]
+type DmaCache = cache::GmacCoherent<cache::Mmio>;
+#[cfg(not(feature = "gmac-coherent-experiment"))]
+type DmaCache = cache::Cache<cache::Mmio>;
+type Memory = Pool<DmaCache, COUNT, RX_COUNT>;
 type Hardware = Backend<Lane, Memory>;
 type PacketEngine = Engine<Lane, Memory, Port<Lane>>;
 static POOL: Slot<Memory> = Slot(UnsafeCell::new(None));
@@ -300,6 +304,13 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         )
         .map_err(|e| failed("cache-geometry", e, Error::InvalidDescription))?;
         let cache = cache.with_readonly_recycle(cfg!(feature = "rx-readonly-recycle-experiment"));
+        // JH7110 GMAC0/1 use the coherent CPU front port (StarFive coherence
+        // table, row GMACx2); this pool is cached identity RAM below 4 GiB.
+        // Claim has not started DMA. No other device receives this service.
+        #[cfg(feature = "gmac-coherent-experiment")]
+        let cache = cache.into_gmac_coherent();
+        report(format_args!("MARS_NET_DMA coherent-front-port={}\n",
+            cfg!(feature = "gmac-coherent-experiment")));
         // .dma is NOLOAD; initialize every byte before creating the Rust pool.
         // No ring has started in this claim; earlier claims require proven stop.
         #[cfg(feature = "rx-pool-experiment")]
@@ -610,6 +621,12 @@ unsafe fn poll_rx_ticket() -> Result<Option<vibeos_hal::network_rx::Ticket>, Err
     snapshot();
     Ok(Some(frame.ticket))
 }
+// Cumulative across driver restarts; read deltas outside traffic. Only calls
+// which pass the descriptor-ready probe are counted, so bucket zero does not
+// represent idle polling. Atomics permit diagnostics without engine borrowing.
+#[cfg(feature = "rx-batch-profile")]
+static RX_BATCH_HIST: [AtomicU64; ring::RX_BATCH + 1] =
+    [const { AtomicU64::new(0) }; ring::RX_BATCH + 1];
 #[cfg(feature = "rx-batch-experiment")]
 unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> {
     let mut output = [None; ring::RX_BATCH];
@@ -620,6 +637,8 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
         Err(EngineError::Ring(ring::Error::Full)) => { RX_META.lock().counts[3] += 1; return Ok(output); }
         Err(e) => return Err(error(e)),
     };
+    #[cfg(feature = "rx-batch-profile")]
+    RX_BATCH_HIST[frames.iter().flatten().count()].fetch_add(1, Ordering::Relaxed);
     if frames.iter().all(Option::is_none) { return Ok(output); }
     let view = access.view.expect("admitted permanent RX view");
     let mut accepted = [false; ring::RX_BATCH];
@@ -691,6 +710,12 @@ unsafe fn recover_rx_borrower(owner: vibeos_hal::network_rx::Owner) -> usize {
 
 #[cfg(feature = "rx-pool-experiment")]
 fn rx_pool_stats() -> vibeos_hal::network_rx::Stats {
+    // Emit before taking RX_META: diagnostics must not invert console/metadata
+    // lock order. No extra logging occurs on the receive path.
+    #[cfg(feature = "rx-batch-profile")]
+    report(format_args!("RX_BATCH_HIST {:?}\n",
+        core::array::from_fn::<_, { ring::RX_BATCH + 1 }, _>(|i|
+            RX_BATCH_HIST[i].load(Ordering::Relaxed))));
     let metadata = RX_META.lock();
     let slots = metadata.buffers.as_ref().map(|b| b.stats()).unwrap_or_default();
     vibeos_hal::network_rx::Stats { received: metadata.counts[0], acquired: metadata.counts[1],

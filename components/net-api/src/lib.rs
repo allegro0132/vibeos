@@ -135,6 +135,15 @@ pub struct TcpListenerSnapshot {
     pub close_request: Option<TcpCloseRequest>,
 }
 
+/// Work available at one network-side reconciliation boundary. This is a hint,
+/// not authority: copying still checks the live queue under its guard. New work
+/// arriving afterward is handled by the next drive and existing readiness hints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpFrontendDriveState {
+    pub receive_capacity: usize,
+    pub queued_send_bytes: usize,
+}
+
 struct Inner {
     state: TcpStreamState,
     generation: u64,
@@ -403,6 +412,13 @@ impl TcpListener {
 
     /// Netstack side: publish the current transport state.
     pub fn network_update_state(&self, state: TcpStreamState) -> Result<(), TcpFrontendError> {
+        self.network_begin_drive(state).map(|_| ())
+    }
+
+    /// Publish transport state and capture bounded work with one metadata guard.
+    pub fn network_begin_drive(&self, state: TcpStreamState)
+        -> Result<TcpFrontendDriveState, TcpFrontendError>
+    {
         let mut inner = self.inner.lock();
         let changed = inner.state != state;
         let was_active = is_connection_state(inner.state);
@@ -426,9 +442,13 @@ impl TcpListener {
             }
         }
         inner.state = state;
+        let drive = TcpFrontendDriveState {
+            receive_capacity: self.receive_capacity.saturating_sub(inner.receive.len()),
+            queued_send_bytes: inner.transmit.len(),
+        };
         drop(inner);
         self.notify_network_progress(changed);
-        Ok(())
+        Ok(drive)
     }
 
     /// Netstack side: copy received transport bytes toward the application.

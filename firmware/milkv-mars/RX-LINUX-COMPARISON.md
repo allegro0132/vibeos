@@ -1257,3 +1257,213 @@ usable kernel stack per hart. This observation does not establish complete
 call-chain stack usage or rule out corruption. A cold power cycle is requested
 because bounded serial recovery also failed. Keep the batch feature opt-in and
 do not claim a CPU improvement or hardware qualification. No SD/SPI writes.
+
+
+## Cold-cycle batch reproduction and recovery (2026-09-15)
+
+After the requested cold cycle, serial and software reboot responded again.
+The previously verified borrowed-token baseline was RAM-loaded with hashes
+checked and passed a fresh 64 MiB patterned test. Reloading the **unchanged**
+batch FIT then passed 64 KiB and 64 MiB tests with continuous serial capture.
+The earlier hang has not been reproduced or explained; it is not fixed merely
+because these retries passed.
+
+Two 20-second batch RX runs at 299.98 Mbps reported h0/h1 active percentages
+44.55/40.63 and 48.35/39.64. Mean total active core seconds per GiB was 24.875,
+versus the historical borrowed-token mean 26.990. This preliminary 7.8% lower
+fixed-load CPU time does not establish a net improvement: the next saturated
+20-second RX result was only 862.04 Mbps (h0/h1 99.70/99.27%), while TX reached
+937.30 Mbps (99.82/99.18%). A same-session reverse baseline comparison follows.
+
+Cancellation during RX and driver restart advanced generation 1 to 2 and
+installed fresh capability grants. The interrupted iperf exited nonzero on its
+own (expected interruption); a fresh 64 MiB patterned transfer passed afterward.
+Final pool counts were received=acquired=released=2,987,918, full=dropped=0,
+free=128, ready=borrowed=0. This covers one cancellation/restart, not arbitrary
+fault injection or long-duration stability.
+
+Evidence: `target/mars-reference/20260915-rx-batch-reproduce-*`,
+`20260915-rx-batch-recovery-{run.log,integrity.json,pool.log}` and
+`target/mars-acceptance/20260913-gigabit/20260915-rx-batch-recovery/`.
+The batch feature remains opt-in; the saturated RX regression and unexplained
+initial hang prevent promoting it to the standard image. SD/SPI are untouched.
+
+
+### Same-session reverse comparison rejects the apparent CPU gain
+
+Reloading the identical borrowed-token baseline FIT and repeating two 20-second
+300 Mbps runs gave h0/h1 43.26/40.16% and 43.63/40.27%. Its mean active core
+seconds per GiB was **24.042**, versus batch **24.875**: batch used **3.47% more**
+in this sequential comparison. The apparent 7.8% saving against historical
+samples is therefore not attributable to batching and must not be reported as
+an optimization. Saturated baseline RX/TX were **949.08/938.91 Mbps**, whereas
+the batch runs were **862.04/937.30 Mbps**. These are short sequential samples,
+not confidence intervals, but they do not justify adopting this implementation.
+
+Evidence: `target/mars-reference/20260915-rx-batch-reverse-{300,full}/`,
+`20260915-rx-batch-same-session-comparison.json` and reverse RAM boot logs.
+Board is now back on baseline FIT
+`e762f8b33d4c90bb0407f93101c933562aa772b69d624044e7d8c1d0339f5c80`.
+Default Ethernet feature selection remains unchanged; batch stays opt-in and
+unqualified. Before another batch rewrite, measure actual batch occupancy and
+phase costs: fewer lock acquisitions alone have not translated into lower CPU
+cost. The initial unexplained hang and long-duration qualification remain open.
+
+
+### Batch occupancy diagnostic
+
+Added opt-in `rx-batch-profile` (implies batch RX) with nine cumulative atomic
+buckets. `nrpool` prints them before taking RX_META; receive performs no serial
+logging or timing reads. The histogram counts normal ring returns after the
+ready probe, before packet validation. Fast idle probes, Full and error returns
+are excluded; bucket zero is therefore not an idle-poll counter. Counts survive
+driver restarts and must be differenced. Independent atomic reads are not a
+simultaneous snapshot; read outside offered traffic as done here.
+
+Target build and RAM payload/DTB hash checks passed. FIT SHA-256:
+`315e57e2c73917776616bb714f0f3192a6995e29b0191ede0f40c969d4bcf2e7`. A fresh 64 MiB patterned transfer passed before
+measurement. At 300 Mbps, the histogram delta was
+`[0,4599,112437,22564,9970,3900,2325,6331,12524]`: 515,004 frames in
+174,650 successful callbacks, mean **2.949**. At saturated RX it was
+`[0,5448,291775,56315,22227,12717,14230,11291,47834]`: 1,457,525 frames in
+461,837 callbacks, mean **3.156**. Two-frame batches account for approximately
+64% and 63% of calls. Full eight-frame batches account for approximately 7%
+and 10%. The diagnostic full RX result was 851.12 Mbps; this instrumented
+image is not used to claim an uninstrumented CPU/performance result.
+
+Evidence: `target/mars-reference/20260915-rx-batch-occupancy-measure/`,
+its parent build/boot logs, and exact `20260915-rx-batch-occupancy.elf`.
+Default feature selection is restored; board currently runs this diagnostic
+RAM image. No SD/SPI writes. The data motivates examining work over unused
+array slots and per-batch handoff costs, but does not yet isolate a dominant
+cost or prove a fix. Batch RX is still not qualified for default use.
+
+
+### Compact runtime batch stamp (experiment)
+
+StampedBatch now stores one immutable publication-time PacketStamp with the
+original ticket array. Pop constructs a Stamped value using that stored stamp;
+it never queries the current session. Existing five core receive tests pass,
+including holes, backpressure/rebinding, and retained-loan release. Target build,
+RAM hashes and 64 MiB patterned integrity passed. FIT: `0eb72860f5069cbfd7a38f11370571ba0b35a58f71a7d7fd090169ac8302eba3`;
+exact ELF: `target/mars-reference/20260915-compact-batch.elf`.
+Two 300 Mbps runs reported h0/h1 48.20/46.25% and 48.11/47.38%, which do NOT
+prove CPU improvement. Saturated RX/TX reached 947.75/935.94 Mbps with h0/h1
+99.73/99.52% and 99.66/97.36%, restoring target-range RX in this short sample.
+The change is retained inside the unqualified batch path for further comparison,
+not promoted as a CPU win. Evidence: `20260915-compact-batch-{300,full}/`,
+build, core-test, integrity and RAM boot logs under target/mars-reference.
+Default Ethernet feature selection is restored. Board currently runs compact
+batch RAM, without the occupancy profiler; no SD/SPI writes.
+
+### Revisit the GMAC cache-coherency assumption before more batch tuning
+
+Read StarFive's JH7100 Cache Coherence V1.0 PDF, page 6 (Hardware Solution for
+JH7110 SOC), including the rendered table: row 13 GMACx2 explicitly lists
+Coherency Y and front port. This is a hardware-design document, not a measurement
+of our actual Mars setup. Source:
+https://raw.githubusercontent.com/starfive-tech/beaglev_doc/main/JH7100%20Cache%20Coherence%20V1.0.pdf
+Local PDF/text and rendered diagram are under target/mars-reference.
+Linux upstream jh7110.dtsi (downloaded 2026-09-15) has no dma-noncoherent
+property on GMAC; absence alone is not proof of coherency or Linux's default.
+The March 2026 RISC-V RFC also distinguishes coherent front-port traffic from
+noncoherent video/sys-port traffic:
+https://lists.infradead.org/pipermail/linux-riscv/2026-March/087202.html
+Its uncached alias discussion must not be generalized to all JH7110 devices.
+
+Current platform/jh7110/src/cache.rs unconditionally FLUSH64s RX payloads and
+bidirectional descriptors. That policy may be unnecessary for GMAC. Next verify
+upstream DMA defaults, actual controller/AXI configuration and the production
+SoC memory map; then test a GMAC-specific coherent service with ordering fences
+and all existing ownership checks retained. Do not globally remove cache
+maintenance for SD/video/other devices, or claim the diagram proves the current
+hardware setup. Multi-core patterned RX/TX, repeated recovery and sustained
+load must qualify any changed coherence policy before promotion.
+
+
+### GMAC-specific coherent DMA service, first physical checks
+
+Linux arch/riscv/Kconfig selects ARCH_DMA_DEFAULT_COHERENT; the downloaded
+upstream JH7110 GMAC DT nodes do not override it. This supports the StarFive
+front-port diagram, rather than the earlier blanket noncoherent assumption.
+Source: https://raw.githubusercontent.com/torvalds/linux/master/arch/riscv/Kconfig
+
+Added a separate GmacCoherent<R> DMA service, selected only by optional Mars
+`gmac-coherent-experiment`. Its unsafe constructor requires a JH7110 GMAC
+front-port device, normal cached physical RAM and no active ownership transition.
+It preserves span admission and all full ordering barriers, without FLUSH64.
+The existing Cache service and all other peripheral bindings retain their
+original behavior. Seven cache model tests pass, including normal noncoherent
+behavior and coherent admission/ordering checks. Hardware semantics are not
+proved by those models.
+
+Actual target build, RAM hashes and initial 64 MiB patterned verification pass.
+FIT `737fdc351f2aec2fc1dd2faf9f0ac9068e89d9ef33110abf3176ea78a94451a9`; exact ELF
+`target/mars-reference/20260915-gmac-coherent.elf`. Boot explicitly reports
+`MARS_NET_DMA coherent-front-port=true`. Two 300 Mbps samples gave h0/h1
+46.97/47.44% and 42.23/40.58%, too variable to claim a CPU reduction.
+Saturated RX/TX reached 948.40/946.36 Mbps; h0/h1 active percentages were
+99.82/99.61% and 99.83/87.63%. RX CPU saturation remains unresolved; the TX
+observation needs repeated same-session comparison.
+
+Cancellation/restart under RX advanced driver generation 1 to 2. Following
+recovery, 512 MiB of changing RX pattern was verified while a 20-second reverse
+iperf TX ran concurrently. RX confirmed every byte (8.174 seconds board time),
+and both client processes completed successfully. The TX service's constant
+payload is not a changing-pattern TX integrity proof. This is not long-duration
+qualification and the optional coherent policy is not promoted by these checks.
+
+Evidence: target/mars-reference/20260915-gmac-coherent-{300,full}/,
+cache-tests/build/ramboot/recovery logs, duplex-integrity directory and exact ELF;
+recovery serial files under target/mars-acceptance/20260913-gigabit/.
+Default feature selection restored; board stays on the coherent experimental
+RAM image. No SD/SPI writes. Repeated CPU measurements, changing-pattern TX,
+fault scenarios and prolonged mixed workload remain to be completed.
+
+
+## Updated target and coherent-path frontend profile
+
+The active target is now MTU 1500, single-direction TCP above 900 Mbps with
+aggregate CPU cost below one core as the effort target. Sum all measured hart
+active percentages; do not substitute a low-load result or a per-hart percentage.
+WFI residency is still a proxy, not an instruction/cycle measurement.
+
+A 30-second deferred NPROF capture containing 20-second RX traffic at 946.61 Mbps
+on the coherent path recorded exclusive elapsed seconds: protocol_poll 11.998,
+frontend 7.793, driver 6.175, rx callback 5.543, executor 3.423 and application
+2.387. Frontend contended wait was 1.290 seconds; RX_META accounted for about
+0.405 seconds across RX and protocol scopes. Exact ELF symbol mapping identifies
+0x405f4480 as RX_META and 0x405fd128 as SCHED; the dominant frontend lock
+0x41821fe8 is dynamic and has NOT been symbolically identified. Queue high water
+was inbound=64/outbound=2; 4,040 inbound full retries are not packet drops.
+The totals aggregate cores and include diagnostic cost and idle edges; they are
+not a clean CPU-cycle decomposition. There were 740,136 network-side frontend
+calls against 61,678 protocol polls. The source drives all listeners before and
+after interface polling, even for empty directions.
+Evidence: target/mars-acceptance/20260913-gigabit/20260915-gmac-coherent-rx-profile-*
+and target/mars-reference/20260915-gmac-coherent-profile.elf/symbols.txt.
+
+### Coalesced frontend drive snapshot
+
+network_begin_drive publishes connection state and captures RX capacity/TX queued
+bytes under one metadata guard. The original network_update_state API remains a
+wrapper. drive_tcp_frontend uses conservative turn-local budgets to skip empty
+directions; actual copies still validate live queue capacity, and new work is
+observed next turn through existing polling/readiness. Device authority is checked
+at entry, including empty turns, and before real transfers; close requests retain
+their live check. No borrowed socket memory escapes the synchronous operation.
+Default protocol tests (24), pooled/GRO/native segmentation tests (4 unit/39
+integration), and frontend activity-event tests pass. A new test checks stale
+snapshots, later application progress, capacity bounds, reset and generation reuse.
+
+Build and RAM hashes pass. FIT `e0dbd97811e6cc7b036e54c2efa82bcf3b3bff616bf7f73a8be51a0b6ca627bd`; exact ELF
+`target/mars-reference/20260915-frontend-drive.elf`. Initial 64 MiB pattern passed.
+Two 300 Mbps samples gave h0/h1 45.62/36.70% and 42.30/39.56%. At the target
+rate, RX was 909.96 and 909.92 Mbps with aggregate non-WFI occupancy approximately
+**1.947 and 1.904 cores**. TX reached 945.90 Mbps with h0/h1 99.84/88.36%.
+Thus bandwidth exceeds 900 Mbps but the below-one-core goal is NOT achieved.
+Low-load observations do not prove target-rate CPU success or a stable causal
+improvement over earlier images without a reverse comparison.
+Evidence: target/mars-reference/20260915-frontend-drive-{300,910,tx}/ and related
+build, test, integrity and boot logs. Board stays on this test RAM image; default
+Ethernet build feature selection is restored. No SD/SPI writes.

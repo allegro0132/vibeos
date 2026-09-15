@@ -106,6 +106,39 @@ unsafe impl<R: Registers> DmaCache for Cache<R> {
     }
 }
 
+/// DMA ordering service for the JH7110 GMAC front-port coherent interconnect.
+/// This is a separate type so other peripherals retain explicit cache maintenance.
+pub struct GmacCoherent<R: Registers>(Cache<R>);
+impl<R: Registers> Cache<R> {
+    /// Select only before any DMA ownership is published.
+    ///
+    /// # Safety
+    /// The caller must establish that this service is exclusively used by a
+    /// JH7110 GMAC connected to the coherent CPU front port. CPU mappings must
+    /// use normal cached RAM, and the device must address those same physical
+    /// bytes (not a noncoherent alias). DMA ownership/isolation still apply.
+    /// This must not be used for video/sys-port or arbitrary JH7110 peripherals.
+    pub unsafe fn into_gmac_coherent(self) -> GmacCoherent<R> { GmacCoherent(self) }
+}
+impl<R: Registers> GmacCoherent<R> {
+    fn synchronize(&mut self, r: DmaRegion) {
+        Cache::<R>::validate_region(r).expect("unadmitted coherent GMAC span");
+        // Coherency supplies visibility, not ordering of fields/OWN/tail MMIO.
+        self.0.registers.barrier();
+    }
+}
+// Constructor establishes hardware coherency; the pool/ring retains exclusive
+// ownership transitions and dedicated lines. All ordering points are preserved.
+unsafe impl<R: Registers> DmaCache for GmacCoherent<R> {
+    fn validate(&self, r: DmaRegion) -> Result<(), MemoryError> {
+        Cache::<R>::validate_region(r)
+    }
+    fn for_device(&mut self, r: DmaRegion, _: DmaDirection) { self.synchronize(r); }
+    fn for_cpu(&mut self, r: DmaRegion, _: DmaDirection) { self.synchronize(r); }
+    unsafe fn recycle_readonly(&mut self, r: DmaRegion) { self.synchronize(r); }
+    fn barrier(&mut self) { self.0.registers.barrier(); }
+}
+
 pub struct Mmio {
     base: usize,
 }

@@ -149,3 +149,28 @@ fn readonly_recycle_opt_in_preserves_admission_and_post_dma_invalidation() {
     assert!(bad.is_err());
     assert!(e.borrow().is_empty());
 }
+
+
+#[test]
+fn coherent_gmac_preserves_all_ordering_without_cache_commands() {
+    let (c, events) = cache();
+    let mut c = unsafe { c.into_gmac_coherent() };
+    let r = DmaRegion { physical: 0x42000000, bytes: 1536 };
+    for direction in [DmaDirection::ToDevice, DmaDirection::FromDevice, DmaDirection::Bidirectional] {
+        events.borrow_mut().clear();
+        c.for_device(r, direction);
+        c.for_cpu(r, direction);
+        unsafe { c.recycle_readonly(r); }
+        c.barrier();
+        assert_eq!(*events.borrow(), [Event::Barrier, Event::Barrier, Event::Barrier, Event::Barrier]);
+    }
+    events.borrow_mut().clear();
+    for r in [DmaRegion { physical: 0x440000000, bytes: 64 },
+              DmaRegion { physical: 0x42000001, bytes: 64 },
+              DmaRegion { physical: 0x42000000, bytes: 0 }] {
+        assert!(c.validate(r).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            c.for_cpu(r, DmaDirection::FromDevice))).is_err());
+        assert!(events.borrow().is_empty());
+    }
+}

@@ -20,21 +20,28 @@ impl Stamped {
 /// The producer must drain/discard it, or retire its device after owner failure.
 /// This owns ticket bookkeeping only, never payload references or DMA authority.
 pub struct StampedBatch {
-    frames: [Option<Stamped>; vibeos_hal::network_rx::BATCH_SIZE],
+    tickets: vibeos_hal::network_rx::TicketBatch,
+    // Captured at publication, never refreshed when a pending ticket is popped.
+    // One immutable stamp covers the batch without expanding every slot.
+    stamp: Option<PacketStamp>,
     next: usize,
 }
 impl StampedBatch {
     pub const fn empty() -> Self {
-        Self { frames: [None; vibeos_hal::network_rx::BATCH_SIZE], next: vibeos_hal::network_rx::BATCH_SIZE }
+        Self { tickets: [None; vibeos_hal::network_rx::BATCH_SIZE], stamp: None,
+            next: vibeos_hal::network_rx::BATCH_SIZE }
     }
     pub fn new(tickets: vibeos_hal::network_rx::TicketBatch, stamp: PacketStamp) -> Self {
-        Self { frames: tickets.map(|ticket| ticket.map(|ticket| Stamped::new(ticket, stamp))), next: 0 }
+        Self { tickets, stamp: Some(stamp), next: 0 }
     }
     pub fn pop(&mut self) -> Option<Stamped> {
-        while self.next < self.frames.len() {
+        let stamp = self.stamp?;
+        while self.next < self.tickets.len() {
             let index = self.next;
             self.next += 1;
-            if let Some(frame) = self.frames[index].take() { return Some(frame); }
+            if let Some(ticket) = self.tickets[index].take() {
+                return Some(Stamped::new(ticket, stamp));
+            }
         }
         None
     }

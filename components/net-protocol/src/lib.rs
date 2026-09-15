@@ -706,6 +706,10 @@ impl phy::Device for PacketDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Include pooled loans and GRO, not only the legacy copied queue path.
+        // The guard ends before token consumption, leaving TCP/IP work in its
+        // parent protocol scope. TX reservation/flush inside receive is included.
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::PacketQueue);
         // Previous tokens cannot coexist with this mutable device invocation.
         // Dropping an admitted loan releases storage even after revocation.
         #[cfg(feature = "pooled-rx")]
@@ -1237,16 +1241,21 @@ impl SharedIpv4TcpStack {
             return Err(TcpFrontendDriveError::QueueInvariant);
         }
 
+        // Empty directions must still reject revoked device authority.
+        self.device.revalidate_authority()?;
         let mut report = TcpFrontendDriveReport::default();
-        frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
+        let transport = self.tcp_stream_status(listener)?;
+        let drive = frontend.network_begin_drive(transport.state)?;
+        // Conservative turn-local budgets. Concurrent application progress may
+        // add work, but cannot cause over-consumption; next drive rechecks it.
+        let mut receive_budget = drive.receive_capacity.min(transport.readable_bytes);
+        let mut transmit_budget = drive.queued_send_bytes;
         // Borrow transport storage only for the synchronous copy. No socket
         // buffer escapes into the frontend, and each turn retains its byte and
         // chunk limits even when either ring wraps. This avoids clearing and
         // copying through a 32 KiB scratch buffer on every frontend poll.
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            let capacity = frontend
-                .network_receive_capacity()
-                .min(MAX_TCP_STREAM_BYTES_PER_CALL);
+            let capacity = receive_budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
             if capacity == 0 {
                 break;
             }
@@ -1261,12 +1270,15 @@ impl SharedIpv4TcpStack {
                 (length, length)
             }) {
                 Ok(0) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
-                Ok(length) => report.received_bytes += length,
+                Ok(length) => {
+                    report.received_bytes += length;
+                    receive_budget -= length;
+                }
             }
         }
 
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            if self.tcp_stream_status(listener)?.writable_bytes == 0 {
+            if transmit_budget == 0 || self.tcp_stream_status(listener)?.writable_bytes == 0 {
                 break;
             }
             self.device.revalidate_authority()?;
@@ -1276,7 +1288,7 @@ impl SharedIpv4TcpStack {
             }
             let socket = entry.socket;
             match self.sockets.get_mut::<tcp::Socket>(socket).send(|output| {
-                let capacity = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+                let capacity = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL).min(transmit_budget);
                 let length = frontend.network_copy_transmit(&mut output[..capacity]);
                 (length, length)
             }) {
@@ -1285,6 +1297,7 @@ impl SharedIpv4TcpStack {
                     // Commit only bytes actually enqueued by the transport.
                     frontend.network_consume_transmit(sent);
                     report.transmitted_bytes += sent;
+                    transmit_budget -= sent;
                 }
                 Err(tcp::SendError::InvalidState) => {
                     return Err(TcpFrontendDriveError::QueueInvariant);

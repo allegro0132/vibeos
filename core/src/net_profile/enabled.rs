@@ -1,4 +1,4 @@
-use super::{Stage, STAGE_COUNT};
+use super::{Stage, STAGE_COUNT, SAMPLE_INTERVAL};
 use crate::{arch, exec::MAX_HARTS};
 use core::{marker::PhantomData, sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*}};
 
@@ -76,6 +76,12 @@ fn hart() -> usize {
     { arch::current_hart_id() }
 }
 
+#[repr(align(64))]
+struct SampleCounters([AtomicUsize; STAGE_COUNT]);
+static SAMPLES: [SampleCounters; MAX_HARTS] = [const {
+    SampleCounters([const { AtomicUsize::new(0) }; STAGE_COUNT])
+}; MAX_HARTS];
+
 /// Parent-exclusive accounting: children (including measured contended-lock
 /// waits) add to ACCOUNTED before their parent exits. Scopes are hart-affine.
 /// Intervals are attributed to the bucket of completion, not split at edges.
@@ -94,6 +100,20 @@ impl Scope {
                   now, LOCAL[h].accounted.load(Relaxed)))
         } else { None };
         Self { state, _not_send: PhantomData }
+    }
+    /// Record one in 64 calls, independently per hart and stage. Unselected
+    /// time stays in the parent. Never multiply these counters into timeline
+    /// totals: selected calls are a diagnostic sample, not exhaustive work.
+    #[inline]
+    pub fn sampled(stage: Stage) -> Self {
+        if START.load(Acquire) != 0 && !EXPIRED.load(Relaxed) {
+            let h = hart();
+            if h < MAX_HARTS && SAMPLES[h].0[stage as usize]
+                .fetch_add(1, Relaxed) % SAMPLE_INTERVAL == 0 {
+                return Self::enter(stage);
+            }
+        }
+        Self { state: None, _not_send: PhantomData }
     }
     pub fn task(name: &str) -> Self {
         Self::enter(match name {

@@ -1469,6 +1469,13 @@ impl TaskHandle {
             })
     }
 
+    /// Elapsed timebase ticks in completed polls, including interrupt time.
+    /// Retained after exit so monitors can compute deltas across teardown.
+    #[cfg(feature = "executor-profile")]
+    pub fn poll_ticks(&self) -> u64 {
+        self.status.poll_ticks.load(Ordering::Relaxed)
+    }
+
     /// Number of tasks currently registered to join this task.
     ///
     /// This is exposed for runtime diagnostics and reclamation invariants.

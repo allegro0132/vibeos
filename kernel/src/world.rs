@@ -127,6 +127,7 @@ pub struct Component {
     space: Arc<Space>,
     template: Option<ComponentTemplate>,
     instance: SpinLock<ComponentInstance>,
+    lifecycle: SpinLock<()>,
     memory_owner: OwnerId,
     memory_budget: usize,
 }
@@ -377,13 +378,20 @@ pub struct ComponentSnapshot {
     pub state: exec::TaskState,
     pub terminal_reason: Option<&'static str>,
     pub polls: u64,
+    pub poll_ticks: u64,
     pub memory: MemoryAccount,
 }
 
 impl Component {
     pub fn snapshot(&self) -> ComponentSnapshot {
+        self.try_snapshot().expect("a component allocation owner must remain registered")
+    }
+
+    /// A monitor may retain a record while a test/supervisor removes it.
+    /// Missing retired accounts are omitted rather than faulting the monitor.
+    pub fn try_snapshot(&self) -> Option<ComponentSnapshot> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let (generation, arena, task_id, state, polls) = {
+        let (generation, arena, task_id, state, polls, poll_ticks) = {
             let instance = self.instance.lock();
             (
                 instance.generation,
@@ -391,11 +399,10 @@ impl Component {
                 instance.task.id(),
                 instance.task.state(),
                 instance.task.polls(),
+                instance.task.poll_ticks(),
             )
         };
-        let account = HEAP
-            .account_stats(self.memory_owner)
-            .expect("a component allocation owner must remain registered");
+        let account = HEAP.account_stats(self.memory_owner)?;
         debug_assert_eq!(account.owner, self.memory_owner);
         let snapshot = ComponentSnapshot {
             id: self.id,
@@ -407,6 +414,7 @@ impl Component {
             state,
             terminal_reason: state.terminal_reason(),
             polls,
+            poll_ticks,
             memory: MemoryAccount {
                 owner: self.id,
                 budget_bytes: account.quota_bytes,
@@ -416,8 +424,10 @@ impl Component {
             },
         };
         system_owner.restore();
-        snapshot
+        Some(snapshot)
     }
+
+    pub fn is_restartable(&self) -> bool { self.template.is_some() }
 
     pub fn memory_owner(&self) -> OwnerId {
         self.memory_owner
@@ -802,6 +812,7 @@ impl World {
             None => exec::spawn_pinned_owned(memory_owner, name, fut),
         };
         let component = Arc::new(Component {
+            lifecycle: SpinLock::new_recoverable(()),
             id,
             name: String::from(name),
             cspace,
@@ -1473,6 +1484,12 @@ impl World {
     /// memory-owner, Space, and supervisor-route identities.
     pub fn restart_component(&self, name: &str) -> Result<RestartReport, RestartError> {
         let component = self.component_named(name).ok_or(RestartError::NotFound)?;
+        let _lifecycle = component.lifecycle.lock();
+        if !self.components.lock().contains_key(&component.id) { return Err(RestartError::NotFound); }
+        self.restart_component_locked(&component)
+    }
+
+    fn restart_component_locked(&self, component: &Arc<Component>) -> Result<RestartReport, RestartError> {
         let template = component.template.ok_or(RestartError::NotRestartable)?;
         let before = component.snapshot();
         if before.state == exec::TaskState::Running {
@@ -1521,6 +1538,42 @@ impl World {
         })
     }
 
+    /// Serialize an operator action with automatic supervision. Retrying a
+    /// pending stop/restart never retargets a newer incarnation.
+    pub(crate) fn control_component(
+        &self,
+        request: &vibeos_vsh::vtop::Request,
+    ) -> Result<vibeos_vsh::vtop::Control, &'static str> {
+        use vibeos_vsh::vtop::{Action, Control};
+        let component = self.component_named(&request.name).ok_or("service no longer exists")?;
+        let _lifecycle = component.lifecycle.lock();
+        if !self.components.lock().contains_key(&component.id) { return Err("service no longer exists"); }
+        if !component.is_restartable() { return Err("read-only: no audited restart template"); }
+        let instance = component.instance.lock();
+        if instance.generation != request.generation || instance.task.id() != request.task {
+            return Err("service generation changed; select it again");
+        }
+        let task = instance.task.clone();
+        drop(instance);
+        let running = task.state() == exec::TaskState::Running;
+        match request.action {
+            Action::Start if running => return Err("service is already running"),
+            Action::Stop if !running => return Ok(Control::Done),
+            Action::Stop | Action::Restart if running => {
+                task.cancel();
+                return Ok(Control::Pending);
+            }
+            _ => {}
+        }
+        self.restart_component_locked(&component).map_err(|error| match error {
+            RestartError::NotFound => "service no longer exists",
+            RestartError::NotRestartable => "read-only: no audited restart template",
+            RestartError::StillRunning => "service is still running",
+            RestartError::GenerationExhausted => "service generation exhausted",
+        })?;
+        Ok(Control::Done)
+    }
+
     /// Remove a terminal test/supervisor record once its allocation domain is
     /// empty (normal Drop) or has been raw-reclaimed (audited fault arena).
     pub(crate) fn remove_terminal_component(&self, id: ComponentId) -> bool {
@@ -1528,7 +1581,8 @@ impl World {
         let Some(component) = component else {
             return false;
         };
-        let snapshot = component.snapshot();
+        let _lifecycle = component.lifecycle.lock();
+        let Some(snapshot) = component.try_snapshot() else { return false; };
         if snapshot.state == exec::TaskState::Running {
             return false;
         }

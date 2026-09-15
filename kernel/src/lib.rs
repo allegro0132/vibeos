@@ -1170,6 +1170,7 @@ mod entropy_device;
 #[cfg(feature = "queued-entropy")]
 mod virtio_rng;
 mod vsh_platform;
+mod vtop_platform;
 mod world;
 #[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 mod xhci;

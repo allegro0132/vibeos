@@ -1467,3 +1467,150 @@ improvement over earlier images without a reverse comparison.
 Evidence: target/mars-reference/20260915-frontend-drive-{300,910,tx}/ and related
 build, test, integrity and boot logs. Board stays on this test RAM image; default
 Ethernet build feature selection is restored. No SD/SPI writes.
+
+
+## Split pooled receive from protocol execution; isolate hart context lines
+
+PacketDevice::receive now enters the existing PacketQueue diagnostic stage.
+It includes pooled acquisition, GRO, authority checks, pending TX flushing and
+reply reservation, and ends before RxToken consumption. The metric therefore
+is not pure queue wait. Profile-enabled pooled/GRO/native protocol tests passed.
+A fresh target build, RAM hashes and 64 MiB pattern passed. The subsequent
+20-second RX run reached 947.42 Mbps inside a 30-second capture. Exclusive
+elapsed totals: receive entry 7.204 s, remaining protocol_poll 5.102 s, frontend
+7.421 s, driver 6.223 s, RX hardware callback 5.597 s. Receive-entry contended
+wait was 0.320 s; frontend wait 1.311 s. These are aggregate instrumented times,
+not CPU cycles. Evidence: target/mars-acceptance/20260913-gigabit/
+20260915-receive-stage-rx-profile-* and corresponding target/mars-reference logs.
+Exact ELF disassembly confirms memcpy has an aligned word-copy loop and a
+misalignment shift/merge path, not an unconditional byte-at-a-time copy loop.
+
+Inspection found per-hart allocation owner/arena and task recovery keys packed
+into shared cache lines. The preceding ELF lists each four-hart array as only
+32 bytes. They now use 64-byte-aligned per-hart records; owner/arena share the
+same hart's line, and recovery identity retains its own record. All existing
+atomic orderings, interrupt masks, scope lifetimes and recovery rules remain.
+Full core tests pass, including fault recovery/cancellation and compile-fail
+lifetime tests. New ELF arrays are 256 bytes each, 64-byte aligned. No generic
+lock behavior or authority checks were relaxed.
+
+Target build, RAM hashes and 64 MiB verification passed. FIT `528350654608e19f2d127cf9c9884bd97b33dd5a56c15e8a636f60660bf36ffc`;
+exact ELF target/mars-reference/20260915-hart-context.elf.
+At 909.96 Mbps, h0/h1 active percentages were 97.32/90.69% and 97.16/91.85%,
+about **1.880 and 1.890 total cores**. This is only slightly below prior sequential
+samples and does not prove a repeatable causal gain. The below-one-core target
+is not met. Evidence: target/mars-reference/20260915-hart-context-910/.
+
+### Read-only CPU clock baseline
+
+After software reboot, U-Boot md.l read SYS CRG 0x13020000:
+`01000000 00000001 00000002`, and SYS SYSCON 0x13030018:
+`034fea80 0000007d 45555555 042ba603`.
+Existing PLL decoding gives integer PLL0 = 24 MHz * 125 / 3 = **1 GHz**;
+CPU root selects PLL0 and CPU core divider is 1. The upstream clock driver
+confirms oscillator/PLL0 CPU mux and CPU-core divider:
+https://raw.githubusercontent.com/torvalds/linux/master/drivers/clk/starfive/clk-starfive-jh7110-sys.c
+This is a post-reboot register snapshot; VibeOS's current network setup does
+not reprogram CPU root/PLL0. No clock or voltage was changed. Record 1 GHz as
+the observed boot baseline rather than assuming the nominal maximum CPU rate.
+Raw evidence: target/mars-reference/20260915-cpu-clock-registers.log.
+The same hart-context RAM FIT was hash-checked and booted again afterward.
+Default build feature selection restored, board stays on this image, SD/SPI
+untouched. Repeated target-rate comparisons and broader qualification remain.
+
+
+## RX entry substage diagnostic (2026-09-15)
+
+Added optional network-profile scopes for receive-loan acquisition (including
+queue/capability admission), GRO begin/append/finish, TX reservation and egress
+flush. Existing stage indices are preserved; the deferred dump now declares
+16 stages. The analyzer accepts the earlier 8/12-stage recordings as well as
+16-stage data and rejects truncated arrays. Five analyzer tests, default
+protocol integration tests (24), and profile-enabled pooled/GRO/native tests
+(4 unit, 39 integration) passed. Normal builds retain zero-sized no-op scopes.
+
+The new RAM FIT passed both payload hashes and a 64 MiB changing-pattern TCP
+check. This is a diagnostic build of the current workspace, including other
+ongoing changes, not an isolated performance A/B experiment. A 20-second RX
+transfer in a 30-second capture reached only 696.06 Mbps, appreciably below
+the preceding uninstrumented runs. Additional per-packet scopes perturb the
+pipeline, so the following elapsed times cannot establish production CPU
+costs or causally rank optimization gains:
+
+| Stage | Exclusive aggregate seconds | Contended wait seconds |
+| --- | ---: | ---: |
+| GRO begin/append/finish | 3.536 | 0 |
+| Receive loan acquisition | 1.893 | 0.145 |
+| Remaining receive entry | 2.242 | 0.057 |
+| TX reservation | 0.248 | 0 |
+| Egress flush | 0.143 | 0 |
+
+Flush/reservation totals include their other call sites too. Loan release is
+outside acquisition and remains charged to its caller. These are 4 MHz timer
+intervals, include instrumentation/interrupts, and are not hardware cycles.
+The inbound queue reached 64 entries with 276959 full retry attempts; these
+are not 276959 lost frames. Backpressure spans almost the entire traffic
+interval. Do not infer the production pipeline has the same distribution.
+Next measurement should sample bounded events or use lower-overhead counters
+before changing ownership/queue behavior based on these numbers. No reduction
+in production CPU usage is demonstrated by this diagnostic change.
+
+Evidence: target/mars-acceptance/20260913-gigabit/20260915-rx-detail-rx-profile-*
+and target/mars-reference/20260915-rx-detail-{build,tests,default-tests,ramboot,run}.log,
+20260915-rx-detail-integrity.json, and exact 20260915-rx-detail.elf.
+Diagnostic FIT SHA-256: `9d99e14b8ed0a74340612c64c54b6c81e47ea615891ad08f40323a38d61a99e6`.
+After capture, RX pool received/acquired/released each equaled 1240003;
+free=128, ready=borrowed=full=dropped=0. Software reboot and RAM restore of
+hart-context FIT 528350654608e19f2d127cf9c9884bd97b33dd5a56c15e8a636f60660bf36ffc
+passed hashes and 1000 Mbps full-duplex initialization. The restored image
+passed a fresh 64 MiB pattern check (20260915-rx-detail-restore-integrity.json).
+Board stays on that uninstrumented image. Default Cargo Ethernet selection
+was restored; no SD/SPI writes. The below-one-core objective remains unmet.
+
+
+## Reduce receive diagnostic perturbation with per-hart sampling
+
+The four RX-detail child scopes now select one in 64 calls independently per
+hart and stage. Unselected calls do not read the timer or update timeline
+buckets. The gate uses bounded per-hart atomic counters without allocation,
+locks or console output; normal builds remain no-ops. Deferred logs explicitly
+record NPROF_SAMPLING, which the analyzer validates (including duplicate,
+malformed and unsupported metadata). Old exhaustive 8/12/16-stage dumps remain
+readable. Sampled time is NOT multiplied into exclusive timeline totals:
+unsampled child work remains in its parent. Deterministic sampling can alias
+periodic traffic; sample means are not an unbiased causal measurement.
+
+Five parser tests and profile-enabled protocol tests (4 unit, 39 integration)
+passed. SDK fetch failed with a GitHub TLS error; the local SDK was verified
+clean at pinned 1fd6bac9f2efde47fbb8afd28d2903c49f893e3f. The payload was built
+offline with build-milkv-mars.sh and packaged using the existing stage25
+container plus the earlier hash-verified Mars DTB. This produced a RAM-test
+FIT only, not a new complete SD image. Exact ELF is archived separately.
+
+RAM payload hashes, 1000 Mbps full-duplex startup and 64 MiB pattern passed.
+A 20-second RX transfer within the 30-second sampled capture reached
+**946.31 Mbps**, recovering from the previous exhaustive-detail 696.06 Mbps.
+This shows gross instrumentation slowdown is reduced; it does not demonstrate
+lower production CPU consumption or prove that remaining probe cost is zero.
+
+| Sampled stage | Selected calls | Recorded exclusive seconds | Mean selected call, microseconds |
+| --- | ---: | ---: | ---: |
+| rx_loan | 27894 | 0.044258 | 1.587 |
+| rx_gro | 28749 | 0.073715 | 2.564 |
+| tx_reserve | 4755 | 0.004690 | 0.986 |
+| tx_flush | 5812 | 0.003634 | 0.625 |
+
+Whole-window frontend=7.234 s, driver=6.189 s, RX callback=5.459 s,
+protocol_poll=5.064 s, remaining receive entry=7.145 s. The latter contains
+unsampled loan/GRO/reservation/flush work; do not sum an extrapolated child
+estimate with that parent. These aggregate timer intervals include interrupts
+and instrumentation, not hardware CPU cycles. TX reservation/flush are small
+in the selected samples; further work should focus on the common receive and
+frontend path without assuming GRO alone explains the CPU gap.
+RX pool received=acquired=released=1666739, full=dropped=ready=borrowed=0,
+free=128 after the capture.
+
+Evidence: target/mars-reference/20260915-rx-sample-{cached-build,fit,ramboot,tests,run}.log,
+20260915-rx-sample-integrity.json, 20260915-rx-sample.elf, and
+ target/mars-acceptance/20260913-gigabit/20260915-rx-sample-rx-profile-*.
+FIT SHA-256: `c972dc1b17654f18a593de8c1ccdc057df4c5fc09eda252b79c4809b063c8808`.

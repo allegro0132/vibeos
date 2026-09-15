@@ -23,7 +23,12 @@ const ACQUIRING: u64 = 1;
 const HELD: u64 = 2;
 const RECOVERING: u64 = 3;
 
-static TASK_RECOVERY_CONTEXTS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+// Read at every recoverable acquisition and changed at task boundaries.
+// Per-hart cache isolation avoids invalidating another hart's current identity.
+#[repr(align(64))]
+struct HartRecoveryContext(AtomicU64);
+static TASK_RECOVERY_CONTEXTS: [HartRecoveryContext; MAX_HARTS] =
+    [const { HartRecoveryContext(AtomicU64::new(0)) }; MAX_HARTS];
 
 const fn state_token(generation: u64, phase: u64) -> u64 {
     (generation << PHASE_BITS) | phase
@@ -82,7 +87,7 @@ fn recovery_context_hart_index() -> Option<usize> {
 
 fn current_task_recovery_key() -> u64 {
     recovery_context_hart_index()
-        .map(|hart| TASK_RECOVERY_CONTEXTS[hart].load(Ordering::Acquire))
+        .map(|hart| TASK_RECOVERY_CONTEXTS[hart].0.load(Ordering::Acquire))
         .unwrap_or(0)
 }
 
@@ -98,7 +103,7 @@ pub fn enter_task_recovery_context(key: TaskRecoveryKey) -> TaskRecoveryContext 
         irq_restore(irq);
         panic!("task recovery context requires a mapped logical hart");
     };
-    let slot = &TASK_RECOVERY_CONTEXTS[hart];
+    let slot = &TASK_RECOVERY_CONTEXTS[hart].0;
     let previous = slot.swap(key.get(), Ordering::AcqRel);
     let physical_hart = current_hart_id();
     irq_restore(irq);
@@ -123,7 +128,7 @@ pub(crate) unsafe fn enter_task_recovery_context_on_hart(
 ) -> TaskRecoveryContext {
     let irq = irq_save();
     debug_assert_eq!(recovery_context_hart_index(), Some(hart.index()));
-    let slot = &TASK_RECOVERY_CONTEXTS[hart.index()];
+    let slot = &TASK_RECOVERY_CONTEXTS[hart.index()].0;
     let previous = slot.swap(key.get(), Ordering::AcqRel);
     let physical_hart = current_hart_id();
     irq_restore(irq);

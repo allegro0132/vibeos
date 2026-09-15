@@ -4415,6 +4415,7 @@ enum Applet {
         command: fn(Vec<String>) -> crate::AsyncCommandFuture,
         observability: bool,
     },
+    Vtop(Arc<dyn crate::vtop::Backend>),
     CapabilityHost(fn(CapabilityCommandContext) -> crate::CapabilityCommandFuture),
     Component {
         manifest: Arc<ComponentCommandManifest>,
@@ -4869,6 +4870,7 @@ pub fn install_persistent_proxy<T: Resource>(
 
 #[derive(Clone)]
 struct JobControl {
+    external_cancel: Option<Arc<CancellationSignal>>,
     live: Arc<AtomicBool>,
     completed: CancellationSignal,
     pipes: Vec<Arc<ByteStream>>,
@@ -5813,6 +5815,32 @@ impl Session {
     pub fn local_authority_count(&self) -> usize {
         self.cspace.lock().list().len()
     }
+    /// Install a monitor backend only in the interactive command profile.
+    /// Its Command capability gates both scripted and full-screen access.
+    pub fn install_vtop(&mut self, backend: Arc<dyn crate::vtop::Backend>) {
+        if self.profile != SessionProfile::Interactive { return; }
+        self.install("vtop", Applet::Vtop(backend), 0, 2, StreamMode::Closed, false);
+    }
+
+    fn with_vtop<T>(&self, f: impl FnOnce(&Arc<dyn crate::vtop::Backend>) -> T) -> Result<T, Status> {
+        let cap = self.commands.get("vtop").ok_or(Status::Unavailable)?;
+        let token = self.cspace.lock().lookup_revocable::<Command>(*cap, Rights::INVOKE)
+            .map_err(|_| Status::Denied)?;
+        token.try_with(|command| match &command.applet {
+            Applet::Vtop(backend) => Ok(f(backend)),
+            _ => Err(Status::Unavailable),
+        }).map_err(|_| Status::Denied)?
+    }
+
+    pub fn vtop_snapshot(&self) -> Result<crate::vtop::Snapshot, Status> {
+        self.with_vtop(|backend| backend.snapshot())
+    }
+
+    pub fn vtop_control(&self, request: &crate::vtop::Request) -> Result<crate::vtop::Control, &'static str> {
+        self.with_vtop(|backend| backend.control(request))
+            .map_err(|_| "vtop command authority is unavailable")?
+    }
+
     /// Boot-policy hook for one audited, in-tree control command. Possession
     /// of the resulting Command capability is the authority to invoke the
     /// operation; the function pointer is never accepted from shell text.
@@ -7108,7 +7136,8 @@ impl Session {
                     })?;
                 if matches!(
                     command_resource.applet,
-                    Applet::Host { .. }
+                    Applet::Vtop(_)
+                        | Applet::Host { .. }
                         | Applet::AsyncHost { .. }
                         | Applet::CapabilityHost(_)
                         | Applet::Component { .. }
@@ -7937,6 +7966,7 @@ impl PreparedPipeline {
             ));
         }
         let job = JobControl {
+            external_cancel: if background { None } else { session.external_cancel.clone() },
             live: Arc::new(AtomicBool::new(true)),
             completed: CancellationSignal::new(),
             pipes: pipes.clone(),
@@ -9074,6 +9104,20 @@ async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
             Ok(output) => write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await,
             Err(status) => status,
         },
+        Applet::Vtop(backend) => {
+            match crate::vtop::command(backend, &stage.args, || {
+                job.live.load(Ordering::Acquire)
+                    && !job.external_cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled())
+                    && stage.cspace.lock()
+                    .rights_of(stage.command).is_ok_and(|r| r.contains(Rights::INVOKE))
+            }).await {
+                Ok((output, status)) => {
+                    let written = write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await;
+                    if written == Status::Success { status } else { written }
+                },
+                Err(status) => status,
+            }
+        }
         Applet::AsyncHost {
             command,
             observability,

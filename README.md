@@ -36,6 +36,7 @@ and Duo/Mars packaging.
   Blob layout, CAS catalog ABI, complete-Blob deduplication, and authority rules.
 - **[docs/STORAGE_V2_GC.md](docs/STORAGE_V2_GC.md)** — persistent/runtime roots,
   typed edges, generation pins, and the crash-safe G/G+1/G+2 reuse barrier.
+- **[docs/VTOP.md](docs/VTOP.md)** — live CPU/heap monitoring and audited service management in UART and SSH terminals.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.

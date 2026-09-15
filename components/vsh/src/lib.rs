@@ -14,6 +14,7 @@ mod engine;
 #[cfg(feature = "file-tree")]
 mod file_commands;
 pub mod terminal;
+pub mod vtop;
 
 pub use block_commands::*;
 pub use engine::*;
@@ -52,6 +53,9 @@ pub trait Platform: Sync {
     fn read_byte(&self) -> ReadByteFuture<'_>;
     fn accept_byte(&self, byte: u8) -> Option<InputEvent>;
     fn write(&self, text: &str);
+    /// Physical consoles may suppress background chatter during a full-screen view.
+    fn enter_fullscreen(&self) {}
+    fn leave_fullscreen(&self) {}
 }
 
 #[derive(Clone, Copy)]
@@ -133,11 +137,44 @@ pub async fn interactive(
         platform.set_completion_candidates(&session.completion_candidates());
         platform.prompt("vsh> ");
         match read_line(platform).await {
-            Some(line) if !line.is_empty() => run_source(platform, &line, session).await,
+            Some(line) if !line.is_empty() => {
+                if let Some(dashboard) = vtop::Dashboard::open(session, &line) {
+                    run_vtop(platform, session, dashboard).await;
+                } else { run_source(platform, &line, session).await; }
+            },
             Some(_) => {}
             None if return_on_interrupt => return,
             None => {}
         }
+    }
+}
+
+/// Fullscreen cleanup runs on normal exit and cooperative cancellation.
+pub async fn run_vtop(platform: &dyn Platform, session: &Session, mut dashboard: vtop::Dashboard) {
+    struct Screen<'a>(&'a dyn Platform);
+    impl Drop for Screen<'_> {
+        fn drop(&mut self) { self.0.write(vtop::LEAVE); self.0.leave_fullscreen(); }
+    }
+    platform.enter_fullscreen();
+    let _screen = Screen(platform);
+    platform.write(vtop::ENTER);
+    platform.write(&dashboard.render(80, 24));
+    let mut tick = pin!(vibeos_core::exec::sleep_ms(vtop::INTERVAL_MS));
+    loop {
+        let mut input = platform.read_byte();
+        let event = poll_fn(|cx| {
+            if tick.as_mut().poll(cx).is_ready() { return Poll::Ready(None); }
+            input.as_mut().poll(cx).map(Some)
+        }).await;
+        match event {
+            Some(byte) if dashboard.key(session, byte) => break,
+            Some(_) => {},
+            None => {
+                if dashboard.refresh(session).is_err() { break; }
+                tick.set(vibeos_core::exec::sleep_ms(vtop::INTERVAL_MS));
+            }
+        }
+        platform.write(&dashboard.render(80, 24));
     }
 }
 
@@ -250,6 +287,7 @@ pub fn help(_args: &[String]) -> Result<String, Status> {
          \x20 jobs            list session jobs\n\
          \x20 wait %N         join a job\n\
          \x20 cancel %N       cancel a job\n\
+         \x20 vtop            live resources and service management (--help)\n\
          \x20 ps              component lifecycle snapshots\n\
          \x20 caps [space]    sanitized capability summary\n\
          \x20 mem             bounded-memory accounts\n\

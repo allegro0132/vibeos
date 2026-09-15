@@ -77,7 +77,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let first = trimmed.split_whitespace().next().unwrap_or("");
     let vsh_command = matches!(
         first,
-        "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
+        "vtop" | "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
     ) || (first == "cancel"
         && trimmed
             .split_whitespace()
@@ -189,6 +189,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                     return;
                 }
                 println!("NPROF window={:?} stages={:?} units=timer_ticks queues=[inbound,outbound]", (start,end,width), p::NAMES);
+                println!("NPROF_SAMPLING stages={:?} interval={}", p::SAMPLED_NAMES, p::SAMPLE_INTERVAL);
                 for h in 0..exec::MAX_HARTS {
                     let b = p::snapshot_hart(h);
                     println!("NPROF_HART h={} ticks={:?} wait={:?} calls={:?}", h,b.ticks,b.wait,b.calls);

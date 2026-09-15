@@ -584,7 +584,8 @@ vibeos-component-host = { path = "../services/component-host", optional = true }
 vibeos-component-image-adapter = { path = "../services/component-image-adapter", optional = true }
 vibeos-component-loader = { path = "../services/component-loader", optional = true }
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
-vibeos-core = { path = "../core" }
+# vtop uses real WFI residency and per-task elapsed poll time on every image.
+vibeos-core = { path = "../core", features = ["idle-profile", "executor-profile"] }
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-virtio-protocol = { path = "../contracts/virtio", optional = true }
 vibeos-hal = { path = "../hal" }

@@ -48,6 +48,28 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.analyze(text.replace(', 7, 0, 0, 0]', ']', 1))
 
+    def test_receive_schema_accounts_children_and_rejects_partial_arrays(self):
+        text = self.fixture().replace('window=(100, 200, 100)',
+            'window=(100, 200, 100) stages=' + json.dumps(m.RX_STAGES))
+        text = re.sub(r'(ticks|wait|calls)=(\[[^\]]*\])',
+            lambda x: x[1] + '=' + json.dumps(json.loads(x[2]) + [0, 0, 0, 0, 11, 12, 13, 14]), text)
+        result = m.analyze(text)
+        self.assertEqual(len(result['stages']), 16)
+        sampled = text + 'NPROF_SAMPLING stages=' + json.dumps(m.RX_STAGES[-4:]) + ' interval=64\n'
+        self.assertEqual(m.analyze(sampled)['sampling'], dict(stages=m.RX_STAGES[-4:], interval=64))
+        self.assertEqual(m.analyze(sampled)['phases'], result['phases'])
+        for bad in [sampled.replace('interval=64', 'interval=0'),
+                    sampled.replace('interval=64', 'interval=63'),
+                    sampled.replace('interval=64', 'interval=invalid'),
+                    sampled + sampled.splitlines()[-1] + '\n']:
+            with self.assertRaises(ValueError):
+                m.analyze(bad)
+
+        for stage, expected in zip(m.RX_STAGES[-4:], [11, 12, 13, 14]):
+            self.assertEqual(result['phases'][stage]['exclusive_ticks'], expected)
+        with self.assertRaises(ValueError):
+            m.analyze(text.replace(', 11, 12, 13, 14]', ']', 1))
+
     def test_incomplete_or_inconsistent_dump_is_not_success(self):
         for text in [self.fixture().replace('NPROF_END', ''),
                      self.fixture().replace('i=0', 'i=1'),

@@ -19,22 +19,33 @@ use crate::world::{world, Space};
 
 pub struct VshPlatform {
     front: Option<(Arc<Space>, Cap)>,
+    saved_quiet: core::sync::atomic::AtomicBool,
 }
 
 impl VshPlatform {
     fn capability_front(space: Arc<Space>, console: Cap) -> Self {
         Self {
             front: Some((space, console)),
+            saved_quiet: core::sync::atomic::AtomicBool::new(false),
         }
     }
 
     #[cfg(feature = "legacy-shell")]
     fn diagnostic_uart() -> Self {
-        Self { front: None }
+        Self { front: None, saved_quiet: core::sync::atomic::AtomicBool::new(false) }
     }
 }
 
 impl Platform for VshPlatform {
+    fn enter_fullscreen(&self) {
+        self.saved_quiet.store(crate::tty::is_quiet(), core::sync::atomic::Ordering::Relaxed);
+        crate::tty::set_quiet(true);
+    }
+
+    fn leave_fullscreen(&self) {
+        crate::tty::set_quiet(self.saved_quiet.load(core::sync::atomic::Ordering::Relaxed));
+    }
+
     fn prompt(&self, text: &'static str) {
         crate::tty::prompt(text);
     }
@@ -94,13 +105,16 @@ pub async fn interactive_legacy(session: &mut Session) {
 #[cfg(feature = "legacy-shell")]
 pub async fn run_legacy_source(source: &str, session: &mut Session) {
     let platform = VshPlatform::diagnostic_uart();
-    vibeos_vsh::run_source(&platform, source, session).await;
+    if let Some(dashboard) = vibeos_vsh::vtop::Dashboard::open(session, source) {
+        vibeos_vsh::run_vtop(&platform, session, dashboard).await;
+    } else { vibeos_vsh::run_source(&platform, source, session).await; }
 }
 
 pub fn install_standard_commands(session: &mut Session) {
     #[cfg(feature = "wasi-preview1")]
     if crate::platform::component_enabled("wasi") { crate::wasi::install(session); }
     install_shared_commands(session);
+    session.install_vtop(Arc::new(crate::vtop_platform::Monitor::local()));
     vibeos_vsh::install_lsblk_command(session);
     #[cfg(feature = "file-tree")]
     if crate::platform::component_enabled("file-tree") { vibeos_vsh::install_file_commands(session); }
@@ -189,6 +203,7 @@ fn install_shared_commands(session: &mut Session) {
 ))]
 pub fn install_remote_commands(session: &mut Session) {
     install_shared_commands(session);
+    session.install_vtop(Arc::new(crate::vtop_platform::Monitor::remote()));
     #[cfg(feature = "provisioned-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }

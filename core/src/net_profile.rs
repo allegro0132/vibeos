@@ -3,9 +3,11 @@
 //! allocation, locks, or reset; one capture window is permitted per boot.
 #[derive(Clone, Copy)]
 #[repr(usize)]
-pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend, PacketQueue, Completion, PacketBuild, ProtocolPoll }
-pub const STAGE_COUNT: usize = 12;
-pub const NAMES: [&str; STAGE_COUNT] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend", "packet_queue", "completion", "packet_build", "protocol_poll"];
+pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend, PacketQueue, Completion, PacketBuild, ProtocolPoll, RxLoan, RxGro, TxReserve, TxFlush }
+pub const SAMPLE_INTERVAL: usize = 64;
+pub const SAMPLED_NAMES: [&str; 4] = ["rx_loan", "rx_gro", "tx_reserve", "tx_flush"];
+pub const STAGE_COUNT: usize = 16;
+pub const NAMES: [&str; STAGE_COUNT] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend", "packet_queue", "completion", "packet_build", "protocol_poll", "rx_loan", "rx_gro", "tx_reserve", "tx_flush"];
 
 #[cfg(feature = "network-profile")]
 mod enabled;
@@ -17,6 +19,7 @@ pub struct Scope;
 #[cfg(not(feature = "network-profile"))]
 impl Scope {
     #[inline(always)] pub fn enter(_: Stage) -> Self { Self }
+    #[inline(always)] pub fn sampled(_: Stage) -> Self { Self }
     #[inline(always)] pub fn task(_: &str) -> Self { Self }
 }
 #[cfg(not(feature = "network-profile"))]

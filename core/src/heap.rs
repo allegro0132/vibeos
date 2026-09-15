@@ -109,10 +109,20 @@ impl AllocationDomain {
     }
 }
 
-static CURRENT_OWNERS: [AtomicU64; MAX_HARTS] =
-    [const { AtomicU64::new(OwnerId::SYSTEM.0) }; MAX_HARTS];
-static CURRENT_ARENAS: [AtomicU64; MAX_HARTS] =
-    [const { AtomicU64::new(ArenaId::UNTRACKED.0) }; MAX_HARTS];
+// Context switches write these fields while recoverable locks read them.
+// Keep different harts off the same 64-byte cache line (including on Mars).
+// Atomic ordering and the interrupt-masked scope protocol remain unchanged.
+#[repr(align(64))]
+struct HartAllocationContext {
+    owner: AtomicU64,
+    arena: AtomicU64,
+}
+static CURRENT_DOMAINS: [HartAllocationContext; MAX_HARTS] = [const {
+    HartAllocationContext {
+        owner: AtomicU64::new(OwnerId::SYSTEM.0),
+        arena: AtomicU64::new(ArenaId::UNTRACKED.0),
+    }
+}; MAX_HARTS];
 
 #[inline(always)]
 fn allocation_context_hart_index() -> Option<usize> {
@@ -136,8 +146,8 @@ fn allocation_context_hart_index() -> Option<usize> {
 #[inline(always)]
 fn domain_on_hart(hart: usize) -> AllocationDomain {
     AllocationDomain {
-        owner: OwnerId(CURRENT_OWNERS[hart].load(Ordering::SeqCst)),
-        arena: ArenaId(CURRENT_ARENAS[hart].load(Ordering::SeqCst)),
+        owner: OwnerId(CURRENT_DOMAINS[hart].owner.load(Ordering::SeqCst)),
+        arena: ArenaId(CURRENT_DOMAINS[hart].arena.load(Ordering::SeqCst)),
     }
 }
 
@@ -191,8 +201,8 @@ pub unsafe fn enter_domain(domain: AllocationDomain) -> OwnerScope {
         arch::irq_restore(irq);
         panic!("allocation owner scope requires a mapped logical hart");
     };
-    let owner_slot = &CURRENT_OWNERS[hart];
-    let arena_slot = &CURRENT_ARENAS[hart];
+    let owner_slot = &CURRENT_DOMAINS[hart].owner;
+    let arena_slot = &CURRENT_DOMAINS[hart].arena;
     let previous = AllocationDomain {
         owner: OwnerId(owner_slot.load(Ordering::SeqCst)),
         arena: ArenaId(arena_slot.load(Ordering::SeqCst)),
@@ -224,8 +234,8 @@ pub unsafe fn enter_domain(domain: AllocationDomain) -> OwnerScope {
 pub(crate) unsafe fn enter_domain_on_hart(domain: AllocationDomain, hart: HartId) -> OwnerScope {
     let irq = arch::irq_save();
     debug_assert_eq!(allocation_context_hart_index(), Some(hart.index()));
-    let owner_slot = &CURRENT_OWNERS[hart.index()];
-    let arena_slot = &CURRENT_ARENAS[hart.index()];
+    let owner_slot = &CURRENT_DOMAINS[hart.index()].owner;
+    let arena_slot = &CURRENT_DOMAINS[hart.index()].arena;
     let previous = AllocationDomain {
         owner: OwnerId(owner_slot.load(Ordering::SeqCst)),
         arena: ArenaId(arena_slot.load(Ordering::SeqCst)),

@@ -57,6 +57,7 @@ impl Buffer {
             merged_segments: 0, aggregates: 0 }
     }
     pub fn begin(&mut self, b: &[u8], trusted: bool) -> bool {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
         self.data.clear();
         self.segments = 0;
         self.done = true;
@@ -73,6 +74,7 @@ impl Buffer {
     /// `original` is the same immutable frame passed to begin, still owned by
     /// the receive token builder. Materialize it only on the first actual merge.
     pub fn append(&mut self, original: &[u8], b: &[u8], trusted: bool) -> bool {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
         if self.done || self.segments >= MAX_SEGMENTS { return false; }
         let Some((header, end)) = eligible(b, trusted) else { return false; };
         let payload = end - header;
@@ -104,6 +106,7 @@ impl Buffer {
     pub fn has_aggregate(&self) -> bool { self.segments >= 2 }
     pub fn finished(&self) -> bool { self.done }
     pub fn finish(&mut self, trusted: bool) {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
         if self.segments < 2 { return; }
         self.aggregates += 1;
         let len = (self.data.len() - 14) as u16;

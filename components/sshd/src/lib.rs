@@ -4154,6 +4154,71 @@ async fn render_shell_execution(
     }
 }
 
+/// Drive the shared vtop model with raw PTY bytes, preserving SSH channel
+/// backpressure, window changes and transport-authority validation.
+#[allow(clippy::too_many_arguments)]
+async fn run_shell_vtop(
+    mut dashboard: vibeos_vsh::vtop::Dashboard,
+    session: &vibeos_vsh::Session,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut dyn TcpTransport,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    input: &mut PendingInput,
+    frontend: &mut TerminalFrontend,
+    require_carrier: bool,
+) -> Result<(), ConnectionEnd> {
+    macro_rules! emit {
+        ($text:expr) => {
+            emit_shell_text($text, runner, signer, space, control, bound_epoch,
+                policy, stack, bridge, protocol, input, frontend, require_carrier).await
+        };
+    }
+    emit!(vibeos_vsh::vtop::ENTER)?;
+    let mut next_refresh = monotonic_ms().saturating_add(vibeos_vsh::vtop::INTERVAL_MS);
+    let mut last_size = None;
+    let mut redraw = true;
+    loop {
+        let eof = input.bytes.is_empty() && protocol.channel.as_ref()
+            .is_some_and(|channel| runner.is_channel_eof(channel));
+        if input.signal_interrupt || eof {
+            input.signal_interrupt = false;
+            break;
+        }
+        let mut quit = false;
+        for _ in 0..MAX_SHELL_INPUT_ACTIONS_PER_TURN {
+            let Some(byte) = input.bytes.pop_front() else { break; };
+            redraw = true;
+            if dashboard.key(session, byte) { quit = true; break; }
+        }
+        if quit { break; }
+        let now = monotonic_ms();
+        if now >= next_refresh {
+            if dashboard.refresh(session).is_err() { break; }
+            next_refresh = now.saturating_add(vibeos_vsh::vtop::INTERVAL_MS);
+            redraw = true;
+        }
+        let size = protocol.pty.map(|size| (size.cols as usize, size.rows as usize)).unwrap_or((80, 24));
+        if redraw || last_size != Some(size) {
+            emit!(&dashboard.render(size.0, size.1))?;
+            redraw = false;
+            last_size = Some(size);
+        }
+        let turn = drive_shell_turn(runner, signer, space, control, bound_epoch,
+            policy, stack, bridge, protocol, input, frontend, require_carrier)?;
+        // Keep pumping SSH and wake for a refresh even if TCP has no work.
+        let until_refresh = next_refresh.saturating_sub(monotonic_ms()).min(50);
+        cooperate(turn.worked, Some(turn.next_poll_delay_ms.unwrap_or(until_refresh).min(until_refresh))).await;
+    }
+    emit!(vibeos_vsh::vtop::LEAVE)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_shell_repl(
     session: &mut vibeos_vsh::Session,
@@ -4196,6 +4261,13 @@ async fn run_shell_repl(
                 }
                 if matches!(command, "exit" | "logout") {
                     return Ok(0);
+                }
+                if let Some(dashboard) = vibeos_vsh::vtop::Dashboard::open(session, command) {
+                    run_shell_vtop(dashboard, session, runner, signer, space, control,
+                        bound_epoch, policy, stack, bridge, protocol, input, frontend,
+                        require_carrier).await?;
+                    status = 0;
+                    continue;
                 }
                 // VSH captures bounded command output internally. Rendering
                 // starts only after execute_cancellable has actually finished;

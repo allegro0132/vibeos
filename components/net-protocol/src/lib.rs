@@ -350,6 +350,7 @@ impl PacketDevice {
 
     /// Try once to publish a frame retained after endpoint backpressure.
     pub fn flush_egress(&mut self) -> Result<bool, StackError> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::TxFlush);
         self.authority_result()?;
         #[cfg(feature = "native-tcp-segmentation")]
         if let Some(pending) = self.pending_pooled.as_mut() {
@@ -469,6 +470,7 @@ impl PacketDevice {
 
     #[cfg(feature = "native-tcp-segmentation")]
     fn reserve_transmit(&mut self) -> Option<Option<transmit::Reservation>> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::TxReserve);
         match self.outbound.reserve(self.stamp) {
             Ok(reservation) => Some(reservation),
             Err(transmit::ReserveError::Pool(vibeos_core::net_segment_pool::Error::Full)) => {
@@ -481,6 +483,7 @@ impl PacketDevice {
 
     #[cfg(feature = "pooled-rx")]
     fn receive_pooled(&mut self) -> Option<vibeos_core::net_receive::Loan> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxLoan);
         #[cfg(feature = "bounded-gro")]
         if self.ingress_remaining == 0 { return None; }
         let result = self.inbound.receive_loan(self.stamp)?;

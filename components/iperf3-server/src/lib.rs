@@ -92,6 +92,7 @@ pub async fn task(space: &Space, control_listener: Cap, data_listener: Cap) {
             Ok(worked) => {
                 #[cfg(feature = "event-driven")]
                 if notifications.is_some() {
+                    vibeos_core::net_profile::poll_decision(worked, worked || waits.is_none());
                     if worked {
                         armed = false;
                         vibeos_core::exec::yield_now().await;

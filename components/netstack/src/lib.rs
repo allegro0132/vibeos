@@ -351,6 +351,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
         }
         #[cfg(feature = "event-driven")]
         {
+            vibeos_core::net_profile::poll_decision(more_work, more_work || !event_armed);
             if more_work {
                 wake_futures.clear();
                 event_armed = false;
@@ -490,6 +491,7 @@ impl InterfaceTask {
             .poll_network(now_ms)
             .map_err(|_| InterfaceError::Retired)?;
         frontend_work |= drive_frontends(active_stack).map_err(|_| InterfaceError::Retired)?;
+        vibeos_core::net_profile::stack_activity(report.ingress_frames, frontend_work);
         config::publish_stack_status(
             self.interface,
             self.observed_config_revision,

@@ -568,6 +568,7 @@ pub async fn driver_task(
             Ok(worked) => {
                 #[cfg(feature = "rx-interrupt-poll")]
                 if device().rx_interrupts.is_some() {
+                    vibeos_core::net_profile::poll_decision(worked, worked);
                     if worked {
                         crate::exec::yield_now().await;
                     } else if wait_rx_work(&mmio, &dma, &control, &outbound).await.is_err() {

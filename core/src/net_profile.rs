@@ -24,3 +24,10 @@ impl Scope {
 }
 #[cfg(not(feature = "network-profile"))]
 #[inline(always)] pub fn queue(_: &str, _: usize, _: bool) {}
+
+#[cfg(not(feature = "network-profile"))]
+#[inline(always)]
+pub fn poll_decision(_: bool, _: bool) {}
+#[cfg(not(feature = "network-profile"))]
+#[inline(always)]
+pub fn stack_activity(_: usize, _: bool) {}

@@ -1614,3 +1614,93 @@ Evidence: target/mars-reference/20260915-rx-sample-{cached-build,fit,ramboot,tes
 20260915-rx-sample-integrity.json, 20260915-rx-sample.elf, and
  target/mars-acceptance/20260913-gigabit/20260915-rx-sample-rx-profile-*.
 FIT SHA-256: `c972dc1b17654f18a593de8c1ccdc057df4c5fc09eda252b79c4809b063c8808`.
+Both profile-enabled and profile-disabled pooled/GRO/native protocol tests
+passed (4 unit and 39 integration in each configuration). Restored the earlier
+hart-context FIT after capture; hashes, gigabit startup, and a fresh 64 MiB
+pattern passed (20260915-rx-sample-restore-*). Default Ethernet feature mapping
+is restored. Board stays on the uninstrumented image; SD/SPI unchanged.
+The below-one-core objective remains unverified and unmet by the latest
+available production-load measurements.
+
+
+## Rejected passive-listener synchronization experiment
+
+The sampled profile's hart 1 had exactly 811836 frontend-drive calls for
+67653 protocol polls: six listeners driven both before and after each poll.
+The other 349995 frontend-stage calls were application-side I/O and must not
+be attributed to listener traversal. Four independent probe listeners are
+normally passive during iperf. An opt-in experiment cached successful Listen
+synchronization per BoundListener, checking live transport state and revocable
+frontend authority on every turn while skipping repeated passive queue locks.
+Fresh bindings initialized the hint false; non-Listen states took the full path.
+Host tests covered initial sync, reset/re-listen and revocation after cached
+passive state, and passed in experimental/default configurations.
+
+The unprofiled experiment FIT passed hashes, gigabit startup and 64 MiB TCP
+pattern verification. However iperf control connections closed unexpectedly
+both in the attempted 910 Mbps benchmark and a second short unpaced run.
+Tasks remained running with zero recorded faults/cancellations. There is no
+valid experiment throughput/CPU result. Do not treat the narrow host tests or
+independent single-port TCP success as proof of shared-port iperf correctness.
+
+A same-workspace build disabling the experiment successfully completed a short
+iperf test and two 20-second 910 Mbps RX runs: 909.90 and 909.96 Mbps;
+h0/h1 active occupancy 97.42/99.00% and 97.51/99.24%, respectively (about
+1.964 and 1.968 total cores). These are outside-WFI proxies, not CPU cycles.
+The control restores functionality; the exact experiment failure mechanism
+is not established. The runtime changes and feature switches were reverted,
+with their complete patch archived for diagnosis, not promoted as an
+optimization. Next diagnosis can capture the existing iperf phase-error event
+while reproducing the shared-port control connection failure.
+
+Control boot first encountered U-Boot DHCP retries despite active en13 link
+and a running host bootpd. Explicit temporary U-Boot addresses (board .15,
+server .1) pinged successfully and loaded the hash-verified FIT; no saveenv
+or SPI writes. VibeOS remained reachable at 192.168.77.10 for the successful
+control tests. This DHCP observation is separate from the unresolved earlier
+iperf failure and is not evidence that the fast path is correct.
+
+Artifacts in target/mars-reference/: 20260915-idle-listener-rejected.patch,
+20260915-idle-listener{,-control}.elf, corresponding build/fit/ramboot/test logs,
+20260915-idle-listener-910/ (failed test), 20260915-idle-listener-iperf-recheck.json,
+and 20260915-idle-listener-control-910/ (successful control).
+Experiment FIT fc3045bd6d464564d7134144a0a52668354da58e5e9aaf6a5e6b4e2eeb67bb09;
+control FIT f83005decda62ba0918a86a9c3f002872c7bd1ecce3c9fc93aedd27deb78de26.
+Board stays on the control RAM image, default build mapping restored, SD/SPI
+untouched. Below-one-core objective remains unmet.
+Fresh post-control 64 MiB pattern verification passed; evidence is
+20260915-idle-listener-control-integrity.json.
+
+
+## Reproduction did not establish a passive-listener regression
+
+Rebooted the exact previously failing experiment FIT (fc3045bd...) without
+changing its code. The first U-Boot ARP attempt after link negotiation timed
+out, but the next explicit ping succeeded and the subsequent FIT hashes and
+boot passed. A short iperf run with simultaneous serial capture succeeded at
+947.52 Mbps. A fresh 64 MiB independent TCP pattern passed, followed by another
+successful short iperf at 941.95 Mbps. No iperf phase-error event was captured.
+Two complete 20-second 910 Mbps runs then passed at 909.92/909.96 Mbps;
+h0/h1 active percentages were 97.30/96.77 and 97.37/91.94, or roughly
+1.941/1.893 aggregate cores. These overlap earlier measurements and do not
+establish a stable CPU gain over the control's 1.964/1.968 cores.
+
+This changes the previous interpretation: the failed controls did not prove
+the passive-listener hint caused a regression. The error remains intermittent
+and unexplained; absence of failure on this boot does not establish reliability.
+No runtime patch was reintroduced and the experimental feature remains absent.
+Both the negative evidence and later successful exact-image reproduction are
+retained. Further tests should classify progress versus empty polling before
+inferring that reducing frontend work necessarily reduces non-WFI occupancy.
+
+Evidence: target/mars-reference/20260915-idle-listener-repro{,2}-ramboot.log,
+20260915-idle-listener-{repro,after-probe}-{serial.log,iperf.json},
+20260915-idle-listener-repro-integrity.json and
+20260915-idle-listener-repro-910/. The unchanged experiment patch remains in
+20260915-idle-listener-rejected.patch for diagnosis only.
+Restoration of the control FIT f83005de... passed hashes, gigabit startup,
+and a new 64 MiB pattern check (20260915-idle-listener-repro-control-integrity.json).
+First post-negotiation U-Boot ARP again timed out; a subsequent bounded retry
+succeeded. Raw restore logs use the repro-control/repro-control2 prefixes.
+Board remains on control; default source/configuration unchanged; no SD/SPI
+writes. The complete gigabit/CPU goal remains active and not achieved.

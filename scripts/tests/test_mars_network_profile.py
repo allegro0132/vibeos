@@ -70,6 +70,17 @@ class ProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.analyze(text.replace(', 11, 12, 13, 14]', ']', 1))
 
+    def test_poll_decisions_are_separate_from_timer_totals(self):
+        row = 'NPROF_POLL h=0 stage=stack counts=[10, 20, 30, 4, 5, 60]\n'
+        result = m.analyze(self.fixture() + row)
+        self.assertEqual(result['phases'], m.analyze(self.fixture())['phases'])
+        self.assertEqual(result['poll_decisions'][0]['empty_retry'], 20)
+        self.assertEqual(result['poll_decisions'][0]['ingress_frames'], 60)
+        for bad in [row + row, row.replace('h=0', 'h=9'), row.replace('stage=stack', 'stage=bogus'),
+                    row.replace('10, 20', '-10, 20'), row.replace(', 60]', ']'), 'NPROF_POLL invalid\n']:
+            with self.assertRaises(ValueError):
+                m.analyze(self.fixture() + bad)
+
     def test_incomplete_or_inconsistent_dump_is_not_success(self):
         for text in [self.fixture().replace('NPROF_END', ''),
                      self.fixture().replace('i=0', 'i=1'),

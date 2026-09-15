@@ -191,6 +191,12 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 println!("NPROF window={:?} stages={:?} units=timer_ticks queues=[inbound,outbound]", (start,end,width), p::NAMES);
                 println!("NPROF_SAMPLING stages={:?} interval={}", p::SAMPLED_NAMES, p::SAMPLE_INTERVAL);
                 for h in 0..exec::MAX_HARTS {
+                    for stage in 0..p::STAGE_COUNT {
+                        let counts = p::poll_snapshot(h, stage);
+                        if counts.iter().any(|n| *n != 0) {
+                            println!("NPROF_POLL h={} stage={} counts={:?}", h, p::NAMES[stage], counts);
+                        }
+                    }
                     let b = p::snapshot_hart(h);
                     println!("NPROF_HART h={} ticks={:?} wait={:?} calls={:?}", h,b.ticks,b.wait,b.calls);
                 }

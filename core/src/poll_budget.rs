@@ -14,6 +14,11 @@ impl PollBudget {
     /// Actual progress renews grace. Empty polls cannot extend it, and the
     /// attempt cap bounds work even if the clock is unavailable or stops.
     pub fn runnable(&mut self, now: u64, progress: bool) -> bool {
+        let runnable = self.decide(now, progress);
+        crate::net_profile::poll_decision(progress, runnable);
+        runnable
+    }
+    fn decide(&mut self, now: u64, progress: bool) -> bool {
         if progress {
             self.last = Some(now);
             self.remaining = self.limit;

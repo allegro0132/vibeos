@@ -79,6 +79,21 @@ def analyze(text):
         for h, totals in harts.items():
             if totals['wait'] != [sum(r['wait'][i] for r in locks if r['hart'] == h) for i in range(count)]:
                 raise ValueError('lock identities and hart wait totals disagree')
+    decisions = []
+    seen_decisions = set()
+    for row in re.findall(r'NPROF_POLL[^\r\n]*', text):
+        match = re.fullmatch(r'NPROF_POLL h=(\d+) stage=(\w+) counts=(\[[^\]]*\])', row)
+        if not match:
+            raise ValueError('invalid poll decision row')
+        hart, stage, values = int(match[1]), match[2], json.loads(match[3])
+        if hart not in harts or stage not in stages or (hart, stage) in seen_decisions:
+            raise ValueError('duplicate or unknown poll decision identity')
+        if len(values) != 6 or any(type(n) is not int or n < 0 for n in values):
+            raise ValueError('invalid poll decision counters')
+        seen_decisions.add((hart, stage))
+        decisions.append(dict(hart=hart, stage=stage, work_hint_runnable=values[0],
+            empty_retry=values[1], wait_attempt=values[2], ingress_turns=values[3],
+            frontend_progress_turns=values[4], ingress_frames=values[5]))
     active = sum(work) + sum(wait)
     phases = {name: dict(exclusive_ticks=work[i], contended_wait_ticks=wait[i],
                         percent_active_work=100*work[i]/max(1, active),
@@ -93,9 +108,10 @@ def analyze(text):
                 status=b['dma'][1], mtl=b['dma'][2])
            for i, b in buckets.items() if b['dma'][0]]
     return dict(start=start, end=end, width=width, stages=stages, phases=phases, harts=harts,
-                sampling=dict(stages=sampled_stages, interval=interval),
+                sampling=dict(stages=sampled_stages, interval=interval), poll_decisions=decisions,
                 queues=queues, dma_observations=dma, buckets=buckets, locks=locks,
-                limitations=['Sampled child stages contain only selected calls; unsampled work remains in parents. Do not scale timeline totals.',
+                limitations=['Poll decisions are counts, not CPU time. Work hints include pending work; wait attempts may complete immediately.',
+                    'Sampled child stages contain only selected calls; unsampled work remains in parents. Do not scale timeline totals.',
                     'Elapsed 4 MHz timer ticks on Mars, not CPU cycles.',
                     'Work includes interrupts, MMIO polling, and instrumentation overhead.',
                     'Only contended core SpinLock acquisition time is classified as wait.',

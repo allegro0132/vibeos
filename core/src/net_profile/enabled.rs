@@ -237,3 +237,35 @@ pub fn lock_snapshot(hart: usize, slot: usize) -> (usize, [u64; STAGE_COUNT], [u
     (entry.address.load(Relaxed), core::array::from_fn(|i| entry.wait[i].load(Relaxed)),
      core::array::from_fn(|i| entry.calls[i].load(Relaxed)))
 }
+
+/// Decision counters, not time: [work-hint runnable, empty retry, wait attempt,
+/// interface turns with ingress, interface turns with frontend progress, frames].
+/// A work hint may represent pending/backpressured work, not completed I/O.
+#[repr(align(64))]
+struct PollCounts([[AtomicU64; 6]; STAGE_COUNT]);
+static POLL_COUNTS: [PollCounts; MAX_HARTS] = [const { PollCounts(
+    [const { [const { AtomicU64::new(0) }; 6] }; STAGE_COUNT]) }; MAX_HARTS];
+fn poll_counters() -> Option<&'static [AtomicU64; 6]> {
+    live_time()?;
+    let h = hart();
+    if h >= MAX_HARTS { return None; }
+    let stage = LOCAL[h].current.load(Relaxed);
+    if stage >= STAGE_COUNT { return None; }
+    Some(&POLL_COUNTS[h].0[stage])
+}
+pub fn poll_decision(work_hint: bool, runnable: bool) {
+    if let Some(counters) = poll_counters() {
+        let index = if !runnable { 2 } else if work_hint { 0 } else { 1 };
+        counters[index].fetch_add(1, Relaxed);
+    }
+}
+pub fn stack_activity(ingress: usize, frontend: bool) {
+    if let Some(counters) = poll_counters() {
+        counters[3].fetch_add(u64::from(ingress != 0), Relaxed);
+        counters[4].fetch_add(u64::from(frontend), Relaxed);
+        counters[5].fetch_add(ingress as u64, Relaxed);
+    }
+}
+pub fn poll_snapshot(hart: usize, stage: usize) -> [u64; 6] {
+    core::array::from_fn(|i| POLL_COUNTS[hart].0[stage][i].load(Relaxed))
+}

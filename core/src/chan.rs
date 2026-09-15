@@ -61,6 +61,7 @@ impl<T: Send + 'static> Endpoint<T> {
     }
 
     /// Notification only; this handle cannot read messages or bypass authority.
+    /// Signals empty-to-nonempty transitions, not individual messages.
     /// Construct its listener before checking has_message under live authority.
     pub fn message_event(&self) -> MessageEvent { MessageEvent(self.on_message.clone()) }
     pub fn has_message(&self) -> bool { !self.inner.lock().queue.is_empty() }
@@ -71,11 +72,14 @@ impl<T: Send + 'static> Endpoint<T> {
             crate::net_profile::queue(&self.name, i.queue.len(), true);
             return Err(msg);
         }
+        let was_empty = i.queue.is_empty();
         i.queue.push_back(msg);
         crate::net_profile::queue(&self.name, i.queue.len(), false);
         i.sent += 1;
         drop(i);
-        self.on_message.wake_all();
+        // Waiters may park only after observing empty. Wake all on that
+        // transition; additional queued messages need no additional signal.
+        if was_empty { self.on_message.wake_all(); }
         Ok(())
     }
 
@@ -99,10 +103,13 @@ impl<T: Send + 'static> Endpoint<T> {
 
     pub fn try_recv(&self) -> Option<T> {
         let mut i = self.inner.lock();
+        let was_full = i.queue.len() == self.bound;
         let msg = i.queue.pop_front()?;
         i.received += 1;
         drop(i);
-        self.on_space.wake_all();
+        // A blocked sender observed full. Its listener predates that check,
+        // so a single full-to-space signal also covers not-yet-polled waiters.
+        if was_full { self.on_space.wake_all(); }
         Some(msg)
     }
 
@@ -143,5 +150,7 @@ impl<T: Send + 'static> Resource for Endpoint<T> {
 /// A wake is only a hint: revalidate authority and retry the queue operation.
 pub struct MessageEvent(Arc<WaitQueue>);
 impl MessageEvent {
+    /// Wrap a notification queue; this handle grants no access to resource data.
+    pub fn from_queue(queue: Arc<WaitQueue>) -> Self { Self(queue) }
     pub fn wait(&self) -> crate::exec::WaitFuture<'_> { self.0.wait() }
 }

@@ -58,6 +58,8 @@ impl Buffer {
     }
     pub fn begin(&mut self, b: &[u8], trusted: bool) -> bool {
         self.data.clear();
+        self.segments = 0;
+        self.done = true;
         let Some((header, end)) = eligible(b, trusted) else { return false; };
         if end > MAX_BYTES { return false; }
         self.header = header;

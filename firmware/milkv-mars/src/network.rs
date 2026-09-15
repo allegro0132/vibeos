@@ -46,18 +46,22 @@ static CLAIMED: AtomicBool = AtomicBool::new(false);
 static LINK: AtomicBool = AtomicBool::new(false);
 static TX: AtomicU64 = AtomicU64::new(0);
 static RX: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "rx-status-experiment")]
+#[cfg(all(feature = "rx-status-experiment", feature = "controller-profile"))]
 static mut PROFILE_CHECKSUM_LAST: u64 = 0;
 
-// Serialized diagnostic counters for locating the gigabit bottleneck. Device
+// Opt-in diagnostic counters; disabled counters add no timing reads. Device
 // invocation authority is the sole owner, just as for ENGINE and its DMA ring.
+#[cfg(feature = "controller-profile")]
 struct Profile {
     ticks: [u64; 3],
     calls: [u64; 3],
     last: u64,
 }
+#[cfg(feature = "controller-profile")]
 struct ProfileSlot(UnsafeCell<Profile>);
+#[cfg(feature = "controller-profile")]
 unsafe impl Sync for ProfileSlot {}
+#[cfg(feature = "controller-profile")]
 static PROFILE: ProfileSlot = ProfileSlot(UnsafeCell::new(Profile {
     ticks: [0; 3],
     calls: [0; 3],
@@ -66,11 +70,13 @@ static PROFILE: ProfileSlot = ProfileSlot(UnsafeCell::new(Profile {
 fn profile_time() -> u64 {
     vibeos_runtime_riscv::time()
 }
+#[cfg(feature = "controller-profile")]
 unsafe fn profile_end(kind: usize, start: u64) {
     let p = &mut *PROFILE.0.get();
     p.ticks[kind] += profile_time().wrapping_sub(start);
     p.calls[kind] += 1;
 }
+#[cfg(feature = "controller-profile")]
 unsafe fn profile_report() {
     let now = profile_time();
     let p = &mut *PROFILE.0.get();
@@ -394,6 +400,10 @@ fn irq_lane() -> Lane {
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
     #[cfg(feature = "rx-pool-experiment")]
     receive_buffers: Some(vibeos_hal::network_rx::Operations {
+        #[cfg(feature = "rx-batch-experiment")]
+        poll_batch: Some(poll_rx_batch),
+        #[cfg(not(feature = "rx-batch-experiment"))]
+        poll_batch: None,
         stats: rx_pool_stats,
         poll: poll_rx_ticket, acquire: acquire_rx_loan, discard: discard_rx_ticket, recover: recover_rx_borrower,
     }),
@@ -427,22 +437,26 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     },
     claim,
     tx_owned: || unsafe {
+        #[cfg(feature = "controller-profile")]
         let start = profile_time();
         let result = engine().tx_owned();
         #[cfg(feature = "tso-experiment")]
         if matches!(result,Ok(false)) { service_tso_probe(); }
         #[cfg(feature = "network-tx-audit")]
         service_tx_audit();
+        #[cfg(feature = "controller-profile")]
         profile_end(0, start);
         snapshot();
         result.expect("Mars EQoS TX fault")
     },
     transmit: |p| unsafe {
+        #[cfg(feature = "controller-profile")]
         let start = profile_time();
         #[cfg(not(feature = "tx-checksum-experiment"))]
         let result = engine().transmit(p);
         #[cfg(feature = "tx-checksum-experiment")]
         let result = engine().transmit_checksum(p);
+        #[cfg(feature = "controller-profile")]
         profile_end(1, start);
         snapshot();
         result.map_err(|e| {
@@ -470,8 +484,10 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         { None }
     },
     receive: |out| unsafe {
+        #[cfg(feature = "controller-profile")]
         let start = profile_time();
         let result = engine().receive(out);
+        #[cfg(feature = "controller-profile")]
         profile_end(2, start);
         snapshot();
         result.expect("Mars EQoS RX fault")
@@ -489,7 +505,7 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
             #[cfg(feature = "symmetric-pause-experiment")]
             report(format_args!("MARS_FLOW_CONFIG {:?}\n", engine().flow_diagnostics()));
         }
-        #[cfg(feature = "rx-status-experiment")]
+        #[cfg(all(feature = "rx-status-experiment", feature = "controller-profile"))]
         if !cfg!(feature = "network-profile") && engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
             PROFILE_CHECKSUM_LAST = profile_time();
             report(format_args!(
@@ -513,6 +529,7 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
                 drops.rejected, drops.last_status, drops.last_word1
             ));
         }
+        #[cfg(feature = "controller-profile")]
         profile_report();
         snapshot();
         #[cfg(feature = "symmetric-pause-experiment")]
@@ -545,31 +562,95 @@ fn initialize_rx_pool(ring: &mut ring::Ring<Hardware>) -> Result<(), ring::Error
     ring.initialize_pooled(metadata.buffers.as_mut().unwrap())
 }
 #[cfg(feature = "rx-pool-experiment")]
+struct RxAccess {
+    // Captured under the first metadata guard of this invocation. The HAL
+    // engine lease excludes pool replacement/reset until validation finishes.
+    view: Option<vibeos_eqos_net::pool::RxView>,
+}
+// HAL invocation authority excludes concurrent engine initialization/reset.
+// Stack callbacks only borrow/release/discard entries in this permanent table.
+#[cfg(feature = "rx-pool-experiment")]
+unsafe impl vibeos_eqos_net::rx_buffers::Access<COUNT, RX_COUNT> for RxAccess {
+    fn with<T>(&mut self, f: impl FnOnce(&mut vibeos_eqos_net::rx_buffers::Buffers<COUNT, RX_COUNT>) -> T)
+        -> Result<T, vibeos_eqos_net::rx_buffers::Error>
+    {
+        let mut metadata = RX_META.lock();
+        if self.view.is_none() { self.view = metadata.view; }
+        metadata.buffers.as_mut().map(f).ok_or(vibeos_eqos_net::rx_buffers::Error::Geometry)
+    }
+}
+#[cfg(feature = "rx-pool-experiment")]
 unsafe fn poll_rx_ticket() -> Result<Option<vibeos_hal::network_rx::Ticket>, Error> {
     // Only the driver touches descriptor ownership. Empty polling needs no
     // allocator metadata and must not delay stack-side acquire/release.
     // Fault/invalid-ring states return true and take the normal error path.
     if !engine().receive_pending() { return Ok(None); }
-    let mut metadata = RX_META.lock(); let metadata = &mut *metadata;
-    // Before the first resolved PHY link there is no initialized RX ring.
-    let Some(buffers) = metadata.buffers.as_mut() else { return Ok(None); };
-    let frame = match engine().receive_detached(buffers) {
+    let mut access = RxAccess { view: None };
+    let frame = match engine().receive_detached(&mut access) {
         Ok(Some(frame)) => frame, Ok(None) => return Ok(None),
-        Err(EngineError::Ring(ring::Error::Full)) => { metadata.counts[3] += 1; return Ok(None); }
+        Err(EngineError::Ring(ring::Error::Full)) => { RX_META.lock().counts[3] += 1; return Ok(None); }
         Err(e) => return Err(error(e)),
     };
-    let view = metadata.view.expect("admitted permanent RX view");
-    // The Ready ticket is private to this invocation until its return. The
-    // metadata guard excludes acquisition/reset throughout checksum admission.
+    let view = access.view.expect("admitted permanent RX view");
+    // The ticket remains private until return. HAL engine ownership excludes
+    // reset while validating, and no queue consumer can acquire this ticket yet.
     let accepted = view.read(frame.ticket.index(), frame.bytes,
         |bytes| engine().validate_rx_frame(bytes, frame.checksum)).expect("validated RX span");
-    if !accepted { metadata.counts[4] += 1; let _ = buffers.discard(frame.ticket); return Ok(None); }
-    metadata.counts[0] += 1;
-    metadata.lengths[frame.ticket.index()] = frame.bytes;
+    {
+        let mut metadata = RX_META.lock();
+        if !accepted {
+            metadata.counts[4] += 1;
+            let _ = metadata.buffers.as_mut().unwrap().discard(frame.ticket);
+            return Ok(None);
+        }
+        metadata.counts[0] += 1;
+        metadata.lengths[frame.ticket.index()] = frame.bytes;
+    }
     let engine = engine(); engine.rx_packets = engine.rx_packets.saturating_add(1);
     snapshot();
     Ok(Some(frame.ticket))
 }
+#[cfg(feature = "rx-batch-experiment")]
+unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> {
+    let mut output = [None; ring::RX_BATCH];
+    if !engine().receive_pending() { return Ok(output); }
+    let mut access = RxAccess { view: None };
+    let frames = match engine().receive_detached_batch(&mut access) {
+        Ok(frames) => frames,
+        Err(EngineError::Ring(ring::Error::Full)) => { RX_META.lock().counts[3] += 1; return Ok(output); }
+        Err(e) => return Err(error(e)),
+    };
+    if frames.iter().all(Option::is_none) { return Ok(output); }
+    let view = access.view.expect("admitted permanent RX view");
+    let mut accepted = [false; ring::RX_BATCH];
+    for (i, frame) in frames.iter().enumerate() {
+        if let Some(frame) = frame {
+            accepted[i] = view.read(frame.ticket.index(), frame.bytes,
+                |bytes| engine().validate_rx_frame(bytes, frame.checksum)).expect("validated RX span");
+        }
+    }
+    let mut count = 0;
+    {
+        let mut metadata = RX_META.lock();
+        for (i, frame) in frames.into_iter().enumerate() {
+            if let Some(frame) = frame {
+                if accepted[i] {
+                    metadata.counts[0] += 1;
+                    metadata.lengths[frame.ticket.index()] = frame.bytes;
+                    output[count] = Some(frame.ticket);
+                    count += 1;
+                } else {
+                    metadata.counts[4] += 1;
+                    let _ = metadata.buffers.as_mut().unwrap().discard(frame.ticket);
+                }
+            }
+        }
+    }
+    let engine = engine(); engine.rx_packets = engine.rx_packets.saturating_add(count as u64);
+    snapshot();
+    Ok(output)
+}
+
 #[cfg(feature = "rx-pool-experiment")]
 unsafe fn release_rx_borrow(borrow: vibeos_hal::network_rx::Borrow) {
     let mut metadata = RX_META.lock();

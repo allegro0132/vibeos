@@ -13,6 +13,8 @@ pub mod bench;
 pub mod cap;
 pub mod chan;
 pub mod exec;
+#[cfg(feature = "idle-profile")]
+mod idle_profile;
 pub mod heap;
 pub mod instance;
 pub mod interrupt;

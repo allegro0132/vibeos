@@ -76,6 +76,10 @@ pub struct Stats {
     pub received: u64, pub acquired: u64, pub released: u64, pub full: u64, pub dropped: u64,
     pub free: usize, pub ready: usize, pub borrowed: usize,
 }
+/// Bounded, allocation-free FIFO result. None entries contain no ticket.
+pub const BATCH_SIZE: usize = 8;
+pub type TicketBatch = [Option<Ticket>; BATCH_SIZE];
+
 /// # Safety
 /// Static operations validate every ticket against permanent ownership state.
 /// poll requires exclusive engine invocation; acquire/discard/recover serialize
@@ -88,6 +92,11 @@ pub struct Stats {
 pub struct Operations {
     pub stats: fn() -> Stats,
     pub poll: unsafe fn() -> Result<Option<Ticket>, super::network::Error>,
+    /// Optional batch poll under the same exclusive engine invocation as poll.
+    /// Some entries are in wire order and all are private until return. Runtime
+    /// stamps the complete result under one session-publication barrier. Err
+    /// exposes no tickets; partial ownership must remain quarantined until reset.
+    pub poll_batch: Option<unsafe fn() -> Result<TicketBatch, super::network::Error>>,
     pub acquire: unsafe fn(Ticket, Owner) -> Result<Loan, super::network::Error>,
     pub discard: unsafe fn(Ticket) -> bool,
     pub recover: unsafe fn(Owner) -> usize,

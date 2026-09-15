@@ -44,6 +44,17 @@ impl Engine {
         unsafe { (operations.poll)() }
     }
     #[cfg(feature = "pooled-rx")]
+    pub fn receive_batch(&mut self) -> Result<vibeos_hal::network_rx::TicketBatch, Error> {
+        let operations = device().receive_buffers.as_ref().ok_or(Error::InvalidDescription)?;
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Rx);
+        if let Some(poll) = operations.poll_batch { unsafe { poll() } }
+        else {
+            let mut batch = [None; vibeos_hal::network_rx::BATCH_SIZE];
+            batch[0] = unsafe { (operations.poll)()? };
+            Ok(batch)
+        }
+    }
+    #[cfg(feature = "pooled-rx")]
     pub fn discard_ticket(&mut self, ticket: vibeos_hal::network_rx::Ticket) {
         if let Some(operations) = &device().receive_buffers { unsafe { (operations.discard)(ticket); } }
     }

@@ -15,6 +15,7 @@ unsafe fn release(b: Borrow) {
     assert_eq!(record.state, State::Borrowed(b.owner())); record.state = State::Released;
 }
 static OPS: Operations = Operations {
+        poll_batch: None,
         stats: Default::default,
     poll: || Ok(None),
     acquire: |ticket, owner| {
@@ -95,4 +96,34 @@ fn queue_retirement_preserves_loans_and_fault_cleanup_matches_incarnation() {
     std::mem::forget(loan);
     assert_eq!(unsafe { q.recover(domain(4)) }, 1);
     assert_eq!(unsafe { q.recover(domain(4)) }, 0);
+}
+
+#[test]
+fn pending_batch_keeps_original_generation_through_queue_pressure_and_rebinding() {
+    let q = unsafe { ReceiveEndpoint::new("batch-rx", 1, &OPS).unwrap() };
+    let old = stamp();
+    let new = old.next_stack_generation().unwrap();
+    let frames = [frame(old), frame(old), frame(old)];
+    let mut tickets = [None; vibeos_hal::network_rx::BATCH_SIZE];
+    tickets[0] = Some(frames[0].ticket());
+    tickets[2] = Some(frames[1].ticket());
+    tickets[7] = Some(frames[2].ticket());
+    let mut batch = StampedBatch::new(tickets, old);
+    q.try_send(batch.pop().unwrap()).unwrap();
+    let blocked = q.try_send(batch.pop().unwrap()).unwrap_err();
+    let loan = q.try_receive(old, domain(12)).unwrap().unwrap();
+    // Rebinding cannot relabel either the blocked head or the unqueued tail.
+    assert_eq!(blocked.stamp(), old);
+    q.try_send(blocked).unwrap();
+    assert!(matches!(q.try_receive(new, domain(13)), Err(Error::Session(_))));
+    let tail = batch.pop().unwrap();
+    assert_eq!(tail, frames[2]);
+    q.try_send(tail).unwrap();
+    assert!(matches!(q.try_receive(new, domain(13)), Err(Error::Session(_))));
+    assert!(batch.pop().is_none());
+    assert_eq!(loan.as_bytes(), &[0x39; 64]);
+    drop(loan);
+    for frame in frames {
+        assert_eq!(records().lock().unwrap()[&frame.ticket().pool()].state, State::Released);
+    }
 }

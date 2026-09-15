@@ -529,8 +529,12 @@ pub async fn driver_task(
     }
     let mut pending_tx = None;
     let mut pending_rx = None;
+    #[cfg(feature = "pooled-rx")]
+    let mut pending_rx_batch = vibeos_core::net_receive::StampedBatch::empty();
     let mut tx_deadline = 0;
     let mut link_poll = None;
+    #[cfg(feature = "driver-stage-profile")]
+    let mut stage_turn = 0u64;
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(crate::exec::timebase_hz() / 1000, 64);
     loop {
         #[cfg(feature = "rx-interrupt-poll")]
@@ -541,15 +545,21 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
+        #[cfg(feature = "driver-stage-profile")]
+        let sample_stage = { stage_turn = stage_turn.wrapping_add(1); stage_turn & 63 == 0 };
         let turn = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
                 session.engine_mut(),
+                #[cfg(feature = "driver-stage-profile")]
+                sample_stage,
                 &outbound,
                 &inbound,
                 &mut pending_tx,
                 #[cfg(feature = "network-tso-coalesce")]
                 &mut tx_batch,
                 &mut pending_rx,
+                #[cfg(feature = "pooled-rx")]
+                &mut pending_rx_batch,
                 &mut tx_deadline,
                 &mut link_poll,
             )
@@ -708,21 +718,30 @@ fn with_device_authority<R>(
 
 fn driver_turn(
     engine: &mut Engine,
+    #[cfg(feature = "driver-stage-profile")] sample_stage: bool,
     outbound: &Revocable<OutboundResource>,
     inbound: &Revocable<InboundResource>,
     pending_tx: &mut Option<PendingTx>,
     #[cfg(feature = "network-tso-coalesce")]
     tx_batch: &mut vibeos_core::net_tx_coalesce::TxCoalescer,
     pending_rx: &mut Option<PendingRx>,
+    #[cfg(feature = "pooled-rx")] pending_rx_batch: &mut vibeos_core::net_receive::StampedBatch,
     tx_deadline: &mut u64,
     link_poll: &mut Option<u64>,
 ) -> Result<bool, NetError> {
+    #[cfg(feature = "tx-wait-profile")]
+    let turn_started = crate::sbi::time();
     // Observe cable/negotiation changes even when a queued DHCP packet is
     // waiting for the first link, or sustained traffic keeps the turn busy.
     if crate::network_poll::due(link_poll, crate::sbi::time(), crate::exec::timebase_hz()) {
         engine.poll_link();
     }
+    #[cfg(feature = "driver-stage-profile")]
+    let stage_started = if sample_stage { crate::sbi::time() } else { 0 };
+    #[cfg(feature = "driver-stage-profile")]
+    let mut stage = [0u64; 8];
     let mut immediate_work = false;
+    let tx_dma_pending;
     // Once a packet leaves the bounded endpoint, this task owns it until a TX
     // descriptor accepts it. Ring pressure is ordinary backpressure until the
     // bounded hardware deadline; retain the one packet that did not fit.
@@ -869,7 +888,7 @@ fn driver_turn(
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
         #[cfg(feature = "network-tso-coalesce")]
         { state.tx_inflight |= tx_batch.frames() != 0; }
-        immediate_work |= descriptor_busy;
+        tx_dma_pending = descriptor_busy;
         if state.tx_inflight && *tx_deadline == 0 {
             *tx_deadline = now.saturating_add(tx_timeout_ticks());
         } else if !state.tx_inflight {
@@ -878,20 +897,42 @@ fn driver_turn(
 
     }
 
+    #[cfg(feature = "driver-stage-profile")]
+    let rx_started = if sample_stage {
+        let now = crate::sbi::time();
+        stage[0] = 1;
+        stage[1] = now.wrapping_sub(stage_started);
+        now
+    } else { 0 };
+
     #[cfg(feature = "pooled-rx")]
     for _ in 0..DRIVER_BATCH_PACKETS {
         let state = CONTROL.lock();
-        let frame = if let Some(frame) = pending_rx.take() {
+        let frame = if let Some(frame) = pending_rx.take().or_else(|| pending_rx_batch.pop()) {
             frame
         } else {
-            let Some(ticket) = engine.receive_ticket().map_err(|_| NetError::DriverFault)? else { break; };
+            #[cfg(feature = "driver-stage-profile")]
+            let hw_started = if sample_stage { crate::sbi::time() } else { 0 };
+            let tickets = engine.receive_batch().map_err(|_| NetError::DriverFault)?;
+            let count = tickets.iter().flatten().count();
+            #[cfg(feature = "driver-stage-profile")]
+            if sample_stage {
+                stage[3] += crate::sbi::time().wrapping_sub(hw_started);
+                stage[4] += count as u64;
+                if count == 0 { stage[7] += 1; }
+            }
+            if count == 0 { break; }
             immediate_work = true;
             let Some(stamp) = state.sessions.active_stamp() else {
-                engine.discard_ticket(ticket);
-                STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                for ticket in tickets.into_iter().flatten() { engine.discard_ticket(ticket); }
+                STALE_INGRESS_DROPS.fetch_add(count as u64, Ordering::Relaxed);
                 continue;
             };
-            PendingRx::new(ticket, stamp)
+            // Entire returned batch is stamped before CONTROL is released.
+            // Queue pressure retains this stamp; no firmware-prefetched ticket
+            // can later acquire a new device/stack generation.
+            *pending_rx_batch = vibeos_core::net_receive::StampedBatch::new(tickets, stamp);
+            pending_rx_batch.pop().expect("nonempty admitted RX batch")
         };
         if state.sessions.active_stamp() != Some(frame.stamp()) {
             engine.discard_ticket(frame.ticket());
@@ -899,8 +940,16 @@ fn driver_turn(
             continue;
         }
         match inbound.try_with(|q| q.try_send(frame)) {
-            Ok(Ok(())) => immediate_work = true,
-            Ok(Err(frame)) => { *pending_rx = Some(frame); immediate_work = true; break; }
+            Ok(Ok(())) => {
+                immediate_work = true;
+                #[cfg(feature = "driver-stage-profile")]
+                if sample_stage { stage[5] += 1; }
+            },
+            Ok(Err(frame)) => {
+                #[cfg(feature = "driver-stage-profile")]
+                if sample_stage { stage[6] += 1; }
+                *pending_rx = Some(frame); immediate_work = true; break;
+            }
             Err(_) => { engine.discard_ticket(frame.ticket()); return Err(NetError::AuthorityRevoked); }
         }
     }
@@ -935,7 +984,43 @@ fn driver_turn(
             IngressDelivery::Delivered | IngressDelivery::Empty => {}
         }
     }
-    Ok(immediate_work)
+    #[cfg(feature = "driver-stage-profile")]
+    if sample_stage {
+        stage[2] = crate::sbi::time().wrapping_sub(rx_started);
+        for (counter, value) in DRIVER_STAGES.iter().zip(stage) {
+            counter.fetch_add(value, Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "tx-wait-profile")]
+    {
+        // Do not call the first bucket productive: queue backpressure also
+        // requests another turn. TX-only means no other runnable flag was set.
+        let bucket = if immediate_work { 0 } else if tx_dma_pending { 1 } else { 2 };
+        let elapsed = crate::sbi::time().wrapping_sub(turn_started);
+        TX_WAIT_TURNS[bucket * 2].fetch_add(1, Ordering::Relaxed);
+        TX_WAIT_TURNS[bucket * 2 + 1].fetch_add(elapsed, Ordering::Relaxed);
+    }
+    Ok(immediate_work || tx_dma_pending)
+}
+
+// Opt-in turn attribution, separate from low-overhead WFI residency counters.
+// Buckets are [other runnable work, TX ownership only, idle], each count/ticks.
+// Elapsed scopes include lock wait, preemption, link checks and reclamation;
+// they are not CPU cycles or a measure of hardware DMA latency.
+#[cfg(feature = "tx-wait-profile")]
+static TX_WAIT_TURNS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+#[cfg(feature = "tx-wait-profile")]
+pub fn tx_wait_stats() -> [u64; 6] {
+    TX_WAIT_TURNS.each_ref().map(|v| v.load(Ordering::Relaxed))
+}
+
+// Systematic 1/64 turn sampling limits hot-path perturbation. Do not scale
+// these scopes into CPU usage: workload periodicity may bias the sample.
+#[cfg(feature = "driver-stage-profile")]
+static DRIVER_STAGES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[cfg(feature = "driver-stage-profile")]
+pub fn driver_stage_stats() -> [u64; 8] {
+    DRIVER_STAGES.each_ref().map(|v| v.load(Ordering::Relaxed))
 }
 
 fn tx_timeout_ticks() -> u64 {

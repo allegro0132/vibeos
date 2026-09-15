@@ -149,6 +149,10 @@ struct Inner {
 /// The resource contains only bounded byte queues and lifecycle metadata. The
 /// corresponding smoltcp socket remains private to the netstack task.
 pub struct TcpListener {
+    #[cfg(feature = "activity-events")]
+    on_application: Arc<vibeos_core::exec::WaitQueue>,
+    #[cfg(feature = "activity-events")]
+    on_network: Arc<vibeos_core::exec::WaitQueue>,
     name: String,
     id: TcpListenerId,
     port: u16,
@@ -159,6 +163,33 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
+    /// Prepare a listener before polling network/frontend work. Notification
+    /// never grants read/write authority and may outlive a revoked capability.
+    #[cfg(feature = "activity-events")]
+    pub fn application_event(&self) -> vibeos_core::chan::MessageEvent {
+        vibeos_core::chan::MessageEvent::from_queue(self.on_application.clone())
+    }
+    #[inline]
+    fn notify_application_progress(&self) {
+        #[cfg(feature = "activity-events")]
+        self.on_application.wake_all();
+    }
+
+    /// Network-to-application readiness hint. Capture before checking I/O;
+    /// the caller must still check capability authority and connection generation.
+    #[cfg(feature = "activity-events")]
+    pub fn network_event(&self) -> vibeos_core::chan::MessageEvent {
+        vibeos_core::chan::MessageEvent::from_queue(self.on_network.clone())
+    }
+
+    #[inline]
+    fn notify_network_progress(&self, changed: bool) {
+        #[cfg(feature = "activity-events")]
+        if changed { self.on_network.wake_all(); }
+        #[cfg(not(feature = "activity-events"))]
+        let _ = changed;
+    }
+
     pub fn new(
         name: &str,
         id: TcpListenerId,
@@ -208,6 +239,10 @@ impl TcpListener {
 
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let listener = Arc::new(Self {
+            #[cfg(feature = "activity-events")]
+            on_application: Arc::new(vibeos_core::exec::WaitQueue::new()),
+            #[cfg(feature = "activity-events")]
+            on_network: Arc::new(vibeos_core::exec::WaitQueue::new()),
             name: name.to_string(),
             id,
             port,
@@ -266,10 +301,10 @@ impl TcpListener {
             return None;
         }
         inner.accepted = true;
-        Some(TcpConnectionToken {
-            listener: self.id,
-            generation: inner.generation,
-        })
+        let token = TcpConnectionToken { listener: self.id, generation: inner.generation };
+        drop(inner);
+        self.notify_application_progress();
+        Some(token)
     }
 
     /// Application side: receive one bounded fragment for an accepted peer.
@@ -295,6 +330,8 @@ impl TcpListener {
             let second_length = length - first_length;
             output[first_length..length].copy_from_slice(&second[..second_length]);
             inner.receive.drain(..length);
+            drop(inner);
+            self.notify_application_progress();
             return Ok(TcpIoResult::Progress(length));
         }
         if matches!(
@@ -338,6 +375,8 @@ impl TcpListener {
         // Passing the slice iterator directly selects VecDeque's specialized
         // wrapped bulk-copy implementation for Copy elements.
         inner.transmit.extend(&input[..length]);
+        drop(inner);
+        self.notify_application_progress();
         Ok(TcpIoResult::Progress(length))
     }
 
@@ -357,12 +396,15 @@ impl TcpListener {
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         inner.close_request = Some(request);
+        drop(inner);
+        self.notify_application_progress();
         Ok(())
     }
 
     /// Netstack side: publish the current transport state.
     pub fn network_update_state(&self, state: TcpStreamState) -> Result<(), TcpFrontendError> {
         let mut inner = self.inner.lock();
+        let changed = inner.state != state;
         let was_active = is_connection_state(inner.state);
         let becomes_active = is_connection_state(state);
         if !was_active && becomes_active {
@@ -384,6 +426,8 @@ impl TcpListener {
             }
         }
         inner.state = state;
+        drop(inner);
+        self.notify_network_progress(changed);
         Ok(())
     }
 
@@ -400,7 +444,10 @@ impl TcpListener {
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
             .min(self.receive_capacity.saturating_sub(inner.receive.len()));
+        let became_readable = length != 0 && inner.receive.is_empty();
         inner.receive.extend(&input[..length]);
+        drop(inner);
+        self.notify_network_progress(became_readable);
         length
     }
 
@@ -428,7 +475,10 @@ impl TcpListener {
     pub fn network_consume_transmit(&self, length: usize) {
         let mut inner = self.inner.lock();
         let length = length.min(inner.transmit.len());
+        let became_writable = length != 0 && inner.transmit.len() == self.transmit_capacity;
         inner.transmit.drain(..length);
+        drop(inner);
+        self.notify_network_progress(became_writable);
     }
 
     /// Convenience operation for tests or transports which accept the entire

@@ -92,6 +92,12 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        #[cfg(feature = "driver-stage-profile")]
+        "ndrvstage" => println!("DRIVER_STAGE hz={} sample_every=64 fields=[turns,tx_ticks,rx_ticks,rx_hw_ticks,rx_acquired,rx_published,rx_full,rx_empty] values={:?}",
+            crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),
+        #[cfg(feature = "tx-wait-profile")]
+        "ntxwait" => println!("TX_WAIT hz={} fields=[other_turns,other_ticks,tx_only_turns,tx_only_ticks,idle_turns,idle_ticks] values={:?}",
+            crate::exec::timebase_hz(), crate::dwmac_net::tx_wait_stats()),
         #[cfg(feature = "pooled-rx")]
         "nrpool" => if let Some(ops) = &vibeos_hal::network::device().receive_buffers {
             println!("RX_POOL {:?}", (ops.stats)());
@@ -157,6 +163,18 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         "ngro" => {
             println!("NGRO fields=[rx_frames,merged_segments,aggregates] values={:?} approximate=true",
                 vibeos_netstack::gro_stats());
+        }
+        #[cfg(feature = "idle-profile")]
+        "nidle" => {
+            println!("NIDLE hz={} harts={} units=timer_ticks source=wfi_interval", exec::timebase_hz(), exec::MAX_HARTS);
+            for (hart, sample) in exec::idle_profile().iter().enumerate() {
+                match sample {
+                    Some(s) => println!("NIDLE_HART h={} active={} since={} now={} idle={} sleeps={}",
+                        hart, s.active, s.since, s.now, s.idle, s.sleeps),
+                    None => println!("NIDLE_UNAVAILABLE h={}", hart),
+                }
+            }
+            println!("NIDLE_END");
         }
         #[cfg(feature = "network-profile")]
         "nprof" => {

@@ -271,6 +271,8 @@ pub struct PacketDevice {
     rx_packet: Option<Packet>,
     #[cfg(feature = "pooled-rx")]
     rx_loan: Option<vibeos_core::net_receive::Loan>,
+    #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+    pending_rx_loan: Option<vibeos_core::net_receive::Loan>,
     outbound: PacketTransmit,
     pending_egress: Option<StampedPacket>,
     #[cfg(feature = "native-tcp-segmentation")]
@@ -301,6 +303,8 @@ impl PacketDevice {
             rx_packet: None,
             #[cfg(feature = "pooled-rx")]
             rx_loan: None,
+            #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+            pending_rx_loan: None,
             outbound: outbound.into(),
             pending_egress: None,
             #[cfg(feature = "native-tcp-segmentation")]
@@ -439,6 +443,8 @@ impl PacketDevice {
         if self.pending_segments.is_some() || self.pending_pooled.is_some() { return Ok(true); }
         #[cfg(feature = "bounded-gro")]
         if self.pending_ingress.is_some() { return Ok(true); }
+        #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+        if self.pending_rx_loan.is_some() { return Ok(true); }
         match self.inbound.has_message() {
             Ok(has_ingress) => Ok(has_ingress),
             Err(_) => {
@@ -470,6 +476,35 @@ impl PacketDevice {
                 None
             }
             Err(_) => { self.authority_revoked = true; None }
+        }
+    }
+
+    #[cfg(feature = "pooled-rx")]
+    fn receive_pooled(&mut self) -> Option<vibeos_core::net_receive::Loan> {
+        #[cfg(feature = "bounded-gro")]
+        if self.ingress_remaining == 0 { return None; }
+        let result = self.inbound.receive_loan(self.stamp)?;
+        if !matches!(&result, Ok(Ok(None)) | Err(_)) {
+            #[cfg(feature = "bounded-gro")]
+            { self.ingress_remaining -= 1; }
+        }
+        match result {
+            Ok(Ok(loan)) => {
+                if loan.is_some() { self.stats.rx_frames = self.stats.rx_frames.saturating_add(1); }
+                loan
+            }
+            Err(_) => { self.authority_revoked = true; None }
+            Ok(Err(error)) => {
+                self.stats.rejected_ingress_frames = self.stats.rejected_ingress_frames.saturating_add(1);
+                if let vibeos_core::net_receive::Error::Session(mismatch) = error {
+                    if mismatch.device_epoch_changed() {
+                        self.stats.rejected_device_epoch_frames = self.stats.rejected_device_epoch_frames.saturating_add(1);
+                    } else {
+                        self.stats.rejected_stack_generation_frames = self.stats.rejected_stack_generation_frames.saturating_add(1);
+                    }
+                }
+                None
+            }
         }
     }
 
@@ -554,10 +589,12 @@ impl phy::RxToken for PacketRxToken<'_> {
     }
 }
 
-/// A transmit token borrowing only the adapter's one-packet pending slot.
+/// A transmit token borrowing the adapter's authority and pending slots.
+/// The device borrow already bounds its lifetime; cloning authority per token
+/// would add reference-count traffic without extending useful ownership.
 pub struct PacketTxToken<'a> {
     stamp: PacketStamp,
-    outbound: PacketTransmit,
+    outbound: &'a PacketTransmit,
     pending_egress: &'a mut Option<StampedPacket>,
     #[cfg(feature = "native-tcp-segmentation")]
     pending_segments: &'a mut Option<vibeos_core::net_segmentation::SoftwareTransmit>,
@@ -674,38 +711,53 @@ impl phy::Device for PacketDevice {
         #[cfg(feature = "pooled-rx")]
         { self.rx_loan = None; }
         #[cfg(feature = "bounded-gro")]
-        if self.revalidate_authority().is_err() { return None; }
+        if self.revalidate_authority().is_err() {
+            #[cfg(feature = "pooled-rx")]
+            { self.pending_rx_loan = None; }
+            return None;
+        }
         if self.flush_egress() != Ok(true) {
             return None;
         }
         #[cfg(feature = "native-tcp-segmentation")]
         let reservation = self.reserve_transmit()?;
         #[cfg(feature = "pooled-rx")]
-        if let Some(result) = self.inbound.receive_loan(self.stamp) {
-            self.rx_loan = match result {
-                Ok(Ok(loan)) => loan,
-                Err(_) => { self.authority_revoked = true; return None; }
-                Ok(Err(error)) => {
-                    self.stats.rejected_ingress_frames = self.stats.rejected_ingress_frames.saturating_add(1);
-                    if let vibeos_core::net_receive::Error::Session(mismatch) = error {
-                        if mismatch.device_epoch_changed() {
-                            self.stats.rejected_device_epoch_frames = self.stats.rejected_device_epoch_frames.saturating_add(1);
-                        } else {
-                            self.stats.rejected_stack_generation_frames = self.stats.rejected_stack_generation_frames.saturating_add(1);
-                        }
+        if matches!(&self.inbound, PacketReceive::Pooled { .. }) {
+            #[cfg(feature = "bounded-gro")]
+            let loan = self.pending_rx_loan.take().or_else(|| self.receive_pooled())?;
+            #[cfg(not(feature = "bounded-gro"))]
+            let loan = self.receive_pooled()?;
+            #[cfg(feature = "bounded-gro")]
+            if self.gro.begin(loan.as_bytes(), self.rx_checksum_offload) {
+                for _ in 1..gro::MAX_SEGMENTS {
+                    if self.gro.finished() { break; }
+                    let Some(next) = self.receive_pooled() else { break; };
+                    if !self.gro.append(loan.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
+                        self.pending_rx_loan = Some(next);
+                        break;
                     }
-                    return None;
+                    // Merged bytes now belong to the bounded aggregation buffer.
+                    // Dropping this loan returns its DMA slot immediately.
                 }
-            };
+            }
+            #[cfg(feature = "bounded-gro")]
+            if self.authority_revoked || self.revalidate_authority().is_err() {
+                self.pending_rx_loan = None;
+                return None;
+            }
+            self.rx_loan = Some(loan);
+            #[cfg(feature = "bounded-gro")]
+            let bytes = if self.gro.has_aggregate() {
+                self.gro.finish(self.rx_checksum_offload);
+                self.gro.bytes()
+            } else { self.rx_loan.as_ref()?.as_bytes() };
+            #[cfg(not(feature = "bounded-gro"))]
             let bytes = self.rx_loan.as_ref()?.as_bytes();
-            self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
-            // Pooled frames bypass contiguous-copy GRO for now. Enabling GRO
-            // still coalesces legacy frames, never silently copies a DMA loan.
             return Some((
                 PacketRxToken(bytes),
                 PacketTxToken {
                     stamp: self.stamp,
-                    outbound: self.outbound.clone(),
+                    outbound: &self.outbound,
                     pending_egress: &mut self.pending_egress,
                     #[cfg(feature = "native-tcp-segmentation")]
                     pending_segments: &mut self.pending_segments,
@@ -749,7 +801,7 @@ impl phy::Device for PacketDevice {
             PacketRxToken(bytes),
             PacketTxToken {
                 stamp: self.stamp,
-                outbound: self.outbound.clone(),
+                outbound: &self.outbound,
                 pending_egress: &mut self.pending_egress,
                 #[cfg(feature = "native-tcp-segmentation")]
                 pending_segments: &mut self.pending_segments,
@@ -773,7 +825,7 @@ impl phy::Device for PacketDevice {
         let reservation = self.reserve_transmit()?;
         Some(PacketTxToken {
             stamp: self.stamp,
-            outbound: self.outbound.clone(),
+            outbound: &self.outbound,
             pending_egress: &mut self.pending_egress,
             #[cfg(feature = "native-tcp-segmentation")]
             pending_segments: &mut self.pending_segments,

@@ -65,6 +65,24 @@ pub struct Buffers<const D: usize, const N: usize> {
     free: [usize; N],
     available: usize,
 }
+/// Short, serialized access to RX ownership metadata. Hardware work runs
+/// outside these closures so borrowers can return unrelated slots concurrently.
+///
+/// # Safety
+/// Every call within a ring operation must access the same table. While it is
+/// active, others may borrow/discard tickets or return/recover unrelated loans, but must not
+/// reset, replace, attach or prepare its descriptor mappings. Engine ownership
+/// must serialize initialization/reset with the entire ring operation, not just
+/// individual metadata closures. A failed closure must not undo a DMA publish.
+pub unsafe trait Access<const D: usize, const N: usize> {
+    fn with<T>(&mut self, f: impl FnOnce(&mut Buffers<D, N>) -> T) -> Result<T, Error>;
+}
+
+// Exclusive Rust access supplies the same serialization as the former API.
+unsafe impl<const D: usize, const N: usize> Access<D, N> for Buffers<D, N> {
+    fn with<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> Result<T, Error> { Ok(f(self)) }
+}
+
 impl<const D: usize, const N: usize> Buffers<D, N> {
     pub fn new() -> Result<Self, Error> {
         if D < 2 || D > 1024 || N <= D || N > 4096 {

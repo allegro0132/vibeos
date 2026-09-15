@@ -296,6 +296,14 @@ impl TestClient {
         inbound: Revocable<Endpoint<StampedPacket>>,
         outbound: Revocable<Endpoint<StampedPacket>>,
     ) -> Self {
+        Self::with_transmit_capacity(inbound, outbound, 4096)
+    }
+
+    fn with_transmit_capacity(
+        inbound: Revocable<Endpoint<StampedPacket>>,
+        outbound: Revocable<Endpoint<StampedPacket>>,
+        transmit_capacity: usize,
+    ) -> Self {
         let mut device = PacketDevice::new(session_stamp(), inbound, outbound);
         device.revalidate_authority().unwrap();
 
@@ -312,7 +320,7 @@ impl TestClient {
         });
 
         let receive = tcp::SocketBuffer::new(vec![0; 4096]);
-        let transmit = tcp::SocketBuffer::new(vec![0; 4096]);
+        let transmit = tcp::SocketBuffer::new(vec![0; transmit_capacity]);
         let socket = tcp::Socket::new(receive, transmit);
         let mut sockets = SocketSet::new(Vec::new());
         let tcp_handle = sockets.add(socket);
@@ -693,6 +701,10 @@ fn shared_stack_enforces_listener_budget() {
 }
 
 fn raw_tcp_pair() -> (StaticIpv4TcpStack, TestClient) {
+    raw_tcp_pair_with_transmit_capacity(4096)
+}
+
+fn raw_tcp_pair_with_transmit_capacity(transmit_capacity: usize) -> (StaticIpv4TcpStack, TestClient) {
     let client_to_server = Endpoint::new("raw-client-to-server", 64);
     let server_to_client = Endpoint::new("raw-server-to-client", 64);
     let mut space = CSpace::new("raw-test-link");
@@ -704,7 +716,7 @@ fn raw_tcp_pair() -> (StaticIpv4TcpStack, TestClient) {
 
     (
         StaticIpv4TcpStack::new(server_config(), session_stamp(), server_in, server_out).unwrap(),
-        TestClient::new(client_in, client_out),
+        TestClient::with_transmit_capacity(client_in, client_out, transmit_capacity),
     )
 }
 
@@ -1339,7 +1351,9 @@ fn frontend_shutdown_behind_full_transport(reset: bool) {
     let mut connection = None;
     let mut now = 0;
     while connection.is_none() && now < 1000 {
-        client.poll(now); server.poll_network(now).unwrap();
+        // Queue more than one emission before polling the receiver. Without
+        // native segmentation, one client poll may expose only a single frame.
+        client.poll(now); client.poll(now); server.poll_network(now).unwrap();
         server.drive_tcp_frontend(socket, &frontend).unwrap();
         connection = frontend.try_accept(); now += 1;
     }
@@ -1501,7 +1515,9 @@ fn gro_keeps_wire_frame_budget_and_requests_another_poll() {
 #[cfg(feature = "bounded-gro")]
 #[test]
 fn gro_delivers_changing_tcp_payload_through_real_socket() {
-    let (mut server,mut client)=raw_tcp_pair();
+    // Keep a sustained sender backlog so ordinary MTU emission does not put
+    // PSH on every refill. GRO deliberately stops at each PSH boundary.
+    let (mut server,mut client)=raw_tcp_pair_with_transmit_capacity(65536);
     let mut now=connect_raw_pair(&mut server,&mut client);
     let expected: Vec<u8>=(0..96_731).map(|i| ((i*17+i/251)%253) as u8).collect();
     let mut sent=0; let mut received=Vec::new();
@@ -1787,6 +1803,7 @@ mod pooled_receive {
         record.borrower = None; record.released = true;
     }
     static OPS: Operations = Operations {
+        poll_batch: None,
         stats: Default::default,
         poll: || Ok(None),
         acquire: |ticket, owner| {
@@ -1849,11 +1866,12 @@ mod pooled_receive {
         let (_, client_rx) = authority(&mut cs, &to_client, Rights::RECV);
         let (_, client_tx) = authority(&mut cs, &to_server, Rights::SEND);
         let mut server = StaticIpv4TcpStack::new(server_config(), session_stamp(), rx, server_tx).unwrap();
-        let mut client = TestClient::new(client_rx, client_tx);
+        let mut client = TestClient::with_transmit_capacity(client_rx, client_tx, 65536);
         let payload: Vec<u8> = (0..65537).map(|i| (i % 251) as u8).collect();
         let mut sent = 0; let mut received = Vec::new(); let mut echoed = 0; let mut replies = Vec::new();
         let mut tickets = Vec::new();
         for now in 0..20000 {
+            client.poll(now);
             client.poll(now);
             while let Some(frame) = to_server.try_recv() {
                 let packet = frame.into_packet(session_stamp()).unwrap();
@@ -1876,8 +1894,107 @@ mod pooled_receive {
         }
         assert_eq!(received, payload); assert_eq!(replies, payload);
         assert!(tickets.len() > 40, "must cover ARP, TCP setup, ACKs and many payload frames");
+        #[cfg(feature = "bounded-gro")]
+        assert!(server.device_stats().gro_merged_segments > 0, "real TCP must use pooled GRO");
         drop(server); q.retire_queued();
         let records = records().lock().unwrap();
         for ticket in tickets { assert!(records[&ticket.pool()].released); }
     }
+    #[cfg(feature = "bounded-gro")]
+    #[test]
+    fn pooled_gro_keeps_order_releases_merged_loans_and_revokes_lookahead() {
+        let q = unsafe { ReceiveEndpoint::new("gro-loans", 16, &OPS).unwrap() };
+        let out = Endpoint::new("gro-loan-out", 16);
+        let mut cs = CSpace::new("gro-loan-test");
+        let (root, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let mut d = PacketDevice::new(session_stamp(), rx, tx);
+        d.set_rx_checksum_offload(true);
+        let tickets: Vec<_> = [0, 100, 500].map(|seq| inject(&q, &gro_test_data(seq))).into();
+        let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume(|bytes| {
+            assert_eq!(bytes.len(), 254);
+            assert_eq!(&bytes[54..154], &[0; 100]);
+            assert_eq!(&bytes[154..], &[100; 100]);
+        });
+        assert!(records().lock().unwrap()[&tickets[1].pool()].released);
+        assert!(!records().lock().unwrap()[&tickets[2].pool()].released);
+        assert!(d.has_immediate_work().unwrap());
+        let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume(|bytes| assert_eq!(bytes, gro_test_data(500)));
+        // An ineligible frame following an aggregate must never expose stale GRO bytes.
+        let raw = inject(&q, &[0x39; 64]);
+        let original = records().lock().unwrap()[&raw.pool()].bytes.as_ptr();
+        let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume(|bytes| { assert_eq!(bytes.as_ptr(), original); assert_eq!(bytes, &[0x39; 64]); });
+        let held = [700, 1000].map(|seq| inject(&q, &gro_test_data(seq)));
+        drop(d.receive(Instant::ZERO).unwrap());
+        cs.revoke(root).unwrap();
+        assert!(d.receive(Instant::ZERO).is_none());
+        for ticket in tickets.into_iter().chain([raw]).chain(held) {
+            assert!(records().lock().unwrap()[&ticket.pool()].released);
+        }
+    }
+
+    #[cfg(feature = "bounded-gro")]
+    #[test]
+    fn pooled_gro_counts_wire_frames_toward_poll_budget() {
+        let q = unsafe { ReceiveEndpoint::new("gro-budget-loans", 64, &OPS).unwrap() };
+        let out = Endpoint::new("gro-budget-out", 64);
+        let mut cs = CSpace::new("gro-budget");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let config = Ipv4StackConfig::from(server_config()).with_rx_checksum_offload(true);
+        let mut stack = SharedIpv4TcpStack::new(config, session_stamp(), rx, tx).unwrap();
+        let tickets: Vec<_> = (0..64).map(|i| inject(&q, &gro_test_data(i * 100))).collect();
+        stack.poll_network(0).unwrap();
+        assert_eq!(stack.device_stats().rx_frames, 32);
+        assert_eq!(stack.device_stats().gro_aggregates, 2);
+        assert!(q.has_message());
+        stack.poll_network(1).unwrap();
+        assert_eq!(stack.device_stats().rx_frames, 64);
+        assert!(!q.has_message());
+        drop(stack);
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
+    #[cfg(feature = "bounded-gro")]
+    #[test]
+    fn revocation_during_pooled_gro_collection_publishes_no_token() {
+        type Revoke = (u64, Arc<Mutex<CSpace>>, Cap);
+        static ACTION: OnceLock<Mutex<Option<Revoke>>> = OnceLock::new();
+        static REVOKING: Operations = Operations {
+        poll_batch: None,
+            stats: Default::default,
+            poll: || Ok(None),
+            acquire: |ticket, owner| {
+                // Forward the same endpoint-validated ticket and owner to the
+                // synthetic DMA backend; its storage remains alive for the loan.
+                let loan = unsafe { (OPS.acquire)(ticket, owner)? };
+                let action = {
+                    let mut action = ACTION.get_or_init(|| Mutex::new(None)).lock().unwrap();
+                    if action.as_ref().is_some_and(|(pool, _, _)| *pool == ticket.pool()) {
+                        action.take()
+                    } else { None }
+                };
+                if let Some((_, space, cap)) = action { space.lock().unwrap().revoke(cap).unwrap(); }
+                Ok(loan)
+            },
+            discard: OPS.discard,
+            recover: OPS.recover,
+        };
+        let q = unsafe { ReceiveEndpoint::new("gro-revoke-collect", 4, &REVOKING).unwrap() };
+        let out = Endpoint::new("gro-revoke-out", 4);
+        let cs = Arc::new(Mutex::new(CSpace::new("gro-revoke")));
+        let (root, rx) = receive(&mut cs.lock().unwrap(), q.clone());
+        let (_, tx) = authority(&mut cs.lock().unwrap(), &out, Rights::SEND);
+        let mut d = PacketDevice::new(session_stamp(), rx, tx);
+        d.set_rx_checksum_offload(true);
+        let tickets = [0, 100].map(|seq| inject(&q, &gro_test_data(seq)));
+        *ACTION.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some((tickets[1].pool(), cs, root));
+        assert!(d.receive(Instant::ZERO).is_none());
+        assert_eq!(d.revalidate_authority(), Err(StackError::AuthorityRevoked));
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
 }

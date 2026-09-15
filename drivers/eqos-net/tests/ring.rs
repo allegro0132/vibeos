@@ -767,3 +767,195 @@ fn pool_admission_and_identity_are_checked_before_dma_access() {
     assert_eq!(other.initialize_pooled(&mut buffers), Err(Error::Controller));
     assert!(state.borrow().events.is_empty());
 }
+
+struct ScopedBuffers {
+    buffers: vibeos_eqos_net::rx_buffers::Buffers<4, 6>,
+    model: Rc<RefCell<State>>,
+    calls: usize,
+    release: Option<vibeos_eqos_net::rx_buffers::Borrow>,
+    fail_publish: bool,
+}
+// The model retains one table; only an unrelated borrow is released between
+// closures. Descriptor mappings/reset remain exclusive to the ring operation.
+unsafe impl vibeos_eqos_net::rx_buffers::Access<4, 6> for ScopedBuffers {
+    fn with<T>(&mut self, f: impl FnOnce(&mut vibeos_eqos_net::rx_buffers::Buffers<4, 6>) -> T)
+        -> Result<T, vibeos_eqos_net::rx_buffers::Error>
+    {
+        self.calls += 1;
+        // A hardware operation during this closure would need borrow_mut and
+        // panic, modeling the ownership lock as unavailable to hardware work.
+        let state = self.model.borrow();
+        if self.calls == 3 {
+            assert!(matches!(state.events.last(), Some(Event::Tail(true, _))));
+            assert_eq!(self.buffers.stats().detached, 1);
+            if let Some(borrow) = self.release.take() { self.buffers.release(borrow).unwrap(); }
+            if self.fail_publish { return Err(vibeos_eqos_net::rx_buffers::Error::Pending); }
+        }
+        let result = f(&mut self.buffers);
+        drop(state);
+        Ok(result)
+    }
+}
+
+#[test]
+fn scoped_metadata_excludes_dma_work_and_allows_unrelated_loan_return() {
+    let (mut ring, state, mut buffers) = pooled::<6>();
+    let base = layout().rx_descriptors;
+    state.borrow_mut().words.insert((base, 3), 0x30000040);
+    let previous = ring.receive_detached(&mut buffers).unwrap().unwrap();
+    let loan = buffers.borrow(previous.ticket, 1).unwrap();
+    state.borrow_mut().events.clear();
+    state.borrow_mut().words.insert((base + 64, 3), 0x30000040);
+    let mut access = ScopedBuffers { buffers, model: state, calls: 0, release: Some(loan), fail_publish: false };
+    let next = ring.receive_detached_scoped(&mut access).unwrap().unwrap();
+    assert_eq!(access.calls, 3);
+    assert_eq!(access.buffers.stats().borrowed, 0);
+    assert_eq!(access.buffers.stats().ready, 1);
+    assert_eq!(access.buffers.stats().free, 1);
+    let loan = access.buffers.borrow(next.ticket, 2).unwrap();
+    access.buffers.release(loan).unwrap();
+}
+
+#[test]
+fn failed_metadata_publication_requires_reset_and_preserves_live_borrows() {
+    let (mut ring, state, mut buffers) = pooled::<6>();
+    let base = layout().rx_descriptors;
+    state.borrow_mut().words.insert((base, 3), 0x30000040);
+    let previous = ring.receive_detached(&mut buffers).unwrap().unwrap();
+    let loan = buffers.borrow(previous.ticket, 1).unwrap();
+    state.borrow_mut().events.clear();
+    state.borrow_mut().words.insert((base + 64, 3), 0x30000040);
+    let mut access = ScopedBuffers { buffers, model: state, calls: 0, release: None, fail_publish: true };
+    assert_eq!(ring.receive_detached_scoped(&mut access), Err(Error::Controller));
+    assert_eq!(access.buffers.stats().detached, 1);
+    assert_eq!(access.buffers.stats().borrowed, 1);
+    assert!(ring.shutdown());
+    ring.initialize_pooled(&mut access.buffers).unwrap();
+    assert_eq!(access.buffers.stats().detached, 0);
+    assert_eq!(access.buffers.stats().borrowed, 1);
+    for d in 0..4 { assert_ne!(access.buffers.descriptor_buffer(d), Some(loan.index())); }
+    access.buffers.release(loan).unwrap();
+}
+
+struct BatchAccess<const N: usize> {
+    buffers: vibeos_eqos_net::rx_buffers::Buffers<4, N>,
+    model: Rc<RefCell<State>>,
+    calls: usize,
+    fail_publish: Option<bool>, // false before closure, true after closure
+}
+unsafe impl<const N: usize> vibeos_eqos_net::rx_buffers::Access<4, N> for BatchAccess<N> {
+    fn with<T>(&mut self, f: impl FnOnce(&mut vibeos_eqos_net::rx_buffers::Buffers<4, N>) -> T)
+        -> Result<T, vibeos_eqos_net::rx_buffers::Error> {
+        self.calls += 1;
+        let state = self.model.borrow(); // Any hardware operation here panics.
+        if self.calls == 3 && self.fail_publish == Some(false) {
+            return Err(vibeos_eqos_net::rx_buffers::Error::Pending);
+        }
+        let value = f(&mut self.buffers);
+        drop(state);
+        if self.calls == 3 && self.fail_publish == Some(true) {
+            return Err(vibeos_eqos_net::rx_buffers::Error::Pending);
+        }
+        Ok(value)
+    }
+}
+#[test]
+fn batch_detaches_fifo_prefix_with_three_metadata_guards_and_no_payload_copy() {
+    let (mut ring, state, buffers) = pooled::<8>();
+    let old: Vec<_> = (0..4).map(|i| buffers.descriptor_buffer(i).unwrap()).collect();
+    let base = layout().rx_descriptors;
+    for i in 0..4 { state.borrow_mut().words.insert((base + i * 64, 3), 0x34000040); }
+    let mut access = BatchAccess { buffers, model: state.clone(), calls: 0, fail_publish: None };
+    let frames = ring.receive_detached_batch(&mut access).unwrap();
+    assert_eq!(access.calls, 3);
+    assert_eq!(frames.iter().flatten().count(), 4);
+    for (i, frame) in frames.iter().flatten().enumerate() {
+        assert_eq!(frame.ticket.index(), old[i]);
+        assert_eq!(frame.bytes, 60);
+        assert_ne!(access.buffers.descriptor_buffer(i), Some(old[i]));
+    }
+    let s = state.borrow();
+    for index in old {
+        assert!(s.events.contains(&Event::Cpu(layout().rx_buffers + (index * BUFFER) as u64, 64, Direction::FromDevice)));
+    }
+    assert!(!s.events.iter().any(|e| matches!(e, Event::Rx(..))));
+    drop(s);
+    assert_eq!(ring.receive_detached_batch(&mut access).unwrap(), [None; RX_BATCH]);
+    for frame in frames.into_iter().flatten() { access.buffers.discard(frame.ticket).unwrap(); }
+    // Wrapped descriptor zero must produce a new ticket, not replay the batch.
+    state.borrow_mut().words.insert((base, 3), 0x30000040);
+    let next = ring.receive_detached_batch(&mut access).unwrap();
+    assert_eq!(next.iter().flatten().count(), 1);
+    access.buffers.discard(next[0].unwrap().ticket).unwrap();
+    assert_eq!(access.buffers.stats().free, 4);
+}
+#[test]
+fn batch_pool_pressure_returns_prefix_then_retries_without_losing_completion() {
+    let (mut ring, state, mut buffers) = pooled::<5>();
+    let base = layout().rx_descriptors;
+    for i in 0..2 { state.borrow_mut().words.insert((base + i * 64, 3), 0x30000040); }
+    let first = ring.receive_detached_batch(&mut buffers).unwrap();
+    assert_eq!(first.iter().flatten().count(), 1);
+    let old = buffers.descriptor_buffer(1);
+    state.borrow_mut().events.clear();
+    assert_eq!(ring.receive_detached_batch(&mut buffers), Err(Error::Full));
+    assert_eq!(buffers.descriptor_buffer(1), old);
+    assert!(!state.borrow().events.iter().any(|e| matches!(e, Event::Word(..) | Event::Tail(..))));
+    buffers.discard(first[0].unwrap().ticket).unwrap();
+    let second = ring.receive_detached_batch(&mut buffers).unwrap();
+    assert_eq!(second.iter().flatten().count(), 1);
+    assert_eq!(Some(second[0].unwrap().ticket.index()), old);
+    buffers.discard(second[0].unwrap().ticket).unwrap();
+}
+#[test]
+fn batch_returns_valid_prefix_before_draining_a_malformed_descriptor() {
+    let (mut ring, state, mut buffers) = pooled::<8>();
+    let base = layout().rx_descriptors;
+    state.borrow_mut().words.insert((base, 3), 0x30000040);
+    state.borrow_mut().words.insert((base + 64, 3), 0);
+    let frames = ring.receive_detached_batch(&mut buffers).unwrap();
+    assert_eq!(frames.iter().flatten().count(), 1);
+    assert!(matches!(ring.receive_detached_batch(&mut buffers), Err(Error::Descriptor(_))));
+    assert_eq!(ring.receive_detached_batch(&mut buffers).unwrap(), [None; RX_BATCH]);
+    buffers.discard(frames[0].unwrap().ticket).unwrap();
+}
+#[test]
+fn batch_publication_failure_quarantines_and_reset_preserves_existing_borrow() {
+    for fail_after in [false, true] {
+        let (mut ring, state, mut buffers) = pooled::<8>();
+        let base = layout().rx_descriptors;
+        state.borrow_mut().words.insert((base, 3), 0x30000040);
+        let prior = ring.receive_detached(&mut buffers).unwrap().unwrap();
+        let borrow = buffers.borrow(prior.ticket, 7).unwrap();
+        for i in 1..3 { state.borrow_mut().words.insert((base + i * 64, 3), 0x30000040); }
+        let mut access = BatchAccess { buffers, model: state, calls: 0, fail_publish: Some(fail_after) };
+        assert_eq!(ring.receive_detached_batch(&mut access), Err(Error::Controller));
+        assert!(ring.quarantined());
+        assert_eq!(ring.receive_detached_batch(&mut access), Err(Error::Offline));
+        ring.initialize_pooled(&mut access.buffers).unwrap();
+        assert_eq!(access.buffers.stats().borrowed, 1);
+        assert_eq!(access.buffers.stats().detached, 0);
+        assert_eq!(access.buffers.stats().ready, 0);
+        access.buffers.release(borrow).unwrap();
+    }
+}
+
+#[test]
+fn batch_bound_is_eight_and_advances_a_larger_ring_without_skipping() {
+    let l = Layout { count: 16, rx_buffers: 0x42010000, ..layout() };
+    let (mut ring, state) = model_layout(l);
+    state.borrow_mut().rx_pool_slots = 32;
+    let mut buffers = vibeos_eqos_net::rx_buffers::Buffers::<16, 32>::new().unwrap();
+    ring.initialize_pooled(&mut buffers).unwrap();
+    let original: Vec<_> = (0..16).map(|i| buffers.descriptor_buffer(i).unwrap()).collect();
+    for i in 0..16 { state.borrow_mut().words.insert((l.rx_descriptors + i * 64, 3), 0x30000040); }
+    for offset in [0, 8] {
+        let frames = ring.receive_detached_batch(&mut buffers).unwrap();
+        assert_eq!(frames.iter().flatten().count(), 8);
+        for (i, frame) in frames.into_iter().flatten().enumerate() {
+            assert_eq!(frame.ticket.index(), original[offset + i]);
+            buffers.discard(frame.ticket).unwrap();
+        }
+    }
+    assert_eq!(ring.receive_detached_batch(&mut buffers).unwrap(), [None; RX_BATCH]);
+}

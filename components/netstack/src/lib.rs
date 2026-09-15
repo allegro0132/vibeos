@@ -246,7 +246,30 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
     if interfaces.is_empty() {
         return;
     }
+    #[cfg(not(feature = "event-driven"))]
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
+    #[cfg(feature = "event-driven")]
+    let notifications = {
+        let mut events = Vec::new();
+        if events.try_reserve_exact(interfaces.len() * (MAX_SERVICE_LISTENERS + 1)).is_err() { return; }
+        for interface in &interfaces {
+            let Ok(input) = interface.inbound.message_event() else { return; };
+            events.push(input);
+            for listener in &interface.listeners {
+                let Ok(event) = listener.try_with(TcpListener::application_event) else { return; };
+                events.push(event);
+            }
+        }
+        events
+    };
+    #[cfg(feature = "event-driven")]
+    let mut event_armed = false;
+    #[cfg(feature = "event-driven")]
+    let mut wake_futures = {
+        let mut waits = Vec::new();
+        if waits.try_reserve_exact(notifications.len()).is_err() { return; }
+        waits
+    };
 
     #[cfg(feature = "bounded-gro")]
     let mut gro_last_ms = 0;
@@ -256,6 +279,13 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
             panic!("injected TCP stack fault");
         }
 
+        // Only an idle candidate pays for listener preparation. After arming,
+        // repeat the full work check before parking to close the wakeup race.
+        #[cfg(feature = "event-driven")]
+        if event_armed {
+            debug_assert!(wake_futures.is_empty());
+            for notification in &notifications { wake_futures.push(notification.wait()); }
+        }
         let now_ms = monotonic_ms();
         let mut live_interfaces = 0usize;
         let mut more_work = false;
@@ -319,6 +349,34 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
         if live_interfaces == 0 {
             return;
         }
+        #[cfg(feature = "event-driven")]
+        {
+            if more_work {
+                wake_futures.clear();
+                event_armed = false;
+                vibeos_core::exec::yield_now().await;
+            } else {
+                if !event_armed {
+                    event_armed = true;
+                    continue;
+                }
+                use core::{future::{poll_fn, Future}, pin::{pin, Pin}, task::Poll};
+                // Timer retains bounded observation of carrier/config changes
+                // and capability revocation, which are not packet notifications.
+                let mut timer = pin!(vibeos_core::exec::sleep_ms(
+                    next_poll_delay_ms.clamp(1, IDLE_POLL_CEILING_MS)));
+                poll_fn(|cx| {
+                    if timer.as_mut().poll(cx).is_ready() { return Poll::Ready(()); }
+                    for waiter in &mut wake_futures {
+                        if Pin::new(waiter).poll(cx).is_ready() { return Poll::Ready(()); }
+                    }
+                    Poll::Pending
+                }).await;
+                wake_futures.clear();
+                event_armed = false;
+            }
+        }
+        #[cfg(not(feature = "event-driven"))]
         if poll_budget.runnable(now_ms, more_work) {
             vibeos_core::exec::yield_now().await;
         } else {

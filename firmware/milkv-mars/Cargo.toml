@@ -5,6 +5,14 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+rx-batch-experiment = ["rx-pool-experiment"]
+# Explicit controller timing and periodic register/checksum reports.
+controller-profile = ["ethernet-device"]
+driver-stage-profile = ["dep:vibeos-kernel", "vibeos-kernel/driver-stage-profile", "rx-pool-experiment"]
+tx-wait-profile = ["dep:vibeos-kernel", "vibeos-kernel/tx-wait-profile"]
+idle-profile = ["dep:vibeos-kernel", "vibeos-kernel/idle-profile"]
+application-event-experiment = ["vibeos-kernel?/application-event-poll"]
+network-event-experiment = ["vibeos-kernel?/network-event-poll"]
 rx-pool-experiment = ["ethernet-device", "dep:vibeos-core", "vibeos-kernel?/pooled-rx"]
 rx-interrupt-experiment = ["vibeos-kernel?/rx-interrupt-poll"]
 direct-tcp-segmentation = ["tso-experiment", "vibeos-kernel?/direct-tcp-segmentation"]

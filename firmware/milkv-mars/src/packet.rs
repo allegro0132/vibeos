@@ -71,14 +71,27 @@ impl<R: Io + 'static, M: Memory, P: MdioPort> Engine<R, M, P> {
     }
     #[cfg(feature = "rx-pool-experiment")]
     pub fn receive_detached<const D: usize, const N: usize>(&mut self,
-        buffers: &mut vibeos_eqos_net::rx_buffers::Buffers<D, N>,
+        buffers: &mut impl vibeos_eqos_net::rx_buffers::Access<D, N>,
     ) -> Result<Option<ring::Detached>, Error> {
         if self.faulted { return Err(Error::Faulted); }
         if self.link.is_none() { return Ok(None); }
-        match self.ring.receive_detached(buffers) {
+        match self.ring.receive_detached_scoped(buffers) {
             Ok(frame) => Ok(frame),
             Err(ring::Error::Full) => Err(ring::Error::Full.into()),
             Err(ring::Error::Descriptor(_)) => Ok(None),
+            Err(error) => { self.fail(); Err(error.into()) }
+        }
+    }
+    #[cfg(feature = "rx-batch-experiment")]
+    pub fn receive_detached_batch<const D: usize, const N: usize>(&mut self,
+        buffers: &mut impl vibeos_eqos_net::rx_buffers::Access<D, N>,
+    ) -> Result<[Option<ring::Detached>; ring::RX_BATCH], Error> {
+        if self.faulted { return Err(Error::Faulted); }
+        if self.link.is_none() { return Ok([None; ring::RX_BATCH]); }
+        match self.ring.receive_detached_batch(buffers) {
+            Ok(frames) => Ok(frames),
+            Err(ring::Error::Full) => Err(ring::Error::Full.into()),
+            Err(ring::Error::Descriptor(_)) => Ok([None; ring::RX_BATCH]),
             Err(error) => { self.fail(); Err(error.into()) }
         }
     }

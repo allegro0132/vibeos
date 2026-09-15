@@ -6328,6 +6328,8 @@ fn waker_for(id: TaskId) -> Waker {
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {
     let hart = require_current_scheduler_hart("executor run loop");
+    #[cfg(feature = "idle-profile")]
+    IDLE_PROFILE[hart.index()].activate(arch::time());
     loop {
         if poll_once_on(hart) {
             continue;
@@ -6350,10 +6352,26 @@ pub fn run() -> ! {
         let queue_idle = SCHED.lock().ready.hart_idle(hart);
         let reasons = ipi::take_idle_reasons(hart);
         if queue_idle && reasons == 0 {
+            #[cfg(feature = "idle-profile")]
+            IDLE_PROFILE[hart.index()].enter(arch::time());
             arch::wait_for_interrupt();
+            #[cfg(feature = "idle-profile")]
+            IDLE_PROFILE[hart.index()].leave(arch::time());
         }
         arch::irq_restore(irq);
     }
+}
+
+#[cfg(feature = "idle-profile")]
+static IDLE_PROFILE: [crate::idle_profile::Counter; MAX_HARTS] =
+    [const { crate::idle_profile::Counter::new() }; MAX_HARTS];
+#[cfg(feature = "idle-profile")]
+pub use crate::idle_profile::Snapshot as IdleSnapshot;
+/// WFI interval residency, sampled without per-packet/per-lock instrumentation.
+/// Includes an ongoing idle interval. Unavailable snapshots are never zero load.
+#[cfg(feature = "idle-profile")]
+pub fn idle_profile() -> [Option<IdleSnapshot>; MAX_HARTS] {
+    core::array::from_fn(|i| IDLE_PROFILE[i].snapshot(arch::time))
 }
 
 /// Poll at most one ready task. Returns false when nothing was runnable.

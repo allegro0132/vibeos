@@ -272,8 +272,18 @@ impl<B: Backend> Ring<B> {
     pub fn receive_detached<const D: usize, const N: usize>(
         &mut self, buffers: &mut crate::rx_buffers::Buffers<D, N>,
     ) -> Result<Option<Detached>, Error> {
+        self.receive_detached_scoped(buffers)
+    }
+
+    /// Equivalent ownership transitions with locks confined to metadata access.
+    /// The Access implementation supplies engine/reset serialization.
+    pub fn receive_detached_scoped<const D: usize, const N: usize>(
+        &mut self, buffers: &mut impl crate::rx_buffers::Access<D, N>,
+    ) -> Result<Option<Detached>, Error> {
         self.running()?;
-        if self.rx_pool != Some(buffers.identity()) || D != self.layout.count {
+        let (identity, slot) = buffers.with(|b| (b.identity(), b.descriptor_buffer(self.receive)))
+            .map_err(|_| Error::Controller)?;
+        if self.rx_pool != Some(identity) || D != self.layout.count {
             return Err(Error::Controller);
         }
         let mut words = self.snapshot(true, self.receive);
@@ -284,22 +294,29 @@ impl<B: Backend> Ring<B> {
             self.backend.barrier();
             words[1] = self.backend.read_word(self.layout.desc(true, self.receive), 1);
         }
-        let slot = buffers.descriptor_buffer(self.receive).ok_or(Error::Controller)?;
+        let slot = slot.ok_or(Error::Controller)?;
         let address = self.layout.buffer(true, slot);
         let result = match result {
             Ok(Some(bytes)) => {
                 self.backend.for_cpu(address, bytes.div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
                 // OWN was clear and payload visibility completed. A failed
                 // reservation has not altered the original descriptor mapping.
-                let prepared = unsafe { buffers.prepare(self.receive) }.map_err(|e| match e {
+                let (prepared, reused) = buffers.with(|b| {
+                    // Access keeps mapping changes serialized with this operation.
+                    let prepared = unsafe { b.prepare(self.receive) }?;
+                    let reused = b.reused(prepared.replacement());
+                    Ok::<_, crate::rx_buffers::Error>((prepared, reused))
+                }).map_err(|_| Error::Controller)?.map_err(|e| match e {
                     crate::rx_buffers::Error::Full => Error::Full, _ => Error::Controller,
                 })?;
                 let replacement = prepared.replacement();
-                self.arm_rx_buffer(self.receive, self.layout.buffer(true, replacement), buffers.reused(replacement));
-                buffers.mark_prepared(replacement);
+                self.arm_rx_buffer(self.receive, self.layout.buffer(true, replacement), reused);
                 self.backend.tail(true, self.layout.desc(true, self.receive));
-                // The old buffer is unreachable by DMA before its ticket escapes.
-                let ticket = unsafe { buffers.publish(prepared) }.map_err(|_| Error::Controller)?;
+                // Keep Detached private until all hardware publication finishes.
+                let ticket = buffers.with(|b| {
+                    b.mark_prepared(replacement);
+                    unsafe { b.publish(prepared) }
+                }).map_err(|_| Error::Controller)?.map_err(|_| Error::Controller)?;
                 Ok(Some(Detached { ticket, bytes, checksum: descriptor::rx_checksum(words) }))
             }
             Err(error) => {
@@ -315,6 +332,96 @@ impl<B: Backend> Ring<B> {
         self.receive = (self.receive + 1) % D;
         result
     }
+    /// Bounded FIFO prefix of detached RX frames. Three short metadata accesses
+    /// cover the batch; all DMA operations remain outside metadata access.
+    /// Pool pressure returns the available prefix. An error before a prefix is
+    /// available leaves it for the single-frame path; post-reservation failures
+    /// quarantine the ring and expose no tickets until a proven reset.
+    pub fn receive_detached_batch<const D: usize, const N: usize>(
+        &mut self, buffers: &mut impl crate::rx_buffers::Access<D, N>,
+    ) -> Result<[Option<Detached>; RX_BATCH], Error> {
+        self.running()?;
+        let mut output = [None; RX_BATCH];
+        let limit = RX_BATCH.min(D);
+        let (identity, slots) = buffers.with(|b| {
+            (b.identity(), core::array::from_fn::<_, RX_BATCH, _>(|i|
+                if i < limit { b.descriptor_buffer((self.receive + i) % D) } else { None }))
+        }).map_err(|_| Error::Controller)?;
+        if self.rx_pool != Some(identity) || D != self.layout.count { return Err(Error::Controller); }
+        let mut words = [[0; 4]; RX_BATCH];
+        let mut lengths = [0; RX_BATCH];
+        let mut ready = 0;
+        for i in 0..limit {
+            let index = (self.receive + i) % D;
+            words[i] = self.snapshot(true, index);
+            match descriptor::rx_complete(words[i], BUFFER) {
+                Ok(Some(bytes)) => lengths[i] = bytes,
+                Ok(None) => break,
+                Err(_) if i == 0 => {
+                    // Preserve the established malformed-frame drain semantics.
+                    output[0] = self.receive_detached_scoped(buffers)?;
+                    return Ok(output);
+                }
+                Err(_) => break, // Return valid prefix; drain this on next call.
+            }
+            let complete = (1 << 29) | (1 << 28) | (1 << 26);
+            if words[i][3] & (descriptor::OWN | (1 << 30) | complete) == complete {
+                self.backend.barrier();
+                words[i][1] = self.backend.read_word(self.layout.desc(true, index), 1);
+            }
+            if slots[i].is_none() { return Err(Error::Controller); }
+            ready += 1;
+        }
+        if ready == 0 { return Ok(output); }
+        // Preserve prepare's visibility precondition for every candidate.
+        for i in 0..ready {
+            let address = self.layout.buffer(true, slots[i].unwrap());
+            self.backend.for_cpu(address, lengths[i].div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
+        }
+        let mut prepared = [const { None }; RX_BATCH];
+        let mut reused = [false; RX_BATCH];
+        let reserved = buffers.with(|b| {
+            let mut count = 0;
+            for i in 0..ready {
+                match unsafe { b.prepare((self.receive + i) % D) } {
+                    Ok(p) => {
+                        reused[i] = b.reused(p.replacement());
+                        prepared[i] = Some(p);
+                        count += 1;
+                    }
+                    Err(crate::rx_buffers::Error::Full) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(count)
+        });
+        let count = match reserved {
+            Ok(Ok(count)) => count,
+            _ => { self.fault(); return Err(Error::Controller); }
+        };
+        if count == 0 { return Err(Error::Full); }
+        for i in 0..count {
+            let index = (self.receive + i) % D;
+            let replacement = prepared[i].as_ref().unwrap().replacement();
+            self.arm_rx_buffer(index, self.layout.buffer(true, replacement), reused[i]);
+            // Keep established per-descriptor tail ordering for this first batch
+            // implementation. Metadata batching does not change MMIO semantics.
+            self.backend.tail(true, self.layout.desc(true, index));
+        }
+        let published = buffers.with(|b| {
+            for i in 0..count {
+                let p = prepared[i].take().unwrap();
+                b.mark_prepared(p.replacement());
+                let ticket = unsafe { b.publish(p) }?;
+                output[i] = Some(Detached { ticket, bytes: lengths[i], checksum: descriptor::rx_checksum(words[i]) });
+            }
+            Ok::<_, crate::rx_buffers::Error>(())
+        });
+        if !matches!(published, Ok(Ok(()))) { self.fault(); return Err(Error::Controller); }
+        self.receive = (self.receive + count) % D;
+        Ok(output)
+    }
+
     fn publish(&mut self, address: u64, words: [u32; 4], prepare_visibility: bool) {
         for (index, value) in words.into_iter().enumerate() {
             self.backend.write_word(address, index, value);
@@ -614,6 +721,9 @@ pub struct RxDiagnostics {
     pub last_status: u32,
     pub last_word1: u32,
 }
+
+/// Maximum bounded metadata transaction; independent of ring size.
+pub const RX_BATCH: usize = vibeos_hal::network_rx::BATCH_SIZE;
 
 /// Validated metadata for a CPU-owned frame detached from all DMA descriptors.
 /// Byte access still requires the pool's unique borrow and session admission.

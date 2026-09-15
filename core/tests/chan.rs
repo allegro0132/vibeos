@@ -93,3 +93,47 @@ fn message_notification_covers_send_before_first_poll_without_consuming() {
     assert_eq!(ep.try_recv(), Some(7));
     assert!(!ep.has_message());
 }
+
+
+#[derive(Default)]
+struct WakeCount(std::sync::atomic::AtomicUsize);
+impl std::task::Wake for WakeCount {
+    fn wake(self: Arc<Self>) { self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+}
+#[test]
+fn transition_notification_wakes_all_consumers_and_rearms_after_drain() {
+    use std::{future::Future, pin::pin, task::{Context, Waker, Poll}};
+    let ep = Endpoint::new("consumer-transitions", 2);
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(count.clone()); let mut cx = Context::from_waker(&waker);
+    let mut first = pin!(ep.recv()); let mut second = pin!(ep.recv());
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    ep.try_send(1u32).unwrap(); ep.try_send(2).unwrap();
+    assert_eq!(count.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(1));
+    assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(2));
+    let mut next = pin!(ep.recv());
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+    ep.try_send(3).unwrap();
+    assert_eq!(count.0.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert_eq!(next.as_mut().poll(&mut cx), Poll::Ready(3));
+}
+#[test]
+fn full_transition_wakes_all_producers_and_loser_rearms() {
+    use std::{future::Future, pin::pin, task::{Context, Waker}};
+    let ep = Endpoint::new("producer-transitions", 1); ep.try_send(0u32).unwrap();
+    let count = Arc::new(WakeCount::default());
+    let waker = Waker::from(count.clone()); let mut cx = Context::from_waker(&waker);
+    let mut first = pin!(ep.send(1)); let mut second = pin!(ep.send(2));
+    assert!(first.as_mut().poll(&mut cx).is_pending());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(ep.try_recv(), Some(0));
+    assert_eq!(count.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert!(first.as_mut().poll(&mut cx).is_ready());
+    assert!(second.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(ep.try_recv(), Some(1));
+    assert_eq!(count.0.load(std::sync::atomic::Ordering::Relaxed), 3);
+    assert!(second.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(ep.try_recv(), Some(2));
+}

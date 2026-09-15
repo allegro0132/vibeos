@@ -25,18 +25,21 @@ def main():
     if a.corrupt_at is not None and not 0 <= a.corrupt_at < a.bytes:
         p.error('corrupt offset must be inside the payload')
     result = dict(address=str(a.address), port=a.port, requested_bytes=a.bytes,
-                  corrupt_at=a.corrupt_at, passed=False, benchmark=False)
+                  corrupt_at=a.corrupt_at, passed=False, benchmark=False,
+                  phase="connect", submitted_bytes=0, admitted=False)
     # Reserve output before sending anything; previous evidence is never replaced.
     with a.output.open('x') as out:
         started = time.monotonic()
         admitted = False
         try:
             with socket.create_connection((str(a.address), a.port), timeout=30) as s:
+                result["phase"] = "admission"
                 s.settimeout(30)
                 s.sendall(b'VBENCH02' + bytes([2]) + bytes(7) + struct.pack('!Q', a.bytes))
                 if s.recv(1) != b'R':
                     raise RuntimeError('verified sink did not admit the request')
                 admitted = True
+                result.update(admitted=True, phase="payload")
                 s.sendall(b'G')
                 block = bytes(range(251)) * 256
                 sent = 0
@@ -48,6 +51,8 @@ def main():
                         chunk = changed
                     s.sendall(chunk)
                     sent += len(chunk)
+                    result["submitted_bytes"] = sent
+                result["phase"] = "verification_result"
                 data = bytearray()
                 while len(data) < 16:
                     b = s.recv(16 - len(data))
@@ -61,6 +66,7 @@ def main():
                 if count != a.bytes or s.recv(1) != b'':
                     raise RuntimeError('invalid verification result or trailing data')
                 result['passed'] = True
+                result['phase'] = 'complete'
         except (BrokenPipeError, ConnectionResetError) as e:
             result['connection_error'] = type(e).__name__
             # Admission distinguishes a tested rejection from a missing service.

@@ -5,6 +5,11 @@ edition = "2021"
 autobins = false
 
 [features]
+driver-stage-profile = ["tx-wait-profile", "pooled-rx"]
+tx-wait-profile = ["packet-network"]
+idle-profile = ["vibeos-core/idle-profile"]
+application-event-poll = ["vibeos-iperf3-server?/event-driven", "vibeos-net-api/activity-events"]
+network-event-poll = ["vibeos-netstack?/event-driven"]
 pooled-rx = ["vibeos-netstack?/pooled-rx"]
 rx-interrupt-poll = []
 direct-tcp-segmentation = ["native-tcp-segmentation"]

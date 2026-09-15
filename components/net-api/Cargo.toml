@@ -3,5 +3,8 @@ name = "vibeos-net-api"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+activity-events = []
+
 [dependencies]
 vibeos-core = { path = "../../core" }

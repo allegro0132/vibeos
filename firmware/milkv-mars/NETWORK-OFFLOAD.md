@@ -695,3 +695,180 @@ Two 20 s tests measured RX 892.44/892.47 and TX 898.24/901.75 Mbps. A subsequent
 60 s per-direction test measured RX 893.58 and TX 909.36 Mbps. All 9,904,794
 loans were returned. The feature remains opt-in pending broader qualification;
 the previously observed boot-time TRNG failure is still unresolved.
+
+
+CPU-focused follow-up changes bounded-channel notifications to empty/nonempty
+and full/space transitions. MPMC wake/rearm tests, core tests (428 passed, one
+ignored), and pooled protocol tests pass. At 300 Mbps, measured active time
+falls only ~1.5%; unprofiled throughput is RX 905.81/906.28, TX 900.25/898.36 Mbps.
+Adding RX IRQs lowers sampled time ~6.4% versus baseline, but repeatedly reduces
+TX to ~841–843 Mbps; that profile remains disabled. See RX-LINUX-COMPARISON.md
+for exact sampling scope, counters, and unresolved CPU work.
+
+
+Further CPU controls add reusable iperf3 scratch storage and an opt-in
+`network-event-experiment` feature. Application scope drops with scratch reuse,
+but polling consumes the freed time: scratch-only total active time is 26.79 s
+versus notification-only 26.60 s. Scratch + RX IRQ measured 25.16 s versus
+baseline 27.01 s (~6.9% lower, single 30-second elapsed-time profile containing
+20 seconds at 300 Mbps). Unprofiled RX is 891.83/899.20 Mbps and TX
+911.49/860.27 Mbps, so TX variability remains unresolved. Experimental IRQ
+and event modes are not enabled in the default ethernet feature. The board
+currently runs the scratch + IRQ diagnostic FIT in RAM, SHA-256
+`39e2cc27424e572153950d949aae39c2b5232f2670bc3687d23c8b4696d499ee`.
+Independent patterned RX/corruption/recovery checks pass. These tests do not
+qualify varying TX payloads or sustained low CPU operation. See the detailed
+comparison and `target/mars-reference/20260915-cpu-final-comparison.json`.
+
+
+The subsequent opt-in `application-event-experiment` connects TCP readiness
+notifications to idle waits in iperf3. In a same-scope 300 Mbps RX sample,
+active core time fell from scratch + IRQ 25.16 to 21.16 seconds (~15.9%),
+but unprofiled RX fell to 852.20/848.74 Mbps and TX was 880.99/889.92 Mbps.
+This demonstrates a CPU/throughput tradeoff, not full-speed low-CPU completion.
+Defaults remain unchanged. Both feature/default host tests pass, as do physical
+RX integrity and driver-restart/new-connection checks. The current RAM image
+is app-wait FIT `b1eb70112984f77dbeb1bda2cc70a4caf18508068d5424d1ccda4768e2391a51`.
+No SD or SPI write was performed.
+
+
+A subsequent inline single-waiter experiment removed waiter-array allocation
+but did not establish a performance benefit: fixed 300 Mbps active time
+21.84 vs 21.16 s; RX 848.86/848.91, TX 936.06/885.77 Mbps. The generic
+WaitQueue change was reverted and its patch/evidence archived. Source retains
+the earlier application-event experiment. The board temporarily runs the
+inline diagnostic FIT `8eaaf0f9de1948b871cbee977cef54dd5fb98987fbeb72860a333e1385494e46`
+in RAM. All 3,759,321 acquired loans returned. Next RX work targets the
+explicit pooled-RX bypass of GRO; no full-speed low-CPU claim is made.
+
+
+Pooled RX now participates in bounded GRO when both features are selected.
+Single frames remain DMA-backed slices; only actual merges copy into the
+32 KiB aggregation buffer (up to 16 segments). Lookahead loans preserve
+order and revocation, and wire-frame poll budgets remain bounded. Combined
+tests pass 4 unit + 39 integration cases, including revocation mid-acquire.
+Legacy and no-TSO configurations also pass after fixing an independently
+reproduced sender-backlog assumption in the GRO test fixture.
+With app waits + RX IRQ + pooled GRO, two 20-second tests measured RX
+897.41/898.35 and TX 937.83/939.63 Mbps. Post-recovery 60-second tests
+measured RX 892.14 and TX 920.96 Mbps. At fixed 300 Mbps, sampled active
+time is 21.394 s versus app-wait alone 21.162 s; GRO restores saturation
+throughput but does not itself demonstrate lower total CPU at that rate.
+All 9,247,420 acquired loans returned. Current RAM FIT SHA-256:
+`bbac3cd1f8e6cfcc0829beda71411a9faedf03b87487db16d11a823b84ded5fd`.
+Default ethernet features remain unchanged. Full-load CPU and full physical
+qualification are still pending.
+
+
+A fresh saturated RX audit does not confirm full-load CPU savings: with
+profiling enabled, pooled GRO received 791.53 Mbps at 41.391 active core
+seconds, versus the comparable older 811.91 Mbps / 41.287 core seconds.
+These 30-second windows contain 20 seconds of traffic; the profiler affects
+throughput. The earlier 300 Mbps improvement cannot be generalized to
+saturation. Matching-ELF attribution identifies RX_META contention (2.686 s
+on the protocol hart) while the driver holds that lock across cache/DMA
+operations. Shortening that ownership lock is the next measured target.
+The board remains on the same pooled-GRO FIT; no SD/SPI change occurred.
+
+
+RX ownership metadata is now accessed in short closures; DMA/cache work
+and descriptor/tail publication happen outside RX_META. Prepared/Detached
+states and engine/reset exclusion remain explicit contracts. 102 EQoS tests
+and 3 firmware library tests pass, including failed publication/reset and
+unrelated loan return between stages. Physical integrity and driver recovery
+checks pass. Under the matched saturated profiler, protocol-hart RX_META wait
+fell 2.686 -> 0.298 s; throughput rose 791.53 -> 847.78 Mbps, with roughly
+unchanged total active time. Cost per GiB improved ~6.7%; both cores still busy.
+Unprofiled short tests: RX 948.19/948.68, TX 883.43/882.78 Mbps. After
+driver recovery, 60-second tests: RX 948.81, TX 938.38 Mbps. The TX difference
+needs investigation, not a universal improvement claim. All 10,650,623 loans
+returned. Current RAM FIT: `33f8ba8be3886cf6a6aa38682a796be4e319ab6d36960b17d2ec1bb5f268905e`.
+Default firmware feature selection is unchanged. Low-overhead CPU residency
+measurement, repeat controls and full physical qualification remain pending.
+
+
+The opt-in idle-profile feature now measures WFI interval residency via
+`nidle`. Detailed network-profile instrumentation is absent from this image.
+431 core tests and 3 parser tests pass. `mars-residency-bench.py` records
+explicit serial/address measurements and rejects missing or reset snapshots.
+Two normal RX runs measured 942.49/942.27 Mbps with cores 0/1 active
+~99.8/99.0%; TX 877.31/885.07 Mbps used ~95/90%. At 299.98 Mbps RX,
+cores 0/1 were active 48.86/47.84%. Empty network intervals still use
+~9.8/6.0% on these cores. These are WFI interval estimates including bounded
+bookkeeping/command overhead, not cycle or power measurements. The result
+confirms that two-core saturation is real, not merely the detailed profiler.
+Current RAM FIT: `b8376b4af1f68c9a9d622f4bab1f6b201d717b53c740d94c0a3d231295d04f4c`.
+Independent 64 MiB RX verification passed; all 4,067,856 acquired loans returned.
+Protocol event waits are still off in this measured configuration.
+
+
+CPU attribution update (2026-09-15): the separate opt-in `tx-wait-profile`
+image is now running in RAM (FIT SHA-256
+`7ab3ce42d418e9a09eb4897c7c4a317ba63f883edb32ba8d87a8793488151728`).
+It preserves scheduling and records successful driver turns by runnable
+cause. TX ownership-only turns were absent at both 300 Mbps and full RX;
+at 932 Mbps TX they accounted for 0.495 seconds of elapsed driver scopes
+in a 20-second workload. Full RX remained 943 Mbps with both working cores
+near busy. This prioritizes attribution of actual packet/backpressure turns
+over a speculative TX interrupt change. A 64 MiB patterned transfer passed.
+See RX-LINUX-COMPARISON.md for raw evidence and measurement limitations.
+Neither full physical qualification nor low-CPU completion is claimed.
+
+
+Latest RAM diagnostic (2026-09-15): `driver-stage-profile`, FIT SHA-256
+`55830ba691490f235c3aad0937e6847841ad0472cf6df3636a26c82f07eaccdb`.
+One-in-64 driver-turn sampling attributes 62%/71% of sampled driver elapsed
+scopes to the RX HAL callback at 300 Mbps/full RX. Inbound queue-full events
+were 125/2 in those respective samples. This prioritizes DMA/descriptor and
+buffer-metadata attribution, without establishing a particular operation
+as the bottleneck. Full RX 943 Mbps, TX 880 Mbps, 64 MiB patterned integrity
+passed. CPU qualification remains incomplete. See RX-LINUX-COMPARISON.md
+for scope definitions, serial retry and evidence paths.
+
+
+Latest retained change (2026-09-15): reuse the immutable RX view captured
+under the first metadata guard of each receive invocation, eliminating one
+additional metadata lock per completed packet. A reverse-control comparison
+at 300 Mbps measured mean active core-seconds/GiB 27.452 -> 26.466 (3.59%
+lower). Saturated RX still occupies both working cores. Two initial full RX
+runs were 942.57/942.58 Mbps; TX 933.89/871.08 Mbps, retaining prior variability.
+After driver cancellation/restart, fresh RX/TX were 942.73/932.67 Mbps and a
+64 MiB patterned transfer passed. Final 2,062,176 received buffers were all
+acquired/returned, free=128, ready=borrowed=0. EQoS 102 host tests and firmware
+build pass. The new RAM FIT is
+`9c9eb201afa4091ebf731efe13b1fc741ed285baea82438e845dd2bccfff8680`;
+default Ethernet profile remains restored. See RX-LINUX-COMPARISON.md for
+reverse-control evidence, ownership argument and measurement limitations.
+
+
+Descriptor completion reuse was tested and withdrawn (2026-09-15): eliminating
+the repeated positive RX descriptor sync did not improve 300 Mbps CPU
+residency (26.742 versus 26.466 active core-seconds/GiB). Experimental source
+and four model tests are archived; they are not retained. Board is restored
+to RX-view FIT `9c9eb201afa4091ebf731efe13b1fc741ed285baea82438e845dd2bccfff8680`,
+with a fresh 64 MiB patterned transfer passing after restoration. See
+RX-LINUX-COMPARISON.md for exact evidence and limits. Saturated CPU reduction
+and full physical qualification remain open.
+
+
+Latest measurement boundary (2026-09-15): old controller timing and periodic
+register/checksum reports now require explicit controller-profile; default
+callbacks omit that instrumentation. Essential timeouts and offload policy
+remain. Disabled target build and enabled release check pass. New RAM FIT:
+`bb27dac8ec2ec2962638ce20025afdb35c67c0e702ecabf0a95b968fb7c16855`.
+Full RX/TX 947.76/937.17 Mbps and 64 MiB patterned verification passed.
+At 300 Mbps, active core-seconds/GiB 27.440 versus preceding RX-view 26.466
+shows no additional CPU benefit; do not carry the earlier 3.6% estimate over
+as this image's measured improvement. Both work cores remain near full under
+saturation. See RX-LINUX-COMPARISON.md for raw evidence and the cache batching
+review. The board remains on this RAM image; qualification remains open.
+
+
+Latest retained cleanup (2026-09-15): transient PacketTxToken borrows the
+adapter's transmit authority instead of cloning it. Independent pending TSO
+reservations keep owned authority; revocation and backpressure tests pass.
+New RAM FIT `e762f8b33d4c90bb0407f93101c933562aa772b69d624044e7d8c1d0339f5c80`.
+Full RX/TX 948.94/937.16 Mbps, 64 MiB patterned verification passed. The
+small 300 Mbps residency difference is not qualified as a stable CPU gain;
+both work cores remain busy at saturation. RX-LINUX-COMPARISON.md records
+all samples, feature tests and the next bounded-batch ownership constraints.

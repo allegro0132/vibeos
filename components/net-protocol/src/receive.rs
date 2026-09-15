@@ -13,6 +13,15 @@ impl From<Revocable<Endpoint<StampedPacket>>> for PacketReceive {
     fn from(authority: Revocable<Endpoint<StampedPacket>>) -> Self { Self::Raw(authority) }
 }
 impl PacketReceive {
+    /// Notification only; callers must revalidate all device/session authority.
+    pub fn message_event(&self) -> Result<vibeos_core::chan::MessageEvent, CapError> {
+        match self {
+            Self::Raw(q) => q.try_with(|q| q.message_event()),
+            #[cfg(feature = "pooled-rx")]
+            Self::Pooled { authority, .. } => authority.try_with(|q| q.message_event()),
+        }
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), CapError> {
         match self {
             Self::Raw(q) => q.try_with(|_| ()),

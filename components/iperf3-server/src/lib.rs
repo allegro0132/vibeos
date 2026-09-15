@@ -44,6 +44,11 @@ pub enum SocketError {
 }
 
 pub trait Platform: Sync {
+    #[cfg(feature = "event-driven")]
+    fn tcp_activity(&self, _listener: Cap) -> Result<Option<vibeos_core::chan::MessageEvent>, SocketError> {
+        Ok(None)
+    }
+
     fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, SocketError>;
     fn tcp_recv(
         &self,
@@ -66,11 +71,48 @@ pub trait Platform: Sync {
 type Space = dyn Platform;
 
 pub async fn task(space: &Space, control_listener: Cap, data_listener: Cap) {
+    #[cfg(feature = "event-driven")]
+    let notifications = match (space.tcp_activity(control_listener), space.tcp_activity(data_listener)) {
+        (Ok(Some(control)), Ok(Some(data))) => Some([control, data]),
+        (Err(_), _) | (_, Err(_)) => return,
+        _ => None,
+    };
+    #[cfg(feature = "event-driven")]
+    let mut armed = false;
     let mut server = Server::new();
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
     loop {
+        // A first idle pass prepares the next pass. Capture epochs before the
+        // second full I/O check so arrivals before waiter registration survive.
+        #[cfg(feature = "event-driven")]
+        let waits = if armed {
+            notifications.as_ref().map(|events| [events[0].wait(), events[1].wait()])
+        } else { None };
         match server.drive(space, control_listener, data_listener) {
             Ok(worked) => {
+                #[cfg(feature = "event-driven")]
+                if notifications.is_some() {
+                    if worked {
+                        armed = false;
+                        vibeos_core::exec::yield_now().await;
+                    } else if let Some(mut waits) = waits {
+                        use core::{future::{poll_fn, Future}, pin::{pin, Pin}, task::Poll};
+                        // Retain bounded deadline/revocation observation even
+                        // when no transport event arrives.
+                        let mut timer = pin!(vibeos_core::exec::sleep_ms(IDLE_POLL_MS));
+                        poll_fn(|cx| {
+                            if timer.as_mut().poll(cx).is_ready() { return Poll::Ready(()); }
+                            for waiter in &mut waits {
+                                if Pin::new(waiter).poll(cx).is_ready() { return Poll::Ready(()); }
+                            }
+                            Poll::Pending
+                        }).await;
+                        armed = false;
+                    } else {
+                        armed = true;
+                    }
+                    continue;
+                }
                 if poll_budget.runnable(space.now_ms(), worked) {
                     vibeos_core::exec::yield_now().await;
                 } else {
@@ -109,6 +151,8 @@ struct Parameters {
 }
 
 pub struct Server {
+    // Reused for bounded synchronous I/O; only returned/queued prefixes are read.
+    scratch: [u8; IO_CHUNK_BYTES],
     phase: Phase,
     control: Option<TcpConnectionToken>,
     data: Option<TcpConnectionToken>,
@@ -127,6 +171,7 @@ pub struct Server {
 impl Server {
     pub const fn new() -> Self {
         Self {
+            scratch: [0; IO_CHUNK_BYTES],
             phase: Phase::AcceptControl,
             control: None,
             data: None,
@@ -172,17 +217,16 @@ impl Server {
                     return Err(SocketError::Failed);
                 };
                 let control_listener = self.control_listener(first_listener, second_listener);
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(control_listener, control, &mut scratch)? {
+                match space.tcp_recv(control_listener, control, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         worked |= length != 0;
                         let needed = COOKIE_BYTES - self.cookie_received;
                         let copied = needed.min(length);
                         self.cookie[self.cookie_received..self.cookie_received + copied]
-                            .copy_from_slice(&scratch[..copied]);
+                            .copy_from_slice(&self.scratch[..copied]);
                         self.cookie_received += copied;
                         if self.cookie_received == COOKIE_BYTES {
-                            self.control_rx.extend_from_slice(&scratch[copied..length]);
+                            self.control_rx.extend_from_slice(&self.scratch[copied..length]);
                             self.control_tx.push_back(PARAM_EXCHANGE);
                             self.phase = Phase::Parameters;
                         }
@@ -214,13 +258,12 @@ impl Server {
                     return Err(SocketError::Failed);
                 };
                 let data_listener = self.data_listener(first_listener, second_listener);
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(data_listener, data, &mut scratch)? {
+                match space.tcp_recv(data_listener, data, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         worked |= length != 0;
                         let needed = COOKIE_BYTES - self.data_cookie_received;
                         let copied = needed.min(length);
-                        if scratch[..copied]
+                        if self.scratch[..copied]
                             != self.cookie
                                 [self.data_cookie_received..self.data_cookie_received + copied]
                         {
@@ -290,8 +333,7 @@ impl Server {
                 let Some(connection) = self.data else {
                     return Err(SocketError::Failed);
                 };
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(data_listener, connection, &mut scratch)? {
+                match space.tcp_recv(data_listener, connection, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         self.bytes_transferred =
                             self.bytes_transferred.saturating_add(length as u64);
@@ -404,12 +446,11 @@ impl Server {
             return Ok(false);
         }
         let listener = self.control_listener(first_listener, second_listener);
-        let mut chunk = [0u8; IO_CHUNK_BYTES];
-        let length = chunk.len().min(self.control_tx.len());
-        for (output, queued) in chunk[..length].iter_mut().zip(self.control_tx.iter()) {
+        let length = self.scratch.len().min(self.control_tx.len());
+        for (output, queued) in self.scratch[..length].iter_mut().zip(self.control_tx.iter()) {
             *output = *queued;
         }
-        match space.tcp_send(listener, connection, &chunk[..length])? {
+        match space.tcp_send(listener, connection, &self.scratch[..length])? {
             TcpIoResult::Progress(sent) => {
                 self.control_tx.drain(..sent);
                 Ok(sent != 0)
@@ -426,10 +467,9 @@ impl Server {
         if self.control_rx.len() >= MAX_CONTROL_JSON_BYTES + 4 {
             return Err(SocketError::Failed);
         }
-        let mut scratch = [0u8; IO_CHUNK_BYTES];
-        match space.tcp_recv(listener, connection, &mut scratch)? {
+        match space.tcp_recv(listener, connection, &mut self.scratch)? {
             TcpIoResult::Progress(length) => {
-                self.control_rx.extend_from_slice(&scratch[..length]);
+                self.control_rx.extend_from_slice(&self.scratch[..length]);
                 Ok(length != 0)
             }
             TcpIoResult::WouldBlock => Ok(false),
@@ -441,8 +481,7 @@ impl Server {
         let Some(connection) = self.data else {
             return Err(SocketError::Failed);
         };
-        let mut scratch = [0u8; IO_CHUNK_BYTES];
-        match space.tcp_recv(listener, connection, &mut scratch)? {
+        match space.tcp_recv(listener, connection, &mut self.scratch)? {
             TcpIoResult::Progress(length) => {
                 self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
                 Ok(length != 0)
@@ -636,4 +675,50 @@ mod tests {
         assert!(json.contains("\"bytes\":123456"));
         assert!(json.contains("\"end_time\":2.345"));
     }
+
+    #[test]
+    fn reused_io_storage_never_extends_short_reads_or_partial_writes() {
+        extern crate std;
+        use std::sync::Mutex;
+        use vibeos_core::cap::{CSpace, Rights};
+        use vibeos_net_api::{TcpListener, TcpListenerId, TcpStreamState};
+        struct Mock {
+            input: Mutex<VecDeque<Vec<u8>>>,
+            output: Mutex<Vec<Vec<u8>>>,
+        }
+        impl Platform for Mock {
+            fn tcp_accept(&self, _: Cap) -> Result<Option<TcpConnectionToken>, SocketError> { Ok(None) }
+            fn tcp_recv(&self, _: Cap, _: TcpConnectionToken, out: &mut [u8]) -> Result<TcpIoResult, SocketError> {
+                let Some(bytes) = self.input.lock().unwrap().pop_front() else { return Ok(TcpIoResult::WouldBlock); };
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(TcpIoResult::Progress(bytes.len()))
+            }
+            fn tcp_send(&self, _: Cap, _: TcpConnectionToken, bytes: &[u8]) -> Result<TcpIoResult, SocketError> {
+                self.output.lock().unwrap().push(bytes.to_vec());
+                Ok(TcpIoResult::Progress(bytes.len().min(2)))
+            }
+            fn tcp_close(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { Ok(()) }
+            fn tcp_reset(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { Ok(()) }
+            fn now_ms(&self) -> u64 { 0 }
+            fn event(&self, _: &'static str) {}
+        }
+        let listener = TcpListener::new("scratch", TcpListenerId::new(1).unwrap(), 5201, 16, 16).unwrap();
+        listener.network_update_state(TcpStreamState::Established).unwrap();
+        let token = listener.try_accept().unwrap();
+        let mut space = CSpace::new("scratch"); let cap = space.mint(listener, Rights::ALL);
+        let mock = Mock { input: Mutex::new([b"abc".to_vec()].into()), output: Mutex::new(Vec::new()) };
+        let mut server = Server::new(); server.control = Some(token);
+        server.scratch.fill(0xa5);
+        assert!(server.read_control(&mock, cap).unwrap());
+        assert_eq!(server.control_rx, b"abc");
+        assert!(!server.read_control(&mock, cap).unwrap());
+        assert_eq!(server.control_rx, b"abc");
+        assert_eq!(server.scratch[IO_CHUNK_BYTES - 1], 0xa5);
+        server.control_tx.extend(b"xyz");
+        assert!(server.flush_control(&mock, cap, cap).unwrap());
+        assert!(server.flush_control(&mock, cap, cap).unwrap());
+        assert!(server.control_tx.is_empty());
+        assert_eq!(*mock.output.lock().unwrap(), [b"xyz".to_vec(), b"z".to_vec()]);
+    }
+
 }

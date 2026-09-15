@@ -15,6 +15,31 @@ impl Stamped {
     pub const fn stamp(self) -> PacketStamp { self.stamp }
     pub const fn ticket(self) -> Ticket { self.ticket }
 }
+/// Runtime-owned pending batch. Construct under the session publication
+/// barrier; remaining tickets keep that original stamp across later rebinding.
+/// The producer must drain/discard it, or retire its device after owner failure.
+/// This owns ticket bookkeeping only, never payload references or DMA authority.
+pub struct StampedBatch {
+    frames: [Option<Stamped>; vibeos_hal::network_rx::BATCH_SIZE],
+    next: usize,
+}
+impl StampedBatch {
+    pub const fn empty() -> Self {
+        Self { frames: [None; vibeos_hal::network_rx::BATCH_SIZE], next: vibeos_hal::network_rx::BATCH_SIZE }
+    }
+    pub fn new(tickets: vibeos_hal::network_rx::TicketBatch, stamp: PacketStamp) -> Self {
+        Self { frames: tickets.map(|ticket| ticket.map(|ticket| Stamped::new(ticket, stamp))), next: 0 }
+    }
+    pub fn pop(&mut self) -> Option<Stamped> {
+        while self.next < self.frames.len() {
+            let index = self.next;
+            self.next += 1;
+            if let Some(frame) = self.frames[index].take() { return Some(frame); }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Capacity, UntrackedOwner, Session(PacketStampMismatch), Device(vibeos_hal::network::Error),
@@ -31,6 +56,7 @@ impl ReceiveEndpoint {
         system.restore(); Ok(endpoint)
     }
     pub fn try_send(&self, frame: Stamped) -> Result<(), Stamped> { self.queue.try_send(frame) }
+    pub fn message_event(&self) -> crate::chan::MessageEvent { self.queue.message_event() }
     pub fn has_message(&self) -> bool { self.queue.has_message() }
     pub fn discard(&self, frame: Stamped) -> bool { unsafe { (self.operations.discard)(frame.ticket) } }
     /// Invoke only inside live receive authority, using the supervisor-derived

@@ -3,6 +3,9 @@ name = "vibeos-iperf3-server"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+event-driven = ["vibeos-net-api/activity-events"]
+
 [dependencies]
 vibeos-core = { path = "../../core" }
 vibeos-net-api = { path = "../net-api" }

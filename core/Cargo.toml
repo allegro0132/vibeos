@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = []
 rx-publish-batch = []
 tx-lease-profile = []
 copy-profile = []

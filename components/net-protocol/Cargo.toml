@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro"]
+gro-end-profile = ["bounded-gro"]
 tx-lease-profile = ["native-tcp-segmentation", "vibeos-core/tx-lease-profile"]
 skip-empty-service = []
 activity-events = ["vibeos-net-api/activity-events"]

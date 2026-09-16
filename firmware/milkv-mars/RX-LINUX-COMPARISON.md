@@ -3871,3 +3871,578 @@ brackets, serial-full.log, GRO snapshots, packet-length/SYN extraction, pcap,
 exact-source restoration hash, integrity JSON and mss2-analysis.json. Diagnostic
 build/FIT/ELF/RAM logs use 20260916-mss536-*. This adds causal packetization
 comparison evidence, not an optimization; <1-core and stability goals remain open.
+
+
+## 2026-09-16 RX producer batch publication: incomplete A/B/A
+
+User-specified UART recovered and showed a demo command set (net info reported
+virtio-net offline). A software reboot identified Milk-V Mars 4 GiB. Loaded the
+known setup-fix baseline into RAM, validating FIT/kernel/DTB hashes and the
+1000-full link before measurement. No SD/SPI writes or saveenv.
+
+The candidate batches producer CONTROL/capability/queue operations with a
+32-frame budget. This is distinct from the earlier consumer prefetch experiment;
+it actually amortizes queue locking. Both paths already wake on empty-to-nonempty,
+so the experiment is not elimination of an unconditional per-frame wake.
+Feature-enabled tests passed (9 channel, 7 RX endpoint); default tests also passed.
+The experimental ethernet feature expansion is restored to the ordinary profile
+in the worktree; rx-publish-batch remains opt-in. Candidate FIT SHA256:
+064198a638257ab9564182bdab656ef8d8e13eb427e1a7609d78da92045f355c.
+
+All traffic runs below are host-to-board, MTU1500, two 20-second runs, same
+continuous serial collector. CPU is summed non-WFI core equivalents without idle
+subtraction, not exclusive driver CPU.
+
+| Phase | RX Mbps | Core equivalents |
+| --- | --- | --- |
+| Baseline, paced 910M | 909.961 / 909.961 | 1.94598 / 1.95598 |
+| Batch candidate, paced 910M | 909.961 / 909.961 | 1.93821 / 1.90202 |
+| Batch candidate, unpaced | 948.884 / 948.724 | 1.99414 / 1.99150 |
+
+Candidate 64 MiB pattern verification passed (1167 ms board time). Paced sample
+means differ by about 1.6%, but candidate variation is substantial and the
+restored-baseline leg failed before traffic. This is insufficient evidence of a
+repeatable saving. Full-rate candidate still consumes nearly two cores; it does
+not meet the <1-core effort target.
+
+Restored baseline FIT 523347fa705950ba8a5aaab74d433f4c98b8d3d7a5c12b461071d642f73242a1
+passed hashes, four-hart admission, network initialization and 1000-full link.
+The next collector timed out on quiet with zero bytes in serial-full.log and no
+iperf started. A follow-up CR probe also received zero bytes and two ICMP probes
+failed. Failure origin is unknown; no panic was captured. It occurred after
+restoring baseline, not while running the candidate. Do not call this a completed
+A/B/A or stability qualification. Current responsiveness needs recovery before
+further performance changes are justified.
+
+Evidence: target/mars-reference/20260916-rx-publish-{baseline4,candidate4,restore4}*
+and target/mars-acceptance/20260913-gigabit/20260916-rx-publish-*-{load,boot}.log.
+User-port identification and restart logs: 20260916-user-port-recheck4-*.log.
+
+
+### Recovery follow-up: no demonstrated RX publication gain
+
+After the user restored the board, UART again showed the demo image. Rebooted
+to U-Boot and RAM-loaded the exact setup-fix baseline (523347fa...); component
+hashes and 1000-full link passed. Two new 20-second 910M RX runs measured
+909.961 / 909.961 Mbps with 1.89913 / 1.89425 non-WFI core equivalents.
+64 MiB changing-pattern verification passed (1131 ms board time).
+
+The restored baseline is at least as efficient as the candidate's 1.93821 /
+1.90202 samples. Thus the small earlier paced reduction is not demonstrated
+as a repeatable batch-publication benefit. The recovery required a power cycle,
+so this is a recovery-separated control comparison, not an uninterrupted A/B/A.
+Candidate full-rate results remain nearly two cores. Keep the experiment opt-in;
+do not promote it into the normal ethernet profile or report it as a CPU win.
+No SD/SPI writes. Evidence: target/mars-reference/20260916-recovered5-* and
+20260916-recovered5-baseline910/; exact RAM load/boot logs are under
+ target/mars-acceptance/20260913-gigabit/20260916-recovered5-*.
+
+The recovered baseline then completed sequential 60-second RX and TX runs:
+- 01-rx: 946.270 Mbps, 1.98988 non-WFI core equivalents.
+- 01-tx: 946.678 Mbps, 1.91584 non-WFI core equivalents.
+Post-traffic n idle snapshots (nidle command) completed in both directions;
+the continuous collector completed successfully. This did not reproduce the
+loss of responsiveness during these limited runs, but does not explain the
+earlier failure or constitute the one-hour mixed-load qualification. Evidence:
+20260916-recovered5-sustained/{summary.json,serial-full.log,*-iperf.json}.
+
+
+### 2026-09-16 GRO wire-boundary diagnostic
+
+Re-reading full-rate evidence (99.68% ingress-active stack turns, 0.19% empty
+retries) does not support changing idle grace as the next primary experiment.
+Captured a fresh setup-fix baseline RX run: 948.915 Mbps,
+1.98773 non-WFI core equivalents over 20 seconds. The bounded capture stopped
+at its 60-second wall timeout, with 185086 captured packets, 187409 received by
+filter and zero kernel drops. It is a prefix, not a complete-run capture.
+
+Tshark extraction selects host-to-board TCP data. The dominant stream has
+175406 packets over 2.164 seconds; 175402 payloads are 1460 bytes, four are
+shorter (including the 37-byte iperf cookie). Only four have PSH. Adjacent ACK,
+window, TCP header length and options never change, and sequence numbers have
+no gap/overlap. 9651 adjacent IP ID transitions (~5.5%) fail the current GRO
+same-or-increment-by-one rule. PSH and short packets therefore are not frequent
+enough in this prefix to explain very small aggregation groups. The IP ID
+condition can terminate some groups; this does not quantify its actual CPU cost.
+
+Host capture cannot observe board queue gaps, actual GRO termination reasons,
+interleaved traffic seen by the board, or exact arrival timing after offload.
+Do not report a simulated GRO speedup or relax validation from these counts.
+The next useful measurement is board-side termination reasons (input unavailable,
+PSH/short, segment budget, incompatible headers including IP ID), paired with
+actual group sizes. This distinguishes changes to batching from protocol policy.
+Linux reference inspected: https://raw.githubusercontent.com/torvalds/linux/master/net/ipv4/tcp_offload.c
+(tcp_gro_receive compares flags, ACK, options, sequence and network flush state;
+master is a moving reference, not a pinned release dependency).
+
+Evidence: target/mars-reference/20260916-gro-boundary.pcap, .tsv,
+20260916-gro-boundary-analysis.json, analyze-gro-boundary.py and
+20260916-gro-boundary-rx/ (continuous serial, iperf and CPU brackets).
+No firmware change, SD/SPI write or demonstrated optimization in this diagnostic.
+
+
+### 2026-09-16 default-off GRO end-reason instrumentation (not yet run)
+
+Added gro-end-profile through protocol/netstack/kernel/Mars. Protocol-local
+non-atomic cumulative counters record one exclusive reason per attempted group:
+first_rejected, psh, short, receive_none, next_ineligible, headers, ipid, budget,
+original_invalid. A second histogram counts attempted group sizes 0..16, with
+zero reserved for rejected first frames. Both pooled and copied adapters record
+attempts before final authority validation, so these are not delivered-group
+counts. receive_none includes empty input, revocation and acquisition failure;
+it must not be interpreted alone as DMA starvation. Header/capacity mismatch
+has precedence over IP ID when both fail. No eligibility or merge policy changes.
+
+The live stack publishes approximate atomic snapshots once per second. ngrodetail
+prints the reasons and histogram outside traffic. Per-counter snapshots can be
+inconsistent during publication; compare quiescent snapshots and check totals.
+No per-packet clocks, printing or diagnostic atomics. Default builds omit fields,
+updates and command. Diagnostic build changes code layout and has overhead;
+its throughput is not directly an uninstrumented optimization result.
+
+Feature-enabled protocol suite: 5 unit + 39 integration tests passed, including
+reason classification, count conservation and rejected-packet preservation.
+RISC-V build/image checks passed. FIT:
+ target/mars-boot-20260916-gro-end/out/artifacts/vibeos.itb
+SHA256 73cab4e1e8e7cff265924ab205a9737c0de67571a78e816258881fb1abb04eef.
+Packaging restored the ordinary ethernet profile. No commit/push or SD/SPI writes.
+
+Before loading, reboot received zero serial bytes for 15 seconds on the existing
+setup-fix baseline; network probes also failed. Diagnostic FIT has NOT been
+loaded and has no hardware results. User asked to restore power. Continue with
+ramboot-gro-end.py after a confirmed U-Boot prompt, take ngrodetail/ngro snapshots
+before and after bounded RX runs, validate size/reason conservation, then restore
+setup-fix via ramboot-gro-end-restore.py and verify data integrity.
+
+Build/tests/feature map/ELF/FIT helper evidence: target/mars-reference/20260916-gro-end-*
+and gro-end-features.json, ramboot-gro-end*.py.
+
+
+### GRO end-profile hardware result
+
+RAM-loaded diagnostic FIT 73cab4e1... after confirmed U-Boot; hashes and gigabit
+link passed. Each phase used one 20-second RX run with pre/post ngrodetail,
+including the runner's idle interval and control traffic in counter deltas.
+Both phase deltas have equal reason totals and size-histogram totals.
+
+| Rate | Mbps | Non-WFI cores | Mean eligible group size | receive_none | IP ID | 16-packet budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Full | 948.886 | 1.98762 | 6.221 | 66.669% | 29.965% | 3.277% |
+| 300M | 299.983 | 0.87104 | 9.730 | 33.566% | 20.822% | 34.736% |
+
+Percentages use all attempted groups; means exclude size-zero rejected first
+frames. Full-rate PSH ends were 0.083%, versus 10.854% at paced 300M. These
+rates have different sender pacing/burst behavior. Diagnostic overhead/layout
+and one sample per rate limit comparisons; there is no optimization claim.
+
+IMPORTANT: source review shows receive_pooled/receive_packet also return None
+when ingress_remaining (per-interface poll budget) reaches zero. Therefore
+receive_none includes a software budget boundary, empty endpoint, unsupported
+transport, authority failure and rejected loan. It does NOT prove producer
+starvation or justify sleeping the consumer. Next split those reasons at the
+actual receive method before experimenting with scheduling or coalescing delay.
+Current data do not support simply raising the 16-packet GRO group limit.
+
+Diagnostic 64 MiB pattern passed (1137 ms). Restored original setup-fix baseline
+523347fa... with verified hashes/1000-full link; fresh pattern passed (1119 ms).
+Board is responsive on the baseline. No SD/SPI writes. Evidence:
+20260916-gro-end-{full,300}*/summary.json and before/after logs,
+analyze-gro-end.py, 20260916-gro-end-analysis.json, integrity JSONs and
+20260916-gro-end[-restore]-ramboot.log under target/mars-reference.
+
+
+### GRO detail v2: distinguish receive-none causes (pending RAM run)
+
+Extended the same default-off gro-end-profile with five receive-none subreasons:
+ingress_budget, empty_endpoint, authority, rejected, unsupported. The adapter
+sets the last failure at its actual return site; only a failed successor read
+inside an eligible GRO attempt increments the subreason. First-frame failures
+and unrelated empty device polls do not inflate this histogram. The original
+nine reasons and 17 group sizes remain at their original offsets; five new
+counters follow them. ngrodetail prints GRO_DETAIL version=2 and GRO_NONE.
+The sum of GRO_NONE must equal the receive_none main count in quiescent deltas.
+No receive or budget policy change, no extra timer reads or hot-path atomics.
+
+A new integration fixture places 33 frames in a real pooled endpoint and closes
+the first group with PSH. The first 32-frame poll stops within a group while a
+packet remains queued, recording only ingress_budget. The next poll drains that
+packet and records empty_endpoint. It verifies all loans release and count
+conservation. Feature-enabled suite: 5 unit + 40 integration tests pass; default
+diagnostic-off regression also passes. RISC-V build/image checks pass.
+
+FIT target/mars-boot-20260916-gro-none/out/artifacts/vibeos.itb:
+b0d41e1f4059d6f0b12c7a12a143a8d271ce07b982f5c28e3db30027af4cc826.
+Exact ELF, tests, build, feature map and helpers are in target/mars-reference
+with gro-none prefixes. Packaging restored the ordinary ethernet profile.
+This v2 image has NOT been loaded. Before RAM loading, reboot on baseline
+returned zero serial bytes for 15 seconds; two network probes failed. An earlier
+40-second serial capture contains only 299 bytes of partial background output,
+not a successful command response. Do not infer from those bytes that the
+board stayed responsive. No panic/root cause established. No SD/SPI writes.
+
+After recovery use ramboot-gro-none.py at a confirmed U-Boot prompt, take
+ngrodetail snapshots around bounded RX traffic and verify both conservation
+relations. Then restore via ramboot-gro-none-restore.py and test integrity.
+
+
+### GRO detail v2 hardware result: endpoint-empty dominates full-rate None
+
+After recovery, RAM-loaded b0d41e1f...; hashes, v2 command and 1000-full link
+verified. One 20-second full RX and one paced 300M run, each bracketed by
+ngrodetail snapshots. Both deltas satisfy reason-total == size-total and
+receive_none == sum(GRO_NONE). Counters include idle/control traffic, published
+approximately once per second. Results are diagnostic, not an optimization.
+
+| Phase | Mbps | Non-WFI cores | Mean eligible group | Ingress-budget None | Empty-endpoint None |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Full | 949.007 | 1.98870 | 5.735 | 105 | 185086 |
+| 300M | 299.983 | 0.84588 | 10.011 | 4774 | 10437 |
+
+Authority/rejected/unsupported None counts were zero in both phases. At full
+rate, 99.943% of receive_none endings are endpoint-empty; only 0.057% are the
+per-poll ingress budget. Across ALL attempted groups, None is 65.346%, IP ID
+34.312%, 16-frame group budget 0.332%, PSH 0.00494%. This does not support raising
+the protocol poll budget to eliminate full-rate early GRO termination. It
+locates the immediate end condition at the driver-to-protocol endpoint, not a
+proved root cause: producer publication timing, application/driver sharing a
+hart, scheduling and wire arrival remain possible contributors. Nor do counts
+establish that removing boundaries would save enough CPU to meet the goal.
+V1/V2 group means differ; do not treat instrumented runs as identical timing.
+
+Diagnostic pattern verification passed (64 MiB, 1156 ms board time). Restored
+setup-fix baseline 523347fa... via RAM with hashes/link verified. No SD/SPI writes.
+Evidence: target/mars-reference/20260916-gro-none-{full,300} directories and
+before/after logs, analyze-gro-none.py, 20260916-gro-none-analysis.json,
+20260916-gro-none[-restore]-ramboot.log and integrity JSONs. Next investigate
+producer/consumer work cadence before choosing a batching delay; do not replace
+these measurements with more blind ring or budget tuning.
+
+
+### Current RX cadence diagnostic prepared; serial confirmation hardened
+
+Reviewed existing notification/placement evidence: channels already wake only
+empty-to-nonempty, inline waiter storage had no measured benefit, stack/application
+co-location reduced throughput, and older driver-stage figures predate the
+current batch HAL. Prepared a combined diagnostic from existing gro-end-profile,
+rx-batch-profile, driver-stage-profile (includes TX-wait) and executor-profile.
+This adds no new production policy or presumed optimization. It can compare
+hardware batch histograms, software GRO groups, sampled driver phases and task
+poll times in the same run; profiling overhead and nested scopes must not be
+summed as independent CPU shares.
+
+RISC-V build/image checks passed. FIT target/mars-boot-20260916-rx-cadence/out/artifacts/vibeos.itb
+SHA256 0c24b5174c2bf1c73149ffdd03c6fd187ac688407b54e3bc2d7f28ba4e7badc0.
+Exact ELF, feature map, build/FIT logs and RAM helpers are archived with
+rx-cadence prefixes in target/mars-reference. Ordinary ethernet profile restored.
+No SD/SPI writes; this diagnostic has NOT been loaded.
+
+Found a host-tool weakness: legacy serial-run.py may return on a buffered vibe
+prompt without establishing that the new command completed (including reboot).
+Added scripts/mars-serial-command.py: preserves but excludes drained pre-command
+bytes from reply matching; requires an explicit command-specific regex; supports
+bounded U-Boot interruption; restores the original termios state on every exit.
+Three PTY tests pass: stale expected marker + unrelated prompt do not succeed,
+reboot waits for chunked U-Boot response and sends the autoboot interrupt, and
+timeout retains asynchronous fault output. New rx-cadence RAM helpers use this
+path and semantic network/load/boot markers, with existing hash checks retained.
+This fixes confirmation logic, not a demonstrated cause of board network loss.
+
+Using the strict tool, reboot still timed out after 15 seconds with zero bytes;
+one ICMP probe also failed. Earlier partial background bytes did not confirm
+interactive health. Actual current image cannot be re-queried. User recovery is
+needed before loading the already-built diagnostic. Latest evidence:
+20260916-rx-cadence-reboot.log, -build-echo.log and 20260916-serial-command-tests.log.
+
+
+### User-reported possible test-induced hang: controlled responsiveness run
+
+Prioritized stability investigation after the user reported that tests may hang
+the board. Recovery produced a fresh echo and the demo command set, so rebooted
+to U-Boot and selected the same known setup-fix baseline (523347fa...), not a new
+profiling build. First U-Boot ARP attempt failed while serial remained responsive;
+a retry reached 192.168.77.1. This is a separate boot-network symptom, not evidence
+of a kernel hang. The strict helper initially stopped on that negative response;
+RAM helpers now recognize positive OR negative ping completion and preserve the
+existing one-retry policy, still requiring positive success before TFTP.
+
+After verified baseline RAM load, a single process continuously collected UART
+and bracketed each phase with complete NIDLE_END responses:
+- 60 seconds idle before traffic: response normal.
+- 20 seconds RX: 949.171 Mbps, response normal.
+- 60 seconds post-RX idle: response normal.
+- 20 seconds TX: 946.269 Mbps, response normal.
+- 60 seconds post-TX idle: response normal.
+All phases completed within 220.39 seconds. This is a short reproducibility
+probe, not throughput/CPU optimization or one-hour stability qualification.
+
+Then closed the serial descriptor for 60 seconds. Network probes at 30 and 60
+seconds both succeeded. Reopening via the strict tool and requesting nidle
+returned all four hart rows and NIDLE_END. Thus neither this traffic sequence nor
+this single close/reopen interval reproduced the reported hang. Earlier repeated
+UART/network silence remains unexplained; this run does not disprove the user's
+observation or establish long-term reliability. No crash cause is claimed.
+
+Board remains on responsive baseline, no SD/SPI writes. Combined rx-cadence
+profiling image is still staged and untested. Evidence:
+target/mars-reference/20260916-hang-triage/{summary.json,serial-full.log,rx.json,tx.json,closed-serial.json,reopened-nidle.log},
+20260916-hang-baseline2-ramboot.log; raw boot/load/network responses in
+ target/mars-acceptance/20260913-gigabit/20260916-hang-baseline2-*.
+The exact orchestration is target/mars-reference/hang-triage.py.
+
+### Later loss of responsiveness and host sleep hypothesis
+
+The responsive-board statement above describes only the end of the short run.
+The next extended run failed on its initial `quiet` command, before any traffic
+phase started (phases=[]). Last successful NIDLE_END log was at 23:20:17.669;
+the new empty UART log opened at 23:21:31.712, about 74 seconds later. Its
+10-second command timeout and subsequent ping failures do not establish whether
+the board, USB path, host power state or command triggered the loss.
+Evidence: target/mars-reference/20260916-hang-extended/.
+
+The user suggested Mac sleep. The inspected pmset log contained no full-system
+sleep/wake transition around 23:19–23:22, and the 23:22 assertion snapshot showed
+idle system sleep prevented. This does not exclude USB/power issues. Subsequent
+hardware commands use `caffeinate -i -s` scoped to their child process; a short
+probe under that assertion still timed out. Preventing future sleep cannot
+recover an already unresponsive endpoint. No new reboot loop was attempted.
+
+### Atomic IPv4 ID experiment (default off; hardware comparison pending)
+
+Full-rate GRO end profiling attributed 34.31% of attempted group boundaries to
+IP ID discontinuity; 65.35% ended on receive-none, almost entirely empty endpoint.
+This motivates removing an unnecessary ID constraint, not increasing poll or
+ring budgets. RFC 6864 section 4.1 requires receivers to ignore the ID of atomic
+IPv4 datagrams (DF=1, MF=0, offset=0):
+https://www.rfc-editor.org/rfc/rfc6864.html#section-4.1
+
+`gro-atomic-id` is propagated through protocol, netstack, kernel and Mars firmware.
+It only bypasses the same-or-next ID comparison after the existing strict atomic
+IPv4 eligibility test. Flow, sequence, ACK, window, options, flags, length and
+checksum checks remain; both first frames and successors reject non-atomic
+packets. The synthetic packet retains the first ID and is consumed locally by
+TCP, not used as a forwarding/GSO template. This is not a claim that Linux GRO
+ignores arbitrary IDs in its forwarding/segmentation paths.
+
+Host tests with the feature enabled and disabled cover payload/checksum
+preservation, repeated/wrapping/arbitrary IDs, non-DF/MF/fragment-offset/reserved
+flags, and diagnostic reason/histogram conservation. Commands:
+
+```
+cargo test --offline --locked -p vibeos-net-protocol --features 'gro-atomic-id,gro-end-profile,pooled-rx,native-tcp-segmentation'
+cargo test --offline --locked -p vibeos-net-protocol --features 'gro-end-profile,pooled-rx,native-tcp-segmentation'
+```
+
+Each passed 6 unit and 40 integration tests. Logs:
+target/mars-reference/20260916-gro-atomic{,-off}-tests.log.
+The candidate uses the optimized setup-fix baseline feature set plus only
+`gro-atomic-id`, excluding GRO diagnostic counters. Build configuration is
+archived in target/mars-reference/gro-atomic-features.json. No default activation,
+CPU saving, increased group size, or hardware correctness is claimed until
+paired baseline/candidate runs and independent payload validation complete.
+
+Atomic-ID candidate build and ELF/image checks passed. RAM-only FIT:
+`target/mars-boot-20260916-gro-atomic/out/artifacts/vibeos.itb`, SHA-256
+`2835183e57cff1dc3f425b8e8604f135685cc9d96d5218273a8e69fdac4f1030`.
+Exact ELF: target/mars-reference/20260916-gro-atomic.elf.
+Ordinary firmware feature selection was restored after packaging.
+
+The user subsequently confirmed immediate UART recovery after board power-cycle.
+This strengthens the board-side hang hypothesis and takes priority over the
+unconfirmed host-sleep explanation. Echo and old SD/demo network status were
+verified, then setup-fix baseline 523347fa... was RAM-loaded with component hashes
+verified. A controlled run uses continuous UART and ten-second NIDLE_END checks,
+180 seconds idle, 10 seconds RX, 180 seconds post-RX idle. No `quiet` command,
+stack restart or new performance feature is introduced in this run. The host
+power assertion snapshot confirms caffeinate was active. Periodic UART commands
+and demo output may change timing; a passing run cannot disprove intermittent
+hangs. Evidence is target/mars-reference/20260916-hang-guarded/ and
+20260916-hang-confirm-ramboot.log. Result recorded below when complete.
+
+Controlled run FAILED before any iperf traffic: last complete four-hart NIDLE_END
+at elapsed 151.541 s; next scheduled command received no response and timed out
+at 171.656 s. Two ICMP requests then received no replies. Raw UART ends after the
+last complete prompt; no panic text. Thus sustained benchmark traffic, `quiet`,
+and the new atomic-ID feature are not necessary for this reproduction. Network
+services and demo tasks were running, so this is not a network-disabled idle
+control. Full Mac system sleep was prevented during the run; USB transport or
+board hardware failure cannot be distinguished solely from this observation.
+Treat as a reproducible board-path liveness failure, not as a proven lock bug.
+
+A separate default-off `lock-stall-probe` instruments failed spinlock acquisition
+only. It samples the timer every 4096 failed attempts (and at first contention),
+and after two seconds reports once per acquisition through SBI legacy console,
+without allocator, scheduler or TTY locks. It never force-unlocks or panics.
+Reports carry physical hart, lock address, elapsed timer ticks and recoverable
+lock state/owner/task-key snapshots; fast-lock ownership is unknown and printed
+as zero with recoverable=0. Independent atomic fields are not a transactional
+owner record. Concurrent reports may interleave; SBI firmware itself may still
+block. No report does NOT exclude a lock problem, MMIO stall, interrupt storm or
+firmware/hardware failure. The diagnostic changes timing and must not be used as
+a CPU-performance result. Build uses baseline features plus this probe only.
+
+Lock-stall diagnostic passed two detector unit tests, seven sync integration
+tests with the feature on and seven with it off, plus the existing sync unit
+test. Target release build and ELF/image checks passed. FIT SHA-256:
+`64727a4a0252ac6d5e40dff5d6d536ce25bea1799db2ffa5827397e4f33315ee`,
+path `target/mars-boot-20260916-lock-stall/out/artifacts/vibeos.itb`.
+Exact ELF and demangled symbols are archived as
+`target/mars-reference/20260916-lock-stall.{elf}` and
+`target/mars-reference/20260916-lock-stall-symbols.txt` for lock-address lookup.
+Ordinary firmware feature selection restored; diagnostic not yet loaded.
+Board remains unresponsive after controlled reproduction; user power recovery
+requested only after this reviewable diagnostic image was ready. No SD/SPI writes.
+
+### Lock-stall image live idle observation
+
+After user power recovery, the first echo marker timed out but its raw log was
+NOT empty: the old SD shell reported `unknown command: xecho` (a stale leading
+input byte), then continued logger output. This was not classified as a hang.
+A subsequent reboot entered U-Boot normally. RAM load of diagnostic FIT
+64727a4a... verified both component hashes and reached ready/1000-full markers.
+
+Ten-minute idle-only run completed in 602.889 seconds with 60 periodic four-hart
+NIDLE_END checks and no LOCK_STALL/panic output. No iperf, quiet, protocol restart
+or performance candidate was used. Both the failed baseline and this diagnostic
+boot used physical hart 1, four online harts and a 4 MHz timebase. This does not
+prove a fix or exclude deadlock: added failed-acquisition instrumentation and
+image layout can change race timing. Diagnostic stays active for further cause
+capture; no performance conclusion follows from it.
+
+Evidence: target/mars-reference/20260916-lock-stall-idle/{summary.json,serial-full.log,host-power-assertions.txt},
+20260916-lock-stall-ramboot.log, 20260916-hang-diag-ready.log,
+and raw boot/load/network logs under mars-acceptance/20260913-gigabit/20260916-lock-stall-*.
+The subsequent passive phase keeps UART capture open but sends no commands for
+180 seconds, bracketed by nidle and nrxirq. Before that phase, RX_IRQ counters
+were [12,622380,0,622364,3] (interrupts,arms,busy_rechecks,timers,tx_wakes): the
+network IRQ top half was not firing continuously during the successful run.
+
+The diagnostic's passive phase passed (180.110 s): IRQ delta was
+[4,174528,0,174524,0], with complete NIDLE_END afterwards. Then closed the serial
+FD for 180 seconds under caffeinate, sent one ICMP request every ten seconds,
+and reopened serial: all 19 ICMP requests and the final NIDLE_END succeeded.
+No lock stall was captured. Evidence:
+20260916-lock-stall-passive/ and 20260916-lock-stall-closed/ under mars-reference.
+These observations do not identify the original hang cause or establish that
+closing serial is harmless under all timing conditions. A subsequent four-minute
+idle control uses the exact earlier baseline 523347fa..., not a rebuilt image,
+to assess whether instrumentation/layout perturbs the reproduction.
+
+### Exact old-image idle control reproduced loss again (September 17)
+
+Reloaded old baseline 523347fa... with verified hashes, no iperf or `quiet`.
+Last complete NIDLE_END returned at 150.744 s; the next command timed out and
+15 seconds of additional raw capture produced no diagnostic. Final error was
+recorded at 185.905 s (includes that extra capture, NOT the failure onset).
+Two ICMP requests failed. Raw UART includes logger readings 55–57 and guest
+heartbeat 19 after the last successful nidle, then stops. No panic.
+Evidence: target/mars-reference/20260917-hang-control/ and
+20260917-hang-control-ramboot.log.
+
+Together with the earlier 151.541 s failure this strengthens the reproducible
+old-image symptom, but does not establish an exact 152-second timer or a
+seventeenth-command bug. Terminal history deduplicates successive identical
+commands and has a 64-entry bound, not a 16-entry rollover. Current diagnostic
+and older archived baseline also differ in build/source history, not solely the
+probe feature; no causal assertion about the lock probe is made. Prepare a fresh
+same-source, same-feature-set control differing from the successful diagnostic
+only by absence of lock-stall-probe. Keep GRO atomic-ID and profiling experiments
+off. Board is currently unresponsive; no new performance experiment is loaded.
+
+Same-source control built and image checks passed; FIT is
+`target/mars-boot-20260917-lock-control/out/artifacts/vibeos.itb`, SHA-256
+`ce40f34edc4cdc48ce899b27abb017cba8b6292baa3aa89f57db77c557e17180`.
+Exact ELF archived as target/mars-reference/20260917-lock-control.elf.
+Its payload length equals the old baseline (4210936 bytes), but 1881627 bytes
+differ; equal size is not source/binary equivalence. Comparison ranges archived
+in 20260917-lock-control-binary-diff.json. This is a control, not a hang fix.
+Ordinary firmware feature selection restored. User power recovery requested;
+new control not loaded and root cause remains unidentified. No SD/SPI writes.
+
+### Serial adapter recovery changes the interpretation
+
+The user reported that board power cycling did not restore serial, but unplugging
+and reconnecting the serial adapter did. Therefore prior UART/ICMP loss proves
+loss of observed responsiveness, not by itself a halted CPU or spinlock deadlock.
+The shared host/USB path remains a candidate. After that reconnect, an explicit
+echo succeeded. The interrupted capture process was checked and was no longer
+running; no competing serial reader was found.
+
+Added a current-boot RAM prefix journal and the physical shell command `bootlog`.
+It records early UART messages, ordinary formatted console output (formatting
+only once), and kernel SBI panic text before attempting the hardware write.
+Prompt redraws/input echoes are excluded. Writers reserve bounded spans without
+locks or allocation; readers stop at an unpublished span rather than waiting.
+The first 32 KiB are retained, with an explicit truncation flag; later output
+cannot overwrite boot history. Dumping bypasses recording so repeated reads do
+not duplicate the journal. Readout includes entry/current timer ticks and Hz,
+allowing elapsed-time comparison across reconnects. It is RAM-only and reset by
+actual reboot/power loss; no SD/SPI persistence is claimed. This is diagnostic
+observability, not a demonstrated hang fix.
+
+Three host tests cover concurrent fragments, bounded/truncated/NUL prefixes,
+repeatable reads, and an interrupted writer with later published fragments.
+Log: target/mars-reference/20260917-bootlog-tests.log.
+
+Bootlog target release build and image checks passed. FIT SHA-256:
+`f8be52ec4e9b3bf6ee32d1be56c6fb233a355eab17bb4e7e4153e3195a06429d`,
+path target/mars-boot-20260917-bootlog/out/artifacts/vibeos.itb.
+RAM load verified both hashes and ready/1000Mbps; ordinary build feature
+selection restored afterwards. No SD/SPI update was made.
+
+Live `bootlog` reads through two separately opened serial connections passed:
+entry_ticks=412768029 in both; now_ticks advanced from 472215335 to 529066271
+at 4 MHz. First/second snapshots contained 1963/2160 bytes, neither truncated;
+second retained the first prefix. Both included entry, page tables, four harts,
+GMAC/PHY setup and 1000Mbps link. No dump markers occurred inside the retained
+body, proving readback did not recursively fill the journal in this test.
+This verifies close/reopen, not a physical USB unplug experiment. A short
+uninterpreted garbage prefix appeared on the first serial capture outside the
+clean retained boot body; do not interpret those bytes as a new kernel failure.
+Evidence: 20260917-bootlog-read{1,2}.log, -validation.json, -ramboot.log,
+-build.log and -package.log under target/mars-reference/.
+
+Usage on this RAM-loaded image: `bootlog`. Compare entry_ticks and elapsed
+(now_ticks-entry_ticks)/hz across reconnects. The journal is a bounded prefix,
+not a persistent crash recorder; once full it preserves boot history and marks
+truncation. Kernel boot begins after SPL/OpenSBI/U-Boot, so their output is only
+available in external serial captures. The original liveness failure remains
+unexplained; this change improves evidence and is not a hang fix.
+
+Post-implementation liveness check passed for another 180.245 seconds: all 18
+10-second windows contained UART output and all 18 independent ICMP probes
+succeeded. Final bootlog retained entry_ticks=412768029, confirming the same
+recorded boot as the earlier reads. Host en13 reported MTU 1500 and 1000baseT
+full-duplex. Evidence: target/mars-reference/20260917-bootlog-liveness/.
+The macOS kernel USB/serial/CDC log query for the earlier failure interval
+2026-09-17 00:06–00:08 returned no entries under the queried/default log level.
+Absence of such entries does not rule out a host/adapter fault. Raw query result:
+20260917-loss-host-usb.log. No cause or fix is established by this passing run.
+If loss recurs, preserve board power while reconnecting only the serial adapter,
+then compare retained bootlog entry/current ticks before considering a board
+reset; resetting first destroys the RAM evidence needed for that distinction.
+
+### Host serial line-setting evidence
+
+The bootlog image completed a short RX/idle/TX/idle liveness sequence: RX10s
+946.745 Mbps, idle60s, TX10s 943.971 Mbps, idle60s; all NIDLE_END checks returned
+and bootlog remained readable. This is neither CPU optimization evidence nor a
+long-duration qualification. Evidence: 20260917-bootlog-load/.
+
+An independent host issue is now observed. After the last serial FD closes,
+a new open reports 9600 baud with HUPCL, although Mars uses 115200. Even explicitly
+setting raw115200/HUPCL=0 and closing WITHOUT restoring saved termios did not
+persist those settings on next open. Thus blaming only the helper's restore
+logic is insufficient: reopen/driver defaults also matter. A pre-command raw
+capture contained 133 bytes of binary-looking prefix; retained bootlog after it
+was intact. Keep raw prefixes as evidence rather than silently flushing them.
+
+A bounded 180-second keeper held a cu FD open at115200/HUPCL=0 and did not read or
+write. With it active, a second FD reported115200/HUPCL=0. First read retained
+previous buffered garbage (38 non-ASCII bytes); the next 21036-byte capture had
+zero non-ASCII or NUL bytes. Both reported the same entry_ticks=412768029.
+This supports retaining a serial session across commands to avoid baud/default
+transitions. It establishes a transport configuration/confounding issue, NOT
+that it caused every earlier loss of UART AND network responsiveness; continuous
+capture had also failed on the old baseline. No kernel hang fix is claimed.
+Evidence: 20260917-serial-{line-settings,held-settings,held-validation}.json and
+20260917-serial-held-bootlog{,2}.log in target/mars-reference/.

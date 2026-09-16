@@ -5,6 +5,11 @@ edition = "2021"
 autobins = false
 
 [features]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = ["vibeos-core/lock-stall-probe"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro", "vibeos-netstack?/gro-atomic-id"]
+gro-end-profile = ["bounded-gro", "vibeos-netstack?/gro-end-profile"]
 rx-publish-batch = ["pooled-rx", "vibeos-core/rx-publish-batch"]
 tx-lease-profile = ["direct-tcp-segmentation", "vibeos-core/tx-lease-profile", "vibeos-netstack?/tx-lease-profile"]
 counter-probe = []

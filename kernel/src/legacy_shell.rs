@@ -92,6 +92,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        "bootlog" => crate::boot_log::dump(),
         #[cfg(feature = "driver-stage-profile")]
         "ndrvstage" => println!("DRIVER_STAGE hz={} sample_every=64 fields=[turns,tx_ticks,rx_ticks,rx_hw_ticks,rx_acquired,rx_published,rx_full,rx_empty] values={:?}",
             crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),
@@ -165,6 +166,14 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         "ngro" => {
             println!("NGRO fields=[rx_frames,merged_segments,aggregates] values={:?} approximate=true",
                 vibeos_netstack::gro_stats());
+        }
+        #[cfg(all(feature = "gro-end-profile", feature = "dhcp-iperf3-server"))]
+        "ngrodetail" => {
+            let counts = vibeos_netstack::gro_end_stats();
+            println!("GRO_DETAIL version=2");
+            println!("GRO_END fields=[first_rejected,psh,short,receive_none,next_ineligible,headers,ipid,budget,original_invalid] values={:?} approximate=true", &counts[..9]);
+            println!("GRO_SIZE sizes=0..16 values={:?} attempted=true", &counts[9..26]);
+            println!("GRO_NONE fields=[ingress_budget,empty_endpoint,authority,rejected,unsupported] values={:?}", &counts[26..]);
         }
         #[cfg(feature = "tx-lease-profile")]
         "ntxlease" => {
@@ -324,6 +333,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             }
         }
         "help" => {
+            println!("  bootlog         retained current-boot RAM output and uptime ticks");
             println!("  ps              component identities, lifecycle, and poll counts");
             println!("  spaces          capability spaces in the system");
             println!("  caps <space>    component owner and capability table");

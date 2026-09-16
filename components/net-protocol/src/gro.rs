@@ -39,7 +39,15 @@ fn eligible(b: &[u8], trusted: bool) -> Option<(usize, usize)> {
     Some((TCP + h, end))
 }
 
+#[cfg(feature = "gro-end-profile")]
+#[derive(Clone, Copy)]
+pub enum NoInput { IngressBudget, EmptyEndpoint, Authority, Rejected, Unsupported }
+
 pub struct Buffer {
+    #[cfg(feature = "gro-end-profile")]
+    pub profile: [u64; 31], // 9 end reasons, sizes 0..=16, then 5 receive-none subreasons.
+    #[cfg(feature = "gro-end-profile")]
+    profile_reason: usize,
     data: Vec<u8>,
     header: usize,
     mss: usize,
@@ -52,12 +60,19 @@ pub struct Buffer {
 }
 impl Buffer {
     pub fn new() -> Self {
-        Self { data: Vec::with_capacity(MAX_BYTES), header: 0, mss: 0,
+        Self {
+            #[cfg(feature = "gro-end-profile")]
+            profile: [0; 31],
+            #[cfg(feature = "gro-end-profile")]
+            profile_reason: 0,
+            data: Vec::with_capacity(MAX_BYTES), header: 0, mss: 0,
             next_seq: 0, last_id: 0, done: true, segments: 0,
             merged_segments: 0, aggregates: 0 }
     }
     pub fn begin(&mut self, b: &[u8], trusted: bool) -> bool {
         let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
+        #[cfg(feature = "gro-end-profile")]
+        { self.profile_reason = 0; }
         self.data.clear();
         self.segments = 0;
         self.done = true;
@@ -69,6 +84,8 @@ impl Buffer {
         self.last_id = u16_at(b, 18);
         self.done = b[47] & 8 != 0;
         self.segments = 1;
+        #[cfg(feature = "gro-end-profile")]
+        { self.profile_reason = if self.done { 1 } else { 7 }; }
         true
     }
     /// `original` is the same immutable frame passed to begin, still owned by
@@ -76,10 +93,18 @@ impl Buffer {
     pub fn append(&mut self, original: &[u8], b: &[u8], trusted: bool) -> bool {
         let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
         if self.done || self.segments >= MAX_SEGMENTS { return false; }
-        let Some((header, end)) = eligible(b, trusted) else { return false; };
+        let Some((header, end)) = eligible(b, trusted) else {
+            #[cfg(feature = "gro-end-profile")]
+            { self.profile_reason = 4; }
+            return false;
+        };
         let payload = end - header;
         let first = if self.segments == 1 {
-            let Some(first) = original.get(..self.header + self.mss) else { return false; };
+            let Some(first) = original.get(..self.header + self.mss) else {
+                #[cfg(feature = "gro-end-profile")]
+                { self.profile_reason = 8; }
+                return false;
+            };
             first
         } else { &self.data };
         let id = u16_at(b, 18);
@@ -87,8 +112,18 @@ impl Buffer {
             || first.len() + payload > MAX_BYTES || u32_at(b, 38) != self.next_seq
             || b[..16] != first[..16] || b[20..24] != first[20..24] || b[26..38] != first[26..38]
             || b[42..47] != first[42..47] || b[48..50] != first[48..50]
-            || b[54..header] != first[54..header]
-            || (id != self.last_id && id != self.last_id.wrapping_add(1)) {
+            || b[54..header] != first[54..header] {
+            #[cfg(feature = "gro-end-profile")]
+            { self.profile_reason = 5; }
+            return false;
+        }
+        // eligible() requires DF=1, MF=0 and offset=0 for both frames.
+        // RFC 6864 section 4.1 makes their IDs meaningless. This opt-in path
+        // produces a local TCP receive packet, not a forwarding/GSO template.
+        if !cfg!(feature = "gro-atomic-id")
+            && id != self.last_id && id != self.last_id.wrapping_add(1) {
+            #[cfg(feature = "gro-end-profile")]
+            { self.profile_reason = 6; }
             return false;
         }
         if self.segments == 1 {
@@ -99,9 +134,26 @@ impl Buffer {
         self.next_seq = self.next_seq.wrapping_add(payload as u32);
         self.last_id = id;
         self.done = b[47] & 8 != 0 || payload < self.mss;
+        #[cfg(feature = "gro-end-profile")]
+        { self.profile_reason = if b[47] & 8 != 0 { 1 } else if payload < self.mss { 2 } else { 7 }; }
         self.segments += 1;
         self.merged_segments += 1;
         true
+    }
+    /// None includes the adapter's per-poll ingress budget, queue exhaustion,
+    /// unsupported transport and capability/acquisition failure. This counter
+    /// alone does not establish hardware starvation.
+    #[cfg(feature = "gro-end-profile")]
+    pub fn profile_no_input(&mut self, why: NoInput) {
+        self.profile_reason = 3;
+        self.profile[26 + why as usize] += 1;
+    }
+    /// One attempted group, including rejected first frames (size zero).
+    /// Recorded before final authority validation; not a delivered-frame count.
+    #[cfg(feature = "gro-end-profile")]
+    pub fn profile_record(&mut self) {
+        self.profile[self.profile_reason] += 1;
+        self.profile[9 + self.segments] += 1;
     }
     pub fn has_aggregate(&self) -> bool { self.segments >= 2 }
     pub fn finished(&self) -> bool { self.done }
@@ -203,6 +255,87 @@ mod tests {
         assert!(g.finished());
         assert!(g.bytes().is_empty());
         assert!(!g.has_aggregate());
+    }
+
+    #[test]
+    fn atomic_id_policy_preserves_payload_checksums_and_fragment_exclusion() {
+        for trusted in [false, true] {
+            let mut a = frame(0, 100);
+            a[18..20].copy_from_slice(&65535u16.to_be_bytes());
+            checksums(&mut a);
+            // Repeated ID and wrapping successor work in both modes; arbitrary
+            // changes are accepted only by the atomic-datagram experiment.
+            for id in [65535u16, 0, 32768, 9] {
+                let mut b = frame(100, 100);
+                b[18..20].copy_from_slice(&id.to_be_bytes());
+                checksums(&mut b);
+                let mut g = Buffer::new();
+                assert!(g.begin(&a, trusted));
+                let accepted = cfg!(feature = "gro-atomic-id") || id == 65535 || id == 0;
+                assert_eq!(g.append(&a, &b, trusted), accepted);
+                if accepted {
+                    // Software finalization verifies the synthetic packet even
+                    // when original ingress checksums were trusted.
+                    g.finish(false);
+                    assert!(eligible(g.bytes(), false).is_some());
+                    assert_eq!(&g.bytes()[66..166], &a[66..]);
+                    assert_eq!(&g.bytes()[166..], &b[66..]);
+                    assert_eq!(u16_at(g.bytes(), 18), 65535);
+                } else {
+                    assert!(!g.has_aggregate());
+                    assert!(g.bytes().is_empty());
+                }
+                for flags in [0u16, 0x2000, 0x6000, 0x4001, 0x0001, 0xc000] {
+                    let mut fragment = b.clone();
+                    fragment[20..22].copy_from_slice(&flags.to_be_bytes());
+                    checksums(&mut fragment);
+                    let mut g = Buffer::new();
+                    assert!(!g.begin(&fragment, trusted));
+                    assert!(g.begin(&a, trusted));
+                    assert!(!g.append(&a, &fragment, trusted));
+                    assert!(!g.has_aggregate());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gro-end-profile")]
+    #[test]
+    fn end_profile_distinguishes_boundaries_and_conserves_attempts() {
+        let a = frame(0, 100);
+        let b = frame(100, 100);
+        let mut g = Buffer::new();
+        assert!(!g.begin(&[], false)); g.profile_record();
+        let mut psh = a.clone(); psh[47] |= 8; checksums(&mut psh);
+        assert!(g.begin(&psh, false)); g.profile_record();
+        assert!(g.begin(&a, false));
+        assert!(g.append(&a, &frame(100, 50), false)); g.profile_record();
+        assert!(g.begin(&a, false)); g.profile_no_input(NoInput::EmptyEndpoint); g.profile_record();
+        assert!(g.begin(&a, false)); assert!(!g.append(&a, &[], false)); g.profile_record();
+        let mut changed = b.clone(); changed[48] ^= 1; checksums(&mut changed);
+        assert!(g.begin(&a, false)); assert!(!g.append(&a, &changed, false)); g.profile_record();
+        let mut id = b.clone(); id[18..20].copy_from_slice(&9u16.to_be_bytes()); checksums(&mut id);
+        assert!(g.begin(&a, false));
+        assert_eq!(g.append(&a, &id, false), cfg!(feature = "gro-atomic-id"));
+        g.profile_record();
+        assert!(g.begin(&a, false));
+        for n in 1..MAX_SEGMENTS { assert!(g.append(&a, &frame(n as u32 * 100, 100), false)); }
+        g.profile_record();
+        assert!(g.begin(&a, false)); assert!(!g.append(&[], &b, false)); g.profile_record();
+        let atomic = cfg!(feature = "gro-atomic-id");
+        assert_eq!(&g.profile[..9], if atomic { &[1,1,1,1,1,1,0,2,1] } else { &[1; 9] });
+        assert_eq!(g.profile[9], 1); // ineligible first frame
+        assert_eq!(g.profile[10], if atomic { 5 } else { 6 }); // singleton attempts
+        assert_eq!(g.profile[11], if atomic { 2 } else { 1 }); // short second frame
+        assert_eq!(g.profile[25], 1); // bounded 16-frame group
+        assert_eq!(g.profile[..9].iter().sum::<u64>(), g.profile[9..26].iter().sum::<u64>());
+        assert_eq!(g.profile[27], 1);
+        assert_eq!(g.profile[26..].iter().sum::<u64>(), g.profile[3]);
+        // The default path still rejects without materializing the frame.
+        assert!(g.begin(&a, false));
+        assert_eq!(g.append(&a, &id, false), atomic);
+        assert_eq!(g.has_aggregate(), atomic);
+        assert_eq!(g.bytes().is_empty(), !atomic);
     }
 
 }

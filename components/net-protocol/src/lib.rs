@@ -258,6 +258,8 @@ pub struct PacketDeviceStats {
     pub pending_egress: bool,
     pub gro_merged_segments: u64,
     pub gro_aggregates: u64,
+    #[cfg(feature = "gro-end-profile")]
+    pub gro_end_profile: [u64; 31],
 }
 
 /// A lossless-at-the-endpoint-boundary smoltcp device adapter.
@@ -287,6 +289,8 @@ pub struct PacketDevice {
     rx_checksum_offload: bool,
     #[cfg(feature = "bounded-gro")]
     gro: gro::Buffer,
+    #[cfg(feature = "gro-end-profile")]
+    gro_last_none: gro::NoInput,
     #[cfg(feature = "bounded-gro")]
     pending_ingress: Option<Packet>,
     #[cfg(feature = "bounded-gro")]
@@ -319,6 +323,8 @@ impl PacketDevice {
             rx_checksum_offload: false,
             #[cfg(feature = "bounded-gro")]
             gro: gro::Buffer::new(),
+            #[cfg(feature = "gro-end-profile")]
+            gro_last_none: gro::NoInput::Unsupported,
             #[cfg(feature = "bounded-gro")]
             pending_ingress: None,
             #[cfg(feature = "bounded-gro")]
@@ -466,6 +472,8 @@ impl PacketDevice {
         {
             stats.gro_merged_segments = self.gro.merged_segments;
             stats.gro_aggregates = self.gro.aggregates;
+            #[cfg(feature = "gro-end-profile")]
+            { stats.gro_end_profile = self.gro.profile; }
         }
         stats
     }
@@ -487,8 +495,16 @@ impl PacketDevice {
     fn receive_pooled(&mut self) -> Option<vibeos_core::net_receive::Loan> {
         let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxLoan);
         #[cfg(feature = "bounded-gro")]
-        if self.ingress_remaining == 0 { return None; }
-        let result = self.inbound.receive_loan(self.stamp)?;
+        if self.ingress_remaining == 0 {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::IngressBudget; }
+            return None;
+        }
+        let Some(result) = self.inbound.receive_loan(self.stamp) else {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::Unsupported; }
+            return None;
+        };
         if !matches!(&result, Ok(Ok(None)) | Err(_)) {
             #[cfg(feature = "bounded-gro")]
             { self.ingress_remaining -= 1; }
@@ -496,10 +512,18 @@ impl PacketDevice {
         match result {
             Ok(Ok(loan)) => {
                 if loan.is_some() { self.stats.rx_frames = self.stats.rx_frames.saturating_add(1); }
+                #[cfg(feature = "gro-end-profile")]
+                if loan.is_none() { self.gro_last_none = gro::NoInput::EmptyEndpoint; }
                 loan
             }
-            Err(_) => { self.authority_revoked = true; None }
+            Err(_) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Authority; }
+                self.authority_revoked = true; None
+            }
             Ok(Err(error)) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Rejected; }
                 self.stats.rejected_ingress_frames = self.stats.rejected_ingress_frames.saturating_add(1);
                 if let vibeos_core::net_receive::Error::Session(mismatch) = error {
                     if mismatch.device_epoch_changed() {
@@ -515,10 +539,21 @@ impl PacketDevice {
 
     fn receive_packet(&mut self) -> Option<Packet> {
         #[cfg(feature = "bounded-gro")]
-        if self.ingress_remaining == 0 { return None; }
+        if self.ingress_remaining == 0 {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::IngressBudget; }
+            return None;
+        }
         let packet = match self.inbound.raw_receive() {
-            Ok(packet) => packet?,
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::EmptyEndpoint; }
+                return None;
+            },
             Err(_) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Authority; }
                 self.authority_revoked = true;
                 return None;
             }
@@ -528,6 +563,8 @@ impl PacketDevice {
         let packet = match packet.into_packet(self.stamp) {
             Ok(packet) => packet,
             Err(mismatch) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Rejected; }
                 self.stats.rejected_ingress_frames =
                     self.stats.rejected_ingress_frames.saturating_add(1);
                 if mismatch.device_epoch_changed() {
@@ -740,7 +777,11 @@ impl phy::Device for PacketDevice {
             if self.gro.begin(loan.as_bytes(), self.rx_checksum_offload) {
                 for _ in 1..gro::MAX_SEGMENTS {
                     if self.gro.finished() { break; }
-                    let Some(next) = self.receive_pooled() else { break; };
+                    let Some(next) = self.receive_pooled() else {
+                        #[cfg(feature = "gro-end-profile")]
+                        self.gro.profile_no_input(self.gro_last_none);
+                        break;
+                    };
                     if !self.gro.append(loan.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
                         self.pending_rx_loan = Some(next);
                         break;
@@ -749,6 +790,8 @@ impl phy::Device for PacketDevice {
                     // Dropping this loan returns its DMA slot immediately.
                 }
             }
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
             #[cfg(feature = "bounded-gro")]
             if self.authority_revoked || self.revalidate_authority().is_err() {
                 self.pending_rx_loan = None;
@@ -789,12 +832,18 @@ impl phy::Device for PacketDevice {
         let bytes = if self.gro.begin(packet.as_bytes(), self.rx_checksum_offload) {
             for _ in 1..gro::MAX_SEGMENTS {
                 if self.gro.finished() { break; }
-                let Some(next) = self.receive_packet() else { break; };
+                let Some(next) = self.receive_packet() else {
+                        #[cfg(feature = "gro-end-profile")]
+                        self.gro.profile_no_input(self.gro_last_none);
+                        break;
+                    };
                 if !self.gro.append(packet.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
                     self.pending_ingress = Some(next);
                     break;
                 }
             }
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
             // Revocation observed while gathering invalidates the whole token.
             if self.authority_revoked { return None; }
             if self.gro.has_aggregate() {
@@ -803,7 +852,11 @@ impl phy::Device for PacketDevice {
             } else {
                 single_rx(packet, &mut self.rx_packet)
             }
-        } else { single_rx(packet, &mut self.rx_packet) };
+        } else {
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
+            single_rx(packet, &mut self.rx_packet)
+        };
         #[cfg(not(feature = "bounded-gro"))]
         let bytes = { single_rx(packet, &mut self.rx_packet) };
         Some((

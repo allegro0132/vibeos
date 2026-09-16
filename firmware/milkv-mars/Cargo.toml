@@ -5,6 +5,11 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = ["vibeos-kernel?/lock-stall-probe"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro", "vibeos-kernel?/gro-atomic-id"]
+gro-end-profile = ["bounded-gro", "vibeos-kernel?/gro-end-profile"]
 rx-publish-batch = ["rx-pool-experiment", "vibeos-kernel?/rx-publish-batch"]
 tx-lease-profile = ["dep:vibeos-kernel", "vibeos-kernel/tx-lease-profile"]
 counter-probe = ["dep:vibeos-kernel", "vibeos-kernel/counter-probe"]
@@ -60,7 +65,7 @@ image = ["sd-device", "dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibe
 # Hardware assembly is independent of the selected network service image.
 ethernet-device = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
 # Compatibility profile used by --ethernet build/package commands.
-ethernet = ["rx-publish-batch", "gmac-coherent-experiment", "rx-batch-experiment", "bounded-gro", "application-event-experiment", "rx-interrupt-experiment", "rx-pool-experiment", "direct-tcp-segmentation", "ethernet-device", "tx-checksum-experiment", "rx-ipv4-checksum-experiment", "rx-error-forward-experiment", "rx-readonly-recycle-experiment", "dma-ring128-experiment", "tx-single-sync-experiment", "idle-profile", "tcp-throughput-probe", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/network-pipeline"]
+ethernet = ["ethernet-device", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/executor-profile", "vibeos-kernel?/network-pipeline"]
 
 # Install a retained, unstarted native owner; source approval is separate.
 entropy-device = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]

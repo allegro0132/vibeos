@@ -35,6 +35,13 @@ pub mod config;
 
 /// Approximate once-per-second totals for live stack instances; no hot-path
 /// atomic increments. Diagnostic only, not a lifetime delivery guarantee.
+#[cfg(feature = "gro-end-profile")]
+static GRO_END_STATS: [core::sync::atomic::AtomicU64; 31] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 31];
+#[cfg(feature = "gro-end-profile")]
+pub fn gro_end_stats() -> [u64; 31] {
+    core::array::from_fn(|i| GRO_END_STATS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
 #[cfg(feature = "bounded-gro")]
 static GRO_STATS: [core::sync::atomic::AtomicU64; 3] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 3];
@@ -339,15 +346,25 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
         #[cfg(feature = "bounded-gro")]
         if now_ms.saturating_sub(gro_last_ms) >= 1000 {
             let mut totals = [0u64; 3];
+            #[cfg(feature = "gro-end-profile")]
+            let mut end_totals = [0u64; 31];
             for interface in &interfaces {
                 if let Some(active) = interface.stack.as_ref() {
                     let stats = active.core.device_stats();
                     totals[0] += stats.rx_frames;
                     totals[1] += stats.gro_merged_segments;
                     totals[2] += stats.gro_aggregates;
+                    #[cfg(feature = "gro-end-profile")]
+                    for (total, value) in end_totals.iter_mut().zip(stats.gro_end_profile) {
+                        *total += value;
+                    }
                 }
             }
             for (slot, value) in GRO_STATS.iter().zip(totals) {
+                slot.store(value, core::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "gro-end-profile")]
+            for (slot, value) in GRO_END_STATS.iter().zip(end_totals) {
                 slot.store(value, core::sync::atomic::Ordering::Relaxed);
             }
             gro_last_ms = now_ms;

@@ -1153,6 +1153,7 @@ mod trampoline;
 mod trap;
 #[cfg(feature = "counter-probe")]
 mod counter_probe;
+mod boot_log;
 mod tty;
 mod uart;
 #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
@@ -1332,6 +1333,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         extern "C" { fn vibeos_select_platform(hart: usize, dtb: usize) -> bool; }
         if !unsafe { vibeos_select_platform(_boot_hart, _firmware_dtb) } { sbi::shutdown(true); }
     }
+    boot_log::init();
     uart::early_write("\r\n[VibeOS] entry\r\n");
     let boot_physical_hart = sbi::current_hart_id();
 
@@ -2315,6 +2317,7 @@ fn panic(info: &PanicInfo) -> ! {
 struct SbiWriter;
 impl core::fmt::Write for SbiWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        boot_log::append(s);
         for b in s.bytes() {
             if b == b'\n' {
                 sbi::legacy_putchar(b'\r');

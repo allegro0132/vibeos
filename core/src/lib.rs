@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod arch;
 pub mod bench;
+pub mod boot_log;
 pub mod cap;
 pub mod chan;
 pub mod exec;
@@ -29,6 +30,8 @@ pub mod pc_sample;
 pub mod net_tx_audit;
 pub mod poll_budget;
 pub mod runqueue;
+#[cfg(feature = "lock-stall-probe")]
+mod lock_stall;
 pub mod sync;
 
 pub mod net_segmentation;

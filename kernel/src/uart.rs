@@ -83,6 +83,7 @@ pub fn init() {
 /// before secondary harts or the executor can introduce another console
 /// writer; one final marker may be emitted immediately after enabling IRQs.
 pub fn early_write(text: &str) {
+    crate::boot_log::append(text);
     if !hardware().capabilities.early_uart {
         return;
     }

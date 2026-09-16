@@ -186,6 +186,14 @@ fn apply_input(tty: &mut ConsoleTty, action: InputAction) -> Option<TerminalEven
 /// Print to UART, redrawing an active console prompt around the output.
 /// `background` marks output that the console's `quiet` setting may drop.
 pub fn emit(args: fmt::Arguments<'_>, background: bool) {
+    emit_inner(args, background, true);
+}
+
+pub(crate) fn emit_unrecorded(args: fmt::Arguments<'_>) {
+    emit_inner(args, false, false);
+}
+
+fn emit_inner(args: fmt::Arguments<'_>, background: bool, record: bool) {
     let tty = TTY.lock();
     if background && tty.quiet {
         return;
@@ -193,7 +201,11 @@ pub fn emit(args: fmt::Arguments<'_>, background: bool) {
     if tty.at_prompt {
         erase_line();
     }
-    let _ = uart::Console.write_fmt(args);
+    if record {
+        let _ = crate::boot_log::Console.write_fmt(args);
+    } else {
+        let _ = uart::Console.write_fmt(args);
+    }
     if tty.at_prompt {
         redraw_contents(&tty);
     }

@@ -1958,6 +1958,41 @@ mod pooled_receive {
         for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
     }
 
+    #[cfg(feature = "gro-end-profile")]
+    #[test]
+    fn gro_none_distinguishes_poll_budget_from_empty_endpoint() {
+        let q = unsafe { ReceiveEndpoint::new("gro-none-loans", 64, &OPS).unwrap() };
+        let out = Endpoint::new("gro-none-out", 64);
+        let mut cs = CSpace::new("gro-none");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let config = Ipv4StackConfig::from(server_config()).with_rx_checksum_offload(true);
+        let mut stack = SharedIpv4TcpStack::new(config, session_stamp(), rx, tx).unwrap();
+        let tickets: Vec<_> = (0..33).map(|i| {
+            let mut frame = gro_test_data(i * 100);
+            // Close the first group after one packet so the 32-frame poll
+            // budget splits a later group, despite another queued packet.
+            if i == 0 { frame[47] |= 8; }
+            inject(&q, &frame)
+        }).collect();
+        stack.poll_network(0).unwrap();
+        let before = stack.device_stats();
+        assert_eq!(before.rx_frames, 32);
+        assert!(q.has_message());
+        assert_eq!(&before.gro_end_profile[26..], &[1, 0, 0, 0, 0]);
+        assert_eq!(before.gro_end_profile[3], 1);
+        stack.poll_network(1).unwrap();
+        let after = stack.device_stats();
+        assert_eq!(after.rx_frames, 33);
+        assert!(!q.has_message());
+        assert_eq!(&after.gro_end_profile[26..], &[1, 1, 0, 0, 0]);
+        assert_eq!(after.gro_end_profile[3], 2);
+        assert_eq!(after.gro_end_profile[..9].iter().sum::<u64>(),
+                   after.gro_end_profile[9..26].iter().sum::<u64>());
+        drop(stack);
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
     #[cfg(feature = "bounded-gro")]
     #[test]
     fn revocation_during_pooled_gro_collection_publishes_no_token() {

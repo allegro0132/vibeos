@@ -316,6 +316,8 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_fast(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "lock-stall-probe")]
+        let mut stall = crate::lock_stall::Probe::new();
         #[cfg(feature = "network-profile")]
         let mut profile_wait = None;
         let mut contended = false;
@@ -336,6 +338,10 @@ impl<T> SpinLock<T> {
                             self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    #[cfg(feature = "lock-stall-probe")]
+                    if let Some(elapsed) = stall.check() {
+                        crate::lock_stall::report(self as *const Self as usize, elapsed, false, 0, 0, 0);
+                    }
                     core::hint::spin_loop();
                 }
             }
@@ -355,6 +361,8 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_recoverable(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "lock-stall-probe")]
+        let mut stall = crate::lock_stall::Probe::new();
         #[cfg(feature = "network-profile")]
         let mut profile_wait = None;
         let mut contended = false;
@@ -397,6 +405,12 @@ impl<T> SpinLock<T> {
                 if self.stats_enabled.load(Ordering::Relaxed) {
                     self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            #[cfg(feature = "lock-stall-probe")]
+            if let Some(elapsed) = stall.check() {
+                crate::lock_stall::report(self as *const Self as usize, elapsed, true,
+                    self.state.load(Ordering::Relaxed), self.owner.load(Ordering::Relaxed),
+                    self.recovery_key.load(Ordering::Relaxed));
             }
             core::hint::spin_loop();
         };

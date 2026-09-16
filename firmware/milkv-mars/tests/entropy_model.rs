@@ -1,6 +1,6 @@
 //! Shared host/RV64 lifecycle model. No noise or physical reset proof.
 use core::cell::Cell;
-use vibeos_firmware_milkv_mars::entropy_instance::Instance;
+use vibeos_firmware_milkv_mars::entropy_instance::{Instance, Failure};
 use vibeos_hal::entropy::Error;
 use vibeos_platform_jh7110::security;
 use vibeos_starfive_trng::{Registers, Trng};
@@ -9,6 +9,7 @@ struct Model {
     gates: [Cell<u32>; 2],
     reset: Cell<u32>,
     stop_fails: Cell<bool>,
+    bad_mode: Cell<bool>,
     repeat: Cell<bool>,
     generated: Cell<u32>,
     fail_at: Cell<u32>,
@@ -16,7 +17,7 @@ struct Model {
 impl Model {
     const fn new() -> Self {
         Self { words: [const { Cell::new(0) }; 26], gates: [const { Cell::new(0) }; 2],
-            reset: Cell::new(0), stop_fails: Cell::new(false), repeat: Cell::new(false),
+            reset: Cell::new(0), stop_fails: Cell::new(false), bad_mode: Cell::new(false), repeat: Cell::new(false),
             generated: Cell::new(0), fail_at: Cell::new(u32::MAX) }
     }
     fn instance(&self) -> Instance<Crg<'_>, Rng<'_>> {
@@ -45,7 +46,10 @@ impl security::Registers for Crg<'_> {
 }
 struct Rng<'a>(&'a Model);
 impl Registers for Rng<'_> {
-    fn read(&mut self, o: usize) -> u32 { self.0.words[o / 4].get() }
+    fn read(&mut self, o: usize) -> u32 {
+        if o == 12 && self.0.bad_mode.get() { return 0; }
+        self.0.words[o / 4].get()
+    }
     fn write(&mut self, o: usize, v: u32) {
         let m = self.0;
         match o {
@@ -96,11 +100,32 @@ pub fn run() {
     m.stop_fails.set(false); i.reset_and_prepare(3).unwrap();
     assert!(!i.completion(pending)); i.shutdown().unwrap();
 
+    let m = Model::new(); let mut i = m.instance(); m.bad_mode.set(true);
+    assert_eq!(i.prepare(1), Err(Error::Protocol));
+    assert_eq!(i.failure(), Some(Failure::Initialize(vibeos_starfive_trng::Error::Mode)));
+    i.shutdown().unwrap();
+    assert_eq!(i.failure(), Some(Failure::Initialize(vibeos_starfive_trng::Error::Mode)));
+    m.bad_mode.set(false); i.prepare(2).unwrap();
+    assert_eq!(i.failure(), None); i.shutdown().unwrap();
+
+    // Preserve the first platform failure through a failing shutdown;
+    // a successful fresh epoch clears it only after reset can be attempted.
+    let m = Model::new(); let mut i = m.instance();
+    m.stop_fails.set(true);
+    assert_eq!(i.prepare(1), Err(Error::Quarantined));
+    assert_eq!(i.failure(), Some(Failure::PrepareDomain(security::Error::TimedOut)));
+    assert_eq!(i.shutdown(), Err(Error::Quarantined));
+    assert_eq!(i.failure(), Some(Failure::PrepareDomain(security::Error::TimedOut)));
+    m.stop_fails.set(false); i.shutdown().unwrap(); i.prepare(2).unwrap();
+    assert_eq!(i.failure(), None); i.shutdown().unwrap();
+
     // Failure in the second block must publish neither a completion nor a prefix.
     let m = Model::new(); m.fail_at.set(2); let mut i = m.instance(); i.prepare(1).unwrap();
     assert_eq!(i.submit(64), Err(Error::Protocol)); assert!(!i.operational());
+    assert_eq!(i.failure(), Some(Failure::Read(vibeos_starfive_trng::Error::Lockup)));
     assert_eq!(i.prepare(2), Err(Error::Quarantined)); i.shutdown().unwrap();
-    i.prepare(2).unwrap(); let t = i.submit(1).unwrap(); assert_eq!(t.serial, 2);
+    assert_eq!(i.failure(), Some(Failure::Read(vibeos_starfive_trng::Error::Lockup)));
+    i.prepare(2).unwrap(); assert_eq!(i.failure(), None); let t = i.submit(1).unwrap(); assert_eq!(t.serial, 2);
     i.shutdown().unwrap();
 
     // Hardware reset cannot erase repeated-output history in the software owner.

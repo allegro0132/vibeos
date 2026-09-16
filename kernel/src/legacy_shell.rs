@@ -95,6 +95,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         #[cfg(feature = "driver-stage-profile")]
         "ndrvstage" => println!("DRIVER_STAGE hz={} sample_every=64 fields=[turns,tx_ticks,rx_ticks,rx_hw_ticks,rx_acquired,rx_published,rx_full,rx_empty] values={:?}",
             crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),
+        #[cfg(all(feature = "receive-buffer-exchange", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "nrxexchange" => println!("RXEX_BYTES fields=[exchanged,copied] values={:?}", vibeos_netstack::receive_exchange_bytes()),
         #[cfg(feature = "tx-wait-profile")]
         "ntxwait" => println!("TX_WAIT hz={} fields=[other_turns,other_ticks,tx_only_turns,tx_only_ticks,idle_turns,idle_ticks] values={:?}",
             crate::exec::timebase_hz(), crate::dwmac_net::tx_wait_stats()),
@@ -175,6 +177,62 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 }
             }
             println!("NIDLE_END");
+        }
+        #[cfg(feature = "pc-sample")]
+        "npc" => {
+            use vibeos_core::pc_sample::RECORDER as p;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                let accepted = p.start(sbi::time(), exec::timebase_hz(), seconds);
+                if accepted {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    // Re-arm on each actual hart through pinned tasks. The SSIP
+                    // handler remains lock-free; existing earlier timers win.
+                    for h in 0..exec::MAX_HARTS {
+                        let hart = vibeos_core::runqueue::HartId::new(h).unwrap();
+                        if vibeos_core::ipi::is_online(hart) {
+                            exec::spawn_pinned_on(hart, "pc-sample-arm", async { exec::init_timer(); });
+                        }
+                    }
+                }
+                println!("NPC_START accepted={} window={:?} hz={}", accepted, p.window(), exec::timebase_hz());
+            } else {
+                if !p.freeze(sbi::time()) {
+                    println!("NPC not ready; arm once with `npc 5`, wait for expiry, then retry");
+                    return;
+                }
+                println!("NPC window={:?} hz={} irq_mask_bias=true ra_is_stack=false", p.window(), exec::timebase_hz());
+                for h in 0..exec::MAX_HARTS {
+                    let (count, dropped) = p.count(h);
+                    println!("NPC_HART h={} count={} dropped={}", h, count, dropped);
+                    for i in 0..count {
+                        let (time, due, pc, ra) = p.sample(h, i);
+                        println!("NPC_SAMPLE h={} i={} time={} due={} pc={:#x} ra={:#x}", h, i, time, due, pc, ra);
+                    }
+                }
+                println!("NPC_END");
+            }
+        }
+        #[cfg(feature = "copy-profile")]
+        "ncopy" => {
+            use vibeos_core::copy_profile as p;
+            let recorder = &p::RECORDER;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                println!("NCOPY_START accepted={} window={:?} hz={}",
+                    recorder.start(sbi::time(), exec::timebase_hz(), seconds), recorder.window(), exec::timebase_hz());
+            } else if recorder.freeze(sbi::time()) {
+                println!("NCOPY window={:?} hz={} interval={} min_bytes={} capacity={} units=timer_ticks",
+                    recorder.window(), exec::timebase_hz(), p::INTERVAL, p::MIN_BYTES, p::CAPACITY);
+                for h in 0..exec::MAX_HARTS {
+                    let (eligible,dropped) = recorder.counts(h);
+                    println!("NCOPY_HART h={} eligible={} dropped={}", h,eligible,dropped);
+                    for i in 0..p::CAPACITY {
+                        let (caller,key,calls,bytes,ticks,max) = recorder.entry(h,i);
+                        if calls != 0 { println!("NCOPY_ENTRY h={} caller={:#x} key={} calls={} bytes={} ticks={} max={}",
+                            h,caller,key,calls,bytes,ticks,max); }
+                    }
+                }
+                println!("NCOPY_END");
+            } else { println!("NCOPY not ready; arm once with `ncopy 1..5`, then dump after expiry"); }
         }
         #[cfg(feature = "network-profile")]
         "nprof" => {

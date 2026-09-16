@@ -10,6 +10,17 @@
 
 extern crate alloc;
 
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_ownership;
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_storage;
+#[cfg(feature = "receive-buffer-exchange")]
+mod receive_queue;
+#[cfg(feature = "receive-buffer-exchange")]
+mod receive_metadata;
+#[cfg(feature = "receive-buffer-exchange")]
+pub const RECEIVE_POOL_SLOTS: usize = 3;
+
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -149,8 +160,26 @@ struct Inner {
     generation: u64,
     accepted: bool,
     receive: VecDeque<u8>,
+    #[cfg(feature = "receive-buffer-exchange")]
+    receive_exchange: Option<receive_queue::Queue<RECEIVE_POOL_SLOTS>>,
     transmit: VecDeque<u8>,
     close_request: Option<TcpCloseRequest>,
+}
+
+impl Inner {
+    fn received_len(&self) -> usize {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &self.receive_exchange { return queue.len(); }
+        self.receive.len()
+    }
+    fn clear_receive(&mut self) -> Result<(), TcpFrontendError> {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut self.receive_exchange {
+            return queue.clear().map_err(|_| TcpFrontendError::InvalidIdentity);
+        }
+        self.receive.clear();
+        Ok(())
+    }
 }
 
 /// Stable capability resource for one exclusive local TCP port.
@@ -169,6 +198,8 @@ pub struct TcpListener {
     receive_capacity: usize,
     transmit_capacity: usize,
     inner: SpinLock<Inner>,
+    #[cfg(feature = "receive-buffer-exchange")]
+    has_receive_exchange: bool,
 }
 
 impl TcpListener {
@@ -258,17 +289,111 @@ impl TcpListener {
             port_group,
             receive_capacity,
             transmit_capacity,
+            #[cfg(feature = "receive-buffer-exchange")]
+            has_receive_exchange: false,
             inner: SpinLock::new(Inner {
                 state: TcpStreamState::Listening,
                 generation: 0,
                 accepted: false,
                 receive: VecDeque::with_capacity(receive_capacity),
+                #[cfg(feature = "receive-buffer-exchange")]
+                receive_exchange: None,
                 transmit: VecDeque::with_capacity(transmit_capacity),
                 close_request: None,
             }),
         });
         system.restore();
         Ok(listener)
+    }
+
+    /// Diagnostic identity only; never dereferenced by the profiler. The
+    /// listener is Arc-owned, so this address is stable for its lifetime.
+    #[cfg(feature = "network-profile")]
+    pub fn profile_lock_address(&self) -> usize {
+        &self.inner as *const SpinLock<Inner> as usize
+    }
+
+    /// Experimental stable-storage frontend, constructed once by image policy.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn new_with_receive_storage(name: &str, id: TcpListenerId, port: u16,
+        receive_capacity: usize, transmit_capacity: usize,
+        pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Result<Arc<Self>, TcpFrontendError> {
+        let listener = Self::new(name, id, port, receive_capacity, transmit_capacity)?;
+        Ok(Self::attach_receive_storage(listener, pool))
+    }
+
+    /// Shared service port with one independently budgeted pool per frontend.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn new_shared_with_receive_storage(name: &str, id: TcpListenerId, port: u16,
+        receive_capacity: usize, transmit_capacity: usize, port_group: TcpPortGroupId,
+        pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Result<Arc<Self>, TcpFrontendError> {
+        let listener = Self::new_shared(name, id, port, receive_capacity, transmit_capacity, port_group)?;
+        Ok(Self::attach_receive_storage(listener, pool))
+    }
+
+    #[cfg(feature = "receive-buffer-exchange")]
+    fn attach_receive_storage(mut listener: Arc<Self>, pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Arc<Self> {
+        let _system = heap::enter_owner(OwnerId::SYSTEM);
+        let unique = Arc::get_mut(&mut listener).expect("unpublished listener");
+        unique.has_receive_exchange = true;
+        {
+            let mut inner = unique.inner.lock();
+            let copied = core::mem::take(&mut inner.receive);
+            inner.receive_exchange = Some(receive_queue::Queue::new(pool, unique.receive_capacity, copied));
+        }
+        listener
+    }
+
+    /// Stable pool selected by image assembly, shared with the protocol owner.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn receive_storage(&self) -> Option<&'static receive_storage::Storage<RECEIVE_POOL_SLOTS>> {
+        self.inner.lock().receive_exchange.as_ref().map(|queue| queue.pool())
+    }
+
+    /// Snapshot the connection generation for a serialized protocol producer.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn network_exchange_generation(&self) -> Option<NonZeroU64> {
+        let inner = self.inner.lock();
+        if !self.has_receive_exchange || !matches!(inner.state, TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) { return None; }
+        NonZeroU64::new(inner.generation)
+    }
+
+    /// Check connection/state/capacity and publish under the listener lock.
+    /// This provides normal concurrent serialization, not hard-fault rollback
+    /// between pool publication and queue insertion.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn network_publish_exchange(&self, ticket: receive_ownership::Ticket,
+        owner: receive_ownership::Owner, generation: NonZeroU64) -> Result<usize, TcpFrontendError> {
+        let mut inner = self.inner.lock();
+        if inner.generation != generation.get() || !matches!(inner.state, TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return Err(TcpFrontendError::StaleConnection);
+        }
+        let became_readable = inner.received_len() == 0;
+        let length = inner.receive_exchange.as_mut().ok_or(TcpFrontendError::InvalidIdentity)?
+            .publish(ticket, owner, generation).map_err(|_| TcpFrontendError::InvalidIdentity)?;
+        drop(inner);
+        self.notify_network_progress(became_readable);
+        Ok(length)
+    }
+
+    /// Trusted adapter entry with exact consumer provenance for read retirement.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn try_recv_for(&self, connection: TcpConnectionToken, consumer: receive_ownership::Owner,
+        output: &mut [u8]) -> Result<TcpIoResult, TcpFrontendError> {
+        if !self.has_receive_exchange { return self.try_recv(connection, output); }
+        let mut inner = self.inner.lock();
+        validate_connection(self.id, &inner, connection)?;
+        if output.is_empty() { return Ok(TcpIoResult::Progress(0)); }
+        if inner.received_len() != 0 {
+            let length = inner.receive_exchange.as_mut().unwrap().read(consumer, output)
+                .map_err(|_| TcpFrontendError::InvalidIdentity)?;
+            drop(inner);
+            self.notify_application_progress();
+            return Ok(TcpIoResult::Progress(length));
+        }
+        if matches!(inner.state, TcpStreamState::PeerClosed | TcpStreamState::Reset | TcpStreamState::Closed | TcpStreamState::Listening) {
+            Ok(TcpIoResult::Closed)
+        } else { Ok(TcpIoResult::WouldBlock) }
     }
 
     pub const fn id(&self) -> TcpListenerId {
@@ -291,7 +416,7 @@ impl TcpListener {
             state: inner.state,
             connection_generation: inner.generation,
             accepted: inner.accepted,
-            readable_bytes: inner.receive.len(),
+            readable_bytes: inner.received_len(),
             queued_send_bytes: inner.transmit.len(),
             writable_bytes: self.transmit_capacity.saturating_sub(inner.transmit.len()),
             close_request: inner.close_request,
@@ -322,6 +447,12 @@ impl TcpListener {
         connection: TcpConnectionToken,
         output: &mut [u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if self.has_receive_exchange {
+            let consumer = receive_ownership::Owner::current_reader()
+                .ok_or(TcpFrontendError::InvalidIdentity)?;
+            return self.try_recv_for(connection, consumer, output);
+        }
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
@@ -331,7 +462,7 @@ impl TcpListener {
         let length = output
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
-            .min(inner.receive.len());
+            .min(inner.received_len());
         if length != 0 {
             let (first, second) = inner.receive.as_slices();
             let first_length = length.min(first.len());
@@ -429,12 +560,12 @@ impl TcpListener {
                 .checked_add(1)
                 .ok_or(TcpFrontendError::GenerationExhausted)?;
             inner.accepted = false;
-            inner.receive.clear();
+            inner.clear_receive()?;
             inner.transmit.clear();
             inner.close_request = None;
         }
         if matches!(state, TcpStreamState::Listening | TcpStreamState::Reset) {
-            inner.receive.clear();
+            inner.clear_receive()?;
             inner.transmit.clear();
             inner.close_request = None;
             if state == TcpStreamState::Listening {
@@ -443,7 +574,7 @@ impl TcpListener {
         }
         inner.state = state;
         let drive = TcpFrontendDriveState {
-            receive_capacity: self.receive_capacity.saturating_sub(inner.receive.len()),
+            receive_capacity: self.receive_capacity.saturating_sub(inner.received_len()),
             queued_send_bytes: inner.transmit.len(),
         };
         drop(inner);
@@ -463,8 +594,15 @@ impl TcpListener {
         let length = input
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
-            .min(self.receive_capacity.saturating_sub(inner.receive.len()));
-        let became_readable = length != 0 && inner.receive.is_empty();
+            .min(self.receive_capacity.saturating_sub(inner.received_len()));
+        let became_readable = length != 0 && inner.received_len() == 0;
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut inner.receive_exchange {
+            let accepted = queue.push_copy(&input[..length]);
+            drop(inner);
+            self.notify_network_progress(became_readable && accepted != 0);
+            return accepted;
+        }
         inner.receive.extend(&input[..length]);
         drop(inner);
         self.notify_network_progress(became_readable);
@@ -473,7 +611,7 @@ impl TcpListener {
 
     pub fn network_receive_capacity(&self) -> usize {
         let inner = self.inner.lock();
-        self.receive_capacity.saturating_sub(inner.receive.len())
+        self.receive_capacity.saturating_sub(inner.received_len())
     }
 
     /// Netstack side: inspect queued transmit bytes without consuming them.

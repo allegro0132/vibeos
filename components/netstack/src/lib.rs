@@ -86,6 +86,13 @@ const TCP_TEST_SEED: u64 = 0x5649_4245_4f53_4e31;
 // acquire an additional 10 ms of latency on polling-only hardware backends.
 const IDLE_POLL_CEILING_MS: u64 = 1;
 
+#[cfg(feature = "receive-buffer-exchange")]
+static EXCHANGE_BYTES: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(feature = "receive-buffer-exchange")]
+pub fn receive_exchange_bytes() -> [u64; 2] {
+    core::array::from_fn(|i| EXCHANGE_BYTES[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
 pub const COMPONENT_NAME: &str = "net-stack";
 pub const MAX_SERVICE_LISTENERS: usize = MAX_TCP_LISTENERS;
 pub type TcpListenerCapabilities = [Option<Cap>; MAX_SERVICE_LISTENERS];
@@ -425,6 +432,10 @@ impl InterfaceTask {
                 }
                 Err(_) => return Err(InterfaceError::Retired),
             };
+            // Binding a new packet session invalidates the old one. End its
+            // socket references before allocating replacement RX writers from
+            // persistent pools. On construction failure no stale stack remains.
+            self.clear_stack();
             let stack_config = Ipv4StackConfig::new(
                 info.ethernet_address,
                 GUEST_IPV4,
@@ -460,6 +471,19 @@ impl InterfaceTask {
                     None => next.add_tcp_listener(port),
                 }
                 .map_err(|_| InterfaceError::Retired)?;
+                #[cfg(feature = "receive-buffer-exchange")]
+                if listener.try_with(|frontend| frontend.receive_storage().is_some())
+                    .map_err(|_| InterfaceError::Retired)? {
+                    listener.try_with(|frontend| frontend.network_update_state(vibeos_net_api::TcpStreamState::Listening))
+                        .map_err(|_| InterfaceError::Retired)?
+                        .map_err(|_| InterfaceError::Retired)?;
+                    // This stack remains inside the current InterfaceTask poll
+                    // future until normal destruction; pools outlive its arena.
+                    // Hard-fault cleanup is still experimental and may require
+                    // restarting the board rather than reusing abandoned state.
+                    unsafe { next.enable_receive_exchange_current_task(socket, listener.clone()) }
+                        .map_err(|_| InterfaceError::Retired)?;
+                }
                 bound_listeners.push(BoundListener {
                     frontend: listener.clone(),
                     socket,
@@ -508,6 +532,10 @@ impl InterfaceTask {
 
     fn drop_carrier(&mut self) {
         config::publish_link_down(self.interface);
+        self.clear_stack();
+    }
+
+    fn clear_stack(&mut self) {
         self.stack = None;
         self.observed_epoch = None;
         self.observed_ethernet_address = None;
@@ -559,6 +587,11 @@ fn drive_frontends(stack: &mut BoundStack) -> Result<bool, DriveError> {
             .try_with(|frontend| stack.core.drive_tcp_frontend(listener.socket, frontend))
         {
             Ok(Ok(report)) => {
+                #[cfg(feature = "receive-buffer-exchange")]
+                if report.received_bytes != 0 {
+                    EXCHANGE_BYTES[0].fetch_add(report.exchanged_bytes as u64, core::sync::atomic::Ordering::Relaxed);
+                    EXCHANGE_BYTES[1].fetch_add((report.received_bytes - report.exchanged_bytes) as u64, core::sync::atomic::Ordering::Relaxed);
+                }
                 worked |= report.received_bytes != 0
                     || report.transmitted_bytes != 0
                     || report.close_applied.is_some();
@@ -582,3 +615,6 @@ fn monotonic_ms() -> u64 {
     let hz = vibeos_core::exec::timebase_hz();
     vibeos_core::arch::time().saturating_mul(1_000) / hz
 }
+
+#[cfg(all(test, feature = "receive-buffer-exchange"))]
+mod lifecycle_tests;

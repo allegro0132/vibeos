@@ -306,6 +306,13 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
     // This also protects future handler changes from accidentally consuming a
     // component quota. Deallocation remains owner-correct because heap headers
     // carry the allocation owner independently of this ambient scope.
+    #[cfg(feature = "pc-sample")]
+    if code == 5 {
+        // Assembly saves interrupted x1/ra at offset zero of this stable frame.
+        let ra = unsafe { core::ptr::read(_frame as *const usize) };
+        vibeos_core::pc_sample::RECORDER.record(hart, irq_entry, sepc, ra);
+    }
+
     IN_INTERRUPT[hart].store(true, Ordering::Release);
 
     #[cfg(feature = "wasm-c84-profile-irq-overlay")]

@@ -1155,6 +1155,14 @@ fn current_task_exact_wake() -> Option<ExactTaskWake> {
     })
 }
 
+/// Current poll's task and registered allocation domain from one scheduler
+/// observation. Temporary heap-owner scopes do not change this identity.
+/// This is provenance, not authority or proof that the task has stopped.
+pub fn current_task_allocation_identity() -> Option<(TaskId, AllocationDomain)> {
+    let current = current_task_exact_wake()?;
+    Some((current.task, current.domain))
+}
+
 /// Exact identity of the executor scope currently polling or destroying a task.
 /// Unlike `current_task_id`, this remains available during guarded destruction
 /// after the running slot is detached. This is cleanup provenance only, not
@@ -7525,7 +7533,12 @@ fn next_timer_id() -> u64 {
 fn arm_locked(timers: &[TimerEntry]) {
     let heartbeat = arch::time().saturating_add(HEARTBEAT_SECS.saturating_mul(timebase_hz()));
     let next = timers.last().map(|timer| timer.deadline);
-    arch::set_timer(next.map_or(heartbeat, |deadline| deadline.min(heartbeat)));
+    let deadline = next.map_or(heartbeat, |deadline| deadline.min(heartbeat));
+    #[cfg(feature = "pc-sample")]
+    let deadline = current_scheduler_hart().map_or(deadline, |hart| {
+        crate::pc_sample::RECORDER.deadline(hart.index(), arch::time(), deadline)
+    });
+    arch::set_timer(deadline);
 }
 
 fn unregister_timer(id: u64) -> Option<Waker> {
@@ -7863,6 +7876,33 @@ mod one_shot_wait_tests {
     }
 
     #[test]
+    fn allocation_identity_uses_running_domain_across_temporary_owner_scopes() {
+        let _serial = EXECUTOR_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        assert!(current_task_allocation_identity().is_none());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let inside = observed.clone();
+        let owner = OwnerId::new(133);
+        spawn_tracked_owned(owner, "allocation-identity", async move {
+            let (task, domain) = current_task_allocation_identity().unwrap();
+            assert_eq!(Some(task), current_task_id());
+            assert_eq!(domain, AllocationDomain::untracked(owner));
+            {
+                let _system = heap::enter_owner(OwnerId::SYSTEM);
+                assert_ne!(heap::current_domain(), domain);
+                assert_eq!(current_task_allocation_identity(), Some((task, domain)));
+            }
+            yield_now().await;
+            assert_eq!(current_task_allocation_identity(), Some((task, domain)));
+            inside.store(1, Ordering::SeqCst);
+        });
+        run_until_idle(10_000);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(current_task_allocation_identity().is_none());
+    }
+
+    #[test]
     fn bounded_continuation_yields_to_ready_work_and_cancellation() {
         let _serial = EXECUTOR_TEST_SERIAL
             .lock()
@@ -8197,6 +8237,7 @@ mod one_shot_wait_tests {
         let _task = unsafe { enter_current_task_on_hart(HartId::BOOT, task, status.clone()) };
         assert_eq!(current_task_scope_id(), Some(task));
         assert_eq!(current_task_id(), None); // Detached scope, like guarded Drop.
+        assert!(current_task_allocation_identity().is_none());
 
         assert!(!try_reserve_current_task_registrations(0));
         assert!(!try_reserve_current_task_registrations(5));

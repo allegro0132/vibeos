@@ -119,7 +119,7 @@ pub unsafe fn probe(write: fn(&str), hz: u32) {
     // A failure keeps the sole SEC/child owner retained through SBI halt.
     let stopped = (table.shutdown)(super::entropy::POLL_BUDGET);
     if started.is_err() || result.is_err() || stopped.is_err() {
-        halt(write, format_args!("MARS_TRNG_PROBE FAIL parent_hz={hz} prepare={started:?} read={result:?} stop={stopped:?} blocks={blocks}\n"));
+        halt(write, format_args!("MARS_TRNG_PROBE FAIL parent_hz={hz} prepare={prepared:?} start={started:?} read={result:?} stop={stopped:?} blocks={blocks} cause={:?} mode={:?}\n", super::entropy::failure(), super::entropy::mode_observation()));
     }
     print(write, format_args!("MARS_TRNG_PROBE protocol-observed parent_hz={hz} blocks={blocks} stopped=true entropy=unqualified\n"));
 }

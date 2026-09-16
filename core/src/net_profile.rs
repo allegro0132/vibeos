@@ -3,11 +3,11 @@
 //! allocation, locks, or reset; one capture window is permitted per boot.
 #[derive(Clone, Copy)]
 #[repr(usize)]
-pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend, PacketQueue, Completion, PacketBuild, ProtocolPoll, RxLoan, RxGro, TxReserve, TxFlush }
-pub const SAMPLE_INTERVAL: usize = 64;
-pub const SAMPLED_NAMES: [&str; 4] = ["rx_loan", "rx_gro", "tx_reserve", "tx_flush"];
-pub const STAGE_COUNT: usize = 16;
-pub const NAMES: [&str; STAGE_COUNT] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend", "packet_queue", "completion", "packet_build", "protocol_poll", "rx_loan", "rx_gro", "tx_reserve", "tx_flush"];
+pub enum Stage { Executor, Driver, Stack, Application, Other, Rx, Tx, Frontend, PacketQueue, Completion, PacketBuild, ProtocolPoll, RxLoan, RxGro, TxReserve, TxFlush, FrontendStatus, FrontendRx, FrontendTx, FrontendClose }
+pub const SAMPLE_INTERVAL: usize = 127;
+pub const SAMPLED_NAMES: [&str; 8] = ["rx_loan", "rx_gro", "tx_reserve", "tx_flush", "frontend_status", "frontend_rx", "frontend_tx", "frontend_close"];
+pub const STAGE_COUNT: usize = 20;
+pub const NAMES: [&str; STAGE_COUNT] = ["executor", "driver", "stack", "application", "other", "rx", "tx", "frontend", "packet_queue", "completion", "packet_build", "protocol_poll", "rx_loan", "rx_gro", "tx_reserve", "tx_flush", "frontend_status", "frontend_rx", "frontend_tx", "frontend_close"];
 
 #[cfg(feature = "network-profile")]
 mod enabled;

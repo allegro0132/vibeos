@@ -101,7 +101,7 @@ impl Scope {
         } else { None };
         Self { state, _not_send: PhantomData }
     }
-    /// Record one in 64 calls, independently per hart and stage. Unselected
+    /// Record one in SAMPLE_INTERVAL calls per hart and stage. Unselected
     /// time stays in the parent. Never multiply these counters into timeline
     /// totals: selected calls are a diagnostic sample, not exhaustive work.
     #[inline]
@@ -239,7 +239,8 @@ pub fn lock_snapshot(hart: usize, slot: usize) -> (usize, [u64; STAGE_COUNT], [u
 }
 
 /// Decision counters, not time: [work-hint runnable, empty retry, wait attempt,
-/// interface turns with ingress, interface turns with frontend progress, frames].
+/// interface turns with ingress, interface turns with frontend progress, packets].
+/// Ingress packets are protocol inputs after optional GRO, not wire frames.
 /// A work hint may represent pending/backpressured work, not completed I/O.
 #[repr(align(64))]
 struct PollCounts([[AtomicU64; 6]; STAGE_COUNT]);

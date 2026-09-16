@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+skip-empty-service = []
+activity-events = ["vibeos-net-api/activity-events"]
+receive-buffer-exchange = ["smoltcp/tcp-buffer-exchange", "vibeos-net-api/receive-buffer-exchange"]
 # DMA loans through the capability-addressed detached receive transport.
 pooled-rx = []
 network-tx-audit = ["vibeos-core/network-tx-audit"]

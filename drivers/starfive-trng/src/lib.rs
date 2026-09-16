@@ -51,12 +51,23 @@ enum State {
     Faulted,
 }
 
+/// Retained non-secret control/status bits from the first mode rejection.
+/// Reading this record performs no MMIO and never includes random output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModeObservation {
+    pub offset: usize,
+    pub value: u32,
+    pub mask: u32,
+    pub expected: u32,
+}
+
 pub struct Trng<R> {
     io: R,
     ticks_per_ms: u64,
     polls: u32,
     state: State,
     previous: Option<[u8; 32]>,
+    mode_observation: Option<ModeObservation>,
 }
 impl<R: Registers> Trng<R> {
     pub fn new(io: R, timebase_hz: u64, max_polls: u32) -> Result<Self, Error> {
@@ -69,6 +80,7 @@ impl<R: Registers> Trng<R> {
             polls: max_polls,
             state: State::New,
             previous: None,
+            mode_observation: None,
         })
     }
     /// Re-arm this same owner after a platform-controlled hardware reset.
@@ -81,7 +93,9 @@ impl<R: Registers> Trng<R> {
     /// No old invocation may resume. Merely requesting reset is insufficient.
     pub unsafe fn reset_observed(&mut self) {
         self.state = State::New;
+        self.mode_observation = None;
     }
+    pub fn mode_observation(&self) -> Option<ModeObservation> { self.mode_observation }
     fn events(&mut self) -> Result<u32, Error> {
         let events = self.io.read(ISTAT);
         if events & LOCKUP != 0 {
@@ -97,6 +111,7 @@ impl<R: Registers> Trng<R> {
         let mask = BUSY | NONCE | R256 | MISSION | if seeded { SEEDED } else { 0 };
         let expected = R256 | MISSION | if seeded { SEEDED } else { 0 };
         if value & mask != expected {
+            self.mode_observation.get_or_insert(ModeObservation { offset: STAT, value, mask, expected });
             return Err(Error::Mode);
         }
         Ok(())
@@ -154,6 +169,7 @@ impl<R: Registers> Trng<R> {
             self.wait(0, 100)?;
             let security = self.io.read(SMODE);
             if security & (MISSION | NONCE) != MISSION {
+                self.mode_observation.get_or_insert(ModeObservation { offset: SMODE, value: security, mask: MISSION | NONCE, expected: MISSION });
                 return Err(Error::Mode);
             }
             self.io.write(IE, 0);

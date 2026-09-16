@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+copy-profile = []
+pc-sample = []
 idle-profile = []
 network-tso-probe = []
 network-profile = []

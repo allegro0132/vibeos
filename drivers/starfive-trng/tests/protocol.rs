@@ -107,7 +107,11 @@ fn mode_seed_or_busy_drift_during_copy_never_returns_a_block() {
         let (mut t, m) = ready();
         m.0.borrow_mut().status_fault = bit;
         assert_eq!(t.read_block(), Err(Error::Mode));
+        let observation = t.mode_observation().unwrap();
+        assert_eq!(observation.offset, 4);
+        assert_ne!(observation.value & observation.mask, observation.expected);
         assert_eq!(t.read_block(), Err(Error::NotReady));
+        assert_eq!(t.mode_observation(), Some(observation));
     }
 }
 fn ready() -> (Trng<Model>, Model) {
@@ -161,6 +165,11 @@ fn nonce_or_nonmission_mode_is_rejected_before_reseed() {
         m.0.borrow_mut().words[3] = smode;
         let mut t = Trng::new(m.clone(), 4_000_000, 4).unwrap();
         assert_eq!(t.initialize(), Err(Error::Mode));
+        let reads = m.0.borrow().reads;
+        assert_eq!(t.mode_observation(), Some(vibeos_starfive_trng::ModeObservation {
+            offset: 12, value: smode, mask: 260, expected: 256,
+        }));
+        assert_eq!(m.0.borrow().reads, reads);
         assert!(!m.0.borrow().writes.iter().any(|&(o, _)| o == 0));
         assert_eq!(t.initialize(), Err(Error::NotReady));
     }

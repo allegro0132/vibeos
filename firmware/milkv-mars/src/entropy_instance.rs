@@ -1,8 +1,18 @@
 //! Firmware-owned PIO request lifecycle. This does not approve the source or
 //! publish capabilities. The shared SEC owner remains retained after failures.
 use vibeos_hal::entropy::{Error, Pending, Submission, MAX_RANDOM_BYTES};
-use vibeos_platform_jh7110::security::{Domain, Registers as DomainRegisters};
+use vibeos_platform_jh7110::security::{Domain, Registers as DomainRegisters, Error as DomainError};
 use vibeos_starfive_trng::{Registers, Trng};
+
+/// First concrete hardware failure in the current preparation epoch. This
+/// records only error codes, never conditioned output or additional MMIO.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    PrepareDomain(DomainError),
+    Initialize(vibeos_starfive_trng::Error),
+    Read(vibeos_starfive_trng::Error),
+    StopDomain(DomainError),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State { New, Ready, Faulted, Stopped }
@@ -12,6 +22,7 @@ pub struct Instance<D, R> {
     trng: Trng<R>,
     state: State,
     epoch: u64,
+    failure: Option<Failure>,
     pending: Pending<usize>,
     output: [u8; MAX_RANDOM_BYTES],
 }
@@ -23,7 +34,7 @@ impl<D: DomainRegisters, R: Registers> Instance<D, R> {
     /// Retain this instance until shutdown confirms stop; do not drop a failed
     /// owner or construct a second view to recover it.
     pub unsafe fn new(domain: Domain<D>, trng: Trng<R>) -> Self {
-        Self { domain, trng, state: State::New, epoch: 0,
+        Self { domain, trng, state: State::New, epoch: 0, failure: None,
             pending: Pending::new(), output: [0; MAX_RANDOM_BYTES] }
     }
     fn wipe(&mut self) {
@@ -39,14 +50,23 @@ impl<D: DomainRegisters, R: Registers> Instance<D, R> {
         if epoch == 0 || epoch <= self.epoch { return Err(Error::IdentityExhausted); }
         self.epoch = epoch;
         self.state = State::Faulted;
-        self.domain.prepare().map_err(|_| Error::Quarantined)?;
+        self.failure = None;
+        self.domain.prepare().map_err(|error| {
+            self.failure = Some(Failure::PrepareDomain(error));
+            Error::Quarantined
+        })?;
         // Domain::prepare confirmed assertion and release. Reuse the same
         // child register owner and preserve its cross-reset output history.
         unsafe { self.trng.reset_observed(); }
-        self.trng.initialize().map_err(|_| Error::Protocol)?;
+        self.trng.initialize().map_err(|error| {
+            self.failure = Some(Failure::Initialize(error));
+            Error::Protocol
+        })?;
         self.state = State::Ready;
         Ok(())
     }
+    pub fn failure(&self) -> Option<Failure> { self.failure }
+    pub fn mode_observation(&self) -> Option<vibeos_starfive_trng::ModeObservation> { self.trng.mode_observation() }
     pub fn epoch(&self) -> u64 { self.epoch }
     pub fn operational(&self) -> bool { self.state == State::Ready }
     pub fn submit(&mut self, bytes: usize) -> Result<Submission, Error> {
@@ -61,7 +81,8 @@ impl<D: DomainRegisters, R: Registers> Instance<D, R> {
                     let count = (bytes - offset).min(32);
                     self.output[offset..offset + count].copy_from_slice(&block[..count]);
                 }
-                Err(_) => {
+                Err(error) => {
+                    self.failure.get_or_insert(Failure::Read(error));
                     self.wipe();
                     self.state = State::Faulted;
                     return Err(Error::Protocol);
@@ -88,7 +109,10 @@ impl<D: DomainRegisters, R: Registers> Instance<D, R> {
         self.state = State::Faulted;
         // &mut self excludes child calls; failed stop retains both owners and
         // pending state. No Drop path claims that hardware has stopped.
-        unsafe { self.domain.stop() }.map_err(|_| Error::Quarantined)?;
+        unsafe { self.domain.stop() }.map_err(|error| {
+            self.failure.get_or_insert(Failure::StopDomain(error));
+            Error::Quarantined
+        })?;
         self.pending.clear();
         self.wipe();
         self.state = State::Stopped;

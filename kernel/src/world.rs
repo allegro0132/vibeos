@@ -2686,7 +2686,7 @@ pub fn build() {
         let listen_port = 2222;
         let id = vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero");
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
-        let listener = vibeos_net_api::TcpListener::new_shared(
+        let listener = new_shared_network_listener(
             listener_label,
             id,
             listen_port,
@@ -2703,11 +2703,13 @@ pub fn build() {
             vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
         );
         let listener = listener.expect("the image TCP listener policy is valid");
+        #[cfg(feature = "network-profile")]
+        crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf_data_listener_root = service_policy.as_ref().map(|policy_space| {
-        let listener = vibeos_net_api::TcpListener::new_shared(
+        let listener = new_shared_network_listener(
             "iperf3-data",
             vibeos_net_api::TcpListenerId::new(2).expect("listener identity is non-zero"),
             vibeos_iperf3_server::DEFAULT_PORT,
@@ -2716,6 +2718,8 @@ pub fn build() {
             vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         )
         .expect("the iperf3 data listener policy is valid");
+        #[cfg(feature = "network-profile")]
+        crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
     #[cfg(feature = "tcp-throughput-probe")]
@@ -2727,6 +2731,8 @@ pub fn build() {
                 vibeos_tcp_probe::FIRST_PORT + index as u16,
                 vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
                 vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES).unwrap();
+            #[cfg(feature = "network-profile")]
+            crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
             policy.mint(listener, Rights::ALL_VOLATILE)
         })
     });
@@ -3812,4 +3818,23 @@ async fn store_fault_probe_task(space: SpaceRef, service: Cap) {
         panic!("injected store fault unexpectedly returned: {result:?}");
     }
     unreachable!("the bounded store-fault retry loop always returns or faults");
+}
+
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+fn new_shared_network_listener(name: &str, id: vibeos_net_api::TcpListenerId, port: u16,
+    receive: usize, transmit: usize, group: vibeos_net_api::TcpPortGroupId,
+) -> Result<Arc<vibeos_net_api::TcpListener>, vibeos_net_api::TcpFrontendError> {
+    #[cfg(feature = "receive-buffer-exchange")]
+    {
+        #[cfg(feature = "tcp-large-window")]
+        let socket_bytes = 256 * 1024;
+        #[cfg(not(feature = "tcp-large-window"))]
+        let socket_bytes = 32 * 1024;
+        let pool = vibeos_net_api::receive_storage::Storage::new_static(socket_bytes, receive)
+            .map_err(|_| vibeos_net_api::TcpFrontendError::InvalidBufferSize)?;
+        crate::println!("RXEX_POOL listener={} port={} bytes={} slots=3", id.get(), port, socket_bytes);
+        vibeos_net_api::TcpListener::new_shared_with_receive_storage(name, id, port, receive, transmit, group, pool)
+    }
+    #[cfg(not(feature = "receive-buffer-exchange"))]
+    vibeos_net_api::TcpListener::new_shared(name, id, port, receive, transmit, group)
 }

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+skip-empty-service = ["vibeos-net-protocol/skip-empty-service"]
+# Experimental protocol binding; firmware assembly remains disabled.
+receive-buffer-exchange = ["vibeos-net-protocol/receive-buffer-exchange"]
 event-driven = ["vibeos-net-api/activity-events"]
 pooled-rx = ["vibeos-net-protocol/pooled-rx"]
 network-tx-audit = ["vibeos-net-protocol/network-tx-audit"]

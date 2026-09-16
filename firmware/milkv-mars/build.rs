@@ -6,6 +6,9 @@ fn main() {
     {
         return;
     }
+    if env::var_os("CARGO_FEATURE_COPY_PROFILE").is_some() {
+        println!("cargo:rustc-link-arg-bin=vibeos-milkv-mars=--wrap=memcpy");
+    }
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let template = fs::read_to_string(manifest.join("../qemu-virt/linker.ld")).unwrap();
     assert_eq!(template.matches("0x80200000").count(), 1);

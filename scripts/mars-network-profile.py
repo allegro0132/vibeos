@@ -11,6 +11,8 @@ EXTENDED_STAGES = STAGES + ['packet_queue', 'completion', 'packet_build', 'proto
 
 RX_STAGES = EXTENDED_STAGES + ['rx_loan', 'rx_gro', 'tx_reserve', 'tx_flush']
 
+FRONTEND_STAGES = RX_STAGES + ['frontend_status', 'frontend_rx', 'frontend_tx', 'frontend_close']
+
 def arrays(line):
     return {key: json.loads(value) for key, value in
             re.findall(r'(ticks|wait|calls|high|full|dma)=(\[[^\]]*\])', line)}
@@ -23,13 +25,14 @@ def analyze(text):
     start, end, width = map(int, header.groups())
     names = re.search(r'NPROF window=[^\n]* stages=(\[[^\]]*\])', text)
     stages = json.loads(names[1]) if names else STAGES
-    if stages not in (STAGES, EXTENDED_STAGES, RX_STAGES):
+    if stages not in (STAGES, EXTENDED_STAGES, RX_STAGES, FRONTEND_STAGES):
         raise ValueError('unsupported stage schema')
     sampling = re.search(r'NPROF_SAMPLING stages=(\[[^\]]*\]) interval=(\d+)', text)
     if text.count('NPROF_SAMPLING') != (1 if sampling else 0):
         raise ValueError('invalid or duplicate sampling metadata')
     sampled_stages, interval = (json.loads(sampling[1]), int(sampling[2])) if sampling else ([], 1)
-    if sampling and (sampled_stages != RX_STAGES[-4:] or stages != RX_STAGES or interval != 64):
+    valid_sampling = sampled_stages == RX_STAGES[-4:] or (stages == FRONTEND_STAGES and sampled_stages == RX_STAGES[-4:] + FRONTEND_STAGES[-4:])
+    if sampling and (not valid_sampling or stages not in (RX_STAGES, FRONTEND_STAGES) or interval not in ((64, 127) if stages == FRONTEND_STAGES else (64,))):
         raise ValueError('unsupported sampling schema')
     count = len(stages)
     if not (width > 0 and end > start):
@@ -110,7 +113,7 @@ def analyze(text):
     return dict(start=start, end=end, width=width, stages=stages, phases=phases, harts=harts,
                 sampling=dict(stages=sampled_stages, interval=interval), poll_decisions=decisions,
                 queues=queues, dma_observations=dma, buckets=buckets, locks=locks,
-                limitations=['Poll decisions are counts, not CPU time. Work hints include pending work; wait attempts may complete immediately.',
+                limitations=['Poll decisions are counts, not CPU time. Work hints include pending work; wait attempts may complete immediately. Ingress frames count protocol inputs after optional GRO, not wire packets.',
                     'Sampled child stages contain only selected calls; unsampled work remains in parents. Do not scale timeline totals.',
                     'Elapsed 4 MHz timer ticks on Mars, not CPU cycles.',
                     'Work includes interrupts, MMIO polling, and instrumentation overhead.',

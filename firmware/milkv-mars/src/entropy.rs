@@ -30,6 +30,21 @@ unsafe fn write() -> Result<&'static mut NativeEntropyInstance, Error> {
     if INSTALLED.load(Ordering::Acquire) != 2 { return Err(Error::Unsupported); }
     (&mut *STORAGE.0.get()).as_mut().ok_or(Error::Unsupported)
 }
+/// # Safety
+/// Boot diagnostic only, with all table invocations and other owners excluded.
+/// Reads retained software error codes; performs no device access.
+#[cfg(feature = "trng-probe")]
+pub unsafe fn failure() -> Option<vibeos_firmware_milkv_mars::entropy_instance::Failure> {
+    read().ok().and_then(|instance| instance.failure())
+}
+
+/// # Safety
+/// Same exclusive boot diagnostic boundary as failure(); no MMIO is performed.
+#[cfg(feature = "trng-probe")]
+pub unsafe fn mode_observation() -> Option<vibeos_starfive_trng::ModeObservation> {
+    read().ok().and_then(|instance| instance.mode_observation())
+}
+
 fn identity(slot: usize, base: usize) -> bool {
     super::entropy_description().is_some_and(|d| d.slot == slot && d.base == base)
 }

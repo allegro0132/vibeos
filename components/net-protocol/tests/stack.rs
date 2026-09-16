@@ -1998,3 +1998,566 @@ mod pooled_receive {
     }
 
 }
+
+#[cfg(feature = "receive-buffer-exchange")]
+fn exercise_receive_exchange<const N: usize>(reorder: bool, make_frontend: impl FnOnce(&'static vibeos_net_api::receive_storage::Storage<N>) -> Option<Arc<TcpListener>>) -> usize {
+    use std::{collections::VecDeque, num::NonZeroU64};
+    use vibeos_core::{
+        heap::{AllocationDomain, ArenaId, OwnerId},
+        sync::TaskRecoveryKey,
+    };
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
+    use vibeos_net_protocol::receive_exchange::Binding;
+    let producer = Owner {
+        domain: AllocationDomain::new(OwnerId::new(71), ArenaId::new(1)),
+        task: TaskRecoveryKey::new(71).unwrap(),
+    };
+    let consumer = Owner {
+        domain: AllocationDomain::new(OwnerId::new(72), ArenaId::new(2)),
+        task: TaskRecoveryKey::new(72).unwrap(),
+    };
+    let connection = NonZeroU64::new(1).unwrap();
+    let pool = Storage::<N>::new_static(4096, 4096).unwrap();
+    let frontend = make_frontend(pool);
+    let mut accepted = None;
+    let (mut binding, receive) = Binding::new(pool, producer).unwrap();
+    let mut server_socket = tcp::Socket::new(receive, tcp::SocketBuffer::new(vec![0; 4096]));
+    server_socket.listen(SERVER_PORT).unwrap();
+    let mut sockets = SocketSet::new(Vec::new());
+    let handle = sockets.add(server_socket);
+    let to_server = Endpoint::new("exchange-server", 128);
+    let to_client = Endpoint::new("exchange-client", 128);
+    let mut space = CSpace::new("exchange-pair");
+    let (_, si) = authority(&mut space, &to_server, Rights::RECV);
+    let (_, so) = authority(&mut space, &to_client, Rights::SEND);
+    let (_, ci) = authority(&mut space, &to_client, Rights::RECV);
+    let (_, co) = authority(&mut space, &to_server, Rights::SEND);
+    let mut device = PacketDevice::new(session_stamp(), si, so);
+    let mut cfg = InterfaceConfig::new(EthernetAddress(SERVER_MAC).into());
+    cfg.random_seed = 0x5566;
+    let mut interface = Interface::new(cfg, &mut device, Instant::ZERO);
+    interface.update_ip_addrs(|addresses| {
+        addresses
+            .push(IpCidr::new(
+                IpAddress::v4(SERVER_IP[0], SERVER_IP[1], SERVER_IP[2], SERVER_IP[3]),
+                24,
+            ))
+            .unwrap();
+    });
+    let mut client = TestClient::new(ci, co);
+    if reorder {
+        client.socket().set_nagle_enabled(false);
+    }
+    let expected: Vec<u8> = (0..300_007).map(|i| (i * 37 + i / 251) as u8).collect();
+    let mut sent = 0;
+    let mut observed = Vec::new();
+    let mut queued = VecDeque::new();
+    let mut scratch = [0u8; 997];
+    let mut exchanged = 0;
+    let mut fallback = 0;
+    let mut backpressure = 0;
+    let mut held = None;
+    let mut hole_refusals = 0;
+    let mut max_batch = 0;
+    let mut withheld = 0;
+    for now in 0..100_000 {
+        if let Some(packet) = held.take() {
+            to_server.try_send(packet).unwrap();
+        }
+        client.poll(now);
+        for _ in 0..if reorder { 4 } else { 1 } {
+            if sent < expected.len() && client.socket().can_send() {
+                let end = if reorder {
+                    (sent + 512).min(expected.len())
+                } else {
+                    expected.len()
+                };
+                sent += client.socket().send_slice(&expected[sent..end]).unwrap();
+            }
+            if reorder {
+                client.poll(now);
+            }
+        }
+        if reorder && queued.is_empty() && frontend.as_ref().is_none_or(|f| f.snapshot().readable_bytes == 0) && now % 13 != 0 {
+            let mut packets = Vec::new();
+            while let Some(packet) = to_server.try_recv() {
+                packets.push(packet.into_packet(session_stamp()).unwrap());
+            }
+            let data_indices: Vec<_> = packets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, packet)| {
+                    let bytes = packet.as_bytes();
+                    if bytes.len() < 54 || bytes[12..14] != [8, 0] || bytes[23] != 6 {
+                        return None;
+                    }
+                    let ip = usize::from(bytes[14] & 15) * 4;
+                    let tcp = 14 + ip;
+                    let tcp_header = usize::from(*bytes.get(tcp + 12)? >> 4) * 4;
+                    let total = usize::from(u16::from_be_bytes([bytes[16], bytes[17]]));
+                    (total > ip + tcp_header).then_some(index)
+                })
+                .collect();
+            max_batch = max_batch.max(data_indices.len());
+            if data_indices.len() >= 3 {
+                held = Some(StampedPacket::new(
+                    packets.remove(data_indices[1]),
+                    session_stamp(),
+                ));
+                withheld += 1;
+            }
+            for packet in packets {
+                to_server
+                    .try_send(StampedPacket::new(packet, session_stamp()))
+                    .unwrap();
+            }
+        }
+        interface.poll(Instant::from_millis(now as i64), &mut device, &mut sockets);
+        device.flush_egress().unwrap();
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        if let Some(frontend) = &frontend {
+            let state = match socket.state() {
+                tcp::State::Listen => TcpStreamState::Listening,
+                tcp::State::SynReceived => TcpStreamState::Handshake,
+                tcp::State::Established => TcpStreamState::Established,
+                _ => panic!("unexpected fixture socket state"),
+            };
+            frontend.network_begin_drive(state).unwrap();
+            accepted = accepted.or_else(|| frontend.try_accept());
+        }
+        let before = socket.recv_queue();
+        let budget = frontend.as_ref().map_or(4096, |f| f.network_receive_capacity());
+        // A zero turn budget also exercises a non-consuming copied fallback.
+        let result =
+            unsafe { binding.exchange(socket, connection, if now % 13 == 0 { 0 } else { budget }) }
+                .unwrap();
+        if let Some(transfer) = result {
+            assert_eq!(socket.recv_queue(), 0);
+            assert_eq!(transfer.length, before);
+            if let Some(frontend) = &frontend {
+                assert_eq!(frontend.network_exchange_generation(), Some(connection));
+                assert_eq!(frontend.network_publish_exchange(transfer.ticket, producer, connection), Ok(transfer.length));
+            } else {
+                pool.publish(transfer.ticket, producer, connection).unwrap();
+                queued.push_back((transfer.ticket, transfer.length));
+            }
+            exchanged += 1;
+        } else {
+            assert_eq!(
+                socket.recv_queue(),
+                before,
+                "failed exchange must preserve stream bytes"
+            );
+            if held.is_some() && before != 0 {
+                hole_refusals += 1;
+            }
+            if before != 0 && (pool.available_bytes() < before || budget < before) {
+                backpressure += 1;
+            }
+            // Preserve ordering with previously published chunks.
+            if let Some(frontend) = &frontend {
+                if before != 0 && budget != 0 {
+                    let maximum = scratch.len().min(budget);
+                    let length = socket.recv_slice(&mut scratch[..maximum]).unwrap();
+                    assert_eq!(frontend.network_receive(&scratch[..length]), length);
+                    fallback += 1;
+                }
+            } else if queued.is_empty() && before != 0 {
+                let length = socket.recv_slice(&mut scratch).unwrap();
+                observed.extend_from_slice(&scratch[..length]);
+                fallback += 1;
+            }
+        }
+        assert!(pool.queued_bytes() <= 4096);
+        // Delayed, partial application reads exercise byte budget and pool reuse.
+        if let Some(frontend) = &frontend {
+            assert!(frontend.snapshot().readable_bytes <= 4096);
+        }
+        if now % 5 == 0 {
+            if let (Some(frontend), Some(peer)) = (&frontend, accepted) {
+                match frontend.try_recv_for(peer, consumer, &mut scratch).unwrap() {
+                    TcpIoResult::Progress(length) => observed.extend_from_slice(&scratch[..length]),
+                    TcpIoResult::WouldBlock => {},
+                    TcpIoResult::Closed => panic!("fixture unexpectedly closed"),
+                }
+            } else if let Some((ticket, remaining)) = queued.front_mut() {
+                let length = pool
+                    .read(*ticket, connection, consumer, &mut scratch)
+                    .unwrap();
+                observed.extend_from_slice(&scratch[..length]);
+                *remaining -= length;
+                if *remaining == 0 {
+                    queued.pop_front();
+                }
+            }
+        }
+        if observed.len() == expected.len() {
+            break;
+        }
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(sent, expected.len());
+    assert!(fallback > 0);
+    if reorder {
+        assert!(hole_refusals > 0, "must reject an exchange with an actual TCP hole: max_batch={max_batch}, withheld={withheld}");
+    }
+    if N > 1 {
+        assert!(backpressure > 0);
+    }
+    assert!(queued.is_empty());
+    assert_eq!(pool.queued_bytes(), 0);
+    // All socket borrows end before trusted cleanup of its last writer.
+    drop(sockets);
+    assert_eq!(
+        unsafe { pool.retire_stopped_owner(producer) },
+        1,
+        "unused spares must not leak"
+    );
+    exchanged
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn real_tcp_receive_exchange_preserves_stream_under_backpressure() {
+    assert!(exercise_receive_exchange::<3>(false, |_| None) > 0);
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn no_spare_receive_pool_keeps_legacy_tcp_receive_working() {
+    assert_eq!(exercise_receive_exchange::<1>(false, |_| None), 0);
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn real_tcp_holes_release_unused_exchange_spares() {
+    assert!(exercise_receive_exchange::<3>(true, |_| None) > 0);
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn real_tcp_exchange_through_listener_preserves_mixed_stream() {
+    for reorder in [false, true] {
+        assert!(exercise_receive_exchange::<3>(reorder, |pool| {
+            Some(TcpListener::new_with_receive_storage("real-exchange", TcpListenerId::new(97).unwrap(),
+                SERVER_PORT, 4096, 4096, pool).unwrap())
+        }) > 0);
+    }
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn shared_stack_exchange_transfers_and_promotes_pending_connection() {
+    use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
+    let owner = Owner { domain: AllocationDomain::new(OwnerId::new(81), ArenaId::new(81)), task: TaskRecoveryKey::new(81).unwrap() };
+    let consumer = Owner { domain: AllocationDomain::new(OwnerId::new(82), ArenaId::new(82)), task: TaskRecoveryKey::new(82).unwrap() };
+    let pool = Storage::<3>::new_static(4096, 8192).unwrap();
+    let to_server = Endpoint::new("direct-to-server", 128);
+    let to_client = Endpoint::new("direct-to-client", 128);
+    let mut space = CSpace::new("direct-transfer");
+    let (server_in_root, server_in) = authority(&mut space, &to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &to_server, Rights::SEND);
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server = SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let socket = server.add_tcp_listener(SERVER_PORT).unwrap();
+    // Odd, small capacities force wrapped frontend storage and partial writes.
+    let frontend = TcpListener::new_with_receive_storage("exchange-shared", TcpListenerId::new(1).unwrap(), SERVER_PORT, 8192, 191, pool).unwrap();
+    // Force installation to fail after preparing its first socket buffer.
+    let occupied = [pool.reserve(consumer).unwrap(), pool.reserve(consumer).unwrap()];
+    assert!(unsafe { server.enable_receive_exchange(socket, frontend.clone(), owner) }.is_err());
+    assert_eq!(server.tcp_listener_port(socket), Ok(SERVER_PORT));
+    for ticket in occupied { unsafe { pool.release_writer(ticket, consumer).unwrap(); } }
+    unsafe { server.enable_receive_exchange(socket, frontend.clone(), owner).unwrap(); }
+    assert!(unsafe { server.enable_receive_exchange(socket, frontend.clone(), owner) }.is_err());
+    let impostor = TcpListener::new("same-id", TcpListenerId::new(1).unwrap(), SERVER_PORT, 8192, 191).unwrap();
+    assert_eq!(server.drive_tcp_frontend(socket, &impostor), Err(vibeos_net_protocol::TcpFrontendDriveError::QueueInvariant));
+    let mut exchange_observed = false;
+    let mut next_time = 0;
+    let mut client = TestClient::new(client_in, client_out);
+    // Exceeds both the default and large TCP windows to wrap transport storage.
+    let request: Vec<u8> = (0..600_007).map(|i| (i * 37 + i / 251) as u8).collect();
+    let response: Vec<u8> = request.iter().map(|b| b ^ 0xa5).collect();
+    let (mut request_sent, mut response_sent) = (0, 0);
+    let (mut received_request, mut received_response) = (Vec::new(), Vec::new());
+    let mut connection = None;
+    let mut scratch = [0u8; 997];
+    for now in 0..100_000 {
+        next_time = now + 1;
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        let report = server.drive_tcp_frontend(socket, &frontend).unwrap();
+        exchange_observed |= pool.queued_bytes() != 0;
+        assert!(report.received_bytes <= 4 * 32768);
+        assert!(report.transmitted_bytes <= 4 * 32768);
+        connection = connection.or_else(|| frontend.try_accept());
+        if client.socket().can_send() && request_sent < request.len() {
+            request_sent += client.socket().send_slice(&request[request_sent..]).unwrap();
+        }
+        if let Some(peer) = connection {
+            // Leave receive queues full on alternate turns to exercise backpressure.
+            if now % 2 == 0 {
+                if let TcpIoResult::Progress(n) = frontend.try_recv_for(peer, consumer, &mut scratch[..61]).unwrap() {
+                    received_request.extend_from_slice(&scratch[..n]);
+                }
+            }
+            if response_sent < response.len() {
+                if let TcpIoResult::Progress(n) = frontend.try_send(peer, &response[response_sent..]).unwrap() {
+                    response_sent += n;
+                }
+            }
+        }
+        if now % 5 == 0 && client.socket().can_recv() {
+            let n = client.socket().recv_slice(&mut scratch).unwrap();
+            received_response.extend_from_slice(&scratch[..n]);
+        }
+        if received_request.len() == request.len() && received_response.len() == response.len() {
+            break;
+        }
+    }
+    assert_eq!(received_request, request);
+    assert_eq!(received_response, response);
+    #[cfg(feature = "native-tcp-segmentation")]
+    assert!(client.device.stats().tx_segmented_requests > 0,
+        "the real TCP transfer must exercise native large-send generation");
+    assert!(exchange_observed, "must use pool exchange, not only copied fallback");
+    let old = connection.unwrap();
+    client.socket().close();
+    for _ in 0..100 {
+        client.poll(next_time); server.poll_network(next_time).unwrap();
+        server.drive_tcp_frontend(socket, &frontend).unwrap(); next_time += 1;
+        if frontend.snapshot().state == TcpStreamState::PeerClosed { break; }
+    }
+    assert_eq!(frontend.snapshot().state, TcpStreamState::PeerClosed);
+    // A successor can handshake on the pending socket before the old frontend closes.
+    let next = client.open_connection(49_153);
+    for _ in 0..100 {
+        client.poll(next_time); server.poll_network(next_time).unwrap();
+        server.drive_tcp_frontend(socket, &frontend).unwrap(); next_time += 1;
+        if client.socket_by_handle(next).may_send() { break; }
+    }
+    assert!(client.socket_by_handle(next).may_send());
+    client.socket_by_handle(next).send_slice(b"pending-buffer").unwrap();
+    frontend.request_close(old).unwrap();
+    let mut fresh = None;
+    let mut second = Vec::new();
+    let mut promoted_exchange = false;
+    for _ in 0..1000 {
+        client.poll(next_time); server.poll_network(next_time).unwrap();
+        server.drive_tcp_frontend(socket, &frontend).unwrap(); next_time += 1;
+        promoted_exchange |= pool.queued_bytes() != 0;
+        fresh = fresh.or_else(|| frontend.try_accept());
+        if let Some(peer) = fresh {
+            if let TcpIoResult::Progress(n) = frontend.try_recv_for(peer, consumer, &mut scratch).unwrap() {
+                second.extend_from_slice(&scratch[..n]);
+            }
+        }
+        if second.len() == 14 { break; }
+    }
+    assert_eq!(second, b"pending-buffer");
+    assert!(promoted_exchange);
+    assert_ne!(old.generation(), fresh.unwrap().generation());
+    assert_eq!(pool.queued_bytes(), 0);
+    space.revoke(server_in_root).unwrap();
+    assert_eq!(
+        server.drive_tcp_frontend(socket, &frontend),
+        Err(vibeos_net_protocol::TcpFrontendDriveError::Stack(StackError::AuthorityRevoked))
+    );
+    drop(server); // Ends both active and pending socket references.
+    assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0, "normal stack drop must release both writers");
+}
+
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn normal_stack_rebuild_reuses_writers_and_preserves_unrelated_leases() {
+    use std::num::NonZeroU64;
+    use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
+    let owner = Owner { domain: AllocationDomain::new(OwnerId::new(91), ArenaId::new(91)), task: TaskRecoveryKey::new(91).unwrap() };
+    let consumer = Owner { domain: AllocationDomain::new(OwnerId::new(92), ArenaId::new(92)), task: TaskRecoveryKey::new(92).unwrap() };
+    let pool = Storage::<3>::new_static(4096, 8192).unwrap();
+    let frontend = TcpListener::new_with_receive_storage("rebuild", TcpListenerId::new(92).unwrap(), SERVER_PORT, 8192, 4096, pool).unwrap();
+    let to_server = Endpoint::new("rebuild-in", 8);
+    let to_client = Endpoint::new("rebuild-out", 8);
+    let mut space = CSpace::new("rebuild");
+    let (_, inbound) = authority(&mut space, &to_server, Rights::RECV);
+    let (_, outbound) = authority(&mut space, &to_client, Rights::SEND);
+    for iteration in 0..100 {
+        let mut stack = SharedIpv4TcpStack::new(
+            Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 92), session_stamp(),
+            inbound.clone(), outbound.clone()).unwrap();
+        let handle = stack.add_tcp_listener(SERVER_PORT).unwrap();
+        unsafe { stack.enable_receive_exchange(handle, frontend.clone(), owner).unwrap(); }
+        let spare = pool.reserve(owner).unwrap();
+        if iteration % 2 == 0 {
+            // A distinct live writer with the same exact task identity must not
+            // be swept up by a whole-owner retirement in stack destruction.
+            drop(stack);
+            assert!(pool.writer_address(spare, owner).is_ok());
+            unsafe { pool.release_writer(spare, owner).unwrap(); }
+        } else {
+            frontend.network_update_state(TcpStreamState::Established).unwrap();
+            let peer = frontend.try_accept().unwrap();
+            let generation = NonZeroU64::new(peer.generation()).unwrap();
+            let (pointer, _) = pool.writer_address(spare, owner).unwrap();
+            unsafe {
+                core::ptr::copy_nonoverlapping(b"survives".as_ptr(), pointer.as_ptr(), 8);
+                pool.prepare(spare, owner, generation, 0, 8).unwrap();
+            }
+            frontend.network_publish_exchange(spare, owner, generation).unwrap();
+            drop(stack);
+            assert_eq!(pool.queued_bytes(), 8);
+            let mut bytes = [0; 8];
+            assert_eq!(frontend.try_recv_for(peer, consumer, &mut bytes), Ok(TcpIoResult::Progress(8)));
+            assert_eq!(&bytes, b"survives");
+            frontend.network_update_state(TcpStreamState::Listening).unwrap();
+        }
+        assert_eq!(pool.queued_bytes(), 0);
+        assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0, "drop must release exactly its own two writers");
+    }
+}
+
+#[test]
+#[cfg(all(feature = "receive-buffer-exchange", feature = "activity-events"))]
+fn rejected_exchange_aborts_stream_and_cannot_be_retried() {
+    use std::{future::Future, pin::pin, sync::atomic::{AtomicBool, Ordering}, task::{Context, Wake, Waker}};
+    use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
+    let owner = Owner { domain: AllocationDomain::new(OwnerId::new(121), ArenaId::new(121)), task: TaskRecoveryKey::new(121).unwrap() };
+    let pool = Storage::<3>::new_static(4096, 8192).unwrap();
+    let frontend = TcpListener::new_with_receive_storage("reject", TcpListenerId::new(121).unwrap(), SERVER_PORT, 256, 256, pool).unwrap();
+    let mut caps = CSpace::new("reject-exchange");
+    let to_server = Endpoint::new("reject-in", 128);
+    let to_client = Endpoint::new("reject-out", 128);
+    let (_, input) = authority(&mut caps, &to_server, Rights::RECV);
+    let (_, output) = authority(&mut caps, &to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut caps, &to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut caps, &to_server, Rights::SEND);
+    let mut server = SharedIpv4TcpStack::new(Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 121), session_stamp(), input, output).unwrap();
+    let handle = server.add_tcp_listener(SERVER_PORT).unwrap();
+    unsafe { server.enable_receive_exchange(handle, frontend.clone(), owner).unwrap(); }
+    let mut client = TestClient::new(client_in, client_out);
+    let mut sent = false;
+    let mut now = 0;
+    while now < 1000 {
+        client.poll(now);
+        if !sent && client.socket().can_send() {
+            assert_eq!(client.socket().send_slice(b"data").unwrap(), 4);
+            sent = true;
+            client.poll(now);
+        }
+        server.poll_network(now).unwrap();
+        now += 1;
+        if server.tcp_stream_status(handle).unwrap().readable_bytes == 4 { break; }
+    }
+    assert_eq!(server.tcp_stream_status(handle).unwrap().readable_bytes, 4);
+    struct Fill { frontend: Arc<TcpListener>, fired: AtomicBool }
+    impl Wake for Fill {
+        fn wake(self: Arc<Self>) {
+            if !self.fired.swap(true, Ordering::Relaxed) {
+                // Consume the capacity after network_begin_drive snapshots it,
+                // but before the exchange publication rechecks admission.
+                assert_eq!(self.frontend.network_receive(&[7; 256]), 256);
+            }
+        }
+    }
+    let fill = Arc::new(Fill { frontend: frontend.clone(), fired: AtomicBool::new(false) });
+    let event = frontend.network_event();
+    let waker = Waker::from(fill.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut waiting = pin!(event.wait());
+    assert!(waiting.as_mut().poll(&mut cx).is_pending());
+    assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+    assert!(fill.fired.load(Ordering::Relaxed));
+    assert_eq!(frontend.snapshot().state, TcpStreamState::Reset);
+    assert_eq!(frontend.snapshot().readable_bytes, 0);
+    assert_eq!(pool.queued_bytes(), 0);
+    assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+    // Even after ordinary network polling, neither socket may auto-relisten.
+    for _ in 0..10 {
+        client.poll(now); server.poll_network(now).unwrap(); now += 1;
+        assert!(!server.tcp_is_listening(handle).unwrap());
+        assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+    }
+    drop(server);
+    assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
+}
+
+#[test]
+#[cfg(feature = "receive-buffer-exchange")]
+fn shared_port_exchange_keeps_simultaneous_streams_in_separate_pools() {
+    use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage, TcpPortGroupId};
+    let owner = Owner { domain: AllocationDomain::new(OwnerId::new(131), ArenaId::new(131)), task: TaskRecoveryKey::new(131).unwrap() };
+    let consumer = Owner { domain: AllocationDomain::new(OwnerId::new(132), ArenaId::new(132)), task: TaskRecoveryKey::new(132).unwrap() };
+    let pools = [Storage::<3>::new_static(4096, 8192).unwrap(), Storage::<3>::new_static(4096, 8192).unwrap()];
+    let group = TcpPortGroupId::new(131).unwrap();
+    let frontends: Vec<_> = (0..2).map(|i| TcpListener::new_shared_with_receive_storage("shared-exchange", TcpListenerId::new(131+i as u64).unwrap(), SERVER_PORT, 8192, 4096, group, pools[i]).unwrap()).collect();
+    let mut caps = CSpace::new("shared-exchange");
+    let incoming = Endpoint::new("shared-in", 128);
+    let outgoing = Endpoint::new("shared-out", 128);
+    let (_, input) = authority(&mut caps, &incoming, Rights::RECV);
+    let (_, output) = authority(&mut caps, &outgoing, Rights::SEND);
+    let (_, client_in) = authority(&mut caps, &outgoing, Rights::RECV);
+    let (_, client_out) = authority(&mut caps, &incoming, Rights::SEND);
+    let mut server = SharedIpv4TcpStack::new(Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 131), session_stamp(), input, output).unwrap();
+    let handles = [server.add_shared_tcp_listener(SERVER_PORT, group.get()).unwrap(), server.add_shared_tcp_listener(SERVER_PORT, group.get()).unwrap()];
+    let mut frontend_roots = Vec::new();
+    for i in 0..2 {
+        let root = caps.mint(frontends[i].clone(), Rights::ALL_VOLATILE);
+        let capability = caps.lookup_revocable::<TcpListener>(root, Rights::RECV).unwrap();
+        unsafe { server.enable_receive_exchange_capability(handles[i], capability, owner).unwrap(); }
+        frontend_roots.push(root);
+    }
+    assert!(server.drive_tcp_frontend(handles[0], &frontends[1]).is_err());
+    let mut client = TestClient::new(client_in, client_out);
+    let second = client.open_connection_to(SERVER_PORT, 49_153);
+    let expected: [Vec<u8>; 2] = core::array::from_fn(|stream| (0..300_007).map(|i| (i * 37 + i / 251 + stream * 73) as u8).collect());
+    let mut sent = [0; 2];
+    let mut observed: [Vec<u8>; 2] = core::array::from_fn(|_| Vec::new());
+    let mut connections = [None; 2];
+    let mut exchanges = [false; 2];
+    for now in 0..100_000 {
+        client.poll(now);
+        for i in 0..2 {
+            let socket = if i == 0 { client.socket() } else { client.socket_by_handle(second) };
+            if socket.can_send() && sent[i] < expected[i].len() {
+                sent[i] += socket.send_slice(&expected[i][sent[i]..]).unwrap();
+            }
+        }
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        for i in 0..2 {
+            server.drive_tcp_frontend(handles[i], &frontends[i]).unwrap();
+            connections[i] = connections[i].or_else(|| frontends[i].try_accept());
+            exchanges[i] |= pools[i].queued_bytes() != 0;
+            assert!(frontends[i].snapshot().readable_bytes <= 8192);
+            if now % (3+i as u64) == 0 {
+                if let Some(peer) = connections[i] {
+                    let mut bytes = [0; 997];
+                    if let TcpIoResult::Progress(n) = frontends[i].try_recv_for(peer, consumer, &mut bytes).unwrap() {
+                        observed[i].extend_from_slice(&bytes[..n]);
+                    }
+                }
+            }
+        }
+        if observed.iter().all(|v| v.len() == expected[0].len()) { break; }
+    }
+    assert_eq!(sent, [300_007; 2]);
+    assert!(exchanges.into_iter().all(|v| v));
+    // Shared-port socket selection need not assign the first SYN to slot zero.
+    assert!((observed[0] == expected[0] && observed[1] == expected[1]) || (observed[0] == expected[1] && observed[1] == expected[0]));
+    caps.revoke(frontend_roots[0]).unwrap();
+    // Retaining an external Arc must not bypass the stored capability's
+    // revocation, and the independent sibling capability remains usable.
+    assert!(server.drive_tcp_frontend(handles[0], &frontends[0]).is_err());
+    assert!(server.drive_tcp_frontend(handles[1], &frontends[1]).is_ok());
+    drop(server);
+    for pool in pools {
+        assert_eq!(pool.queued_bytes(), 0);
+        assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
+    }
+}

@@ -1704,3 +1704,1529 @@ First post-negotiation U-Boot ARP again timed out; a subsequent bounded retry
 succeeded. Raw restore logs use the repro-control/repro-control2 prefixes.
 Board remains on control; default source/configuration unchanged; no SD/SPI
 writes. The complete gigabit/CPU goal remains active and not achieved.
+
+
+## Loaded-window poll decision classification
+
+Added optional per-hart/stage scheduling counters: runnable with a work hint,
+empty retry, wait attempt, interface turns with ingress, interface turns with
+frontend progress, and protocol input packet count. Work hints can include
+pending/backpressured work; wait attempts need not actually block. Ingress
+packet counts are after optional GRO, not Ethernet wire frames. The hooks
+preserve the original PollBudget decision logic and remain no-ops without
+network-profile. No locks, allocation or output occur in the counter hook.
+The deferred parser validates six counters, stage/hart identity and duplicate
+rows without changing timer totals. PollBudget, profiled netstack/event-driven
+iperf tests and six parser tests passed.
+
+The diagnostic payload/FIT built, both RAM payload hashes passed, and a 64 MiB
+pattern check passed. Iperf ran for 30 seconds, with NPROF armed for 20 seconds
+after traffic had started; dumping waited until traffic exited. Overall RX
+was 946.04 Mbps. Interior 6..22 second intervals ranged 939.35..949.56 Mbps,
+mean 947.02 Mbps, so the capture was not merely an idle/slow-path sample.
+
+| Task/hart | Work-hint runnable | Empty retry | Wait attempt |
+| --- | ---: | ---: | ---: |
+| driver / h0 | 173095 | 0 | 53 |
+| iperf application / h0 | 107472 | 34123 | 51920 |
+| stack / h1 | 57963 | 113 | 67 |
+
+Stack ingress progressed on 57959 interface turns and frontend work on 57946,
+out of 58143 scheduling decisions (single interface). Thus roughly 99.68% of
+stack turns processed input; only 0.19% were empty retries. The 177782 protocol
+inputs include GRO aggregation and must not be read as wire packet rate.
+Inbound queue high-water was 64, with 1778 full retry attempts; outbound high
+was 2 with no full attempts. Driver work-hint counts alone cannot distinguish
+TX ownership, backpressure and completed RX, but this sample does not support
+an explanation dominated by empty protocol grace polling. Counts do not
+assign CPU-time percentages: expensive rare empty turns are not bounded here.
+No production CPU reduction is claimed by these diagnostic changes.
+
+After traffic, RX pool received=acquired=released=2476168, full=dropped=0,
+free=128, ready=borrowed=0. Evidence: target/mars-acceptance/20260913-gigabit/
+20260915-poll-decision-rx-profile-* and target/mars-reference/
+20260915-poll-decision-{build,fit,ramboot,run,tests,netstack-tests,iperf-tests}.log,
+20260915-poll-decision-integrity.json and exact 20260915-poll-decision.elf.
+Diagnostic FIT SHA-256: `97cb4782a03f6a592360ab479622e8be6958615f4837e5f5a56c88dcd4d428fd`.
+
+Next concrete controller comparison: our detached batch path intentionally
+still rings RX tail per descriptor (drivers/eqos-net/src/ring.rs); upstream
+stmmac_rx_refill prepares/owns descriptors in a loop and publishes RX tail
+afterward. This suggests evaluating fewer MMIO tail writes with explicit
+partial-failure/wrap/ownership tests, not assuming it already saves CPU.
+Source consulted 2026-09-15:
+https://raw.githubusercontent.com/torvalds/linux/master/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+Restored unprofiled control f83005de... after capture: RAM hashes, gigabit
+startup and fresh 64 MiB pattern passed (20260915-poll-decision-restore-*).
+Default Ethernet features restored, board remains on control, SD/SPI not
+written. The below-one-core objective remains unmet.
+
+
+## RX batch tail publication experiment
+
+Added a generic Ring receive_detached_batch_single_tail entry point and a
+Mars rx-batch-tail-experiment switch (default off, implies rx-batch-experiment).
+Both batch APIs share one implementation. The new path preserves each
+replacement buffer's preparation and descriptor fields/OWN/cache/barrier
+sequence, then writes the inclusive RX tail once to the final reserved slot.
+It publishes tickets only afterward. Zero-reservation/empty paths do not
+write a tail; malformed first-frame fallback remains the existing single-frame
+path. Publication failures still quarantine the ring and require proven reset.
+
+All 108 EQoS model tests pass. Existing batch tests now run both variants,
+covering FIFO/pool pressure, malformed prefixes, publication failures before
+and after metadata changes, borrowed-buffer retention during reset and the
+eight-entry bound. A new wrap test verifies the 3,0,1 descriptor sequence,
+one tail versus three, each OWN/cache visibility before that tail and no
+extra tail on the following empty receive. Models prove ordering/event count,
+not hardware cache coherence or a CPU saving.
+
+The unprofiled target FIT built and passed RAM payload hashes, gigabit startup
+and 64 MiB changing-pattern verification. Two 20-second fixed-rate runs gave
+909.96/909.92 Mbps with h0/h1 active percentages 97.45/98.56 and 97.46/97.75
+(roughly 1.960/1.952 aggregate cores). These do not show a material CPU gain
+over recent control runs. No default promotion or below-one-core claim.
+Under active RX, cancelling/restarting virtio-net advanced generation 1 to 2;
+post-restart 64 MiB verification passed. Final received/acquired/released were
+all 3474078, full=dropped=ready=borrowed=0 and free=128.
+
+FIT SHA-256: 330c89eb6e8af4e14240c09849ef535abbbf28cf648926bcd5d844b8cd8a560b.
+Exact ELF: target/mars-reference/20260915-rx-batch-tail.elf. Evidence under
+that prefix: tests.log, build2.log, fit.log, ramboot.log, integrity.json,
+910/, recovery.log, after-recovery-integrity.json, final-pool.log; detailed
+recovery logs in target/mars-acceptance/20260913-gigabit/20260915-rx-batch-tail-recovery/.
+The experiment stays opt-in. Further descriptor synchronization batching must
+preserve fields-before-OWN and cache-before-tail across wrap and partial
+prefixes; this result alone does not justify removing ordering operations.
+Restored the unprofiled control f83005de...: RAM hashes, gigabit startup and
+fresh 64 MiB pattern passed (20260915-rx-batch-tail-restore-*). Default Ethernet
+selection restored; board remains on control; SD/SPI untouched. Goal unmet.
+
+
+## Batched descriptor visibility experiment; archive without promotion
+
+Extended the prior tail-only prototype with a third publication mode: prepare
+all replacement payloads and descriptor fields, synchronize the reserved
+prefix, issue a barrier, write all OWN bits, synchronize the prefix again,
+issue a barrier, then publish one inclusive tail. Wrapped prefixes split into
+two physical spans and never include unprepared descriptors. Ticket publication
+and quarantine/reset behavior remained afterward as before.
+
+This required explicit Backend/Memory admission. Pool admission validated each
+possible bounded RX span against the cache service before enabling the mode;
+individual line admission was not assumed to imply span admission. Runtime
+range checks rejected zero/misaligned lengths, payload addresses, cross-ring
+ranges, and multi-line TX spans. Default pool construction did not enable it.
+111 model tests passed, including all three modes, wrap visibility before OWN
+and tail, partial prefixes, publication failures, retained borrowers on reset,
+cache services rejecting multi-line ranges, and absent backend admission.
+
+Unprofiled FIT build, RAM hashes, gigabit startup and 64 MiB pattern passed.
+Two fixed-rate 20-second RX samples both reached 909.92 Mbps, with h0/h1
+97.52/96.85% and 97.45/98.03% active (roughly 1.944/1.955 aggregate cores).
+These do not show a material improvement over the recent control/tail-only
+samples. Do not claim that fewer synchronization calls proved lower CPU cost.
+Load-time cancellation and restart advanced generation 1 to 2; afterward a
+fresh 64 MiB pattern passed. Final pool counters: received=3472750,
+acquired=released=3472749, free=128, ready=borrowed=full=dropped=0. One received
+frame was not acquired across the cancellation sequence; the exact retirement
+path was not separately traced. There are no outstanding borrowed/ready slots.
+
+Both tail-only and grouped-sync implementation/tests/feature switches were
+archived together as target/mars-reference/20260915-rx-batch-publication-experiments.patch
+and removed from the working tree. This supersedes the earlier decision to
+retain the tail experiment as an opt-in API. Default driver behavior is restored;
+no extra DMA interfaces are retained without a demonstrated benefit.
+Evidence: target/mars-reference/20260915-rx-batch-publish-{tests,build,fit,ramboot,recovery}.log,
+20260915-rx-batch-publish.elf, 20260915-rx-batch-publish-910/,
+20260915-rx-batch-publish-{integrity,after-recovery-integrity}.json,
+20260915-rx-batch-publish-final-pool.log and the corresponding recovery directory
+under target/mars-acceptance/20260913-gigabit/.
+FIT SHA-256: `5b3aa1d1befcc6c34292e19d0a21b3c3bec64cb48a148af3d2bda183523d2052`.
+
+Next investigation should sample actual interrupted instruction locations with
+minimal hot-path instrumentation, using the exact ELF. Such samples must expose
+bias from delayed interrupts during IRQ-masked critical sections; a PC near
+interrupt restoration alone cannot identify the body that delayed the interrupt.
+Restored unprofiled control f83005de...; RAM hashes, gigabit startup and
+fresh 64 MiB pattern passed (20260915-rx-batch-publish-restore-*). Board remains
+on control, default features restored, no SD/SPI writes. Goal remains unmet.
+
+### Periodic PC sampling (2026-09-15)
+
+The independent `pc-sample` diagnostic feature adds a bounded, one-shot timer
+capture (`npc 1` through `npc 5`, followed by `npc` after expiry). It is separate
+from per-function `network-profile`. Per-hart pinned tasks re-arm local timers;
+the sampler only shortens an existing deadline, never postpones a task timer.
+The SSIP handler still takes no scheduler lock. Sampling skips missed periods
+instead of generating catch-up interrupts. IRQ collection has no allocation,
+lock, or printing; freezing waits for writer publication without spinning.
+Default images contain neither these buffers nor the timer/trap hooks.
+
+The capture contains interrupted PC, saved x1/RA, entry time and expected time.
+`mars-pc-sample.py` requires a complete, non-overflowing dump and the exact ELF,
+retains available symbol aliases and hashes both inputs. IRQ-masked work is
+underrepresented and its pending interrupt can land immediately after `csrs
+sstatus`. RA is not a stack trace. Generic Drop bodies can also be merged under
+one representative symbol name; a displayed VSH type does not imply VSH work.
+Idle harts sampling in `exec::run` are sleeping/WFI, not busy executors. None of
+these percentages are unbiased CPU-cycle shares.
+
+FIT `target/mars-boot-20260915-pc-sample/out/artifacts/vibeos.itb`, SHA-256
+`731186c3ca18ccce611e3dac106d06ff3cfae3da3aabc8c27d83d6228d9506cb`, passed RAM
+hash validation, gigabit negotiation and 64 MiB changing-pattern verification.
+A 3 s capture inside a 15 s RX run gave 947.28 Mbps overall; individual one-second
+intervals were 941.7–949.5 Mbps. h0/h1/h2/h3 recorded 1492/1496/1499/1499 samples
+with no drops. h0/h1 lateness p99 was 28.75/40.25 us; h0 had one 4.23 ms maximum,
+so uniform-period sampling must not be assumed perfect.
+
+On h1, 498/1496 samples (33.3%) landed in `compiler_builtins::mem::memcpy`,
+predominantly in its misaligned-source shift/merge loop. On h0, 724/1492 samples
+landed in one shared SpinGuard drop body. Disassembly verifies the common PC
+`0x4042c9dc` is immediately after interrupt enable. Of those, the saved RA was
+`0x4031f310` 498 times (pooled RX publication loop), `0x4031f108` 185 times (TX
+block), and `0x4031fac4` 37 times. These identify interrupted critical-section
+boundaries, not lock contention duration. The next comparisons should isolate
+copy code generation and per-packet publication synchronization; this evidence
+does not justify attributing all busy time to the hardware driver.
+
+Evidence: `target/mars-reference/20260915-pc-sample-{tests,parser-tests,build,fit,ramboot,run}.log`,
+`20260915-pc-sample-{integrity,analysis}.json`, exact `.elf`, and
+`target/mars-acceptance/20260913-gigabit/20260915-pc-sample-rx-*`.
+
+The sampler subsequently gained a host-tested ceiling division for unusual
+non-divisible timebases, maintaining the 500 samples/s bound. Mars' 4 MHz period
+remains 8000 ticks; the captured ELF predates this source-only arithmetic fix.
+
+#### Copy code-generation comparison: built, not yet measured
+
+A temporary `[profile.release.package.compiler_builtins] opt-level = 3`
+configuration produced the unprofiled `20260915-copy-speed` RAM FIT, SHA-256
+`01891811943207fbd74ef9a6800ff75f1e22517780b1e7be84561a35c4d69cbe`.
+Cargo initially warns that the package is absent from the normal workspace,
+then recompiles the build-std compiler_builtins package. The exact ELF confirms
+changed memcpy code (0x1d6 bytes, versus 0x17c in the sampled ELF), including a
+shorter misaligned steady-state loop. The override is archived at
+`target/mars-reference/20260915-copy-speed-profile.txt`; default Cargo and
+Ethernet feature selection have been restored.
+
+The FIT's load hashes passed, but boot failed before networking:
+`MARS_TRNG_PROBE FAIL ... prepare=Err(Protocol) read=Err(DriverRestarted)` followed
+by `pmic_ops: cannot read pmic power register`. No copy-speed throughput or CPU
+measurement exists. Its integrity JSON records a connection timeout with zero
+bytes submitted, not data corruption. A cold power cycle was requested; the
+cause of this boot failure is not established. Do not promote the build override
+or claim a CPU improvement from these artifacts. After recovery, complete the
+same-rate comparison and restore the known control RAM image.
+
+#### Preserve the boot failure cause
+
+The 2026-09-15 recovery check still received no serial response. Inspection
+found that `entropy_instance::prepare` converted every child initialization
+error into HAL `Protocol`, so the earlier log does not establish that the
+underlying TRNG error was itself a protocol error. Firmware now retains the
+first concrete failure and phase (`PrepareDomain`, `Initialize`, `Read`, or
+`StopDomain`). The diagnostic boot log prints that retained code, as well as
+separate prepare/start outcomes. This adds no MMIO, output-byte logging, retry,
+entropy approval, or weakening of existing failure handling. Shutdown preserves
+the first cause; an admitted new preparation epoch clears it.
+
+`cargo test -p vibeos-firmware-milkv-mars --no-default-features --features
+entropy-device --test entropy_model` passed, including mode failure, domain
+reset timeout, read lockup, retained cause through shutdown, and clearing on a
+new successful epoch. Log: `20260915-trng-cause-host-tests.log`. The initial host
+attempts omitted `--no-default-features` and are separately archived; they failed
+because the bare-metal image binary cannot build for the host. No additional
+hardware qualification is claimed by these model checks.
+
+Diagnostic FIT: `target/mars-boot-20260915-trng-cause/out/artifacts/vibeos.itb`,
+SHA-256 `86e50dbddd3fafd5cbd9271fd91518ad4a4aad46e37acec0bfec3179f6b15dfe`. Build and FIT packaging passed; no RAM boot yet.
+The default Ethernet feature mapping is restored.
+
+### Copy code-generation experiment completed after serial recovery
+
+The user confirmed `/dev/tty.usbmodem54340134951`; interrupt/newline then received
+`vibe>` and live task output. The temporary cold-boot listener was stopped and
+its handle confirmed terminal before another serial owner was started. No
+additional power cycle was required. The `trng-cause` control FIT and the
+same-source `copy-speed-cause` FIT both subsequently passed RAM hash validation,
+TRNG protocol probe, gigabit negotiation and 64 MiB changing-pattern TCP checks.
+The earlier TRNG failure was not reproduced; its cause remains unresolved.
+
+`copy-speed-cause` FIT SHA-256:
+`e9b9f6f7de2ffa801259e10c1536841a815811d1e5ecf1efca9f43d874deb19b`.
+Both images use the same unprofiled network feature set; PC sampling and
+network-profile are off. The sole build override for the experiment is
+compiler_builtins opt-level 3. Exact ELF checks show memcpy text sizes of 0x17c
+(control) and 0x1d6 (experiment), confirming a real code-generation difference.
+No build ran concurrently with a benchmark.
+
+Two 20 s, MTU 1500, 910M host-to-board runs per image:
+
+| RAM image | RX Mbps | Aggregate non-WFI cores |
+| --- | --- | --- |
+| control, run 1 | 909.96 | 1.9177 |
+| control, run 2 | 909.96 | 1.8987 |
+| copy opt-level 3, run 1 | 909.92 | 1.9464 |
+| copy opt-level 3, run 2 | 909.96 | 1.9218 |
+
+This small comparison shows no CPU benefit; it does not establish a general
+regression or isolate every cache/layout effect. Do not promote the build
+change. The default workspace profile and Ethernet feature mapping are restored.
+The board was restored to the `trng-cause` control FIT with successful hash and
+1000-full-duplex checks. The observed non-WFI occupancy is not CPU-cycle or power
+measurement, and it remains well above the one-core effort target.
+
+Evidence: `target/mars-reference/20260915-{trng-cause,copy-speed-cause}-910/`,
+matching `*-integrity.json`, `copy-speed-cause-{build,fit,ramboot}.log`, exact ELFs,
+and `20260915-copy-speed-cause-restore-{ramboot.log,integrity.json}`. The next
+hardware-backed experiment should target per-frame RX queue publication and its
+nested synchronization; optimizing memcpy code generation alone did not remove
+the observed overhead.
+
+### RX queue publication batching: tested, archived without promotion
+
+A separate `rx-queue-batch-experiment` changed only publication above the
+existing detached hardware batch. One session barrier and one live SEND
+invocation covered a batch; the queue transferred available tickets under one
+queue lock, cleared accepted source slots in place, and emitted the existing
+empty-to-nonempty notification after unlocking. No temporary per-frame stamp
+array or new allocation was required. Each ticket still consumed one queue slot.
+Pending tickets retained their original batch stamp through queue pressure;
+stale/revoked pending tickets were discarded. The 32-wire-frame turn budget
+remained bounded. DMA descriptors, cache synchronization, and protocol receive
+consumption stayed on the preceding paths. The older per-frame driver-stage
+profiler was explicitly incompatible with the experiment instead of emitting
+misleading counters.
+
+Host endpoint/receive suites passed 16 tests, including new sparse-batch,
+partial-capacity, wraparound, limit-zero, notification, SEND revocation,
+new-session rejection and concurrent-producer cases. FIT SHA-256:
+`383a331799cc8ed9ca2aeacfd361bb3498fd6bcbad89e9c7d7c078dfd785be15`.
+RAM hashes, gigabit boot and 64 MiB changing-pattern checks passed.
+
+Two 20 s RX runs measured 909.96/909.92 Mbps and 1.9474/1.9280 aggregate
+non-WFI cores. The preceding same-rate control measured 1.9177/1.8987 cores.
+This comparison shows no CPU benefit; it is not proof of a general regression.
+Cancelling the network component during RX and restarting generation 1 -> 2
+passed, followed by another 64 MiB check. Final pool counters were
+received=acquired=released=3,474,002, free=128, ready=borrowed=full=dropped=0.
+
+All queue batching runtime changes, tests and feature declarations were saved
+in `target/mars-reference/20260915-rx-queue-batch-experiment.patch` and removed
+from the working runtime. Existing PC diagnostics and TRNG failure attribution
+were preserved. The board was restored to the `trng-cause` control FIT with
+successful load hashes/gigabit boot. Evidence: `20260915-rx-queue-batch-*` under
+`target/mars-reference`, plus the recovery directory under
+`target/mars-acceptance/20260913-gigabit`.
+
+During review, TX-owned descriptors were reconsidered as a possible reason
+for continuous polling. The earlier TX-wait attribution (table above) already
+recorded zero TX-only turns in RX workloads, so that hypothesis is not supported
+as the next RX remedy. Do not infer a scheduler gain from reducing the lock
+count alone, or repeat the TX-wait experiment without new contradictory evidence.
+
+### Same-hart configuration comparison on the current optimized path
+
+The `same-hart` RAM build removes only the existing `network-pipeline` feature
+from the preceding unprofiled feature manifest. Driver, stack and application
+then execute on logical hart 0; observed h1–h3 non-WFI residency under load was
+zero to the displayed precision. This option also changes component construction
+order and resulting memory layout. It is a practical configuration comparison,
+not an isolated measurement of cross-hart lock traffic. No live arena migration,
+clock change, driver change or build concurrent with traffic was performed.
+
+FIT SHA-256 `93d8284b65c3caa250e5ff5a4c92ca0a9426ee5a78e7301dcf16f9bc3155b2d5`.
+Build, RAM hashes, 1000-full-duplex boot and 64 MiB changing-pattern verification
+passed. Two 20 s fixed-load runs on each configuration:
+
+| Configuration | RX Mbps | Aggregate non-WFI cores | Core-seconds/GiB |
+| --- | --- | --- | --- |
+| preceding two-hart control, run 1 | 299.98 | 0.8488 | 24.385 |
+| preceding two-hart control, run 2 | 299.97 | 0.8185 | 23.515 |
+| same hart, run 1 | 299.98 | 0.6442 | 18.501 |
+| same hart, run 2 | 299.97 | 0.6620 | 19.019 |
+
+Mean fixed-load cost fell 21.67% in this sequential comparison. However, two
+unpaced same-hart runs reached only 694.07/696.49 Mbps at 0.99875/0.99887 cores
+(12.403/12.363 core-seconds/GiB). This does not meet the 900 Mbps target and was
+not promoted. Final same-hart pool counts were received=acquired=released=
+3,457,253, free=128, ready=borrowed=full=dropped=0.
+
+After restoring the exact `trng-cause` two-hart control FIT, a fresh unpaced
+20 s RX run reached 949.06 Mbps with h0/h1 at 99.88/99.69% non-WFI occupancy.
+Full-run GRO delta counters (rx_frames, merged_segments, aggregates) were:
+
+- same hart, two runs: [2381257, 2122810, 244200], about 9.69 segments/aggregate;
+- two-hart control, one run: [1625334, 1343052, 252323], about 6.32 segments/aggregate.
+
+These aggregate averages exclude standalone frames; captures also differ in
+throughput and duration. Placement changes both locality and coalescing, so the
+fixed-load saving must not be assigned entirely to cross-core synchronization.
+The difference motivates separating receive aggregation from placement in the
+next controlled experiment. At roughly 695 Mbps, the same-hart path still needs
+about 30% more throughput to reach 900 Mbps; lower total residency alone is not
+success. Default Ethernet composition and the board are restored to two-hart
+control, followed by another changing-pattern integrity check.
+
+Evidence: `target/mars-reference/20260915-same-hart-comparison.json`,
+`20260915-same-hart-{control-300,300,full,control-full}/`, `*-gro-{before,after}.log`,
+`same-hart-{build,fit,ramboot}.log`, exact ELF and feature manifest, and
+`20260915-same-hart-restore-{ramboot.log,integrity.json}`. No runtime source
+changes were introduced by this placement comparison.
+
+### Complete the 300 Mbps placement/GRO matrix
+
+To separate aggregation from the preceding placement observation, build the
+same unprofiled feature manifests with `bounded-gro` removed, once with and once
+without `network-pipeline`. Other network/offload/window features are unchanged.
+No runtime source was edited. The no-GRO protocol path passed 33 host tests with
+`pooled-rx,native-tcp-segmentation,tcp-large-window`, including backpressure,
+connection transitions, checksum policy and revocation. Both RAM FITs passed
+load hashes, TRNG protocol probe, 1000-full-duplex boot and 64 MiB changing-pattern
+checks before traffic. No build ran during measurement.
+
+Each cell contains two 20 s RX samples; all achieved 299.97–299.98 Mbps:
+
+| Placement | GRO | Aggregate non-WFI cores, runs 1/2 | Mean core-seconds/GiB |
+| --- | --- | --- | --- |
+| two harts | on | 0.8488 / 0.8185 | 23.950 |
+| same hart | on | 0.6441 / 0.6620 | 18.760 |
+| two harts | off | 0.8765 / 0.8546 | 24.864 |
+| same hart | off | 0.6834 / 0.6826 | 19.620 |
+
+Same-hart cost is 21.67% lower with GRO and 21.09% lower without it. Thus the
+fixed-load placement difference persists without GRO and is not explained
+primarily by the observed full-load aggregate-size difference. This still does
+not isolate lock contention from cache locality, component construction order,
+memory layout or scheduling. Samples are sequential, not randomized, and these
+300 Mbps percentages must not be extrapolated to 900 Mbps. The same-hart full
+GRO result remains about 695 Mbps, below the target.
+
+The next bounded placement experiment should co-locate the protocol stack and
+TCP services while retaining the driver on the PLIC dispatch hart, targeting
+the shared frontend boundary rather than moving every network task to one core.
+It must preserve arena affinity and verify cancellation/restart placement before
+promotion; merely changing initial placement is not complete lifecycle support.
+
+No-GRO FIT SHA-256:
+- two harts: `8522e68287024c39d2c3f51c91b4544abc38d57428fca817b3fbe371a8ff0bb9`;
+- same hart: `c2010013193f8b7723997c5b3997bc614aa561fa2aa6b520cab0a534a68f7fe0`.
+
+Same-hart final RX pool: received=acquired=released=1,075,996, free=128,
+ready=borrowed=full=dropped=0. Default composition and the board were restored to
+the `trng-cause` two-hart GRO control FIT, with successful hash/gigabit checks and
+a subsequent changing-pattern verification. Evidence is in
+`target/mars-reference/20260915-gro-placement-matrix.json`, the preceding
+`same-hart-{control-300,300}` directories, `no-gro-{two-hart,same-hart}-300/`,
+matching build/FIT/RAM/integrity logs and exact ELFs, plus
+`20260915-gro-placement-restore-{ramboot.log,integrity.json}`.
+
+### TCP frontend / stack co-location experiment (2026-09-15)
+
+The earlier four-cell placement/GRO matrix could not attribute the co-location
+saving to frontend handoff specifically. This experiment kept the driver on
+logical hart 0 and constructed iperf3, tcp-probe, and net-stack fresh arenas on
+logical hart 1. `nplace` inspected actual scheduler queue ownership. No existing
+raw arena was migrated. All other experimental network features matched the
+unprofiled `trng-cause` control, including GRO and MTU 1500.
+
+To avoid silent migration after a console restart, the opt-in prototype recorded
+network component home harts and dispatched pointer-free, generation/task-bound
+control requests via one bounded mailbox per component to SYSTEM-owned pinned
+workers. Workers rechecked lifecycle identity on the destination hart. No
+lifecycle lock was held while awaiting another hart. Four standalone mailbox
+state tests passed. This was experimental code, not a qualified general-purpose
+lifecycle API: monitor interaction and interrupted worker handling were not
+fully tested. The experiment is archived and removed from active source at
+`target/mars-reference/20260915-frontend-affinity-experiment.patch` (applicability
+checked after removal).
+
+Initial FIT SHA-256:
+`5fa9d81e50d7c3070d6d92c80aae2d9d03fd9675e3fc477eb4c3334851837778`.
+RAM load hashes, gigabit link, actual component placement, and a 64 MiB changing
+pattern TCP verification passed. Two 20-second RX runs at each load gave:
+
+| Placement / load | Received Mbps | Total non-WFI cores | Core-seconds/GiB |
+| --- | ---: | ---: | ---: |
+| frontend + stack hart 1, 300M run 1 | 299.97 | 0.8040 | 23.104 |
+| frontend + stack hart 1, 300M run 2 | 299.98 | 0.7986 | 22.943 |
+| frontend + stack hart 1, unpaced run 1 | 888.22 | 1.9538 | 18.958 |
+| frontend + stack hart 1, unpaced run 2 | 888.84 | 1.9525 | 18.931 |
+
+For context, the earlier same-day two-hart control measured 0.8488/0.8185 cores
+at 300M and 949.06 Mbps / 1.9957 cores unpaced. These are earlier sequential
+controls, not a randomized or immediately paired comparison. At fixed load the
+small apparent saving does not explain the earlier ~22% all-network co-location
+saving; at full load the experiment is slower and uses more core-seconds per GiB.
+There is no evidence to promote this placement toward the >900 Mbps / <1 core
+objective. Non-WFI residency still includes MMIO stalls and interrupt work.
+
+Evidence: `target/mars-reference/20260915-frontend-affinity-comparison.json`,
+`20260915-frontend-affinity-{300,full}/`, matching ELF/build/FIT/RAM-boot logs,
+`20260915-frontend-affinity-placement.log`, and `*-integrity.json`.
+
+### Persistent network control-table allocation ownership (2026-09-15)
+
+The subsequent cancellation/restart acceptance exposed a separate correctness
+problem. iperf3 and tcp-probe each restarted from generation 1 to 2 and stayed on
+hart 1. net-stack cancellation completed, but restart hit the existing
+`close_empty_domain` assertion with `ArenaBusy { live_bytes: 384,
+live_allocations: 2 }`. The remote worker faulted and the waiting console request
+did not complete. The full recovery script failed; post-recovery integrity was
+not run. See `20260915-frontend-affinity-recovery.log` and its per-command folder.
+
+Inspection found that `config::CONTROL` and `LISTENER_INTERFACES` are persistent
+static vectors, but both registration methods reserve/grow them in the caller's
+allocation domain. The caller is the reclaimable net-stack task. Publishing
+these allocations into static storage violates that task's no-escape contract,
+independently of CPU placement. The allocation-domain regression test observed
+four non-SYSTEM allocations covering initial allocation and growth before the
+fix; with the fix all four use SYSTEM/untracked storage. Both functions now
+enter a SYSTEM owner scope for their persistent metadata and restore the caller
+on return. The arena-empty assertion and raw reclamation rules are unchanged.
+The fixed FIT subsequently passed cancellation/restart of all three services
+from generation 1 to 2 on hart 1 and a post-restart 64 MiB data verification.
+The unchanged arena-empty assertion no longer failed. This first fixed replay
+performed the cancellation sequence before a throughput load; a loaded replay
+on the original-placement image is recorded separately below.
+
+`components/netstack/tests/config_allocation.rs` uses a host allocator audit of
+real registration calls. It does not claim to exercise target raw reclamation.
+The test was red before the fix and green afterward. The seven netstack tests
+passed under both default static-address and DHCP/pooled-RX/native-segmentation/
+GRO/large-window feature compositions. Logs:
+`20260915-config-allocation-{before,after,dhcp}.log`.
+
+A second RAM FIT retains the experimental placement solely to replay the failed
+recovery test with the metadata fix. Its SHA-256 is
+`22f0ac273d79b4bf4db01de8ac13255475c10ae43cf8d3deadfeb384cdc207e7`.
+Serial prompt probes initially returned zero bytes after the requested power
+cycles. After the user checked the connections, the serial prompt returned and
+the fixed FIT was loaded with verified hashes and a gigabit link. Evidence:
+`20260915-frontend-affinity-config-{ramboot,recovery}.log`, the matching recovery
+folder, and `20260915-frontend-affinity-config-recovery-integrity.json`.
+
+Active source restores the original placement and keeps only the persistent
+metadata fix from this experiment. No SD/SPI writes or saved U-Boot environment
+changes occurred. The full >900 Mbps / <1 core objective remains open.
+
+The original-placement image with only the metadata fix has SHA-256
+`160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`.
+Its RAM hashes, gigabit link, and initial 64 MiB verification passed. Two
+20-second unpaced RX runs measured 949.17/949.06 Mbps, still near two non-WFI
+cores. This supports retaining the correctness fix, not a CPU-efficiency claim.
+Exact results are in `20260915-config-owner-full/summary.json` and the updated
+frontend-affinity comparison JSON. The corrective patch is archived at
+`target/mars-reference/20260915-config-owner-fix.patch` and retained in source.
+
+After those two full-speed RX runs, the original-placement fixed image also
+passed net-stack cancellation and generation 1 -> 2 restart, followed by another
+64 MiB changing-pattern verification (board time 1212 ms). This covers recovery
+after traffic, in addition to the earlier fixed idle co-location replay.
+Evidence: `20260915-config-owner-loaded-recovery.log`, its per-command folder,
+and `20260915-config-owner-loaded-recovery-integrity.json`.
+The original console restart still constructs a fresh arena on its caller hart;
+this test does not establish affinity preservation for the default API. The
+same fixed FIT is reloaded afterward before further performance measurements.
+
+Final board state: the original-placement `config-owner` FIT above was reloaded,
+its RAM hashes and 1000/full link verified, and a final 64 MiB data test passed
+(board time 1151 ms). Logs: `20260915-config-owner-final-ramboot.log` and
+`20260915-config-owner-final-integrity.json`. The board is not left on the slower
+co-location prototype or the console-restarted placement.
+
+### Attribute bulk memcpy calls instead of timer delivery PCs (2026-09-16)
+
+A default-off `copy-profile` image links `--wrap=memcpy`. The assembly entry
+passes the original caller RA to a bounded per-hart recorder, then calls the
+original compiler_builtins memcpy. Exact ELF disassembly verifies the wrapper's
+sampled call and unselected tail-call both reach `memcpy`, which tail-calls the
+original mangled implementation. No packet bytes are inspected. Calls below
+256 bytes, inline copies, memmove, and reentrant calls while a hart writer is
+busy are not sampled. Every 127th eligible admitted call records caller RA,
+source/destination modulo 8, a power-of-two size bin, bytes, elapsed timer ticks,
+and maximum duration. There is one 1–5 second window per boot and a 512-entry
+bounded table per hart. Freeze first prevents new writers and then checks that
+admitted writers have completed, without spinning. Copies admitted before
+expiry may finish just beyond it. Dumping is deferred until after the window.
+
+The host recorder tests cover capture bounds/single use, a copy finishing across
+freeze, reentrancy, and full-table handling. Parser tests reject missing/corrupt
+samples, inconsistent counts, and duplicate entries. All six tests pass. The
+post-capture source also marks the sample token non-Send; this type-only guard
+was added after the captured ELF was built. The feature and its linker option
+remain off for normal images. No smoltcp/vendor changes were made for collection.
+
+Diagnostic FIT SHA-256:
+`7365ef326d7becad4be5f9c2fc7bbce27cafb8d644097effcdb217ef52a0743e`.
+A 64 MiB pattern test passed. Unarmed RX measured 948.65 Mbps. During a separate
+20-second RX run, the 3-second window was armed about 5.00–5.10 seconds after
+starting iperf. Overall throughput was 948.69 Mbps; fully interior 6–7 and 7–8
+second host intervals were 949.05 and 949.23 Mbps. The 5–6 second interval was
+942.25 Mbps, so arming/transition overhead is not claimed to be zero. The host
+command timestamps bracket the board start approximately, not exactly at an
+iperf interval boundary. The data do not show a large throughput collapse from
+the profiler. They do not prove an unchanged CPU distribution.
+
+Hart 0 admitted 352,932 eligible calls and stored 2,779 samples; hart 1 admitted
+332,274 and stored 2,617. No table overflow occurred. Harts 2/3 had no eligible
+calls. Important sampled callers (weighted elapsed time / sampled bytes):
+
+| Hart / caller | Samples | Sampled bytes | ns/byte |
+| --- | ---: | ---: | ---: |
+| h0 `TcpListener::try_recv` | 113 | 2,670,168 | 1.022 |
+| h1 VecDeque byte extend (network frontend path) | 146 | 3,171,987 | 1.532 |
+| h1 TCP `Socket::process`, main receive write | 234 | 2,860,855 | 1.453 |
+| h1 GRO append, following payloads | 1,716 | 2,505,360 | 1.576 |
+| h1 GRO append, materializing first frame | 197 | 298,258 | 1.379 |
+
+The h0 application copies were source/destination modulo 8 = 0/0. The h1
+frontend source was often 1 or 5 while its destination was 0. TCP receive copies
+were source 6 / destination 1 or 5. GRO 1460-byte append samples split between
+6/2 (1.830 ns/byte) and 6/6 (1.281 ns/byte). This exposes an alignment hypothesis,
+not an isolated proof that alignment alone caused the timing difference: cache
+state, lengths, and surrounding work remain confounders. The frontend generic
+symbol can serve multiple VecDeque users; attribution to receive is based on
+its call sites and this one-direction traffic, not a captured call stack.
+
+The recorder also exposed fixed-size metadata/message movement:
+- h0 `network::poll_rx_batch`: 1,184 samples of 256 bytes, the returned ticket
+  batch representation, not a payload copy.
+- h0 `dwmac_net::driver_task`: multiple callers copy a fixed 1470 bytes; the
+  disassembly includes an immediate `li a2, 0x5be`. These require follow-up
+  tracing through large owned-frame/async-state moves before treating them as
+  actual RX payload copies.
+- h1 `dispatch_ip<PacketTxToken>` has several fixed 1500-byte memcpy callers.
+  `PacketTxToken::consume` currently drops the existing pool reservation for
+  non-segmented traffic and constructs/sends a full owned `Packet`; the native
+  transmit queue and driver pending enum retain the large frame variant. Small
+  ACK transport is a concrete suspect for representation-copy overhead, but
+  copied-size records alone do not establish the wire packet length.
+
+These results identify actual copying sites that the earlier IRQ delivery PC
+histogram could not resolve. Do not multiply the selected times into exact CPU
+shares: selection is deterministic, not every copy is intercepted, and timer
+reads include interrupt time. Next implementation work should address the
+application receive handoff or remove large by-value wire-frame moves from the
+native pooled path, preserving capacity, ordering, generation checks, and fault
+recovery. Merely changing memcpy optimization level already failed its earlier
+A/B and is not re-proposed as a new fix.
+
+Artifacts retain the 20260915 job prefix because the run crossed local midnight:
+`target/mars-reference/20260915-copy-profile-{analysis.json,wrapper-disassembly.txt,build.log,fit.log,ramboot.log,integrity.json}`,
+`20260915-copy-profile-unarmed/`, `20260915-copy-profile-capture/`, and exact
+`20260915-copy-profile.elf`. Parser: `scripts/mars-copy-profile.py`.
+The board was restored to the unwrapped original-placement `config-owner` FIT
+(SHA-256 `160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`),
+RAM hashes and gigabit link passed, and final 64 MiB verification passed (1162 ms
+board time). Restore logs use `20260915-copy-profile-restore-*`. No runtime
+performance change is promoted from this diagnostic turn; >900 Mbps with <1
+core remains unachieved.
+
+### 2026-09-16: ordinary wire-frame pool experiment — rejected
+
+A default-off `pooled-wire-frames` experiment serialized ordinary native TX
+frames directly into the existing segment pool and sent generation-checked
+small tickets through the ordered queue. It removed the large owned-frame
+variant from that path, retained bounded capacity and retry ordering, and used
+an explicit ordinary-frame kind. DMA still copied into its private buffers;
+this was not zero-copy DMA. Raw endpoints were unchanged.
+
+Core pool/queue tests and protocol integration tests passed, including mixed
+ordinary/segmented order, backpressure, stale tickets, serializer failure,
+revocation, actual TCP data delivery, and legacy feature compatibility. The
+experimental FIT SHA-256 was
+`279cee9ba81a3099097e90b6eddfb1c9cee397d9bd71fcfe3a3099290d0e93b1`.
+Initial 64 MiB verification passed. Under RX load, driver cancellation and
+restart advanced generation 1 to 2; subsequent 64 MiB verification passed
+(1142 ms board time).
+
+| Configuration | RX Mbps, two 20 s runs | Total active-core proxy |
+| --- | --- | --- |
+| Fresh control, paced 300M | 300.00 / 299.98 | 0.8142 / 0.8152 |
+| Pooled wire, paced 300M | 299.98 / 299.98 | 0.8282 / 0.8319 |
+| Prior control, unpaced | 949.17 / 949.06 | 1.9958 / 1.9953 |
+| Pooled wire, unpaced | 948.69 / 949.10 | 1.9950 / 1.9953 |
+
+Experimental TX reached 945.83 / 946.94 Mbps at 1.8780 / 1.8947 active-core
+proxy. There was no paired TX control in this run, so this is not a TX gain
+claim. Non-WFI residency includes interrupt and MMIO time and is not an
+instruction-cycle attribution. At matched RX throughput the experiment did
+not reduce CPU occupancy. Added pool synchronization is a possible cost, but
+was not isolated. No new copy-profiler capture established how much copying
+actually disappeared. Large owned-frame movement therefore remains a measured
+copy site, not a demonstrated explanation for the RX CPU limit.
+
+The runtime experiment was removed and archived in
+`target/mars-reference/20260916-pooled-wire-experiment.patch` (reapplication
+check passed). Prior configuration-ownership fixes and default-off diagnostic
+instrumentation are preserved. Evidence is under
+`target/mars-reference/20260916-pooled-wire-*`, including comparison JSON,
+exact ELF, build/test logs, integrity results, and residency directories.
+Recovery serial logs are under
+`target/mars-acceptance/20260913-gigabit/20260916-pooled-wire-recovery/`.
+The >900 Mbps / <1 active core target remains unmet.
+
+After the experiment, the board was restored in RAM to the original-placement
+`config-owner` FIT, SHA-256
+`160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`.
+FIT component hashes and 1000 Mbps full-duplex initialization passed; final
+64 MiB integrity verification passed (1136 ms board time). Restore evidence
+uses `20260916-pooled-wire-restore-*`. No SD/SPI persistent writes were made.
+
+### 2026-09-16: empty TCP receive-ring origin experiment — not promoted
+
+The copy profiler observed receive-buffer/front-end copy addresses with persistent
+non-word offsets. An isolated default-off smoltcp `tcp-rebase-empty-rx` experiment
+cleared the receive ring's origin before placing payload only when BOTH the
+allocated ring and the out-of-order assembler were empty. It did not clear
+storage bytes or change sequence numbers, advertised capacity, MSS, or GRO.
+Rebasing merely because the allocated ring is empty is incorrect: outstanding
+out-of-order bytes can still be relative to its old origin.
+
+194 TCP tests passed with `std,medium-ip,medium-ethernet,proto-ipv4,socket-tcp,
+socket-tcp-reno,tcp-rebase-empty-rx`. The new test covers 1–7 byte consumed prefixes,
+rebasing an empty stream, and holes received while a prefix is still unread,
+followed by prefix drain, another out-of-order segment and gap filling. It checks
+both the resulting bytes and the required storage origin. An initial test run
+without `medium-ip` selected zero TCP tests and was not used as validation. A
+first test fixture also exceeded the previously advertised window after draining;
+the corrected fixture leaves sufficient advertised space and all tests pass.
+
+Experimental FIT SHA-256:
+`7601102d0348775e14f593cf0b593b2017d112f68db60ef3e9a7981b60591e1c`.
+64 MiB and 512 MiB changing-pattern integrity checks passed (1178 / 9292 ms board
+time). Measurements used MTU 1500, two 20-second RX runs per configuration:
+
+| Configuration | Received Mbps | Total active-core proxy |
+| --- | --- | --- |
+| Control before, paced 300M | 299.97 / 299.97 | 0.9068 / 0.9011 |
+| Experiment, paced 300M | 299.97 / 299.95 | 0.9014 / 0.8641 |
+| Control restored, paced 300M | 299.97 / 299.97 | 0.9019 / 0.8923 |
+| Experiment, unpaced | 948.61 / 948.46 | 1.9951 / 1.9951 |
+
+One experimental paced run decreased occupancy; the other matched control. This
+small sample does not prove a reproducible efficiency improvement. The full-rate
+CPU limit remains, and no copy-profile recapture measured how often rebasing
+occurred or changed actual copy alignment. These data do not disprove all alignment
+optimizations; they do not justify promoting this particular change. This turn's
+control also differed from earlier 0.81-core controls, so those older runs were
+not used as the paced A/B baseline. Non-WFI residency remains a proxy, not CPU
+instruction cycles.
+
+The experiment was removed from the worktree, including the smoltcp submodule;
+existing correctness fixes and diagnostics remain. Reapplicable patches are
+`target/mars-reference/20260916-rx-rebase-{smoltcp,integration}.patch` (both apply
+checks passed). Exact ELF, build/test logs, measurement summaries and comparison
+JSON use `20260916-rx-rebase-*`. No upstream commit/push was made for this rejected
+experiment. The board now runs the stable original-placement `config-owner` RAM
+FIT (`160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`);
+component hashes, gigabit initialization, and restored 64 MiB integrity passed
+(1174 ms board time). SD and SPI were not written.
+
+Remaining work should address the shared receive handoff itself or acquire
+stronger synchronization attribution. The frontend still copies TCP storage into
+its SYSTEM-owned bounded byte queue and then into application storage. Removing
+that ownership boundary by exposing task-arena pointers would violate recovery
+requirements; a replacement must preserve bounded capacity, authority and session
+checks, and safe lifetime across netstack cancellation. The >900 Mbps / <1-core
+objective remains open.
+
+### 2026-09-16: identify frontend contention before redesigning the handoff
+
+Added default-off `network-profile` listener lock identities. The net-api exposes
+only the stable Arc-owned lock address; the kernel prints ID/port/address at
+listener construction, outside the data path. Boot identity lines are combined
+with the existing post-window dump for parsing. No locking algorithm, queue
+capacity, lifetime or notification behavior changed. Firmware compilation and
+64 MiB integrity passed (1177 ms board time).
+
+Diagnostic FIT SHA-256:
+`215c2bac5ae6d5d77a1658dffa66ef0e183c27ea5009a6f8995aada40e1a6f2c`.
+A 20 s RX run armed a 5 s profile after a 5 s host delay. Total received rate was
+946.49 Mbps. Full interior one-second intervals at roughly 6–10 s were
+949.2, 949.3, 942.7 and 949.3 Mbps; before/after also varied around 942–949 Mbps.
+There was no gross throughput collapse while armed, but this does not prove
+identical instruction/cache costs with and without instrumentation.
+
+The profile window was [359808540, 379808540) at 4 MHz. All bucket/hart/lock
+wait totals reconciled. Measured contended wait over those five seconds:
+
+| Lock | Hart | Wait seconds | Contended acquisitions |
+| --- | --- | ---: | ---: |
+| TCP data listener 2, port 5201 | 1 | 0.242937 | 9113 |
+| TCP data listener 2, port 5201 | 0 | 0.060856 | 4703 |
+| RX_META | 1 | 0.065635 | 97474 |
+| RX_META | 0 | 0.055868 | 93590 |
+| packet-driver-control | 1 | 0.048210 | 6118 |
+
+Total recorded waits across all locks/harts were 0.530498 seconds (0.1061
+core-equivalent over this window). The frontend data lock accounted for 0.303793
+seconds (0.0608 core-equivalent). `RX_META` at 0x405fb480 and `SCHED` at 0x40604128
+were resolved against the exact captured ELF. Dynamic unnamed locks remain
+unresolved; no nearby-symbol attribution is assumed for them.
+
+Exclusive measured stage times included 7,089,621 frontend ticks and 7,126,738
+PacketQueue ticks, versus 1,216,845 and 340,520 contended wait ticks respectively.
+These broader execution costs warrant follow-up. PacketQueue is NOT pure queue
+synchronization: its scope includes GRO, RX loan lifecycle, TX reservation and
+flush. Its sampled child stages cannot simply be multiplied into exact cost
+shares. Low recorded contention also does not exclude uncontended lock overhead
+or cacheline migration. The data argue against attributing the missing roughly
+one core simply to spinning on the frontend lock; they do not prove which
+execution sub-operation dominates.
+
+Inbound high-water was 64, with 301 full attempts in buckets 0,1,31,43; outbound
+high-water was 2 with no full attempts. After traffic, RX pool counts matched:
+received=acquired=released=1,666,985; free=128, ready=borrowed=0, full=dropped=0.
+Endpoint backpressure counters and DMA-pool counters refer to distinct layers.
+No claim of zero hardware loss is inferred from these pool counts.
+
+Artifacts: exact `target/mars-reference/20260916-frontend-lock.elf`, matching
+build/FIT/RAM logs, symbols and `20260916-frontend-lock-summary.json`. Raw boot,
+arm, dump, named combined log, iperf JSON and parser output are under
+`target/mars-acceptance/20260913-gigabit/20260916-frontend-lock-*`.
+The diagnostic identity feature is retained off by default. The board was
+restored to the original-placement config-owner RAM FIT
+`160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`;
+hashes, gigabit link and final 64 MiB verification passed (1144 ms board time).
+SD/SPI were not written. The >900 Mbps / <1-core goal remains unachieved.
+
+### 2026-09-16: split frontend phases and reject intrusive measurement
+
+Added diagnostic frontend_status, frontend_rx, frontend_tx and frontend_close
+scopes around initial validation/state publication, bounded RX transfer, bounded
+TX transfer and close handling. These retain all existing authority checks,
+queue operations and limits. Without network-profile, scopes are no-ops. The
+parser accepts both prior stage schemas and the new 20-stage schema, checks
+sampling metadata, and reconciles timeline/hart/lock totals. Five parser tests
+cover old/new schemas, 127-call sampling, truncated arrays, inconsistent totals
+and invalid sampling declarations.
+
+The first full-count phase build was too intrusive. Its FIT was
+`bf62b255a94262cfad0653d5a522cbf8fda576b58e58582c0c5fae19f27727ab`.
+During the 5 s armed window within a 20 s RX run, throughput fell from roughly
+949 Mbps to 875 Mbps, then recovered after expiry. Inbound full attempts reached
+88,505, spanning every bucket. The resulting phase proportions must NOT be used
+as normal-load CPU attribution. Full-count data and exact ELF remain under the
+`20260916-frontend-phase-*` prefix; 64 MiB integrity passed (1124 ms board time).
+
+The retained version samples all eight detailed child stages every 127 calls
+per hart/stage. The interval is coprime with the six-listener loop, avoiding the
+obvious fixed-subset alias of a 64-call period; deterministic selection can still
+be biased. A 64-period intermediate build was not run on hardware. Old 64-period
+captures remain parseable. No sampled ticks may be multiplied into exact timeline
+totals: unsampled child work remains in the parent stage.
+
+Sampled FIT SHA-256:
+`33ef570e61217f862913dff3b78b0981ba3db6cb5e82815b53b169f314ac6c1c`.
+A fresh 20 s RX run again armed a five-second window after a five-second host
+delay. Total received rate was 947.07 Mbps. Fully interior one-second intervals
+were 949.4, 946.4, 948.8 and 949.3 Mbps. The gross throughput collapse disappeared;
+this does not prove zero instrumentation overhead or unchanged cache behavior.
+Inbound full attempts were 517 across four buckets, versus 88,505 in the intrusive
+run; outbound high-water was 2 with no full attempts.
+
+Each frontend child collected 1,298 calls on hart 1 during the window:
+
+| Sampled child | Exclusive timer ticks | Contended wait ticks |
+| --- | ---: | ---: |
+| frontend_status | 5,188 | 2,406 |
+| frontend_rx | 31,226 | 3,047 |
+| frontend_tx | 2,599 | 0 |
+| frontend_close | 3,655 | 2,045 |
+
+Among these selected calls, RX transfer accounted for substantially more work
+than state checking, empty TX or close handling. The RX scope includes empty
+iterations, device revalidation, socket lookup/recv and frontend queue copying;
+this is not a memcpy-only measurement. The result supports prioritizing the
+receive handoff over another idle-listener-skip optimization. It does not yet
+quantify the benefit of replacing that handoff or isolate each operation inside
+it. No production performance improvement is claimed from diagnostic changes.
+
+Window data, named lock mapping, iperf intervals and analysis are under
+`target/mars-acceptance/20260913-gigabit/20260916-frontend-sampled-*`; exact ELF,
+build/FIT/RAM logs and parser tests are under `target/mars-reference/` with the
+same prefix. Sampled-image 64 MiB integrity passed (1125 ms board time).
+The board was restored to stable config-owner RAM FIT
+`160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b`;
+hashes, gigabit initialization and final 64 MiB verification passed (1156 ms).
+No SD/SPI writes were made. The >900 Mbps / <1-core target remains open.
+
+### 2026-09-16: TCP receive-buffer exchange primitive (integration pending)
+
+Implemented opt-in smoltcp `tcp-buffer-exchange` and
+`Socket::exchange_receive_buffer(replacement, max_bytes)`. This transfers the
+entire received ring by value, preserving its wrap position, instead of copying
+its payload. The socket receives an empty ring of identical capacity; successful
+consumption advances remote_seq_no by precisely the transferred byte count.
+The operation does not allocate, dereference a foreign task pointer, or change
+advertised capacity. Its ordinary Rust storage lifetime is retained.
+
+Exchange is rejected without consuming bytes if there is no readable data,
+the data exceeds the caller budget, the replacement is occupied or differently
+sized, or the assembler has any outstanding out-of-order bytes. The caller gets
+the original replacement back and may use the existing copied receive path.
+The out-of-order guard is essential even when a subsequent ordinary read drains
+all currently contiguous data.
+
+Four new tests cover wrapped ring contents and pointer-preserving reuse, atomic
+rejection/budget/capacity rules, out-of-order data followed by gap filling, and
+FIN/ACK/window equivalence with recv_slice. Full selected TCP suites passed:
+197 tests without segmentation; 201 with tcp-segmentation. A no-default-feature
+`medium-ip,proto-ipv4,socket-tcp,tcp-buffer-exchange` library check also passed,
+without std/alloc features. A first fixture incorrectly expected a synthetic
+SynSent socket with manually queued data to reject reads; the existing recv
+semantics permit buffered data via may_recv. That fixture was corrected to test
+zero-budget refusal rather than changing unrelated TCP behavior.
+
+Evidence: `target/mars-reference/20260916-buffer-exchange-{tests.log,tso-tests.log,nostd.log,smoltcp.patch}`.
+The patch remains uncommitted in the smoltcp submodule and is disabled by default.
+It is NOT yet connected to VibeOS frontends, and no throughput/CPU improvement
+or physical qualification is claimed. Board runtime remains the previously
+verified config-owner FIT; this turn did not load firmware or write SD/SPI.
+
+The next required integration cannot simply move the existing socket Vec into
+the frontend: socket allocations currently belong to the netstack arena, while
+the capability frontend outlives that arena. Allocating those Vecs in SYSTEM
+alone is insufficient if task fault teardown abandons them without running
+Drop. A stable pool must retain ownership of backing storage and issue bounded,
+generation-checked exclusive leases. Socket-held leases must be retired only
+after the owning task incarnation is stopped; published frontend data must
+remain independently valid or be explicitly invalidated before storage reuse.
+Application/connection generations and existing byte capacity limits still
+apply. At every instant a slot must have one writer/owner, with no mutation of
+published data. Pool exhaustion and any assembler hole must preserve the copied
+fallback and normal TCP backpressure. Those lifetime/recovery obligations remain
+unimplemented and must be tested before activating this primitive on Mars.
+
+### 2026-09-16: stable receive-storage prototype (not wired into firmware)
+
+Added default-off net-api `receive-buffer-exchange` modules for bounded ownership
+metadata and permanent backing storage. They depend on neither smoltcp nor board
+code. Ownership distinguishes Free, Socket, Pending and Published slots. Tickets
+include pool identity, slot and non-wrapping generation; producer identity includes
+both AllocationDomain and TaskRecoveryKey. Pending and Published bytes jointly
+reserve the existing frontend byte budget, and preparation retains the existing
+32 KiB per-call bound. Rollback restores exclusive socket ownership. Published
+ranges support partial reads across ring wrap and release only after consumption
+or explicit frontend discard.
+
+`Storage::new_static` allocates backing memory and metadata in SYSTEM once and
+retains them permanently. It must eventually be called at assembly, not at each
+socket restart. Writer address lookup returns a raw address without constructing
+any payload reference that could alias a live socket mutable borrow. Unsafe
+preparation requires all writer references to have ended and the specified range
+to contain received bytes for that connection. Published reads copy directly into
+application output under the metadata lock; they do not create an intermediate
+byte queue or let payload references escape. A published slot cannot be remapped
+for writing or retired with its former producer. Pending/socket slots can be
+retired only after the exact task is permanently quiescent; capability revocation
+alone is insufficient.
+
+Tests passed: nine ownership/storage unit tests, ten existing frontend/event
+regressions, and one allocator audit. They cover wrong pool, stale slot reuse,
+wrong connection/task/arena, generation exhaustion, byte budget including pending
+transfers, rollback, wrapped partial reads, publication surviving producer stop,
+and exact-owner unpublished-transfer retirement. The allocator audit observed
+exactly three SYSTEM allocations for a two-buffer pool, restored the calling
+allocation domain, and observed zero allocations during 100 transfer/reuse cycles.
+Host System owns the test bytes; this audits allocation provenance, not actual
+raw-arena reclamation. Log:
+`target/mars-reference/20260916-receive-storage-tests.log`.
+
+This is an unfinished opt-in prototype, not a deployed optimization. The existing
+TcpListener still uses its byte queue, socket construction still uses its current
+buffers, and no firmware feature enables these new modules. Hard-fault recovery
+of an abandoned metadata lock is deliberately NOT implemented: the current lock
+must not be force-released merely from a ticket, and a fault during application
+copy needs exact consumer provenance plus quiescence. Frontend queue publication
+must also be serialized with connection checks and Pending->Published transfer.
+Those adapters, fault tests, and actual smoltcp buffer-exchange binding remain
+required before hardware A/B. No claimed throughput/CPU improvement, SD/SPI write,
+or RAM reload occurred in this turn; the board retains the verified config-owner
+image. The >900 Mbps / <1-core objective remains open.
+
+### 2026-09-16: release receive metadata lock during application copy
+
+The unfinished stable-storage prototype now uses an explicit Reading state.
+`Storage::read` acquires a generation-checked read lease under the metadata lock,
+releases that lock, copies the pinned immutable range to application output, and
+commits consumption under the lock. Other slots remain usable during the copy;
+the active slot rejects another read, discard or writer mapping. Published byte
+budget includes active reads. No payload reference escapes the operation.
+
+Read leases carry an independent non-wrapping generation as well as buffer ticket,
+connection and exact consumer domain/task identity. This rejects a delayed read
+completion even when the underlying buffer slot has not been reused. The trusted
+platform adapter must supply the actual consumer identity; it is not client input.
+An ordinary Rust unwind cancels the lease via Drop without consuming bytes. If a
+hard fault skips Drop, a supervisor that has permanently quiesced that exact
+consumer may return its Reading state to Published, preserving uncommitted data.
+A producer's retirement cannot release another task's read. Socket/Pending
+retirement retains the prior exact-owner rules.
+
+The existing unsafe quiescence boundary is still required: all references and
+possible later guard drops belonging to the retired task must be dead, including
+remote-hart references. No barrier is inferred from revocation or a ticket. This
+change removes payload copying from the lock but does not yet implement recovery
+from a hard fault inside metadata mutation or a held metadata lock. It must not
+be presented as complete hard-fault integration.
+
+Validation passed: 13 ownership/storage tests, 10 existing frontend/event tests,
+and the allocator audit (100 transfers, no operation-time allocations). New tests
+cover active-read pinning, same-arena/different-task and different-arena rejection,
+read-generation exhaustion, delayed completion after replacement, normal unwind,
+and a forgotten read guard followed by exact-owner retirement and intact data
+readback. The forgotten-guard test models skipped Drop with no remaining payload
+references; it is not a physical trap or cross-hart acknowledgement test. Log:
+`target/mars-reference/20260916-receive-read-lease-tests.log`.
+
+The modules remain opt-in and unbound to the actual TcpListener/smoltcp path.
+No hardware performance improvement is claimed; no RAM reload or SD/SPI write
+occurred. Remaining integration includes metadata-fault handling, atomic frontend
+publication, socket buffer binding, then real cancellation and throughput/CPU A/B.
+The >900 Mbps / <1-core goal remains open.
+
+### 2026-09-16: connect stable storage to actual smoltcp buffer exchange
+
+Added opt-in net-protocol `receive-buffer-exchange`, connecting the smoltcp
+primitive to the net-api stable pool through `receive_exchange::Binding`.
+Construction reserves one writer and supplies its permanent backing to a new
+socket. Exchange admits only a nonempty entire readable ring within the existing
+turn/byte budget, reserves a spare, and asks smoltcp to exchange storage. A refused
+exchange drops the unused spare borrow and releases exactly that writer. Success
+records the new socket buffer, verifies the outgoing pointer/range against its
+pool slot, ends the outgoing mutable borrow and returns a Pending transfer.
+There is no payload copy in this exchange helper.
+
+This is an explicitly unsafe integration boundary: the socket must own the
+binding's current buffer, the trusted producer identity must be correct, and
+producer/publication operations for that listener must be serialized. The helper
+does not silently recover a post-exchange invariant/preparation error; the caller
+must abort the stream and perform quiescent cleanup. It does not automatically
+release buffers on Binding drop, since a separately owned socket may still hold
+their references. Storage now provides exact-writer release for unused spares,
+with an explicit requirement that all their references have ended.
+
+Three real ARP/TCP integration cases each deliver 300,007 changing payload bytes:
+- three-slot pool, mixed exchange/copied reads, delayed partial application reads
+  and byte-budget backpressure;
+- one-slot pool with no spare, using the copied fallback throughout;
+- deliberately delayed middle TCP payload segments, exercising assembler-hole
+  refusal, returned spares and eventual in-order delivery.
+Each verifies unchanged recv_queue on refused exchange, complete byte equality,
+zero remaining published bytes and exactly one final socket writer to retire
+after dropping the socket set. Thus unused spares are not left reserved. The
+first versions of the hole fixture did not hit the intended path; the final
+fixture filters TCP packets with actual payload, uses small non-Nagle sends and
+asserts that a real hole refusal occurred. Mere handshake/ACK reordering is not
+accepted as coverage.
+
+Validation: 27 default-feature stack integration tests; with pooled-rx,
+bounded-gro, native-tcp-segmentation and tcp-large-window, four protocol unit plus
+42 integration tests passed. Storage/API regression passed 14 unit, ten frontend
+and one allocator-audit test. Logs:
+`target/mars-reference/20260916-receive-exchange-{integration-tests,combined-tests,storage-tests}.log`.
+
+The tests use a real protocol peer but a standalone test frontend queue. The
+production TcpListener queue, SharedIpv4TcpStack construction/relisten and kernel
+supervisor are not yet wired to this binding. Atomic queue publication with
+connection validation and metadata hard-fault recovery remain required. No
+firmware features enable this code, no Mars RAM image was loaded this turn and
+no throughput/CPU gain is claimed. Existing hardware state remains config-owner;
+SD/SPI were not written. The >900 Mbps / <1-core objective stays open.
+
+### 2026-09-16: validate the mixed TcpListener receive queue
+
+The opt-in listener now has an ordered queue of copied runs and exchanged pool
+ranges. A single byte budget covers both forms, copied runs coalesce, and chunk
+metadata reserves space at construction. Publication validates the current
+connection generation, pending pool ticket and capacity while holding the
+listener lock; notifications run after dropping that lock. The regular receive
+API obtains actual executor task provenance for exchange-enabled listeners;
+host fixtures use the explicit trusted-consumer entry. Default listeners keep
+the original copied path.
+
+Added frontend tests for 100 alternating copied/exchanged cycles with wrapped
+pool ranges and partial reads, exact byte capacity, rejected wrong-owner/pool/
+connection and duplicate publications, reset/relisten generation changes,
+unadmitted pending transfer preservation, and reentrant reads from publication
+notifications. A host call without current executor provenance must not consume
+an exchanged range. These tests exercise the actual listener, not a surrogate
+queue.
+
+The real smoltcp TCP fixture now also feeds this listener. It publishes exchanged
+ranges, copies fallback data into the same ordered queue, and consumes through
+try_recv_for. Both normal traffic and deliberately delayed middle payloads
+reconstruct 300,007 bytes exactly under delayed reads and capacity backpressure.
+The original standalone/no-spare fixtures remain as separate coverage. Combined
+pooled-rx, bounded-gro, native-tcp-segmentation and tcp-large-window regression
+passed four protocol unit and 43 integration tests; see
+`target/mars-reference/20260916-exchange-listener-combined.log`.
+Frontend and default-feature regression logs are
+`20260916-exchange-frontend-provenance.log` and
+`20260916-exchange-listener-default.log` under the same directory.
+
+This remains disabled in the firmware: SharedIpv4TcpStack socket assembly and
+supervisor retirement are not connected yet. Publication is serialized for normal
+execution but does not recover a hard fault between pool publication and queue
+insertion. The outer listener lock still spans the application payload copy,
+and neither that boundary nor the pool metadata lock has a completed hard-fault
+protocol. Passing these tests therefore does not establish safe production
+restart or a CPU reduction. Hardware remains the restored config-owner baseline
+(~948.6–948.7 Mbps RX, ~1.995 non-WFI cores); no new RAM image or SD/SPI writes
+were performed in this implementation turn. The >900 Mbps / <1-core goal remains
+open.
+
+### 2026-09-16: bind exchange storage in SharedIpv4TcpStack
+
+Added opt-in `enable_receive_exchange` on the real shared protocol stack. It
+attaches an image-selected frontend's permanent pool before connection activity,
+prepares buffers before replacing sockets, and retains bindings by SocketHandle.
+Exclusive ports have both an active and a pending socket; both are bound, so
+promotion preserves each socket's receive-buffer identity. Failed preparation
+releases unused writers after ending their buffer references. Repeated binding
+and a substituted frontend instance are rejected.
+
+`drive_tcp_frontend` now attempts exchange within its existing receive budget,
+then uses the same ordered frontend copied path for any fallback. All original
+socket options are applied through the shared passive-socket constructor.
+This API is unsafe at the assembly boundary: the stack must remain exclusively
+owned by the specified producer, and no pool retirement may race any live socket
+reference. It is not called by production netstack/firmware yet.
+
+A new actual SharedIpv4TcpStack integration test transfers 600,007 changing bytes
+in each direction with delayed application reads and bounded transmit storage.
+It asserts pooled publication really occurred. It then opens a second client
+while the original peer is closing, sends data through the pending socket,
+closes/drains the old frontend and verifies that the promoted connection uses
+exchange and delivers only its own bytes under a new generation. Packet authority
+revocation still rejects driving. After dropping the entire stack, exactly two
+socket writers retire; there are no remaining published bytes. The test also
+forces failure after the first prepared buffer, retries successfully, and checks
+that no spare leaked and no same-ID frontend substitution is accepted.
+
+Combined pooled-rx/bounded-gro/native-tcp-segmentation/tcp-large-window regression:
+four unit and 44 integration tests passed. Net API exchange/event regression:
+14 ownership/storage, ten existing frontend, five exchange frontend and one
+allocation test passed. Default API/protocol regression: six frontend and 24
+protocol integration tests passed. Logs under target/mars-reference:
+`20260916-exchange-shared-stack-{combined,api,default,rollback}.log`.
+
+Still required before firmware use: task/supervisor assembly, permanent pool
+lifetime across restarts, publication and metadata hard-fault recovery, and
+removing the listener guard around payload copy where safe. This turn changes
+no board image and claims no hardware CPU gain. The current ~949 Mbps/~1.995
+non-WFI-core baseline and >900 Mbps/<1-core objective remain unchanged.
+
+### 2026-09-16: normal exchange-stack destruction and rebuild
+
+SharedIpv4TcpStack now explicitly destroys its SocketSet before releasing its
+exchange bindings' current writers. Cleanup addresses exact tickets, not all
+slots with the producer task identity; it cannot release another stack's live
+writer or a range already published to an application. Invalid writer metadata
+is left unavailable rather than freeing an unverified slot. This Drop path only
+covers ordinary destruction and unwinding that reaches Drop, not skipped Drop
+or abandoned locks after a hard fault.
+
+Added a Pending-only discard transition and used it when normal frontend
+publication rejects an exchanged transfer. It refuses published data and live
+socket writers and validates the exact owner/ticket. The replacement receive
+buffer remains in the socket. Post-exchange internal invariant failures still
+require the separately documented abort/quiescence path.
+
+A 100-cycle lifecycle fixture repeatedly binds active/pending sockets against
+one permanent three-slot pool. It alternates retaining an unrelated live writer
+with the same task identity and publishing bytes before stack destruction. The
+unrelated writer remains valid; published bytes remain readable; subsequent
+construction reuses the two released slots. Exact-owner retirement after each
+cycle must find zero remaining writers (the test does not silently clean up
+leaks). Existing actual TCP promotion coverage now requires ordinary Drop to
+release both socket writers. These are host lifetime tests; they do not emulate
+physical task traps or cross-hart quiescence.
+
+Validation: combined protocol features passed four unit plus 45 integration
+tests. Exchange/event API passed 14 ownership/storage, ten existing frontend,
+six exchange frontend and one allocation tests. Defaults passed six API frontend
+and 24 protocol integration tests. Logs:
+`target/mars-reference/20260916-exchange-lifecycle-{api,combined,default}.log`.
+
+Inspection also identified a required assembly ordering change: InterfaceTask
+currently constructs a replacement stack before dropping its old stack on an
+epoch change. A permanent pool cannot bind both full generations simultaneously;
+when exchange assembly is enabled, the old socket references must be retired
+before reserving the replacement writers. Production assembly and hard-fault
+metadata/publication recovery remain unfinished. No firmware load or hardware
+performance improvement is claimed in this turn; the <1-core effort continues.
+
+### 2026-09-16: retire the previous interface stack before rebuilding
+
+InterfaceTask now clears its old stack and observed session metadata immediately
+after a successful new packet-session bind, before replacement construction.
+This ends old socket references and releases normal exchange writers before a
+new generation can reserve permanent pool slots. A busy/offline bind keeps the
+old instance for retry without polling it; a construction error after successful
+binding leaves no stale stack or observed epoch. Carrier loss uses the same
+local cleanup helper while retaining its existing link-down publication.
+
+Added a real InterfaceTask::poll lifecycle test with an exchange-bound old stack.
+It covers bind-busy retention, invalid-MAC replacement failure, and successful
+replacement; pool admission checks prove that the two old socket writers remain
+owned during the retry case and are free after either completed-bind case. The
+replacement still uses normal production assembly (copied sockets): this test
+does not claim that pool-backed replacement assembly is enabled. Test interface
+IDs 40–42 avoid the configuration tests' global entries and absent-net2 assertion.
+
+Default netstack regression passed two unit, four command and one allocation
+audit tests. Exchange-enabled static and DHCP/combined configurations passed
+three unit, four command and one allocation audit tests. Logs:
+`target/mars-reference/20260916-exchange-epoch-{rebuild,default,dhcp-final}.log`.
+The new netstack receive-buffer-exchange feature forwards the protocol feature
+for validation; no firmware selects it and no production assembly call was
+added. Hard-fault recovery and final owner-aware image assembly remain required.
+No hardware performance measurement or RAM reload occurred in this turn.
+
+### 2026-09-16: fail closed after a rejected receive exchange
+
+Review found that a rejected frontend publication discarded the already-consumed
+TCP range but only returned an error. A caller that retried drive_tcp_frontend
+could otherwise continue the same incomplete byte stream. Exchange failures now
+mark the listener failed, abort active and pending sockets, publish Reset and
+refuse subsequent drives. The listening service does not automatically rearm a
+failed exchange listener; rebuilding the stack is required. Cleanup errors also
+enter this state before returning. Ordinary no-spare/budget refusal (None from
+exchange) continues to use the unchanged copied fallback.
+
+A real TCP test receives four bytes, then uses the existing reentrant network
+notification to fill frontend capacity after its drive snapshot and before
+exchange publication. It verifies rejection, zero remaining pending pool bytes,
+Reset with no queued bytes, repeated drive refusal and no auto-relisten across
+ten further network polls. Normal destruction releases both writers without
+supervisor sweeping. This deliberately injected concurrent admission case
+exercises the actual error path rather than calling the failure helper directly.
+The test uses an opt-in protocol activity-events feature forwarding net-api's
+existing event feature.
+
+Logs under target/mars-reference:
+`20260916-exchange-{rejection-test,fail-closed-combined,fail-closed-default}.log`.
+This closes a normal-return stream-integrity hole; it does not implement
+hard-fault lock recovery or atomic queue publication. Firmware remains unchanged
+and there is no new throughput/CPU result. The >900 Mbps / <1-core goal is open.
+
+### 2026-09-16: admit and publish one exact pool range under one guard
+
+The frontend queue previously read a Pending length under one pool guard and
+published under another. A cancel/reprepare between those observations could
+make the queued length differ from the range actually published. Storage now
+provides publish_bounded: validate the pending ticket/owner/connection, check the
+current range against remaining frontend capacity, publish, and return that
+exact length in one metadata critical section. Queue publication uses this
+operation, removing one pool-lock acquisition from each exchanged chunk.
+
+A regression replaces a pending three-byte range with a nine-byte range under
+the same writer ticket. Admission against the stale three-byte limit must refuse
+without consuming the pending range; nine-byte admission returns the actual
+length and the complete replacement payload remains readable. Existing mixed
+frontend and actual TCP/backpressure/refusal tests pass. This test covers stale
+observations deterministically; it is not a physical concurrency stress test.
+
+Validation logs: target/mars-reference/
+`20260916-exchange-atomic-admission-api.log` (14 ownership/storage, ten legacy
+frontend, seven exchange frontend, one allocation tests), and
+`20260916-exchange-atomic-admission-tcp.log` (four unit, 46 combined integration
+tests). Diff whitespace check passed. Atomicity here means normal lock-based
+serialization, not hard-fault durability: the pool-publication/queue-insertion
+fault window and abandoned lock recovery remain open. No firmware deployment or
+measured CPU improvement occurred; the hardware target remains unmet.
+
+### 2026-09-16: reclaim unread exchange chunks on frontend destruction
+
+The mixed receive queue now discards its published pool chunks during ordinary
+Drop. Previously the VecDeque metadata was freed while unread published slots
+remained occupied in the permanent pool. Destruction validates each ticket and
+connection independently, allowing a stale entry to be skipped without leaking
+later valid entries. It does not retire producer owners, unadmitted pending
+transfers, reused slots, or ranges pinned by a read lease. Failed validation
+never authorizes reuse. Abandoned-lock/skipped-Drop fault recovery is separate.
+
+New tests drop a frontend containing copied and exchanged runs plus an unrelated
+Pending transfer, then prove exactly the published slots are reusable and the
+Pending bytes remain intact. Another test retires the first queue ticket and
+reuses its slot before frontend destruction, verifying both new writers survive
+and the later valid published chunk is reclaimed.
+
+Validation: API exchange/event suite passed 14 ownership/storage, ten legacy
+frontend, nine exchange frontend and one allocation tests. Combined protocol
+suite passed four unit and 46 integration tests; whitespace check passed. Logs:
+`target/mars-reference/20260916-exchange-frontend-drop-{api,tcp}.log`.
+This repairs normal lifecycle leakage; no hardware image changed, and no new
+CPU/throughput improvement is claimed. Production assembly and hard-fault
+recovery are still outstanding for the exchange optimization.
+
+### 2026-09-16: independent exchange pools for shared service ports
+
+Added TcpListener::new_shared_with_receive_storage, retaining existing explicit
+port-group validation while attaching one independently budgeted permanent pool
+to each frontend. Both exclusive and shared constructors use the same private
+pool-attachment implementation. This removes a construction gap for iperf's
+same-port control/data listeners; it does not yet select them in firmware.
+
+A real SharedIpv4TcpStack test binds two exchange-enabled listeners to the same
+port group and sends two distinct 300,007-byte streams simultaneously, with
+different delayed-read schedules. It requires pool publication on both sides,
+exact stream equality without assuming which SYN selects which socket, bounded
+frontend queues, rejection of a substituted sibling frontend, and zero writer
+leases remaining after normal stack drop. The initial fixture compilation had
+a u64/usize modulo mismatch; after correcting it, the transfer test passed.
+
+Logs: target/mars-reference/20260916-exchange-shared-port-{fixed,api,combined}.log.
+This is protocol/assembly preparation, not an iperf service performance result.
+Hardware remains unchanged; hard-fault recovery and owner-aware production
+assembly remain necessary before testing CPU savings on Mars.
+
+### 2026-09-16: RISC-V validation and capability-preserving pool assembly
+
+Checked the exchange/GRO/pool/segmentation/DHCP/event configuration on the real
+riscv64imac-unknown-none-elf no_std target. The first root-directory invocation
+missed the firmware build-std configuration and failed to locate core; rerunning
+from firmware with its existing .cargo configuration passed. This is cargo check,
+not a linked/deployed image or hardware test.
+
+Assembly inspection found that netstack holds Revocable<TcpListener>, whose API
+intentionally cannot expose an Arc or an escaping resource borrow. Added
+`enable_receive_exchange_capability`: it validates inside try_with, retains the
+capability, and revalidates it when matching a frontend for subsequent drives.
+The existing Arc-based entry remains for direct trusted image assembly. Both
+entries share socket installation and lifetime requirements; neither weakens
+Revocable's API or extracts its private Arc.
+
+The simultaneous shared-port TCP fixture now installs both pools through actual
+capabilities. After exact concurrent stream verification, it revokes one root,
+then proves that even an externally retained Arc cannot drive that binding while
+the sibling remains usable. Four unit and 47 combined integration tests passed;
+the changed code also passed the RISC-V no_std check. Logs:
+`target/mars-reference/20260916-exchange-capability-{combined,riscv-check}.log`.
+
+This removes the capability-shape obstacle to netstack assembly. Actual task
+identity selection, supervisor hard-fault recovery and image enablement remain
+unfinished. No new hardware CPU result or RAM deployment occurred.
+
+### 2026-09-16: resolve producer identity from the actual task poll
+
+Added current_task_allocation_identity in core, returning task ID and registered
+domain from one validated current-running observation. Unlike reading the heap
+owner, this is unchanged by temporary SYSTEM allocation scopes. It is only
+provenance, not capability authority or a stopped-task/reclamation proof.
+
+Receive ownership now separates current_producer (scheduler identity; requires a
+tracked arena) from the existing lighter current_reader scope provenance.
+The frontend uses the reader helper without adding a scheduler lock per read.
+A new capability assembly entry resolves the current producer instead of taking
+an image-supplied task ID. Its unsafe full-stack lifetime/quiescence contract
+remains; production netstack does not invoke it yet.
+
+An actual executor test verifies the task/domain pair during polling, inside a
+temporary SYSTEM owner scope, after yielding, and its absence outside a task.
+The guarded detached-task test also checks that producer identity is unavailable
+there. The positive test uses an owner-accounted untracked task to isolate the
+scheduler observation; it does not validate full reclaimable arena teardown.
+RISC-V no_std check passed. API suite passed 14 ownership/storage, ten existing
+frontend, nine exchange frontend and one allocation tests; combined protocol
+passed four unit and 47 integration tests. Logs under target/mars-reference:
+`20260916-exchange-task-identity-{core,detached,api,tcp,riscv}.log`.
+Hard-fault recovery and production image selection are still unfinished. No
+hardware throughput/CPU measurement was made this turn.
+
+### 2026-09-16: commit complete pool metadata banks
+
+Storage metadata mutations now operate on a snapshot and initialize the inactive
+bank before a Release store selects it. Readers Acquire the selected bank. The
+inactive banks use MaybeUninit<Ownership>, so an interrupted write may contain
+invalid enum bytes without constructing/reading a Rust Ownership value from
+those bytes. Only the fully committed bank is exposed; no mutable dereference
+to committed ownership is available. Payload bytes remain in their original
+permanent buffers and are not copied by this transaction.
+
+This prevents a partially updated ownership enum/table from becoming the state
+that a future abandoned-lock recovery would expose. It does not itself recover
+the lock, prove a task stopped, or make pool and frontend queue commits atomic.
+Each mutation now copies the small bounded metadata snapshot, so its CPU cost
+must be measured along with the saved payload copy before retaining the full
+optimization. Firmware remains disabled for this feature.
+
+The new test interrupts a candidate update before commit, verifies the prior
+writer remains valid, fills the inactive bank with arbitrary invalid bytes, and
+then verifies the committed bank and subsequent reservations remain correct.
+The initial mechanical mutation-wrapper edit had nested-argument and test std
+import errors, corrected before validation. API suite passed 15 unit, ten legacy
+frontend, nine exchange frontend and one zero-allocation audit tests; combined
+TCP passed four unit and 47 integration tests. RISC-V no_std check and diff
+whitespace check passed. Logs under target/mars-reference:
+`20260916-exchange-metadata-banks-{fixed,tcp,riscv}.log`.
+No hard-fault hardware result or CPU reduction is claimed in this turn.
+
+### 2026-09-16: exact-task recovery of an abandoned pool metadata guard
+
+Pool metadata now uses the existing recoverable SpinLock acquisition path and
+exposes unsafe recover_metadata_lock. It authenticates the exact acquisition
+domain and globally unique task key through core's existing lock-generation
+protocol. Recovery exposes the last complete metadata bank. False does not
+prove quiescence or validate a free lock, and this API does not retire payloads
+or repair a frontend queue. Cross-hart users must first observe the stopped
+hart's Release acknowledgement with Acquire; no such coordinator is wired yet.
+
+A host test publishes data and reserves another writer, acquires the lock under
+an exact task/domain context, corrupts only the inactive bank, and forgets the
+guard. Wrong-task and wrong-domain recovery attempts fail; exact recovery
+succeeds once, the published payload is intact and the writer remains valid.
+There are no remaining guard/payload references in this fixture. This models
+skipped Drop and invalid inactive bytes, not a physical trap or SMP stop proof.
+
+Validation logs: target/mars-reference/
+`20260916-exchange-lock-recovery-{api,tcp,riscv}.log`. API passed 16 unit, ten
+legacy frontend, nine exchange frontend and one allocation test; combined TCP
+passed four unit and 47 integration tests; RISC-V no_std check passed. The new
+recoverable acquisition has extra provenance bookkeeping, whose real cost is
+not measured yet. Queue joint recovery and supervisor/image integration remain
+unfinished, and no hardware CPU gain is claimed.
+
+### 2026-09-16: first RAM-only receive-exchange CPU experiment
+
+Composed the opt-in experiment into the actual netstack task and iperf control /
+data frontends. Image policy allocates one permanent 3 x 256 KiB pool per shared
+listener (IDs 1/2, port 5201), and task startup binds its capability with the
+scheduler-derived producer identity. Rebuild clears old frontend state before
+reserving new writers. Ordinary independent TCP probe listeners remain copied.
+Added `nrxexchange` cumulative exchanged/copied frontend bytes; two relaxed
+counter updates occur per nonempty drive in the experiment. This bookkeeping is
+included in the results, not claimed free.
+
+FIT SHA256: 7e4112b6a005a5784b88a6ce391196148e028e57fbecd14b39e0c5c1a6d49056.
+Exact ELF: target/mars-reference/20260916-rx-exchange.elf.
+Boot/load: target/mars-reference/20260916-rx-exchange-ramboot.log and
+mars-acceptance/20260913-gigabit/20260916-rx-exchange-{load,boot}.log under target.
+Both FIT component hashes were verified by U-Boot before RAM boot; 1000/full link
+and RXEX_POOL assembly lines were observed. No SD/SPI flashing or saveenv.
+DHCP/event/combined netstack tests passed three unit, four command and one
+allocation audit tests. Final build and image checker passed.
+
+Two 20-second unpaced RX runs: 948.5376 / 947.8985 Mbps, non-WFI 1.982650 /
+1.982211 cores. Cumulative bytes after these runs: 4,334,912,526 exchanged and
+406,477,568 copied, about 91.427% exchanged. Thus the small CPU result is not
+simply a completely unused path. Two 300 Mbps runs: 299.9676 / 299.9526 Mbps,
+0.887032 / 0.871866 cores. Then the exact config-owner baseline was restored in
+RAM (SHA256 160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b)
+and the same paced test repeated: 0.900726 / 0.906545 cores. This small sample's
+mean difference is about 2.67%; it does not establish a durable gain across
+conditions. Full-rate baseline from the earlier same-link check was about
+1.995 cores, so the <1-core objective is plainly unmet.
+
+Evidence directories under target/mars-reference:
+20260916-rx-exchange-{rx,paced,control-paced}/summary.json;
+20260916-rx-exchange-counters.log, -control-ramboot.log and
+-control-integrity.json. The restored baseline gets the independent 64 MiB
+integrity check. Since those probes stay copied, it is NOT hardware byte-for-byte
+qualification of the new exchange path. Host real-TCP tests cover its byte
+ordering, but hard-fault/queue joint recovery and physical integrity qualification
+remain incomplete. Board ends on the baseline; ethernet feature defaults were
+restored by packaging. The experiment remains default-off.
+
+Conclusion for the next experiment: removing most frontend payload copies alone
+has not materially reduced the full-rate two-core residency. Further work must
+measure where time remains (including pool bookkeeping and sustained ready work)
+rather than assume that completing more exchange machinery will reach one core.
+
+### 2026-09-16: remove empty per-packet service traversal candidate
+
+Re-read the existing full-rate poll-decision evidence before changing waiting:
+99.68% of stack turns processed ingress; empty retries were 0.19%, and the prior
+protocol-event comparison showed no CPU improvement. These data do not support
+another idle-grace adjustment as the primary RX optimization.
+
+Found that poll_network supplies an empty application callback but still calls
+service_listeners after each ingress result and once after ingress processing.
+That traversal constructs listener handles and resolves each mutable socket,
+including bounds/type validation whose possible panic is observable even when
+the callback ignores its arguments. Added a default-off skip-empty-service
+feature: a const generic removes those traversals for empty network-only calls;
+real synchronous service_echo continues with SERVICE=true. The feature is
+forwarded through netstack/kernel/Mars as skip-empty-service-experiment.
+
+Validation: four unit/39 combined TCP integration tests and 24 default tests
+passed, including echo and capability frontend behavior. Full Mars build and
+image checker passed. Candidate adds only this experiment to config-owner's
+network feature map; it does not enable receive-buffer exchange. FIT SHA256:
+ea851197f93a3449388ebce782839998670e538cf970ad9430f356f34e3e430d.
+ELF: target/mars-reference/20260916-skip-empty-service.elf.
+The exact poll_network symbol size is 17,438 bytes versus 18,366 in the prior
+config-owner ELF. Address-bounded objdump outputs are archived as
+20260916-skip-empty-service[-control]-disassembly.txt. This proves a generated
+code difference, not a CPU reduction or an attribution of all changed bytes to
+one source statement. Initial symbol-name disassembly lookup failed; the saved
+complete outputs use verified nm address/size bounds instead.
+
+Build/test/FIT logs use target/mars-reference/20260916-skip-empty-service-*;
+feature map: skip-empty-service-features.json. Packaging restored the default
+ethernet flags. No board reload occurred this turn; it remains on config-owner.
+Next action is a RAM-only full-rate and paced CPU comparison of this candidate,
+with integrity and baseline restoration. The >900 Mbps / <1-core goal is open.
+
+### 2026-09-16: skip-empty-service RAM experiment, no demonstrated CPU gain
+
+Loaded ea851197f93a3449388ebce782839998670e538cf970ad9430f356f34e3e430d
+via RAM TFTP with both U-Boot component hashes checked. Candidate 64 MiB patterned
+TCP verification passed (1131 ms board time). Two 20-second full RX runs:
+948.6720 / 948.5980 Mbps, 1.994461 / 1.994898 non-WFI cores. Two paced 300 Mbps
+runs: 299.9826 / 299.9826 Mbps, 0.926773 / 0.914425 cores. Full-rate results are
+essentially the previous ~1.995-core baseline; paced results are above the prior
+0.900726 / 0.906545 control sample, not an improvement. A fresh post-candidate
+control was attempted but not completed, so do not claim a definitive causal
+regression percentage. The experiment remains default-off and is not adopted as
+a CPU optimization.
+
+Restoration loaded and hash-verified the exact config-owner baseline FIT
+160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b, but boot
+failed before shell: MARS_TRNG_PROBE prepare=Err(Protocol), start=Err(Protocol),
+read=Err(DriverRestarted), cause=Some(Initialize(Mode)), followed by
+"pmic_ops: cannot read pmic power register". A further 15-second serial read
+returned no bytes. The restore helper terminated with failure; it is not live or
+waiting. Physical power-cycle requested. Board is NOT recorded as recovered.
+No SD/SPI flashing/saveenv was issued. The entropy gate was not bypassed.
+
+Evidence under target/mars-reference:
+20260916-skip-empty-service-{ramboot,integrity}.log/json (separate log/json files),
+20260916-skip-empty-service-{rx,paced}/summary.json,
+20260916-skip-empty-service-control-{reboot,ramboot,stall}.log.
+Next hardware action after power-cycle: capture boot, restore baseline in RAM,
+complete control/integrity checks. CPU work should return to measured dominant
+packet/frontend costs rather than treating smaller generated code as success.
+
+### 2026-09-16: serial recovery remains blocked after wiring confirmation
+
+After the user confirmed wiring, a 20-second tty read and a separate 12-second
+cu read at 115200 both received zero bytes, including after a carriage return.
+No other serial test process was observed. en13 reports active 1000baseT full
+duplex at 192.168.77.1/24; two pings to 192.168.77.10 timed out. Physical link
+does not establish that U-Boot or VibeOS is running. Evidence:
+20260916-wiring-confirmed-serial.log and 20260916-wiring-confirmed-cu.log.
+Requested an adapter-side TX/RX loopback with the board TX/RX disconnected to
+separate adapter transport from board output. No loopback result yet.
+
+Retained TRNG mode-register observations now have host validation: 10 driver
+protocol tests and the firmware entropy lifecycle model passed. Initial host
+commands failed because they included the image binary or omitted the required
+entropy-device feature; the successful firmware command used
+--no-default-features --features entropy-device --test entropy_model.
+Logs: 20260916-trng-driver-recheck.log and
+20260916-entropy-model-noimage-recheck.log. This does not validate the new boot
+diagnostic on hardware. No new CPU measurement or successful baseline restore
+is claimed; no SD/SPI write or saveenv was performed.
+
+The retained mode observation and boot log also passed the RISC-V firmware
+compile check with the ethernet and trng-probe features:
+`cargo check --config firmware/.cargo/config.toml -p vibeos-firmware-milkv-mars
+--features ethernet,trng-probe`. Log: 20260916-trng-mode-riscv-check.log.
+This checks the boot-only diagnostic call path omitted by host model tests;
+it is not an image-link, hardware recovery, or entropy qualification result.

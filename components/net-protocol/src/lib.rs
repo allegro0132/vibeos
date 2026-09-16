@@ -16,6 +16,8 @@
 extern crate alloc;
 
 pub mod command;
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_exchange;
 mod transmit;
 mod receive;
 pub use receive::PacketReceive;
@@ -926,6 +928,8 @@ pub struct SharedTcpPollReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpFrontendDriveReport {
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub exchanged_bytes: usize,
     pub received_bytes: usize,
     pub transmitted_bytes: usize,
     pub close_applied: Option<TcpCloseRequest>,
@@ -950,7 +954,32 @@ impl From<TcpFrontendError> for TcpFrontendDriveError {
     }
 }
 
+#[cfg(feature = "receive-buffer-exchange")]
+enum ExchangeFrontend {
+    Assembled(alloc::sync::Arc<TcpListener>),
+    Capability(vibeos_core::cap::Revocable<TcpListener>),
+}
+#[cfg(feature = "receive-buffer-exchange")]
+impl ExchangeFrontend {
+    fn matches(&self, frontend: &TcpListener) -> bool {
+        match self {
+            Self::Assembled(value) => core::ptr::eq(value.as_ref(), frontend),
+            Self::Capability(value) => value.try_with(|value| core::ptr::eq(value, frontend)).unwrap_or(false),
+        }
+    }
+}
+
+#[cfg(feature = "receive-buffer-exchange")]
+struct ExchangeSockets {
+    failed: bool,
+    frontend: ExchangeFrontend,
+    owner: vibeos_net_api::receive_ownership::Owner,
+    bindings: Vec<(SocketHandle, receive_exchange::Binding<{ vibeos_net_api::RECEIVE_POOL_SLOTS }>)>,
+}
+
 struct TcpListenerEntry {
+    #[cfg(feature = "receive-buffer-exchange")]
+    exchange: Option<ExchangeSockets>,
     socket: SocketHandle,
     // One bounded pending connection for exclusive service ports. Shared port
     // groups already allocate their own parallel connection sockets.
@@ -986,6 +1015,28 @@ pub struct SharedIpv4TcpStack {
     ipv4_status: Ipv4RuntimeStatus,
     last_now_ms: u64,
     next_listener_generation: u64,
+}
+
+// Normal destruction is distinct from supervisor hard-fault retirement. Remove
+// every socket reference before releasing only the writers owned by this stack.
+// Published frontend ranges and other stacks using the same task are untouched.
+#[cfg(feature = "receive-buffer-exchange")]
+impl Drop for SharedIpv4TcpStack {
+    fn drop(&mut self) {
+        let sockets = core::mem::replace(&mut self.sockets, SocketSet::new(Vec::new()));
+        drop(sockets);
+        for listener in &mut self.listeners {
+            if let Some(exchange) = listener.exchange.take() {
+                for (_, binding) in exchange.bindings {
+                    // The private SocketSet was the sole holder of each
+                    // binding's current mutable buffer; it has now been dropped.
+                    // Invalid metadata remains quarantined rather than freeing
+                    // an unverified slot. Hard-fault lock recovery is separate.
+                    let _ = unsafe { binding.release_writer() };
+                }
+            }
+        }
+    }
 }
 
 impl SharedIpv4TcpStack {
@@ -1097,6 +1148,8 @@ impl SharedIpv4TcpStack {
         let slot = u8::try_from(self.listeners.len())
             .expect("the bounded TCP listener table fits in a u8");
         self.listeners.push(TcpListenerEntry {
+            #[cfg(feature = "receive-buffer-exchange")]
+            exchange: None,
             socket,
             pending,
             port,
@@ -1107,6 +1160,92 @@ impl SharedIpv4TcpStack {
             last_poll: TcpListenerPollReport::default(),
         });
         Ok(TcpListenerHandle { slot, generation })
+    }
+
+    /// Attach permanent RX storage before any network poll or connection activity.
+    /// Both the active and pending sockets retain their original handles, so
+    /// pending-connection promotion does not change buffer/binding identity.
+    ///
+    /// # Safety
+    /// The stack must remain exclusively owned by `owner` until it is dropped.
+    /// No retirement of that owner's pool slots is allowed before all stack
+    /// socket references are dead. Hard-fault recovery is not implemented here;
+    /// image assembly must not enable this without a supervisor protocol.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange(&mut self, listener: TcpListenerHandle,
+        frontend: alloc::sync::Arc<TcpListener>, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let retained = ExchangeFrontend::Assembled(frontend.clone());
+        unsafe { self.install_receive_exchange(listener, frontend.as_ref(), retained, owner) }
+    }
+
+    /// Capability-preserving variant for the netstack service. No bare Arc or
+    /// resource reference is extracted from the resolved authority.
+    ///
+    /// # Safety
+    /// The same producer ownership and quiescence requirements as
+    /// enable_receive_exchange apply for the full stack lifetime.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange_capability(&mut self, listener: TcpListenerHandle,
+        frontend: vibeos_core::cap::Revocable<TcpListener>, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let retained = ExchangeFrontend::Capability(frontend.clone());
+        frontend.try_with(|value| unsafe { self.install_receive_exchange(listener, value, retained, owner) })
+            .map_err(|_| TcpFrontendDriveError::QueueInvariant)?
+    }
+
+    /// Resolve producer identity from the executing task rather than policy
+    /// input. Pool setup is a cold path; reads retain their lighter provenance.
+    ///
+    /// # Safety
+    /// The stack must remain on this producer task until destruction, and the
+    /// lifetime/quiescence contract of enable_receive_exchange still applies.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange_current_task(&mut self, listener: TcpListenerHandle,
+        frontend: vibeos_core::cap::Revocable<TcpListener>,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let owner = vibeos_net_api::receive_ownership::Owner::current_producer()
+            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+        unsafe { self.enable_receive_exchange_capability(listener, frontend, owner) }
+    }
+
+    #[cfg(feature = "receive-buffer-exchange")]
+    unsafe fn install_receive_exchange(&mut self, listener: TcpListenerHandle,
+        frontend: &TcpListener, retained: ExchangeFrontend, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        self.device.revalidate_authority()?;
+        let index = self.listener_index(listener)?;
+        let entry = &self.listeners[index];
+        if entry.exchange.is_some() || entry.connection_active || self.last_now_ms != 0
+            || frontend.port() != entry.port || frontend.port_group().map(|g| g.get()) != entry.port_group {
+            return Err(TcpFrontendDriveError::QueueInvariant);
+        }
+        let pool = frontend.receive_storage().ok_or(TcpFrontendDriveError::QueueInvariant)?;
+        let handles = [Some(entry.socket), entry.pending];
+        if handles.into_iter().flatten().any(|handle| self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::Listen)
+            || frontend.snapshot().state != TcpStreamState::Listening {
+            return Err(TcpFrontendDriveError::QueueInvariant);
+        }
+        let mut prepared = Vec::with_capacity(2);
+        for handle in handles.into_iter().flatten() {
+            match receive_exchange::Binding::new(pool, owner) {
+                Ok((binding, buffer)) => prepared.push((handle, binding, buffer)),
+                Err(_) => {
+                    for (_, binding, buffer) in prepared {
+                        drop(buffer);
+                        unsafe { binding.release_writer() }.map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                    }
+                    return Err(TcpFrontendDriveError::QueueInvariant);
+                }
+            }
+        }
+        let mut bindings = Vec::with_capacity(prepared.len());
+        for (handle, binding, buffer) in prepared {
+            *self.sockets.get_mut::<tcp::Socket>(handle) = passive_socket_with_receive(entry.port, buffer);
+            bindings.push((handle, binding));
+        }
+        self.listeners[index].exchange = Some(ExchangeSockets { failed: false, frontend: retained, owner, bindings });
+        Ok(())
     }
 
     pub fn tcp_listener_port(&self, listener: TcpListenerHandle) -> Result<u16, StackError> {
@@ -1240,6 +1379,7 @@ impl SharedIpv4TcpStack {
         frontend: &TcpListener,
     ) -> Result<TcpFrontendDriveReport, TcpFrontendDriveError> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendStatus);
         if self.tcp_listener_port(listener)? != frontend.port() {
             return Err(TcpFrontendDriveError::QueueInvariant);
         }
@@ -1247,8 +1387,15 @@ impl SharedIpv4TcpStack {
         // Empty directions must still reject revoked device authority.
         self.device.revalidate_authority()?;
         let mut report = TcpFrontendDriveReport::default();
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(exchange) = &self.listener(listener)?.exchange {
+            if exchange.failed || !exchange.frontend.matches(frontend) {
+                return Err(TcpFrontendDriveError::QueueInvariant);
+            }
+        }
         let transport = self.tcp_stream_status(listener)?;
         let drive = frontend.network_begin_drive(transport.state)?;
+        drop(phase);
         // Conservative turn-local budgets. Concurrent application progress may
         // add work, but cannot cause over-consumption; next drive rechecks it.
         let mut receive_budget = drive.receive_capacity.min(transport.readable_bytes);
@@ -1257,6 +1404,43 @@ impl SharedIpv4TcpStack {
         // buffer escapes into the frontend, and each turn retains its byte and
         // chunk limits even when either ring wraps. This avoids clearing and
         // copying through a 32 KiB scratch buffer on every frontend poll.
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
+        #[cfg(feature = "receive-buffer-exchange")]
+        if receive_budget != 0 {
+            let index = self.listener_index(listener)?;
+            let entry = &mut self.listeners[index];
+            if let Some(exchange) = &mut entry.exchange {
+                if !entry.reset_requested {
+                    let generation = frontend.network_exchange_generation()
+                        .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                    let (_, binding) = exchange.bindings.iter_mut().find(|(handle, _)| *handle == entry.socket)
+                        .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                    // enable_receive_exchange's owner/lifetime contract and the
+                    // private handle table preserve exclusive socket ownership.
+                    let transfer = match unsafe { binding.exchange(self.sockets.get_mut::<tcp::Socket>(entry.socket), generation, receive_budget) } {
+                        Ok(transfer) => transfer,
+                        Err(_) => {
+                            self.fail_receive_exchange(index, frontend);
+                            return Err(TcpFrontendDriveError::QueueInvariant);
+                        }
+                    };
+                    if let Some(transfer) = transfer {
+                        let length = match frontend.network_publish_exchange(transfer.ticket, exchange.owner, generation) {
+                            Ok(length) => length,
+                            Err(error) => {
+                                let cleanup = binding.discard_unpublished(transfer);
+                                self.fail_receive_exchange(index, frontend);
+                                cleanup.map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                                return Err(error.into());
+                            }
+                        };
+                        report.exchanged_bytes += length;
+                        report.received_bytes += length;
+                        receive_budget -= length;
+                    }
+                }
+            }
+        }
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
             let capacity = receive_budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
             if capacity == 0 {
@@ -1280,6 +1464,8 @@ impl SharedIpv4TcpStack {
             }
         }
 
+        drop(phase);
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendTx);
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
             if transmit_budget == 0 || self.tcp_stream_status(listener)?.writable_bytes == 0 {
                 break;
@@ -1308,6 +1494,8 @@ impl SharedIpv4TcpStack {
             }
         }
 
+        drop(phase);
+        let _phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendClose);
         if let Some(request) = frontend.close_request() {
             match request {
                 TcpCloseRequest::Close => {
@@ -1374,7 +1562,7 @@ impl SharedIpv4TcpStack {
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<SharedTcpPollReport, StackError> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
-        let work = self.poll_with_application(now_ms, |_, _| 0)?;
+        let work = self.poll_with_application::<{ !cfg!(feature = "skip-empty-service") }>(now_ms, |_, _| 0)?;
         Ok(SharedTcpPollReport {
             ingress_frames: work.ingress_frames,
             more_work: work.more_network_work,
@@ -1382,7 +1570,7 @@ impl SharedIpv4TcpStack {
         })
     }
 
-    fn poll_with_application(
+    fn poll_with_application<const SERVICE: bool>(
         &mut self,
         now_ms: u64,
         mut service: impl FnMut(TcpListenerHandle, &mut tcp::Socket<'static>) -> usize,
@@ -1419,7 +1607,7 @@ impl SharedIpv4TcpStack {
                 PollIngressSingleResult::PacketProcessed
                 | PollIngressSingleResult::SocketStateChanged => {
                     ingress_frames += 1;
-                    application_bytes += self.service_listeners(&mut service);
+                    if SERVICE { application_bytes += self.service_listeners(&mut service); }
                     // Preserve the boundary between old and new users of every
                     // reusable passive socket. Any queued SYN remains in the
                     // packet endpoint until the end-of-turn rearm completes.
@@ -1435,7 +1623,7 @@ impl SharedIpv4TcpStack {
 
         self.apply_dhcp_event()?;
 
-        application_bytes += self.service_listeners(&mut service);
+        if SERVICE { application_bytes += self.service_listeners(&mut service); }
         for _ in 0..MAX_EGRESS_PASSES_PER_POLL {
             let egress_result =
                 self.interface
@@ -1491,8 +1679,23 @@ impl SharedIpv4TcpStack {
         application_bytes
     }
 
+    #[cfg(feature = "receive-buffer-exchange")]
+    fn fail_receive_exchange(&mut self, index: usize, frontend: &TcpListener) {
+        let entry = &mut self.listeners[index];
+        if let Some(exchange) = &mut entry.exchange { exchange.failed = true; }
+        self.sockets.get_mut::<tcp::Socket>(entry.socket).abort();
+        if let Some(pending) = entry.pending { self.sockets.get_mut::<tcp::Socket>(pending).abort(); }
+        entry.reset_requested = true;
+        // Bytes removed from TCP but rejected by the frontend must never be
+        // followed by later bytes on the same stream. Normal errors retire the
+        // listener until stack rebuild; a caller cannot silently retry it.
+        let _ = frontend.network_update_state(TcpStreamState::Reset);
+    }
+
     fn ensure_listening(&mut self, rearm_resets: bool) {
         for listener in &mut self.listeners {
+            #[cfg(feature = "receive-buffer-exchange")]
+            if listener.exchange.as_ref().is_some_and(|exchange| exchange.failed) { continue; }
             if listener.reset_requested && !rearm_resets {
                 continue;
             }
@@ -1716,7 +1919,7 @@ impl StaticIpv4TcpStack {
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
-        let work = self.poll_with_application(now_ms, |_| 0)?;
+        let work = self.poll_with_application::<{ !cfg!(feature = "skip-empty-service") }>(now_ms, |_| 0)?;
         Ok(TcpPollReport {
             ingress_frames: work.ingress_frames,
             connection_started: work.connection_started,
@@ -1726,7 +1929,7 @@ impl StaticIpv4TcpStack {
         })
     }
 
-    fn poll_with_application(
+    fn poll_with_application<const SERVICE: bool>(
         &mut self,
         now_ms: u64,
         mut service: impl FnMut(&mut tcp::Socket<'static>) -> usize,
@@ -1734,7 +1937,7 @@ impl StaticIpv4TcpStack {
         let listener = self.listener;
         let work = self
             .shared
-            .poll_with_application(now_ms, |candidate, socket| {
+            .poll_with_application::<SERVICE>(now_ms, |candidate, socket| {
                 if candidate == listener {
                     service(socket)
                 } else {
@@ -1874,7 +2077,7 @@ impl StaticIpv4EchoStack {
 
     /// Advance ARP, IPv4, TCP, and the compatibility echo application.
     pub fn poll(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
-        let work = self.tcp.poll_with_application(now_ms, service_echo)?;
+        let work = self.tcp.poll_with_application::<true>(now_ms, service_echo)?;
         let echo_ready = self.tcp.echo_has_immediate_work();
         let more_work = work.more_network_work || echo_ready;
         Ok(PollReport {
@@ -1953,6 +2156,10 @@ fn is_unicast_ipv4(octets: [u8; 4]) -> bool {
 
 fn passive_socket(port: u16) -> tcp::Socket<'static> {
     let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+    passive_socket_with_receive(port, receive)
+}
+
+fn passive_socket_with_receive(port: u16, receive: tcp::SocketBuffer<'static>) -> tcp::Socket<'static> {
     let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
     let mut socket = tcp::Socket::new(receive, transmit);
     socket.set_congestion_control(tcp::CongestionControl::Reno);

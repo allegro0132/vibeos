@@ -22,6 +22,10 @@ pub mod ipi;
 pub mod mmu;
 pub mod net;
 pub mod net_profile;
+#[cfg(feature = "copy-profile")]
+pub mod copy_profile;
+#[cfg(feature = "pc-sample")]
+pub mod pc_sample;
 pub mod net_tx_audit;
 pub mod poll_budget;
 pub mod runqueue;

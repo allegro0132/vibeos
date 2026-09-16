@@ -5,6 +5,10 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+skip-empty-service-experiment = ["vibeos-kernel?/skip-empty-service"]
+receive-buffer-exchange-experiment = ["vibeos-kernel?/receive-buffer-exchange"]
+copy-profile = ["dep:vibeos-kernel", "vibeos-kernel/copy-profile"]
+pc-sample = ["dep:vibeos-kernel", "vibeos-kernel/pc-sample"]
 # GMAC front-port coherency experiment; other devices keep cache maintenance.
 gmac-coherent-experiment = ["ethernet-device"]
 rx-batch-experiment = ["rx-pool-experiment"]

@@ -166,6 +166,50 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("NGRO fields=[rx_frames,merged_segments,aggregates] values={:?} approximate=true",
                 vibeos_netstack::gro_stats());
         }
+        #[cfg(feature = "tx-lease-profile")]
+        "ntxlease" => {
+            use vibeos_core::tx_lease_profile as p;
+            println!("TXLEASE hz={} interval={} units=timer_ticks", exec::timebase_hz(), p::INTERVAL);
+            for h in 0..exec::MAX_HARTS {
+                for (kind, name) in p::NAMES.iter().enumerate() {
+                    let [calls, samples, ticks, max] = p::snapshot(h, kind);
+                    println!("TXLEASE_ROW h={} kind={} calls={} samples={} ticks={} max={}", h, name, calls, samples, ticks, max);
+                }
+            }
+            println!("TXLEASE_END");
+        }
+        #[cfg(feature = "counter-probe")]
+        "ncounters" => {
+            println!("NCOUNTERS hz={} units=hardware_counters", exec::timebase_hz());
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { println!("NCOUNTERS_OFFLINE h={}", index); continue; }
+                // Allocate both the result and pinned task in SYSTEM scope,
+                // then restore the ambient domain before awaiting the join.
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(0) }; 6]);
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "counter-probe", async move {
+                        let before = sbi::time();
+                        let (cycle, instret) = unsafe { crate::counter_probe::read() };
+                        let after = sbi::time();
+                        let observed = ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64);
+                        let values = [observed, before, after, cycle.value, instret.value,
+                            (cycle.available as u64) | ((instret.available as u64) << 1)];
+                        for (cell, value) in output.iter().zip(values) { cell.store(value, Ordering::Release); }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                let row = result.each_ref().map(|v| v.load(Ordering::Acquire));
+                if exit.state() == exec::TaskState::Exited && row[0] == index as u64 {
+                    println!("NCOUNTERS_HART h={} before={} after={} cycle={} instret={} available={}",
+                        index, row[1], row[2], row[3], row[4], row[5]);
+                } else { println!("NCOUNTERS_FAILED h={}", index); }
+            }
+            println!("NCOUNTERS_END");
+        }
         #[cfg(feature = "idle-profile")]
         "nidle" => {
             println!("NIDLE hz={} harts={} units=timer_ticks source=wfi_interval", exec::timebase_hz(), exec::MAX_HARTS);

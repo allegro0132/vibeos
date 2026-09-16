@@ -83,6 +83,32 @@ impl<T: Send + 'static> Endpoint<T> {
         Ok(())
     }
 
+    /// Move at most `limit` occupied slots, preserving order and all unsent
+    /// ownership. Bounded metadata only: no callback or allocation under lock.
+    #[cfg(feature = "rx-publish-batch")]
+    pub fn try_send_batch(&self, messages: &mut [Option<T>], limit: usize) -> usize {
+        assert!(messages.len() <= 32, "bounded batch required");
+        if limit == 0 || messages.is_empty() { return 0; }
+        let mut inner = self.inner.lock();
+        let was_empty = inner.queue.is_empty();
+        let mut sent = 0;
+        for message in messages {
+            if message.is_none() { continue; }
+            if sent == limit { break; }
+            if inner.queue.len() == self.bound {
+                crate::net_profile::queue(&self.name, inner.queue.len(), true);
+                break;
+            }
+            inner.queue.push_back(message.take().unwrap());
+            inner.sent += 1;
+            sent += 1;
+        }
+        crate::net_profile::queue(&self.name, inner.queue.len(), false);
+        drop(inner);
+        if was_empty && sent != 0 { self.on_message.wake_all(); }
+        sent
+    }
+
     /// Backpressure is a first-class await, not an `EAGAIN` the caller may ignore.
     pub async fn send(&self, msg: T) {
         let mut pending = msg;

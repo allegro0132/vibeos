@@ -564,6 +564,42 @@ struct RxMetadata {
 #[cfg(feature = "rx-pool-experiment")]
 static RX_META: vibeos_core::sync::SpinLock<RxMetadata> = vibeos_core::sync::SpinLock::new_recoverable(
     RxMetadata { buffers: None, lengths: [0; RX_COUNT], counts: [0; 5], view: None });
+// Only the four hot metadata paths below are sampled. Timer intervals include
+// lock bookkeeping; nested work is inclusive and must not be summed with the
+// existing network stage profile. No packet contents or MMIO are recorded.
+#[cfg(feature = "rx-metadata-profile")]
+#[repr(align(64))]
+struct MetadataCounters([[AtomicU64; 5]; 4]);
+#[cfg(feature = "rx-metadata-profile")]
+static METADATA_COUNTERS: [MetadataCounters; 4] = [const { MetadataCounters(
+    [const { [const { AtomicU64::new(0) }; 5] }; 4]) }; 4];
+#[cfg(feature = "rx-pool-experiment")]
+#[inline]
+fn with_rx_metadata<T>(_kind: usize, f: impl FnOnce(&mut RxMetadata) -> T) -> T {
+    #[cfg(feature = "rx-metadata-profile")]
+    let sample = vibeos_core::arch::cached_logical_hart_index()
+        .and_then(|h| METADATA_COUNTERS.get(h))
+        .map(|h| &h.0[_kind])
+        .filter(|c| c[0].fetch_add(1, Ordering::Relaxed) % 127 == 0);
+    #[cfg(feature = "rx-metadata-profile")]
+    let start = sample.map(|_| profile_time());
+    let mut metadata = RX_META.lock();
+    #[cfg(feature = "rx-metadata-profile")]
+    let acquired = sample.map(|_| profile_time());
+    let result = f(&mut metadata);
+    #[cfg(feature = "rx-metadata-profile")]
+    let end = sample.map(|_| profile_time());
+    drop(metadata);
+    #[cfg(feature = "rx-metadata-profile")]
+    if let Some(c) = sample {
+        let held = end.unwrap().wrapping_sub(acquired.unwrap());
+        c[1].fetch_add(1, Ordering::Relaxed);
+        c[2].fetch_add(acquired.unwrap().wrapping_sub(start.unwrap()), Ordering::Relaxed);
+        c[3].fetch_add(held, Ordering::Relaxed);
+        c[4].fetch_max(held, Ordering::Relaxed);
+    }
+    result
+}
 #[cfg(feature = "rx-pool-experiment")]
 fn initialize_rx_pool(ring: &mut ring::Ring<Hardware>) -> Result<(), ring::Error> {
     let mut metadata = RX_META.lock();
@@ -585,9 +621,10 @@ unsafe impl vibeos_eqos_net::rx_buffers::Access<COUNT, RX_COUNT> for RxAccess {
     fn with<T>(&mut self, f: impl FnOnce(&mut vibeos_eqos_net::rx_buffers::Buffers<COUNT, RX_COUNT>) -> T)
         -> Result<T, vibeos_eqos_net::rx_buffers::Error>
     {
-        let mut metadata = RX_META.lock();
-        if self.view.is_none() { self.view = metadata.view; }
-        metadata.buffers.as_mut().map(f).ok_or(vibeos_eqos_net::rx_buffers::Error::Geometry)
+        with_rx_metadata(0, |metadata| {
+            if self.view.is_none() { self.view = metadata.view; }
+            metadata.buffers.as_mut().map(f).ok_or(vibeos_eqos_net::rx_buffers::Error::Geometry)
+        })
     }
 }
 #[cfg(feature = "rx-pool-experiment")]
@@ -649,8 +686,7 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
         }
     }
     let mut count = 0;
-    {
-        let mut metadata = RX_META.lock();
+    with_rx_metadata(1, |metadata| {
         for (i, frame) in frames.into_iter().enumerate() {
             if let Some(frame) = frame {
                 if accepted[i] {
@@ -664,7 +700,7 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
                 }
             }
         }
-    }
+    });
     let engine = engine(); engine.rx_packets = engine.rx_packets.saturating_add(count as u64);
     snapshot();
     Ok(output)
@@ -672,28 +708,30 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
 
 #[cfg(feature = "rx-pool-experiment")]
 unsafe fn release_rx_borrow(borrow: vibeos_hal::network_rx::Borrow) {
-    let mut metadata = RX_META.lock();
-    if metadata.buffers.as_mut().is_some_and(|buffers| buffers.release(borrow).is_ok()) {
-        metadata.counts[2] += 1;
-    }
+    with_rx_metadata(3, |metadata| {
+        if metadata.buffers.as_mut().is_some_and(|buffers| buffers.release(borrow).is_ok()) {
+            metadata.counts[2] += 1;
+        }
+    });
 }
 #[cfg(feature = "rx-pool-experiment")]
 unsafe fn acquire_rx_loan(ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_hal::network_rx::Owner)
     -> Result<vibeos_hal::network_rx::Loan, Error>
 {
-    let mut metadata = RX_META.lock(); let metadata = &mut *metadata;
-    let view = metadata.view.ok_or(Error::InvalidDescription)?;
-    let bytes = *metadata.lengths.get(ticket.index()).ok_or(Error::InvalidDescription)?;
-    let buffers = metadata.buffers.as_mut().ok_or(Error::InvalidDescription)?;
-    let borrow = buffers.borrow(ticket, owner.key()).map_err(|_| Error::Busy)?;
-    let pointer = match view.read(borrow.index(), bytes, |bytes| bytes.as_ptr()) {
-        Ok(pointer) => pointer,
-        Err(_) => { let _ = buffers.release(borrow); return Err(Error::InvalidDescription); }
-    };
-    match vibeos_hal::network_rx::Loan::new(borrow, pointer, bytes, release_rx_borrow) {
-        Ok(loan) => { metadata.counts[1] += 1; Ok(loan) },
-        Err(borrow) => { let _ = buffers.release(borrow); Err(Error::InvalidDescription) }
-    }
+    with_rx_metadata(2, |metadata| {
+        let view = metadata.view.ok_or(Error::InvalidDescription)?;
+        let bytes = *metadata.lengths.get(ticket.index()).ok_or(Error::InvalidDescription)?;
+        let buffers = metadata.buffers.as_mut().ok_or(Error::InvalidDescription)?;
+        let borrow = buffers.borrow(ticket, owner.key()).map_err(|_| Error::Busy)?;
+        let pointer = match view.read(borrow.index(), bytes, |bytes| bytes.as_ptr()) {
+            Ok(pointer) => pointer,
+            Err(_) => { let _ = buffers.release(borrow); return Err(Error::InvalidDescription); }
+        };
+        match vibeos_hal::network_rx::Loan::new(borrow, pointer, bytes, release_rx_borrow) {
+            Ok(loan) => { metadata.counts[1] += 1; Ok(loan) },
+            Err(borrow) => { let _ = buffers.release(borrow); Err(Error::InvalidDescription) }
+        }
+    })
 }
 #[cfg(feature = "rx-pool-experiment")]
 unsafe fn discard_rx_ticket(ticket: vibeos_hal::network_rx::Ticket) -> bool {
@@ -710,6 +748,13 @@ unsafe fn recover_rx_borrower(owner: vibeos_hal::network_rx::Owner) -> usize {
 
 #[cfg(feature = "rx-pool-experiment")]
 fn rx_pool_stats() -> vibeos_hal::network_rx::Stats {
+    #[cfg(feature = "rx-metadata-profile")]
+    for (hart, counters) in METADATA_COUNTERS.iter().enumerate() {
+        for (kind, row) in counters.0.iter().enumerate() {
+            report(format_args!("RX_META_SAMPLE hart={} kind={} interval=127 fields=[calls,samples,acquire_ticks,held_ticks,max_held_ticks] values={:?}\n",
+                hart, kind, row.each_ref().map(|v| v.load(Ordering::Relaxed))));
+        }
+    }
     // Emit before taking RX_META: diagnostics must not invert console/metadata
     // lock order. No extra logging occurs on the receive path.
     #[cfg(feature = "rx-batch-profile")]

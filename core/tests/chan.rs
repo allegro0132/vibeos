@@ -137,3 +137,24 @@ fn full_transition_wakes_all_producers_and_loser_rearms() {
     assert!(second.as_mut().poll(&mut cx).is_ready());
     assert_eq!(ep.try_recv(), Some(2));
 }
+
+#[test]
+#[cfg(feature = "rx-publish-batch")]
+fn batch_moves_only_admitted_prefix_and_notifies_empty_transition() {
+    use std::{future::Future, pin::pin, task::{Context,Waker}};
+    let q=Endpoint::new("batch",2);
+    let event=q.message_event();let mut wait=pin!(event.wait());
+    let mut items=[Some(String::from("first")),None,Some(String::from("second")),Some(String::from("third"))];
+    assert_eq!(q.try_send_batch(&mut items,0),0);
+    assert!(wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    assert_eq!(q.try_send_batch(&mut items,1),1);
+    assert!(wait.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_ready());
+    assert!(items[0].is_none());assert_eq!(items[2].as_deref(),Some("second"));
+    assert_eq!(q.try_send_batch(&mut items,32),1);
+    assert_eq!(q.try_send_batch(&mut items,32),0);
+    assert_eq!(items[3].as_deref(),Some("third"));assert_eq!(q.stats(),(2,0,2));
+    assert_eq!(q.try_recv().as_deref(),Some("first"));
+    assert_eq!(q.try_send_batch(&mut items,32),1);
+    assert_eq!(q.try_recv().as_deref(),Some("second"));assert_eq!(q.try_recv().as_deref(),Some("third"));
+    assert!(items.iter().all(Option::is_none));assert_eq!(q.stats(),(3,3,0));
+}

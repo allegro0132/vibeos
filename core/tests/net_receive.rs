@@ -127,3 +127,37 @@ fn pending_batch_keeps_original_generation_through_queue_pressure_and_rebinding(
         assert_eq!(records().lock().unwrap()[&frame.ticket().pool()].state, State::Released);
     }
 }
+
+#[test]
+#[cfg(feature = "rx-publish-batch")]
+fn batch_partial_publication_retains_order_and_old_stamp_across_rebind() {
+    let q=unsafe {ReceiveEndpoint::new("rx-batch",1,&OPS).unwrap()};
+    let old=stamp();let new=old.next_stack_generation().unwrap();
+    let frames=[frame(old),frame(old),frame(old)];
+    let mut tickets=[None;vibeos_hal::network_rx::BATCH_SIZE];
+    for (slot,f) in [0,2,7].into_iter().zip(frames) {tickets[slot]=Some(f.ticket());}
+    let mut batch=StampedBatch::new(tickets,old);
+    assert_eq!(batch.remaining(),3);assert_eq!(q.try_send_batch(&mut batch,0),0);
+    assert_eq!(q.try_send_batch(&mut batch,2),1);assert_eq!(batch.remaining(),2);
+    assert_eq!(q.try_send_batch(&mut batch,2),0);
+    let loan=q.try_receive(old,domain(50)).unwrap().unwrap();
+    assert_eq!(q.try_send_batch(&mut batch,1),1);assert_eq!(batch.remaining(),1);
+    assert!(matches!(q.try_receive(new,domain(51)),Err(Error::Session(_))));
+    assert_eq!(batch.stamp(),Some(old));assert_eq!(batch.pop(),Some(frames[2]));
+    assert!(q.discard(frames[2]));assert_eq!(batch.remaining(),0);assert_eq!(q.try_send_batch(&mut batch,32),0);
+    assert_eq!(loan.as_bytes(),&[0x39;64]);drop(loan);
+    for f in frames {assert_eq!(records().lock().unwrap()[&f.ticket().pool()].state,State::Released);}
+}
+
+#[test]
+#[cfg(feature = "rx-publish-batch")]
+fn revoked_batch_sender_cannot_move_pending_tickets() {
+    let q=unsafe {ReceiveEndpoint::new("rx-revoked-batch",2,&OPS).unwrap()};
+    let mut space=CSpace::new("batch");let root=space.mint(q.clone(),Rights::SEND.union(Rights::REVOKE));
+    let authority=space.lookup_revocable::<ReceiveEndpoint>(root,Rights::SEND).unwrap();
+    let f=frame(stamp());let mut tickets=[None;vibeos_hal::network_rx::BATCH_SIZE];tickets[0]=Some(f.ticket());
+    let mut batch=StampedBatch::new(tickets,stamp());space.revoke(root).unwrap();
+    assert!(authority.try_with(|q|q.try_send_batch(&mut batch,32)).is_err());
+    assert_eq!(batch.remaining(),1);assert!(!q.has_message());
+    assert_eq!(batch.pop(),Some(f));assert!(q.discard(f));
+}

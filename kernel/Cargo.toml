@@ -5,6 +5,9 @@ edition = "2021"
 autobins = false
 
 [features]
+rx-publish-batch = ["pooled-rx", "vibeos-core/rx-publish-batch"]
+tx-lease-profile = ["direct-tcp-segmentation", "vibeos-core/tx-lease-profile", "vibeos-netstack?/tx-lease-profile"]
+counter-probe = []
 skip-empty-service = ["vibeos-netstack?/skip-empty-service"]
 receive-buffer-exchange = ["vibeos-net-api?/receive-buffer-exchange", "vibeos-netstack?/receive-buffer-exchange"]
 copy-profile = ["vibeos-core/copy-profile"]

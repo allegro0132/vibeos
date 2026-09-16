@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+tx-lease-profile = ["native-tcp-segmentation", "vibeos-core/tx-lease-profile"]
 skip-empty-service = []
 activity-events = ["vibeos-net-api/activity-events"]
 receive-buffer-exchange = ["smoltcp/tcp-buffer-exchange", "vibeos-net-api/receive-buffer-exchange"]

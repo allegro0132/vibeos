@@ -25,16 +25,57 @@ class SerialTimeout(TimeoutError):
         self.response = bytes(response)
 
 
-def command(fd, text):
-    termios.tcflush(fd, termios.TCIFLUSH)
+def read_serial(fd, capture):
+    part = os.read(fd, 65536)
+    if not part:
+        raise RuntimeError('serial disconnected')
+    capture.write(part)
+    capture.flush()
+    if capture.tell() > 16 * 1024 * 1024:
+        raise RuntimeError('serial capture exceeds 16 MiB')
+    return part
+
+
+def collect_serial(fd, capture, seconds, process=None):
+    """Single-reader capture during idle, traffic and post-test gaps."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if select.select([fd], [], [], min(0.1, max(0, deadline-time.monotonic())))[0]:
+            read_serial(fd, capture)
+        if process is not None and process.poll() is not None:
+            return
+    if process is not None and process.poll() is None:
+        raise subprocess.TimeoutExpired(process.args, seconds)
+
+
+def run_iperf(fd, capture, args, output, stderr, timeout):
+    # Files preserve partial JSON/stderr even when the client times out or the
+    # UART disconnects. Reap this exact child on every exit; no orphan traffic.
+    with output.open('x') as out, stderr.open('x') as err:
+        proc = subprocess.Popen(args, stdout=out, stderr=err)
+        try:
+            collect_serial(fd, capture, timeout, proc)
+            return proc.returncode
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+
+
+def command(fd, text, capture):
+    # Preserve asynchronous diagnostics before establishing the reply boundary.
+    # Never tcflush here: that discarded faults emitted during the last test.
+    drained = 0
+    while select.select([fd], [], [], 0)[0]:
+        drained += len(read_serial(fd, capture))
+        if drained > 1024 * 1024:
+            raise RuntimeError('serial output did not quiesce before command')
     os.write(fd, text.encode() + b'\r')
     result = bytearray()
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if select.select([fd], [], [], 0.2)[0]:
-            part = os.read(fd, 65536)
-            if not part:
-                raise RuntimeError('serial disconnected')
+            part = read_serial(fd, capture)
             result.extend(part)
             if len(result) > 1024 * 1024:
                 raise RuntimeError('unexpected serial output volume')
@@ -55,6 +96,7 @@ def main():
     p.add_argument('--driver-stage-stats', action='store_true', help='Capture sampled driver phase counters')
     p.add_argument('--tx-wait-stats', action='store_true', help='Capture opt-in TX turn counters outside residency snapshots')
     p.add_argument('--rate', help='Optional host-to-board rate, e.g. 300M; requires --direction rx')
+    p.add_argument('--mss', type=int, help='Requested iperf TCP maximum segment size; record separately from observed packet sizes')
     p.add_argument('--iperf', default=shutil.which('iperf3'))
     a = p.parse_args()
     if not a.iperf:
@@ -63,50 +105,56 @@ def main():
         p.error('rate must be a positive iperf bitrate and direction must be rx')
     if a.rate and float(a.rate.rstrip('KMG')) <= 0:
         p.error('rate must be positive')
+    if a.mss is not None and not 1 <= a.mss <= 65535:
+        p.error('mss must be in 1..65535')
     a.output.mkdir(parents=True, exist_ok=False)
-    summary = dict(address=str(a.address), serial=a.serial, rate=a.rate,
+    summary = dict(address=str(a.address), serial=a.serial, rate=a.rate, requested_mss=a.mss,
                    iperf_version=subprocess.check_output([a.iperf, '--version'], text=True),
                    passed=False, physical_qualification=False, results=[])
-    fd = os.open(a.serial, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
-    saved = termios.tcgetattr(fd)
+    capture = (a.output / 'serial-full.log').open('xb')
+    fd = saved = None
     try:
+        fd = os.open(a.serial, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        saved = termios.tcgetattr(fd)
         attrs = copy.deepcopy(saved)
         attrs[:6] = [0, 0, termios.CS8 | termios.CREAD | termios.CLOCAL, 0, termios.B115200, termios.B115200]
         attrs[6][termios.VMIN] = 0
         attrs[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        (a.output / 'quiet.log').write_text(command(fd, 'quiet'))
+        (a.output / 'quiet.log').write_text(command(fd, 'quiet', capture))
         directions = ['rx', 'tx'] if a.direction == 'both' else [a.direction]
         jobs = [('idle', a.idle_seconds)] + [(f'{i:02}-{d}', a.seconds) for i in range(1, a.rounds + 1) for d in directions]
         for name, seconds in jobs:
             if a.driver_stage_stats:
-                (a.output / (name + '-stage-before.log')).write_text(command(fd, 'ndrvstage'))
+                (a.output / (name + '-stage-before.log')).write_text(command(fd, 'ndrvstage', capture))
             if a.tx_wait_stats:
-                (a.output / (name + '-txwait-before.log')).write_text(command(fd, 'ntxwait'))
-            before = command(fd, 'nidle')
+                (a.output / (name + '-txwait-before.log')).write_text(command(fd, 'ntxwait', capture))
+            before = command(fd, 'nidle', capture)
             residency.parse(before)  # Fail before traffic if diagnostics are absent.
             (a.output / (name + '-before.log')).write_text(before)
             received = None
             if name == 'idle':
-                time.sleep(seconds)
+                collect_serial(fd, capture, seconds)
             else:
                 args = [a.iperf, '-c', str(a.address), '-t', str(seconds), '-J']
                 if name.endswith('tx'):
                     args += ['-R']
                 if a.rate:
                     args += ['-b', a.rate]
-                with (a.output / (name + '-iperf.json')).open('x') as out:
-                    proc = subprocess.run(args, stdout=out, stderr=subprocess.PIPE, text=True, timeout=seconds + 30)
-                (a.output / (name + '-stderr.log')).write_text(proc.stderr)
+                if a.mss is not None:
+                    args += ['-M', str(a.mss)]
+                returncode = run_iperf(fd, capture, args,
+                                       a.output / (name + '-iperf.json'),
+                                       a.output / (name + '-stderr.log'), seconds + 30)
                 data = json.loads((a.output / (name + '-iperf.json')).read_text())
                 received = data.get('end', {}).get('sum_received', {})
-                if proc.returncode or data.get('error') or received.get('seconds', 0) < seconds * 0.9 or not received.get('bytes'):
+                if returncode or data.get('error') or received.get('seconds', 0) < seconds * 0.9 or not received.get('bytes'):
                     raise RuntimeError('incomplete iperf test: ' + name)
-            after = command(fd, 'nidle')
+            after = command(fd, 'nidle', capture)
             if a.driver_stage_stats:
-                (a.output / (name + '-stage-after.log')).write_text(command(fd, 'ndrvstage'))
+                (a.output / (name + '-stage-after.log')).write_text(command(fd, 'ndrvstage', capture))
             if a.tx_wait_stats:
-                (a.output / (name + '-txwait-after.log')).write_text(command(fd, 'ntxwait'))
+                (a.output / (name + '-txwait-after.log')).write_text(command(fd, 'ntxwait', capture))
             (a.output / (name + '-after.log')).write_text(after)
             result = residency.compare(before, after)
             result['name'] = name
@@ -117,15 +165,22 @@ def main():
             summary['results'].append(result)
             print(name, 'Mbps=', round(received['bits_per_second'] / 1e6, 2) if received else None,
                   'active%=', [round(h['active_percent'], 2) for h in result['harts']], flush=True)
-            time.sleep(2)
+            collect_serial(fd, capture, 2)
         summary['passed'] = True
-    except SerialTimeout as error:
-        (a.output / 'serial-timeout.log').write_bytes(error.response)
+    except Exception as error:
+        summary['error'] = dict(type=type(error).__name__, message=str(error))
+        if isinstance(error, SerialTimeout):
+            (a.output / 'serial-timeout.log').write_bytes(error.response)
         raise
     finally:
-        termios.tcsetattr(fd, termios.TCSANOW, saved)
-        os.close(fd)
-        (a.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        try:
+            if fd is not None and saved is not None:
+                termios.tcsetattr(fd, termios.TCSANOW, saved)
+        finally:
+            if fd is not None:
+                os.close(fd)
+            capture.close()
+            (a.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     return 0
 
 

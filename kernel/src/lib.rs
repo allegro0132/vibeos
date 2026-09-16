@@ -1151,6 +1151,8 @@ mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
 mod trap;
+#[cfg(feature = "counter-probe")]
+mod counter_probe;
 mod tty;
 mod uart;
 #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]

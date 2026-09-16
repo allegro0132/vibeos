@@ -15,36 +15,70 @@ impl Stamped {
     pub const fn stamp(self) -> PacketStamp { self.stamp }
     pub const fn ticket(self) -> Ticket { self.ticket }
 }
+#[cfg(feature = "rx-publish-batch")]
+const _: () = assert!(vibeos_hal::network_rx::BATCH_SIZE <= 32);
+
 /// Runtime-owned pending batch. Construct under the session publication
 /// barrier; remaining tickets keep that original stamp across later rebinding.
 /// The producer must drain/discard it, or retire its device after owner failure.
 /// This owns ticket bookkeeping only, never payload references or DMA authority.
 pub struct StampedBatch {
+    #[cfg(not(feature = "rx-publish-batch"))]
     tickets: vibeos_hal::network_rx::TicketBatch,
+    #[cfg(feature = "rx-publish-batch")]
+    frames: [Option<Stamped>; vibeos_hal::network_rx::BATCH_SIZE],
+    #[cfg(feature = "rx-publish-batch")]
+    end: usize,
     // Captured at publication, never refreshed when a pending ticket is popped.
-    // One immutable stamp covers the batch without expanding every slot.
+    // All pending entries retain their original publication stamp.
     stamp: Option<PacketStamp>,
     next: usize,
 }
 impl StampedBatch {
     pub const fn empty() -> Self {
-        Self { tickets: [None; vibeos_hal::network_rx::BATCH_SIZE], stamp: None,
-            next: vibeos_hal::network_rx::BATCH_SIZE }
+        Self {
+            #[cfg(not(feature = "rx-publish-batch"))]
+            tickets: [None; vibeos_hal::network_rx::BATCH_SIZE],
+            #[cfg(feature = "rx-publish-batch")]
+            frames: [None; vibeos_hal::network_rx::BATCH_SIZE],
+            #[cfg(feature = "rx-publish-batch")]
+            end: 0,
+            stamp: None, next: vibeos_hal::network_rx::BATCH_SIZE,
+        }
     }
     pub fn new(tickets: vibeos_hal::network_rx::TicketBatch, stamp: PacketStamp) -> Self {
-        Self { tickets, stamp: Some(stamp), next: 0 }
+        #[cfg(not(feature = "rx-publish-batch"))]
+        { Self { tickets, stamp: Some(stamp), next: 0 } }
+        #[cfg(feature = "rx-publish-batch")]
+        {
+            let mut batch = Self::empty(); batch.stamp = Some(stamp); batch.next = 0;
+            for ticket in tickets.into_iter().flatten() {
+                batch.frames[batch.end] = Some(Stamped::new(ticket, stamp)); batch.end += 1;
+            }
+            batch
+        }
     }
     pub fn pop(&mut self) -> Option<Stamped> {
-        let stamp = self.stamp?;
-        while self.next < self.tickets.len() {
-            let index = self.next;
-            self.next += 1;
-            if let Some(ticket) = self.tickets[index].take() {
-                return Some(Stamped::new(ticket, stamp));
-            }
+        #[cfg(feature = "rx-publish-batch")]
+        {
+            if self.next >= self.end { return None; }
+            let index = self.next; self.next += 1; self.frames[index].take()
         }
-        None
+        #[cfg(not(feature = "rx-publish-batch"))]
+        {
+            let stamp = self.stamp?;
+            while self.next < self.tickets.len() {
+                let index = self.next; self.next += 1;
+                if let Some(ticket) = self.tickets[index].take() { return Some(Stamped::new(ticket, stamp)); }
+            }
+            None
+        }
     }
+    #[cfg(feature = "rx-publish-batch")]
+    pub fn remaining(&self) -> usize { self.end.saturating_sub(self.next) }
+    #[cfg(feature = "rx-publish-batch")]
+    pub fn stamp(&self) -> Option<PacketStamp> { self.stamp }
+
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +97,15 @@ impl ReceiveEndpoint {
         system.restore(); Ok(endpoint)
     }
     pub fn try_send(&self, frame: Stamped) -> Result<(), Stamped> { self.queue.try_send(frame) }
+    /// Caller holds live send authority and the session publication barrier.
+    /// Accepted prefix moves into the queue; unsent suffix retains its stamp.
+    #[cfg(feature = "rx-publish-batch")]
+    pub fn try_send_batch(&self, batch: &mut StampedBatch, limit: usize) -> usize {
+        if batch.remaining() == 0 { return 0; }
+        let sent = self.queue.try_send_batch(&mut batch.frames[batch.next..batch.end], limit);
+        batch.next += sent;
+        sent
+    }
     pub fn message_event(&self) -> crate::chan::MessageEvent { self.queue.message_event() }
     pub fn has_message(&self) -> bool { self.queue.has_message() }
     pub fn discard(&self, frame: Stamped) -> bool { unsafe { (self.operations.discard)(frame.ticket) } }

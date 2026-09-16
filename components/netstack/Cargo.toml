@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+tx-lease-profile = ["vibeos-net-protocol/tx-lease-profile"]
 skip-empty-service = ["vibeos-net-protocol/skip-empty-service"]
 # Experimental protocol binding; firmware assembly remains disabled.
 receive-buffer-exchange = ["vibeos-net-protocol/receive-buffer-exchange"]

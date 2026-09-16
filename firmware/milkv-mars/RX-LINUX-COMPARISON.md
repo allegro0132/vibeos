@@ -3230,3 +3230,644 @@ compile check with the ethernet and trng-probe features:
 --features ethernet,trng-probe`. Log: 20260916-trng-mode-riscv-check.log.
 This checks the boot-only diagnostic call path omitted by host model tests;
 it is not an image-link, hardware recovery, or entropy qualification result.
+
+### 2026-09-16: serial and known network baseline recovered
+
+After the operator re-confirmed the working port 54340134951, a cu-endpoint
+probe received shell prompts and background logger output. It explicitly
+asserted DTR/RTS, but modem bits were 0x6 both before and after: this observation
+does not prove that the control lines caused recovery. Leading bytes were
+garbled; subsequent commands and reboot output were readable. The old tty
+command helper then worked too. The initially running image reported no modern
+network transport; its identity was not established.
+
+Software reboot reached U-Boot and was intercepted. RAM-only restoration of
+the exact config-owner FIT 160ebbe055260612a0320f15c353d2373eec154e87f01152ebe72b779773120b
+passed both component hash checks, boot admission, four-hart online, the
+unqualified TRNG protocol probe, and 1000 Mbps full-duplex link. No SD/SPI write
+or saveenv. The earlier hardware recovery blocker is now cleared.
+
+64 MiB TCP pattern validation passed with all bytes confirmed (1153 ms board
+time). Two 20-second host-to-board iperf runs reported 948.2227 / 948.7863 Mbps
+in iperf end.sum_received and 1.993819 / 1.995365 aggregate non-WFI cores.
+These reproduce the previous baseline; they do not demonstrate a CPU reduction
+or sub-one-core completion. Evidence: 20260916-cu-dtr-rts-check.log,
+20260916-restored-{quiet,net,reboot}.log,
+20260916-restored-baseline-{ramboot.log,integrity.json,rx/summary.json} under
+target/mars-reference, plus restored-baseline boot/load logs under
+target/mars-acceptance/20260913-gigabit. Board remains on this known baseline.
+
+### 2026-09-16: same-image RX rate curve after recovery
+
+Kept the restored config-owner FIT, network adapter, MTU and task placement
+unchanged. Ran two 20-second RX tests at each of 900M, 600M and 300M, following
+the two unpaced runs above. This is a sequential baseline characterization,
+not a randomized optimization A/B or an attribution to one code path.
+
+| Offered rate | iperf end.sum_received Mbps | Aggregate non-WFI cores |
+| --- | --- | --- |
+| Unpaced | 948.2227 / 948.7863 | 1.993819 / 1.995365 |
+| 900M | 899.9928 / 899.9478 | 1.939014 / 1.874073 |
+| 600M | 599.9652 / 599.9652 | 1.440770 / 1.343564 |
+| 300M | 299.9826 / 299.9826 | 0.841968 / 0.827190 |
+
+Pre-run idle samples were 0.205–0.224 aggregate cores. They are not subtracted:
+the objective concerns total cost, and idle/background behavior need not add
+linearly to traffic cost. In particular harts 2/3 show background activity
+while idle but nearly none during sustained traffic. No IRQ, MMIO or lock time
+is excluded from the non-WFI proxy. Near 900 Mbps still consumes about 1.9
+cores; full-link saturation alone does not explain the unmet CPU objective.
+The 600M runs vary by about 0.097 core, so small cross-session differences
+must not be promoted as demonstrated optimization gains. This does not erase
+earlier measurements, but strengthens the need for interleaved controls.
+
+The JSON sender=true field also appears in receiver/sum_received records;
+the measurement script explicitly selects end.sum_received. The previous
+recovery entry's description as sender summaries was corrected accordingly.
+Neither this field nor iperf's reported remote CPU=0 is a CPU measurement.
+
+Evidence: target/mars-reference/20260916-baseline-{900m,600m,300m}/summary.json
+with raw iperf and before/after NIDLE logs, and
+20260916-baseline-rate-curve.json. No code or firmware configuration changed
+for this rate curve. Board remains on the working baseline; sub-one-core
+performance and full hardware qualification remain unachieved.
+
+### 2026-09-16: sample RX metadata acquisition and protected work separately
+
+Added default-off rx-metadata-profile to Mars assembly. Four hot RX_META paths
+use the same existing recoverable guard through an inline closure: driver ring
+metadata access (kind 0), batch length publication (1), loan acquisition (2),
+and loan return (3). Per logical hart/kind, sample one in 127 calls; count all
+calls but read the timer only for selected operations. Report cumulative
+calls/samples/acquire_ticks/held_ticks/max_held_ticks from nrpool outside traffic.
+No ownership transitions, capability checks, DMA operations or reset rules
+were removed. No global SpinLock changes. Normal images have no counters/timer
+reads from this diagnostic.
+
+Acquisition time starts before lock() and therefore includes IRQ masking,
+contended wait and recoverable owner bookkeeping. Held time ends before unlock;
+it excludes guard release/IRQ restoration. The timer is 4 MHz (0.25 us), and
+the sampling reads perturb short sections. These are inclusive durations,
+not contention-only measurements or unbiased/exclusive CPU shares. Maxima are
+cumulative boot maxima; do not subtract them or treat them as complete tails.
+
+Diagnostic FIT: 12803efb7f9378fd851da44f4c432c9066e86c32c933a75f6fbd6344092ad7c1.
+Full build/image check and enabled/disabled RISC-V checks passed. All 107 EQoS
+driver tests passed. RAM component hashes and 1000 Mbps link passed; 64 MiB
+patterned TCP passed (1109 ms). A 20-second RX capture reported 948.8686 Mbps
+and 1.989464 non-WFI cores, not a demonstrated performance improvement.
+
+| Hart / kind | Calls in counter interval | Samples | Mean acquisition us | Mean held us |
+| --- | ---: | ---: | ---: | ---: |
+| 0 / ring metadata | 2196978 | 17299 | 0.5760 | 0.7585 |
+| 0 / batch publication | 732326 | 5767 | 0.5859 | 0.8520 |
+| 1 / loan acquisition | 1624887 | 12794 | 0.5868 | 0.6721 |
+| 1 / loan return | 1624887 | 12794 | 0.5597 | 0.4845 |
+
+Sampled held maxima since boot were 2.25 / 1.75 / 1.50 / 0.75 us respectively.
+This capture does not reveal long RX_META critical sections; it does establish
+frequent short serialized operations. About 2.22 packets were admitted per
+publication batch in the interval. The observed ring metadata call count is
+exactly three per publication. Batching can amortize those operations, but the
+prior queue-publication experiment did not prove a CPU gain; these results do
+not justify simply increasing a batch limit or removing ownership checks.
+
+Evidence: target/mars-reference/20260916-rx-metadata-{check,disabled-check,
+build,driver-tests,fit,ramboot,capture}.log; exact ELF and feature map; capture/
+contains raw pool and NIDLE before/after logs, iperf JSON and analysis.json.
+Restored exact config-owner FIT in RAM; both hashes and gigabit initialization
+passed, then 64 MiB verification passed (1142 ms). Restore evidence uses
+20260916-rx-metadata-restore-*; raw boot/load logs are under
+target/mars-acceptance/20260913-gigabit. No persistent writes. Board remains on
+the unprofiled baseline. The sub-one-core objective is still open.
+
+### 2026-09-16: bounded consumer admission primitive, not yet a runtime experiment
+
+Reviewed descriptor synchronization, OWN reads, RX readiness probing and TX
+reaping. No barrier was removed: the ordering contracts do not justify treating
+adjacent synchronization calls as interchangeable. Consumer admission is a
+separate potential source of repeated work after the hardware batches arrive.
+
+Added ReceiveEndpoint::try_receive_batch, capped at the HAL batch size (8),
+with a caller-specified smaller limit. A caller can hold one existing live
+receive capability invocation around it. Each frame still leaves the queue
+and becomes an owner-tracked DMA loan before the next dequeue; there is no
+array of prefetched raw Ready tickets outside queue retirement or borrower
+recovery. Queue locks and HAL loan acquisition remain per frame. This primitive
+alone therefore does not amortize those locks or change existing callers.
+
+On a late session/device error, admitted loans drop normally, the rejected
+ticket follows existing single-frame discard rules, and the unvisited tail
+stays queued. Revocation blocks new invocation; already admitted loans retain
+their original lifetime/owner until release or proven stopped-owner recovery.
+The existing single-frame dequeue/acquire fault window is not claimed fixed.
+
+Nine receive tests passed, including four new tests for limit-zero/full-cap,
+FIFO storage identity, queued-tail retirement versus live loans, late session
+failure cleanup, invalid owner, revocation, exact-owner recovery and duplicate
+ticket device rejection without double release. RISC-V core check passed.
+Logs: target/mars-reference/20260916-rx-consumer-batch-{final-tests,riscv}.log.
+No protocol caller, firmware feature or hardware image selects the new method
+yet. Next step is a default-off adapter integration with bounded retained loans,
+ingress budget/revocation/drop tests, then same-rate interleaved hardware
+controls. There is no new performance measurement or improvement claim here.
+
+### 2026-09-16: consumer batch adapter integration and paired RAM artifacts
+
+Added default-off rx-consumer-batch to protocol/netstack/kernel, selected in
+Mars by rx-consumer-batch-experiment. PacketReceive performs one existing live
+authority invocation around the bounded endpoint admission. PacketDevice keeps
+at most eight admitted loans, preserving FIFO across refills and GRO lookahead.
+Admission charges the existing wire-frame budget; retained loans already
+charged at admission are not charged a second time. A failed batch conservatively
+charges its requested limit because the endpoint error does not report how many
+prefix loans were consumed/released. Queue/HAL ownership checks remain per frame.
+
+Cached loans keep the adapter runnable even if the endpoint queue is empty.
+Receive-time authority failure clears cached loans; normal adapter destruction
+also drops them. End-of-GRO revalidation still prevents a revoked collection
+from publishing a token. Admitted immutable loans retain the existing cleanup
+and exact-owner recovery contract. No raw DMA tickets are prefetched separately.
+
+Four protocol unit tests and 41 combined pooled/GRO/native-TCP integration tests
+passed. Two new adapter tests exercise FIFO across batch refills, queued-empty
+runnability, normal destruction with cached loans and receive revocation without
+dequeueing the unvisited tail. Existing wire-budget, GRO revocation-during-
+collection and actual TCP changing-payload tests also pass. Default protocol
+regression passed 24 integration tests; netstack rx-consumer-batch tests passed.
+Both feature-on and feature-off full Mars builds/image checks passed.
+
+Built paired artifacts from the same working runtime source, rather than using
+the older config-owner ELF as the sole performance control:
+- Experiment target/mars-boot-20260916-rx-consumer/out/artifacts/vibeos.itb:
+  fd74a303c2833c5d253729d1703d711b6ea465edebc1e72d99dc9c0d60b5220c.
+- Control target/mars-boot-20260916-rx-consumer-control/out/artifacts/vibeos.itb:
+  17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a.
+
+Feature maps, exact ELFs, build/FIT and host test logs use the
+20260916-rx-consumer[-control] prefix under target/mars-reference. Default
+ethernet feature selection was restored after packaging. These images have
+NOT been loaded or performance-tested yet. Board remains on the previously
+validated config-owner baseline. Next action is RAM-only integrity and
+interleaved same-rate control/experiment measurements before any promotion.
+
+### 2026-09-16: consumer batching A/B/A — no demonstrated CPU gain
+
+Rechecked both FIT SHA256 values above, then RAM-loaded control, experiment,
+control in that order. Each load passed U-Boot component hash verification,
+gigabit link initialization and a 64 MiB changing-pattern TCP check (1125,
+1178, 1175 ms board time respectively). No SD/SPI write or saveenv was issued.
+
+| Image / rate | Receiver Mbps, two 20 s runs | Aggregate non-WFI cores |
+| --- | --- | --- |
+| Control before, 910M | 909.9157 / 909.9612 | 1.927288 / 1.938279 |
+| Consumer batch, 910M | 909.9157 / 909.9612 | 1.945316 / 1.943267 |
+| Consumer batch, unpaced | 947.9235 / 948.6278 | 1.993414 / 1.995531 |
+| Control after, 910M | 909.9157 / 909.9157 | 1.932381 / 1.946091 |
+
+The candidate overlaps the post-control range and does not beat the preceding
+control. This short sequential A/B/A demonstrates no CPU reduction; it is not
+a confidence interval or proof of a general regression. The experiment only
+amortized receive capability invocation; per-frame queue/HAL locks and loan
+ownership operations remained. Do not infer that all batching designs fail,
+or attribute this result solely to one atomic/array operation without evidence.
+
+Archived and removed the consumer-batch runtime API, adapter fields/methods,
+feature forwarding and its dedicated tests. Patch:
+target/mars-reference/20260916-rx-consumer-experiment.patch. Reverse application
+and clean reapplication checks passed. Other diagnostics and prior work were
+preserved. Existing receive tests and pooled/GRO/native protocol tests passed
+after removal. Board remains on the feature-off paired control FIT
+17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a.
+
+Evidence: target/mars-reference/20260916-rx-consumer-comparison.log and
+20260916-rx-consumer-results.json; control1/candidate/control2 integrity files,
+paced residency directories, candidate-full directory, RAM helpers and logs.
+Raw boot/load/network evidence is under target/mars-acceptance/20260913-gigabit
+with the same phase prefixes. Host post-removal tests use
+20260916-rx-consumer-removed-{core,protocol}-tests.log. There is no performance
+optimization promoted from this experiment; the <1-core objective remains open.
+
+### 2026-09-16: independent sink and multi-flow CPU cross-check
+
+Used the unchanged paired-control FIT 17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a
+to compare independent VBENCH02 mode-0 sinks on ports 5300–5303 with iperf3.
+Mode 0 counts bytes without the per-byte pattern validation of mode 2; the
+earlier integrity-test runtime is therefore not a comparable throughput result.
+The independent client first calibrated at 32108.70 Mbps single-flow and
+10001.17 Mbps four-flow on host loopback (128 MiB per flow).
+
+Each board run transferred a fixed aggregate 2 GiB: 2 GiB for one flow or
+512 MiB per flow for four. The barrier action captured NIDLE only after every
+flow received application-ready R and before sending G. Post-capture followed
+byte-count confirmation/close; it includes that small completion overhead.
+This avoids counting application readiness as low-CPU payload execution.
+Later port-5300 setup waits measured 9.14–9.85 seconds and were excluded.
+No CPU/clock/firmware/MTU setting was changed.
+
+| Independent sink | Receiver Mbps | Aggregate non-WFI cores |
+| --- | ---: | ---: |
+| Single flow, first | 945.2367 | 1.980249 |
+| Four flows, first | 943.8200 | 1.974080 |
+| Single flow, second | 946.5163 | 1.983403 |
+| Four flows, second | 944.0515 | 1.977047 |
+
+All 8 GiB were confirmed by board byte counts; this benchmark does not validate
+payload patterns. A subsequent same-image two-round iperf control reached
+948.34 / 948.37 Mbps at approximately 1.994 cores. Rates have different timing
+boundaries, so the few-Mbps gap is not an isolated service-performance effect.
+Replacing iperf control/parser/service state did not remove near-two-core RX
+cost; the shared TCP capability/frontend/stack/driver path remains the target.
+Four flows did not materially improve throughput or total CPU. This does not
+separate every common-path cost or prove that the services have zero overhead.
+
+Evidence: target/mars-reference/20260916-independent-rx-loopback.json;
+run-independent-rx-residency.py; 20260916-independent-rx-run.log;
+20260916-independent-rx/{summary.json,*flow-*.json,*-before.log,*-after.log};
+20260916-independent-rx-iperf-control/summary.json and raw iperf/NIDLE logs.
+Board remains on the same functional control image. No code optimization,
+persistent write, sub-one-core result or full qualification is claimed.
+
+### 2026-09-16: hardware cycle/retired-instruction availability and first RX sample
+
+Added default-off kernel/Mars counter-probe and ncounters. Each command spawns
+one short pinned task per online hart, allocating task/result storage under
+SYSTEM and restoring that scope before awaiting. Tasks read time/cycle/instret/
+time and report the observed hart; no recurring task or per-packet counters.
+Cycle/instret availability has separate bits, so unavailable is not valid zero.
+
+The diagnostic trap hook resumes only S-mode illegal-instruction exceptions at
+the exact two static CSR probe sites. It sets saved a0/a1 to unavailable and
+advances four bytes. Other exceptions/PCs retain the original trap policy;
+ordinary IRQs return before reading extra CSRs. The host predicate test covers
+both sites, unrelated exceptions/PCs, interrupts, user mode, alignment, null
+and overflow. It does not execute the machine trap-return path. Full RISC-V
+build/image check and feature-disabled check passed. Exact ELF disassembly
+confirms fixed-width rdcycle/rdinstret followed by ret and separate site labels.
+
+Local SDK sbi_hart.c enables MCOUNTEREN and leaves cycle/instret uninhibited,
+but this was not treated as proof of the SPI binary. RAM FIT
+03d80009469f8c01dfe2dbfcb52b4e064292a0d5eaec35b8f3b5954a015ca33e
+passed load hashes and gigabit boot; all four actual harts reported available=3.
+Unsupported-counter recovery was therefore NOT exercised on this hardware.
+
+One 10-second idle interval and one 20-second RX interval produced these
+counter deltas, normalized by each hart's own rdtime bracket midpoint:
+
+| Workload / hart | Cycles per wall second | Instret/cycle | Non-WFI % |
+| --- | ---: | ---: | ---: |
+| Idle / 0 | 112838182 | 0.5399 | 10.511 |
+| Idle / 1 | 61290544 | 0.5304 | 5.985 |
+| Idle / 2 | 25656653 | 0.4198 | 2.501 |
+| Idle / 3 | 26225458 | 0.4280 | 2.560 |
+| RX / 0 | 984104596 | 0.7258 | 99.372 |
+| RX / 1 | 977638893 | 0.8435 | 99.134 |
+| RX / 2 | 117397 | 0.4459 | 0.011 |
+| RX / 3 | 112409 | 0.4563 | 0.011 |
+
+RX receiver throughput was 948.3915 Mbps. Cycle rates track busy residency,
+rather than an invariant wall-clock rate on all harts; these observations are
+consistent with counter/clock gating during WFI on this setup. Counter and
+WFI snapshots have slightly different boundaries and include command/probe
+overhead. They independently support the near-two-core load and do not by
+themselves distinguish cache stalls, barriers, branches or execution width.
+Do not call 1-IPC a stall percentage or claim an instruction-level attribution.
+
+Diagnostic 64 MiB TCP pattern verification passed (1188 ms). Restored the
+feature-off paired control FIT 17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a;
+load hashes, gigabit boot and 64 MiB verification passed (1154 ms). No SD/SPI
+write or saveenv. Board remains on this control.
+
+Evidence uses target/mars-reference/20260916-counter-probe-* (host tests,
+checks, build/FIT, exact ELF, address-bounded instructions, sample1, integrity,
+restore logs). The capture directory contains raw ncounters/NIDLE brackets,
+iperf JSON and analysis.json. The earlier symbol-name disassembly was truncated
+at alias labels; counter-probe-instructions.txt is the complete verified range.
+This adds a diagnostic capability, not a CPU optimization; the target is open.
+
+### 2026-09-16: compact short-frame queue A/B/A (not adopted)
+
+Serial at /dev/tty.usbmodem54340134951 was revalidated with a prompt,
+background output and a command response. Software reboot and RAM FIT loading
+also worked; no additional cable/power intervention was required.
+
+Tested a complete default-off inline-wire-frames path, not merely a standalone
+message type. Native frames up to 128 bytes carried immutable stamped inline
+bytes through the ordered transmit endpoint, protocol pending retry and driver
+pending state. Larger ordinary frames used the existing bounded, recoverable
+segment pool with a distinct request kind. TSO remained in the same queue.
+Compile-time bounds limited InlineFrame to 160 bytes and Transmit to 168 bytes.
+Legacy Packet/raw endpoints were unchanged. Admission still reserved before
+serialization and cancelled unused reservations; this experiment did NOT remove
+RX-side eager TX reservations or their capability/lock costs.
+
+Tests covered bounds before serialization, session mismatch, owned bytes,
+FIFO/backpressure, pending inline retry blocking successors, revocation both
+before token serialization and while pending, large-frame fallback, stale pool
+generations, invalid lengths and interrupted serialization. Core suites passed
+4 inline + 8 existing pool + 2 transmit + 3 fallback tests. Protocol combined
+suite passed 4 unit + 41 integration tests. Disabled-feature regression passed
+4 unit + 39 protocol integration and 8 pool + 2 transmit tests. Mars RISC-V
+build and image checks passed.
+
+Candidate FIT SHA256:
+bde84b43542922a063f792a4a8e6941cabed5f3a6b4d20ef07932dc3a8a18cf6.
+Control was the previously verified feature-off FIT
+17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a.
+Every RAM load checked kernel/DTB hashes and gigabit link initialization.
+MTU 1500 RX runs were 20 seconds, two per phase; CPU is summed non-WFI
+residency without idle subtraction, not a per-function execution profile.
+
+| Phase | RX Mbps (two runs) | Active-core equivalents (two runs) |
+| --- | --- | --- |
+| Control before, 910M paced | 909.916 / 909.961 | 1.94113 / 1.94734 |
+| Inline candidate, 910M paced | 909.961 / 909.961 | 1.91506 / 1.94167 |
+| Inline candidate, unlimited | 948.452 / 948.558 | 1.99376 / 1.99434 |
+| Control after, 910M paced | 909.916 / 909.915 | 1.93902 / 1.93350 |
+
+Candidate 64 MiB patterned TCP verification passed in 1109 ms; restored control
+passed in 1166 ms. These are integrity checks, not throughput measurements.
+The paced ranges overlap and the unlimited candidate still occupies nearly two
+cores. This does not establish a repeatable CPU benefit and cannot attribute
+the remaining cost to ACK representation. The complete experiment was removed
+from active source, including its preliminary standalone type. Its patch is
+archived at target/mars-reference/20260916-inline-wire-experiment.patch;
+reverse application and clean reapplication checks passed. Prior counter and
+RX metadata diagnostics and unrelated work were preserved. No SD/SPI writes
+or saveenv; the board remains on control.
+
+Evidence: target/mars-reference/20260916-inline-* contains build/FIT logs,
+exact candidate ELF, enabled/disabled tests, integrity JSON, raw residency and
+iperf captures, and inline-wire-comparison.json. RAM boot component hash logs
+are under target/mars-acceptance/20260913-gigabit/20260916-inline-*.
+The >900 Mbps throughput threshold remains demonstrated; the <1-core effort
+objective remains unmet. Any next optimization must measure a distinct cost,
+such as eager TX reservation frequency/cost, rather than reusing this negative
+result as proof of a dominant bottleneck.
+
+### 2026-09-16: native TX lease cost sampled before optimization
+
+The preceding compact-frame A/B/A was progress (new hardware evidence), but
+provided no repeatable efficiency gain. Added default-off tx-lease-profile and
+ntxlease to measure the distinct eager-admission hypothesis before redesigning
+it. Three per-hart counters cover pooled reserve (including capability invoke
+and authority clone), Reservation cancellation (capability invoke/pool cancel),
+and publish. They count calls and sample elapsed timer ticks every 127 calls,
+with no allocation, reset, locks or printing in the sampler. Scopes are !Send
+and synchronous. Cancellation scope does not include the later implicit drop
+of Reservation fields. Counts include failure paths; fault-abandoned scopes
+need not have completed samples. Snapshots are non-transactional and maxima
+are boot-wide. Feature-off code has no hooks or counter module.
+
+Enabled protocol tests passed 4 unit + 39 integration cases; disabled tests
+passed the same suite. RISC-V build/image verification passed. Diagnostic FIT:
+a567070cd0b8c1cf7e9f70a62583f29a4b243abe39a253b6b8eb01bdaf388f82.
+RAM load checked kernel/DTB hashes and 1000 Mbps initialization. Captured one
+10-second idle interval and one 20-second MTU 1500 RX interval, with raw
+ntxlease and NIDLE brackets plus iperf JSON.
+
+RX receiver throughput was 949.029 Mbps, summed non-WFI residency 1.98758
+cores. Only logical hart 1 performed these lease operations:
+
+| RX operation | Calls | Samples | Mean sampled elapsed us | Projected elapsed seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Reserve | 494117 | 3891 | 0.896106 | 0.442781 |
+| Cancel | 494118 | 3890 | 1.033290 | 0.510567 |
+| Publish pooled request | 0 | 0 | n/a | 0 |
+
+The ordinary ACK path uses the frame queue, so zero pooled publish calls does
+not imply zero ACK transmission. Reserve/cancel differ by one because brackets
+are not atomic. Idle recorded 10110 calls each, with mean sampled reserve
+0.909375 us and cancel 1.071875 us; idle residency was 0.21908 cores.
+
+Scaling the RX means by calls gives about 0.95335 elapsed seconds over the
+roughly 20-second workload (~0.048 core). This is a sampling estimate, not an
+exclusive-cycle total, a guaranteed saving, or an upper bound: it includes
+interrupt/lock delay, excludes some destruction/instrumentation costs, and may
+miss sampling correlations or cache effects. Nevertheless these measurements
+do not support prioritizing eager TX lease removal as an explanation for the
+roughly one-core gap. No admission or ownership semantics were changed.
+
+Evidence: target/mars-reference/20260916-tx-lease-* includes tests, build/FIT,
+exact ELF, boot logs and integrity reports. The capture directory has raw
+before/after counters, CPU brackets, iperf JSON, host timing and analysis.json;
+analyze-tx-lease.py validates sample declarations, nonnegative deltas and sample
+count consistency. This is diagnostic evidence, not a CPU optimization.
+
+Diagnostic 64 MiB pattern verification passed (1147 ms). Restored control FIT
+17fb3a5fd2459ac6d2aa30a873266b2adfddb3e5a122e893144b54ed9bd73d6a;
+component hashes, gigabit boot and restored 64 MiB verification passed (1114 ms).
+Board remains on this feature-off control. No SD/SPI writes or saveenv. The
+sampler remains default-off for future diagnostics; <1-core goal remains open.
+
+### 2026-09-16: MSS diagnostic exposed an iperf setup recovery defect
+
+Attempted a constant-300-Mbps MSS sweep to distinguish packet-rate costs from
+byte-transfer costs. Added an explicit --mss option to mars-residency-bench.py,
+recorded as requested_mss separately from observed sizes. On this macOS host,
+iperf3 -M 1460 fails with "unable to set TCP/SCTP MSS: Invalid argument" before
+creating its data stream. Thus target/mars-reference/20260916-mss-sweep contains
+NO valid MSS performance comparison. An existing Linux container could not
+connect to the board; its connection timed out and no matching traffic was seen
+on en13 during that attempt. The temporary capture was stopped and verified
+absent. A subsequent native 64 MiB TCP verification passed (1155 ms). No host
+MTU change, container install, or prepared board MSS source edit was performed.
+The later capture includes that native integrity traffic and must not be
+misrepresented as container traffic.
+
+The failed native -M connection exposed a real service problem: a subsequent
+ordinary iperf run timed out after 50 seconds, while the independent TCP service
+remained usable. AcceptData checked only data accept; it never read an abandoned
+control connection, and setup phases had no deadline. This can permanently
+occupy the single supported iperf session after a client-side setup failure.
+
+Fixed components/iperf3-server: AcceptData and DataCookie now observe control
+EOF/termination/unexpected input. AcceptData accepts first so cleanup can reset
+an already-arrived data stream too. ControlCookie, Parameters, AcceptData and
+DataCookie share a 10-second deadline starting at control acceptance. The idle
+listener has no setup deadline; running-test timing/payload work are unchanged.
+Existing task error handling resets both held tokens and creates a fresh server.
+Tests cover EOF and CLIENT_TERMINATE during both stream setup phases, reset of
+both connections and acceptance of the next client, each silent setup phase at
+the deadline boundary, and unlimited idle acceptance. Both default and
+event-driven suites passed 8 tests; RISC-V build/image verification passed.
+
+RAM FIT SHA256:
+523347fa705950ba8a5aaab74d433f4c98b8d3d7a5c12b461071d642f73242a1.
+Component hashes and gigabit link initialization passed. Twice reproduced the
+same expected native -M failure on the fixed firmware and immediately followed
+it with an ordinary 5-second iperf run: 945.443 and 946.229 Mbps. A connection
+sending only a partial control cookie was reset after 10.007 seconds; the next
+ordinary test delivered 946.205 Mbps. The harness asserts the expected client
+error, successful following byte counts and bounded silent-connection reset.
+These are service-recovery tests, not a new CPU efficiency claim.
+
+Evidence: target/mars-reference/20260916-iperf-setup-* contains tests, exact ELF,
+build/FIT/load logs, raw recovery client JSON, recovery summary and integrity.
+The 64 MiB patterned TCP verification passed (1128 ms). The abandoned MSS
+sweep and container connectivity evidence remain under 20260916-mss-* and
+20260916-linux-mss; no packet-vs-byte cost conclusion can be drawn from them.
+
+Post-fix MTU 1500, 1000baseT full-duplex tests (20 seconds each, alternating
+RX/TX) gave:
+
+| Run | Receiver Mbps | Summed non-WFI core equivalents |
+| --- | ---: | ---: |
+| RX 1 | 948.862 | 1.99529 |
+| TX 1 | 946.416 | 1.91371 |
+| RX 2 | 949.006 | 1.99548 |
+| TX 2 | 897.549 | 1.82842 |
+
+The low TX run is preserved: its first second was ~7.2 Mbps, second ~913.2,
+third ~943.0, and subsequent intervals ~947 Mbps. Do not remove that startup
+interval or reinterpret the lower CPU as efficiency. No packet capture yet
+attributes this startup stall to TCP, host, DMA or scheduling.
+
+A requested TX repeat did NOT run: the initial quiet command timed out with
+zero serial bytes. Follow-up tty and cu probes at 115200 both produced zero
+bytes, no other process held the serial port, and three ICMP probes timed out.
+en13 remained active at MTU 1500, 1000baseT full duplex; the USB UART device
+still existed and modem bits were 0x6. These observations do not prove a cable
+fault or a kernel root cause. A software reboot/capture was started and physical
+RESET requested. Last loaded firmware is the above setup-fix RAM FIT, but it
+cannot currently be described as responsive or stability-qualified. The single
+low TX run, later loss of responsiveness and <1-core target remain unresolved.
+No SD/SPI write, saveenv, or smoltcp MSS edit occurred in this turn.
+
+### 2026-09-16: preserve serial diagnostics throughout performance tests
+
+The previous reset capture was polled to completion: exit 0, 180-second window,
+0 captured bytes. A fresh five-second serial probe also returned zero bytes
+with no other reader. No physical RESET acknowledgement has arrived. The UART
+has been released; no capture process is being described as still live.
+
+Source review found an evidence-loss path in mars-residency-bench.py: it blocked
+in subprocess.run throughout iperf and called tcflush(TCIFLUSH) before the next
+serial command. Unsolicited panic/fault messages could therefore be discarded.
+This does NOT establish that any panic actually occurred in the previous run.
+
+The benchmark now uses a single serial reader while polling its exact iperf
+child, during idle measurements, and between tests. Raw bytes are flushed to
+serial-full.log; command preamble bytes are preserved before starting the reply
+boundary instead of being discarded. A 16 MiB limit bounds capture size. Client
+stdout/stderr are written directly to files, retaining partial output on timeout.
+Every workload exit kills/reaps its own child if still running. Summary errors
+include the exception type/message; UART attributes and descriptor are restored
+and released on failure. No concurrent serial-reader thread is introduced.
+
+Four host PTY tests passed: pre-command fault preservation without treating its
+prompt as a fresh reply; asynchronous diagnostic retention while a client fails;
+timeout retention of partial outputs plus child reaping; and idle diagnostics.
+Python compilation and diff checks passed. Evidence is
+ target/mars-reference/20260916-residency-capture-tests-final.log.
+These tests qualify the collector behavior only, not board stability or CPU
+performance. A fresh physical capture after RESET is still required to locate
+the TX startup stall and subsequent loss of response. The goal remains open.
+
+Recovery blocking audit: on the third consecutive goal turn with the same
+unresponsive-board condition, a fresh five-second serial probe again captured
+zero bytes with no competing reader. Three fresh ICMP probes received no replies;
+en13 remained active at MTU 1500 / 1000baseT full duplex. Both probe processes
+completed and released their resources. Evidence is
+ target/mars-reference/20260916-blocked-audit3-serial.log plus the tool output.
+The prior turn completed the remaining collector repair and host tests. Further
+hardware attribution and optimization validation now require physical RESET or
+another external recovery; no response has acknowledged that action. The goal
+is blocked, not complete. Resume with boot capture, verify the actual image,
+and reproduce the TX startup stall with continuous serial/packet evidence
+before making further performance changes.
+
+### 2026-09-16: user RESET restored service; repeat with preserved serial output
+
+After the user's ready reply, serial returned a usable vibe prompt (preceded by
+uninterpreted buffered bytes). Software reboot worked. Reloaded setup-fix FIT
+523347fa705950ba8a5aaab74d433f4c98b8d3d7a5c12b461071d642f73242a1
+into RAM; verified both component hashes and 1000 Mbps initialization. This
+restores test access, not proof of the previous unresponsive condition's cause.
+
+Using the repaired continuous serial collector, two 20-second TX runs delivered
+946.391 / 947.355 Mbps, with non-WFI residency 1.90640 / 1.91007 cores. A bounded
+128-byte-snaplen host capture recorded 250000 packets and reported zero kernel
+capture drops. The first TX data stream prefix spans 2.756659 seconds with
+226911 board data packets; the parser reported no retransmission/zero-window
+flags and a maximum host-observed inter-data gap of 1.45793 ms. These are
+Wireshark heuristics at a host capture point, not proof of exact wire timing or
+absence of loss outside that prefix. The prior 897.549 Mbps startup-stall sample
+remains valid evidence and is not superseded by these normal repeats.
+
+No panic/fatal/fault/stopped/timeout text was found in the TX continuous log.
+A subsequent 30-second serial observation retained a valid NIDLE response and
+the next benchmark could issue commands normally. Two 20-second RX runs then
+delivered 948.47 / 947.85 Mbps; exact values and residency are recorded in
+ target/mars-reference/20260916-ready-resume-summary.json.
+Final 64 MiB patterned TCP verification passed (1129 ms). The additional host
+serial polling can extend the CPU bracket by up to approximately 100 ms after
+client completion; small differences from earlier residency runs are not an
+optimization result. RX remains close to two core equivalents.
+
+Artifacts: 20260916-ready-resume-* RAM/reboot logs; 20260916-ready-tx/ contains
+raw pcap, tcpdump completion/drops, parser output, bounded prefix summary, iperf
+JSON and serial-full.log; 20260916-ready-rx/ contains the RX measurements and
+continuous serial log. The packet-capture supervisor and benchmark processes
+completed normally and the serial port is released. Board remains on the
+setup-fix RAM image; no SD/SPI writes or saveenv. The goal is active again.
+The earlier loss of responsiveness and TX startup stall are not reproduced or
+root-caused; <1-core efficiency and long stability qualification remain open.
+
+### 2026-09-16: controlled packetization comparison at fixed byte rate
+
+Completed the previously blocked MSS experiment using board SYN advertisement,
+not macOS -M. Baseline and restored image were the setup-fix FIT
+523347fa705950ba8a5aaab74d433f4c98b8d3d7a5c12b461071d642f73242a1.
+A diagnostic-only build changed the SYN MSS expression to min(calculated,536)
+and nothing about interface MTU, receive capacity, payload copying, scheduling
+or GRO limits. Its FIT SHA256 was
+1cb41fd4cbf65a7c6a92f7a9aa5f4fea5f279fda9e23730dfeffab70056673e6.
+The one-line source change was undone immediately after compilation; the full
+TCP source SHA256 matches its pre-experiment value, preserving prior submodule
+work. All RAM loads checked component hashes and gigabit initialization.
+This is a diagnostic artifact, not a production configuration or SD image.
+
+Each phase used two 20-second host-to-board tests paced at 300 Mbps, the same
+continuous serial collector, with no idle subtraction. Interface MTU remained
+1500. iperf reported MSS 1460 / 536 / 1460 across the three phases. The small-MSS
+host capture contains both SYN pairs: host advertises 1460 and board 536. Among
+captured host data packets, 239943 had 536-byte payload, 970 had 288 bytes, and
+all remaining payloads were smaller; none exceeded 536. The capture stopped at
+250000 packets and reported zero kernel drops. These are host capture facts,
+not a full-run loss qualification.
+
+| Phase | RX Mbps (two runs) | Non-WFI core equivalents (two runs) |
+| --- | --- | --- |
+| Normal MSS before | 299.983 / 299.983 | 0.86048 / 0.85072 |
+| MSS 536 diagnostic | 299.983 / 299.983 | 1.21597 / 1.22829 |
+| Normal MSS restored | ~299.98 / ~299.97 | mean 0.86082 |
+
+GRO counter deltas bracket both tests and include idle/control traffic:
+
+| Phase | RX frames | Merged segments | Aggregates |
+| --- | ---: | ---: | ---: |
+| Normal before | 1030012 | 929024 | 99112 |
+| MSS 536 | 2804201 | 2577283 | 211125 |
+| Normal restored | 1030010 | 928608 | 99260 |
+
+At unchanged byte rate, small MSS raises frame count about 2.72x and aggregate
+count about 2.13x; CPU rises from about 0.86 to 1.22 cores. Both active harts
+increase (driver/application hart and protocol hart). This reproducible response
+supports measuring packet and aggregation/handoff-frequency costs together.
+It is NOT a pure cycles-per-packet model: MSS also changes ACK behavior, GRO
+sizes, copying granularity/cache behavior, and application delivery frequency.
+It does not isolate a driver bottleneck or justify claiming copies are irrelevant.
+Do not extrapolate this one operating point into a promised full-rate CPU saving.
+
+Small-MSS 64 MiB pattern verification passed (1261 ms), as did restored normal
+MSS (1118 ms). Board remains responsive on the setup-fix normal-MSS RAM image;
+no SD/SPI writes or saveenv. Temporary source edits are gone. The staged mss536
+FIT and archived ELF are explicitly diagnostic, and must not be used for SD
+release packaging. Rebuild the normal source for any new release artifact.
+
+Evidence: target/mars-reference/20260916-mss2-* contains A/B/A raw iperf and CPU
+brackets, serial-full.log, GRO snapshots, packet-length/SYN extraction, pcap,
+exact-source restoration hash, integrity JSON and mss2-analysis.json. Diagnostic
+build/FIT/ELF/RAM logs use 20260916-mss536-*. This adds causal packetization
+comparison evidence, not an optimization; <1-core and stability goals remain open.

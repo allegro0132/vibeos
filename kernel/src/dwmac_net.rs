@@ -906,7 +906,58 @@ fn driver_turn(
         now
     } else { 0 };
 
-    #[cfg(feature = "pooled-rx")]
+    #[cfg(feature = "rx-publish-batch")]
+    {
+        let mut budget = DRIVER_BATCH_PACKETS;
+        while budget != 0 {
+            let state = CONTROL.lock();
+            if pending_rx_batch.remaining() == 0 {
+                #[cfg(feature = "driver-stage-profile")]
+                let hw_started = if sample_stage { crate::sbi::time() } else { 0 };
+                let tickets = engine.receive_batch().map_err(|_| NetError::DriverFault)?;
+                let count = tickets.iter().flatten().count();
+                #[cfg(feature = "driver-stage-profile")]
+                if sample_stage {
+                    stage[3] += crate::sbi::time().wrapping_sub(hw_started);
+                    stage[4] += count as u64;
+                    if count == 0 { stage[7] += 1; }
+                }
+                if count == 0 { break; }
+                immediate_work = true;
+                let Some(stamp) = state.sessions.active_stamp() else {
+                    for ticket in tickets.into_iter().flatten() { engine.discard_ticket(ticket); }
+                    STALE_INGRESS_DROPS.fetch_add(count as u64, Ordering::Relaxed);
+                    budget = budget.saturating_sub(count); continue;
+                };
+                *pending_rx_batch = vibeos_core::net_receive::StampedBatch::new(tickets, stamp);
+            }
+            if pending_rx_batch.stamp() != state.sessions.active_stamp() {
+                while budget != 0 {
+                    let Some(frame) = pending_rx_batch.pop() else { break; };
+                    engine.discard_ticket(frame.ticket());
+                    STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed); budget -= 1;
+                }
+                continue;
+            }
+            let wanted = pending_rx_batch.remaining().min(budget);
+            let sent = match inbound.try_with(|q| q.try_send_batch(pending_rx_batch, budget)) {
+                Ok(sent) => sent,
+                Err(_) => {
+                    while let Some(frame) = pending_rx_batch.pop() { engine.discard_ticket(frame.ticket()); }
+                    return Err(NetError::AuthorityRevoked);
+                }
+            };
+            budget -= sent; immediate_work = true;
+            #[cfg(feature = "driver-stage-profile")]
+            if sample_stage { stage[5] += sent as u64; }
+            if sent < wanted {
+                #[cfg(feature = "driver-stage-profile")]
+                if sample_stage { stage[6] += 1; }
+                break;
+            }
+        }
+    }
+    #[cfg(all(feature = "pooled-rx", not(feature = "rx-publish-batch")))]
     for _ in 0..DRIVER_BATCH_PACKETS {
         let state = CONTROL.lock();
         let frame = if let Some(frame) = pending_rx.take().or_else(|| pending_rx_batch.pop()) {

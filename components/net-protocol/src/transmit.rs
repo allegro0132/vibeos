@@ -36,6 +36,8 @@ impl PacketTransmit {
         match self {
             Self::Raw(_) => Ok(None),
             Self::Pooled { authority, domain } => {
+                #[cfg(feature = "tx-lease-profile")]
+                let _sample = vibeos_core::tx_lease_profile::Scope::enter(0);
                 let ticket = authority.try_with(|q|q.pool().reserve(stamp,*domain))
                     .map_err(|_|ReserveError::Revoked)?.map_err(ReserveError::Pool)?;
                 Ok(Some(Reservation { authority: authority.clone(), ticket: Some(ticket), stamp, frames: 0 }))
@@ -55,6 +57,8 @@ pub(crate) struct Reservation {
 #[cfg(feature = "native-tcp-segmentation")]
 impl Reservation {
     pub(crate) fn publish(&mut self) -> Result<bool,ReserveError> {
+        #[cfg(feature = "tx-lease-profile")]
+        let _sample = vibeos_core::tx_lease_profile::Scope::enter(2);
         let ticket=self.ticket.expect("live reservation");
         let result=self.authority.try_with(|q|q.publish(ticket,self.stamp))
             .map_err(|_|ReserveError::Revoked)?.map_err(ReserveError::Pool)?;
@@ -65,6 +69,8 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if let Some(ticket)=self.ticket.take() {
+            #[cfg(feature = "tx-lease-profile")]
+            let _sample = vibeos_core::tx_lease_profile::Scope::enter(1);
             // A revoked/faulted owner is retired by the supervisor's pool hook;
             // local cleanup never bypasses revoked authority.
             let _=self.authority.try_with(|q|q.pool().cancel(ticket,self.stamp));

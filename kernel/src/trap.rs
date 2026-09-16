@@ -259,6 +259,9 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
     #[cfg(feature = "wasmtime-async")]
     if unsafe { recover_bad_stack_probe(scause, sepc, _frame) } { return; }
 
+    #[cfg(feature = "counter-probe")]
+    if unsafe { crate::counter_probe::recover(scause, sepc, _frame) } { return; }
+
     let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1usize << 63);
 

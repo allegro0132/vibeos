@@ -98,6 +98,9 @@ pub enum Direction {
 /// Errors may leave DMA active and must not release storage. Tail pointers use
 /// the same 32-bit address domain as Layout; RX tail names the last returned slot.
 pub unsafe trait Backend {
+    /// Monotonic diagnostic timer only; software models may leave it at zero.
+    #[cfg(feature = "rx-stage-profile")]
+    fn profile_ticks(&mut self) -> u64 { 0 }
     /// Read-only diagnostics; implementations must not acknowledge or reset DMA.
     fn diagnostics(&mut self) -> Option<crate::controller::DmaDiagnostics> { None }
     fn mmc_tx_counters(&mut self) -> Option<crate::controller::MmcTxCounters> { None }
@@ -340,86 +343,117 @@ impl<B: Backend> Ring<B> {
     pub fn receive_detached_batch<const D: usize, const N: usize>(
         &mut self, buffers: &mut impl crate::rx_buffers::Access<D, N>,
     ) -> Result<[Option<Detached>; RX_BATCH], Error> {
-        self.running()?;
-        let mut output = [None; RX_BATCH];
-        let limit = RX_BATCH.min(D);
-        let (identity, slots) = buffers.with(|b| {
-            (b.identity(), core::array::from_fn::<_, RX_BATCH, _>(|i|
-                if i < limit { b.descriptor_buffer((self.receive + i) % D) } else { None }))
-        }).map_err(|_| Error::Controller)?;
-        if self.rx_pool != Some(identity) || D != self.layout.count { return Err(Error::Controller); }
-        let mut words = [[0; 4]; RX_BATCH];
-        let mut lengths = [0; RX_BATCH];
-        let mut ready = 0;
-        for i in 0..limit {
-            let index = (self.receive + i) % D;
-            words[i] = self.snapshot(true, index);
-            match descriptor::rx_complete(words[i], BUFFER) {
-                Ok(Some(bytes)) => lengths[i] = bytes,
-                Ok(None) => break,
-                Err(_) if i == 0 => {
-                    // Preserve the established malformed-frame drain semantics.
-                    output[0] = self.receive_detached_scoped(buffers)?;
-                    return Ok(output);
-                }
-                Err(_) => break, // Return valid prefix; drain this on next call.
-            }
-            let complete = (1 << 29) | (1 << 28) | (1 << 26);
-            if words[i][3] & (descriptor::OWN | (1 << 30) | complete) == complete {
-                self.backend.barrier();
-                words[i][1] = self.backend.read_word(self.layout.desc(true, index), 1);
-            }
-            if slots[i].is_none() { return Err(Error::Controller); }
-            ready += 1;
-        }
-        if ready == 0 { return Ok(output); }
-        // Preserve prepare's visibility precondition for every candidate.
-        for i in 0..ready {
-            let address = self.layout.buffer(true, slots[i].unwrap());
-            self.backend.for_cpu(address, lengths[i].div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
-        }
-        let mut prepared = [const { None }; RX_BATCH];
-        let mut reused = [false; RX_BATCH];
-        let reserved = buffers.with(|b| {
-            let mut count = 0;
-            for i in 0..ready {
-                match unsafe { b.prepare((self.receive + i) % D) } {
-                    Ok(p) => {
-                        reused[i] = b.reused(p.replacement());
-                        prepared[i] = Some(p);
-                        count += 1;
+        #[cfg(feature = "rx-stage-profile")]
+        let mut profile = rx_stage_profile::Sample::new();
+        #[cfg(feature = "rx-stage-profile")]
+        if profile.sampled { profile.start(self.backend.profile_ticks()); }
+        let result = (|| {
+            self.running()?;
+            let mut output = [None; RX_BATCH];
+            let limit = RX_BATCH.min(D);
+            let (identity, slots) = buffers.with(|b| {
+                (b.identity(), core::array::from_fn::<_, RX_BATCH, _>(|i|
+                    if i < limit { b.descriptor_buffer((self.receive + i) % D) } else { None }))
+            }).map_err(|_| Error::Controller)?;
+            if self.rx_pool != Some(identity) || D != self.layout.count { return Err(Error::Controller); }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
+            let mut words = [[0; 4]; RX_BATCH];
+            let mut lengths = [0; RX_BATCH];
+            let mut ready = 0;
+            for i in 0..limit {
+                let index = (self.receive + i) % D;
+                words[i] = self.snapshot(true, index);
+                match descriptor::rx_complete(words[i], BUFFER) {
+                    Ok(Some(bytes)) => lengths[i] = bytes,
+                    Ok(None) => break,
+                    Err(_) if i == 0 => {
+                        // Preserve the established malformed-frame drain semantics.
+                        output[0] = self.receive_detached_scoped(buffers)?;
+                        return Ok(output);
                     }
-                    Err(crate::rx_buffers::Error::Full) => break,
-                    Err(error) => return Err(error),
+                    Err(_) => break, // Return valid prefix; drain this on next call.
                 }
+                let complete = (1 << 29) | (1 << 28) | (1 << 26);
+                if words[i][3] & (descriptor::OWN | (1 << 30) | complete) == complete {
+                    self.backend.barrier();
+                    words[i][1] = self.backend.read_word(self.layout.desc(true, index), 1);
+                }
+                if slots[i].is_none() { return Err(Error::Controller); }
+                ready += 1;
             }
-            Ok(count)
-        });
-        let count = match reserved {
-            Ok(Ok(count)) => count,
-            _ => { self.fault(); return Err(Error::Controller); }
-        };
-        if count == 0 { return Err(Error::Full); }
-        for i in 0..count {
-            let index = (self.receive + i) % D;
-            let replacement = prepared[i].as_ref().unwrap().replacement();
-            self.arm_rx_buffer(index, self.layout.buffer(true, replacement), reused[i]);
-            // Keep established per-descriptor tail ordering for this first batch
-            // implementation. Metadata batching does not change MMIO semantics.
-            self.backend.tail(true, self.layout.desc(true, index));
-        }
-        let published = buffers.with(|b| {
+            if ready == 0 { return Ok(output); }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
+            // Preserve prepare's visibility precondition for every candidate.
+            for i in 0..ready {
+                let address = self.layout.buffer(true, slots[i].unwrap());
+                self.backend.for_cpu(address, lengths[i].div_ceil(STRIDE) * STRIDE, Direction::FromDevice);
+            }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
+            let mut prepared = [const { None }; RX_BATCH];
+            let mut reused = [false; RX_BATCH];
+            let reserved = buffers.with(|b| {
+                let mut count = 0;
+                for i in 0..ready {
+                    match unsafe { b.prepare((self.receive + i) % D) } {
+                        Ok(p) => {
+                            reused[i] = b.reused(p.replacement());
+                            prepared[i] = Some(p);
+                            count += 1;
+                        }
+                        Err(crate::rx_buffers::Error::Full) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(count)
+            });
+            let count = match reserved {
+                Ok(Ok(count)) => count,
+                _ => { self.fault(); return Err(Error::Controller); }
+            };
+            if count == 0 { return Err(Error::Full); }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
             for i in 0..count {
-                let p = prepared[i].take().unwrap();
-                b.mark_prepared(p.replacement());
-                let ticket = unsafe { b.publish(p) }?;
-                output[i] = Some(Detached { ticket, bytes: lengths[i], checksum: descriptor::rx_checksum(words[i]) });
+                let index = (self.receive + i) % D;
+                let replacement = prepared[i].as_ref().unwrap().replacement();
+                self.arm_rx_buffer(index, self.layout.buffer(true, replacement), reused[i]);
+                #[cfg(not(feature = "rx-tail-batch"))]
+                self.backend.tail(true, self.layout.desc(true, index));
             }
-            Ok::<_, crate::rx_buffers::Error>(())
-        });
-        if !matches!(published, Ok(Ok(()))) { self.fault(); return Err(Error::Controller); }
-        self.receive = (self.receive + count) % D;
-        Ok(output)
+            #[cfg(feature = "rx-tail-batch")]
+            {
+                // Every replacement's fields, OWN and DMA visibility barrier have
+                // completed. Notify once with the same final address as the scalar
+                // path, including wrapped and partially replenished batches. Do not
+                // change the controller's existing tail-address convention here.
+                let last = (self.receive + count - 1) % D;
+                self.backend.tail(true, self.layout.desc(true, last));
+            }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
+            let published = buffers.with(|b| {
+                for i in 0..count {
+                    let p = prepared[i].take().unwrap();
+                    b.mark_prepared(p.replacement());
+                    let ticket = unsafe { b.publish(p) }?;
+                    output[i] = Some(Detached { ticket, bytes: lengths[i], checksum: descriptor::rx_checksum(words[i]) });
+                }
+                Ok::<_, crate::rx_buffers::Error>(())
+            });
+            if !matches!(published, Ok(Ok(()))) { self.fault(); return Err(Error::Controller); }
+            #[cfg(feature = "rx-stage-profile")]
+            if profile.sampled { profile.next(self.backend.profile_ticks()); }
+            self.receive = (self.receive + count) % D;
+            Ok(output)
+        })();
+        #[cfg(feature = "rx-stage-profile")]
+        if profile.sampled {
+            profile.finish(self.backend.profile_ticks(), result.as_ref().map(|a| a.iter().flatten().count()).ok());
+        }
+        result
     }
 
     fn publish(&mut self, address: u64, words: [u32; 4], prepare_visibility: bool) {
@@ -732,4 +766,64 @@ pub struct Detached {
     pub ticket: crate::rx_buffers::Ticket,
     pub bytes: usize,
     pub checksum: descriptor::RxChecksum,
+}
+
+/// Opt-in cumulative batch phase times; read between traffic runs. These nested
+/// elapsed scopes include interrupts and lock waits, not exclusive CPU time.
+#[cfg(feature = "rx-stage-profile")]
+pub mod rx_stage_profile {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static COUNTERS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+    pub fn snapshot() -> [u64; 13] { COUNTERS.each_ref().map(|c| c.load(Ordering::Relaxed)) }
+    pub(super) struct Sample { pub sampled: bool, phase: usize, last: u64, ticks: [u64; 7] }
+    impl Sample {
+        pub fn new() -> Self {
+            Self { sampled: COUNTERS[0].fetch_add(1, Ordering::Relaxed) % 131 == 0,
+                phase: 0, last: 0, ticks: [0; 7] }
+        }
+        pub fn start(&mut self, now: u64) { self.last = now; }
+        pub fn next(&mut self, now: u64) {
+            self.ticks[self.phase] += now.wrapping_sub(self.last);
+            self.last = now; self.phase += 1;
+        }
+        pub fn finish(mut self, now: u64, frames: Option<usize>) {
+            self.ticks[self.phase] += now.wrapping_sub(self.last);
+            COUNTERS[1].fetch_add(1, Ordering::Relaxed);
+            for (counter, ticks) in COUNTERS[2..9].iter().zip(self.ticks) { counter.fetch_add(ticks, Ordering::Relaxed); }
+            let outcome = match frames { Some(0) => 11, Some(n) => { COUNTERS[9].fetch_add(n as u64, Ordering::Relaxed); 10 }, None => 12 };
+            COUNTERS[outcome].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "rx-stage-profile"))]
+mod rx_stage_profile_tests {
+    // One test owns the module's counters in this unit-test process. Integration
+    // tests execute separately and exercise ring errors with profiling enabled.
+    #[test]
+    fn sampled_phases_include_early_exits_and_timer_wrap() {
+        use super::rx_stage_profile::{Sample, snapshot};
+        let before = snapshot();
+        // Force known samples without making timing depend on the global cadence.
+        for outcome in [Some(3), Some(0), None] {
+            let mut sample = Sample::new();
+            sample.sampled = true;
+            sample.start(u64::MAX - 1);
+            for now in 0..6 { sample.next(now); }
+            sample.finish(6, outcome);
+        }
+        let after = snapshot();
+        let delta: [u64; 13] = core::array::from_fn(|i| after[i] - before[i]);
+        assert_eq!(delta, [3, 3, 6, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1]);
+        for phase in 0..7 {
+            let before = snapshot();
+            let mut sample = Sample::new(); sample.sampled = true; sample.start(0);
+            for i in 0..phase { sample.next((i + 1) as u64); }
+            sample.finish((phase + 1) as u64, None);
+            let after = snapshot();
+            assert_eq!(after[1] - before[1], 1);
+            assert_eq!(after[12] - before[12], 1);
+            for i in 0..7 { assert_eq!(after[2+i] - before[2+i], u64::from(i <= phase)); }
+        }
+    }
 }

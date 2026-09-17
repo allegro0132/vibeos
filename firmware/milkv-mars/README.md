@@ -76,3 +76,33 @@ or entropy command and preserves epoch zero for kernel startup. The existing
 installed owner before stopping it. Both modes remain `DiagnosticOnly` at HAL
 discovery; neither enables production entropy or SSH. Complete SEC ownership
 handoff and physical source qualification are still required.
+
+## Recovering boot output after a serial reconnect
+
+Run `bootlog` at the `vibe>` prompt to retrieve the current boot's retained
+output. The kernel records output before writing it to UART. The journal keeps
+the first 32 KiB, without allocating or locking on the writer path; once full,
+it preserves the boot prefix and reports `truncated=true`. Reading the journal
+does not consume it or append another copy. Shell input is not recorded.
+
+For a bounded capture on the host (choose a new output filename each time):
+
+```sh
+python3 scripts/mars-serial-command.py \
+  --serial /dev/cu.usbmodem54340134951 \
+  --command bootlog --expect BOOTLOG_END --seconds 15 \
+  --output /tmp/mars-bootlog.serial
+```
+
+`BOOTLOG_BEGIN` includes `entry_ticks`, `now_ticks`, `hz`, retained byte count,
+capacity and truncation status. `(now_ticks - entry_ticks) / hz` estimates time
+since kernel entry. Compare captures before and after a serial reconnect for
+continuity; entry ticks alone are not a unique boot identifier. A repeated log
+with advancing time supports continuity, but does not by itself diagnose a
+previous CPU hang or serial adapter failure.
+
+Storage is RAM only: resetting or removing board power discards the previous
+boot's journal. SPL, OpenSBI and U-Boot output precedes kernel recording and
+requires host serial capture. A completely unresponsive kernel cannot serve
+`bootlog`; capture it once access returns, before rebooting if possible. This
+facility adds no SD writes to the network test path.

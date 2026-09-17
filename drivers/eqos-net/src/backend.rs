@@ -84,6 +84,8 @@ impl<R: Io, M: Memory> Backend<R, M> {
 // pool admission. Controller config never starts DMA, and reset/stop only succeed
 // after the bounded SWR and disabled-enable readback checks.
 unsafe impl<R: Io, M: Memory> ring::Backend for Backend<R, M> {
+    #[cfg(feature = "rx-stage-profile")]
+    fn profile_ticks(&mut self) -> u64 { self.controller.profile_ticks() }
     fn flow_diagnostics(&mut self) -> Option<[u32; 4]> { Some(self.controller.flow_diagnostics()) }
     fn mmc_tx_counters(&mut self) -> Option<crate::controller::MmcTxCounters> {
         self.controller.mmc_tx_counters()

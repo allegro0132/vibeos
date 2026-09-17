@@ -4446,3 +4446,736 @@ that it caused every earlier loss of UART AND network responsiveness; continuous
 capture had also failed on the old baseline. No kernel hang fix is claimed.
 Evidence: 20260917-serial-{line-settings,held-settings,held-validation}.json and
 20260917-serial-held-bootlog{,2}.log in target/mars-reference/.
+
+### One-connection serial diagnostic sessions
+
+`scripts/mars-serial-command.py` now exposes `SerialSession` and `--sequence`
+(JSON command/expect steps and passive collect_seconds steps). It configures
+115200/no-HUPCL once, retains one FD and raw capture between commands, and
+restores saved settings only at session end. Existing single-command callers
+remain compatible. Stale buffered bytes are retained in the raw log but cannot
+satisfy a new command marker. Capture, response and sequence duration are bounded;
+invalid sequences are rejected before opening the port. Use one reader/owner.
+
+Five host tests passed, including same-FD commands/passive diagnostics, stale
+markers, timeout capture and upfront sequence validation. On macOS, the kernel
+can set PENDIN when restoring canonical mode with buffered input; the test checks
+the exact restoration argument and masks only that kernel-maintained readback
+flag. Evidence: 20260917-serial-session-tests-final2.log.
+
+Live sequence: bootlog, three 60-second passive captures each followed by nidle,
+then bootlog. All commands completed on one connection. Both bootlog responses
+were ASCII, retained entry_ticks=412768029, and advanced 182.3184915 seconds;
+bytes grew from24406 to28183 with the original prefix intact, no truncation and
+no recursive dump markers. Passive captures received1143/1148/1145 bytes and
+all three NIDLE_END markers arrived. Two concurrent ICMP probes also succeeded.
+Evidence under target/mars-reference/: 20260917-session-liveness-{steps.json,
+raw.log,results.jsonl,validation.json,ping.log}. This validates the diagnostic
+transport workflow; it does not establish a cause or cure for previous failures.
+
+### Bootlog baseline residency and load-exit check (2026-09-17)
+
+With the f8be52ec bootlog RAM image, one continuously open serial session ran
+idle10s, RX20s, idle30s, RX20s, TX20s, idle30s. RX measured949.092/949.003Mbps
+with total resident occupancy1.98969/1.99583 cores; TX947.097Mbps with1.91501
+cores. Idle totals were0.20813 initially,0.21853 after RX and0.22265 after TX.
+No idle subtraction is applied to loaded occupancy. Host en13 remained MTU1500,
+1000baseT full-duplex. All NIDLE_END replies and final bootlog completed.
+
+Both bootlog snapshots retained entry_ticks=412768029, with133.60850625 seconds
+between snapshots. During this run the bounded journal reached32768 bytes and
+correctly reported truncated=true; this preserves the boot prefix and does not
+indicate a fault. These short tests establish that the logging baseline still
+reaches gigabit throughput and remains near two active cores; they neither meet
+the one-core effort target nor explain previous intermittent loss of liveness.
+Evidence: target/mars-reference/20260917-bootlog-residency/, with the exact helper
+in target/mars-reference/20260917-bootlog-residency.py.
+
+### Atomic-ID experiment with boot logging: paired hardware result
+
+Rebuilt the same optimized bootlog baseline plus only gro-atomic-id. Build and
+ELF/image checks passed; ordinary ethernet feature selection was restored after
+packaging. Candidate FIT74b48b31172e07b30067d9d770d4bd5d0bc92f2b05adb14a5d703731a8c21d81
+is target/mars-boot-20260917-bootlog-atomic/out/artifacts/vibeos.itb. The exact ELF
+and feature map are archived under target/mars-reference/20260917-bootlog-atomic.elf
+and bootlog-atomic-features.json. RAM boot verified component hashes and1Gbps.
+
+The same idle/RX/idle/RX/TX/idle sequence measured candidate RX948.999/949.098Mbps
+at1.99004/1.98674 resident cores, versus baseline949.092/949.003Mbps at
+1.98969/1.99583 cores. Candidate TX946.189Mbps used1.89165 cores, versus
+947.097Mbps at1.91501 for baseline; this isolated TX difference is not an RX
+optimization result. All liveness queries completed. Independent64MiB TCP
+application byte verification passed (67108864 bytes confirmed, not a throughput
+benchmark). These short tests show no material full-rate RX residency improvement;
+they do not measure actual candidate GRO group sizes or prove that an individual
+pipeline stage consumes fewer cycles. Keep the feature default-off.
+
+Evidence: 20260917-bootlog-atomic-{build.log,package.log,residency/,integrity.json,
+comparison.json,ramboot/} in target/mars-reference/. After testing, the exact
+f8be52ec bootlog baseline was RAM-restored; both image hashes, readiness,1Gbps
+and bootlog readback passed (20260917-bootlog-atomic-restore/). No SD/SPI writes.
+
+Restored baseline RX repeats measured 948.695Mbps at1.98576 cores, 948.855Mbps at1.99056 cores. These overlap candidate occupancy and confirm no observed benefit in this
+comparison. Evidence: 20260917-bootlog-atomic-restored-residency/.
+
+### RX cadence attribution with bootlog (2026-09-17)
+
+Built and RAM-booted the optimized baseline plus rx-batch-profile,
+driver-stage-profile (includes tx-wait-profile), executor-profile and GRO end
+profiling. No atomic-ID or publish-batch experiment. Build/image checks passed;
+FIT35daf15411c27270cd29a6e9f70c0b70bd32e9495dbc60dc2c9105c713971896.
+Exact image: target/mars-boot-20260917-bootlog-cadence/out/artifacts/vibeos.itb;
+ELF and feature map: target/mars-reference/20260917-bootlog-cadence.elf and
+bootlog-cadence-features.json. Ordinary build features restored after packaging.
+
+One serial session collected counters before/after20s full RX and20s300Mbps RX.
+Full RX948.358Mbps occupied1.99391 resident cores;300Mbps299.968Mbps occupied
+0.95005. These are instrumented results, not a performance improvement; do not
+compare300Mbps occupancy directly with earlier differently instrumented images.
+
+Full-rate successful receive batches averaged2.365 frames (300Mbps:2.268).
+The RX_BATCH_HIST excludes descriptor-not-ready and pool-full early returns;
+its zero bucket MUST NOT be interpreted as the fraction of all empty polls.
+Within5003 sampled driver turns, RX acquired27350 frames, published27340,
+encountered10 queue-full events and4993 empty receive calls. Sampling is every64
+turns, potentially biased by workload periodicity. RX hardware callback time
+was397174 of562315 RX-phase timer ticks (70.63%); at300Mbps134633/194819 (69.11%).
+These are nested elapsed scopes including waits/preemption, not exclusive CPU
+cycles, and must not be scaled into total CPU usage or added to task timings.
+
+GRO averaged5.768 eligible frames per group at full rate, with182206 receive-none
+boundaries:182010 empty endpoint and196 ingress budget. IP-ID boundaries96954.
+At300Mbps the mean was8.060 and receive-none31441:28193 endpoint,3248 budget.
+This repeats software queue exhaustion without showing pervasive sampled queue
+backpressure. It does not prove the physical DMA engine is starved.
+
+Full-rate task elapsed scopes: net-stack18.984s/112766 polls, virtio-net11.431s/
+320128 polls, iperf3-server4.800s/178961 polls. These include interrupts/waits;
+task/counter snapshots are sequential, with slightly different time windows.
+No exclusive per-core attribution follows. The next narrower measurement target
+is receive_batch's descriptor/DMA and metadata handling: the successful batches
+are small and its sampled scope dominates driver RX, while removing only the
+GRO ID boundary did not improve residency in the preceding paired experiment.
+
+Source inspection found receive_detached_batch still writes the RX tail for
+every rearmed descriptor; this is a candidate fixed cost to examine against
+controller ordering requirements, not evidence that batching it is safe or
+beneficial. No new DMA ordering change was made in this diagnostic run.
+
+Evidence: target/mars-reference/20260917-bootlog-cadence-measure/ (raw snapshots,
+iperf, residency, attribution.json), helper20260917-bootlog-cadence-measure.py,
+analyzer20260917-cadence-analyze.py, build/package logs and ramboot directory.
+Both workload phases and final bootlog read completed; no loss of liveness was
+observed in this short run. The prior intermittent issue remains unexplained.
+
+After collection, exact f8be52ec bootlog baseline RAM restore passed component
+hash validation, readiness,1000Mbps link and bootlog readback. Evidence:
+target/mars-reference/20260917-bootlog-cadence-restore/. No SD/SPI writes.
+
+### RX tail notification batching experiment (2026-09-17)
+
+Linux v6.12 stmmac_rx_refill publishes OWN in its replenishment loop and writes
+the RX tail once after the loop (including partial allocation):
+https://github.com/torvalds/linux/blob/v6.12/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c#L4459-L4516
+This supports testing notification amortization separately from descriptor
+visibility. Linux's dirty_rx address convention is not copied into VibeOS:
+the experiment retains exactly the last tail address emitted by the existing
+scalar path, including wraparound. Controller/model evidence and live testing
+are still required; Linux source alone is not proof of this driver's correctness.
+
+Added default-off eqos-net feature rx-tail-batch, selected by Mars feature
+rx-tail-batch-experiment. In receive_detached_batch, all successful replacements
+retain existing per-descriptor payload maintenance, fields, OWN publication,
+descriptor visibility and barriers. Only intermediate RX tail notifications are
+suppressed; one write advertises the last replenished descriptor before ticket
+publication. Empty/fully pool-blocked batches emit no notification. Malformed
+first-frame handling continues using the existing scalar path; publication
+failure still faults/quarantines as before. No other RX/TX path is changed.
+
+Host driver tests passed both with and without the feature (108 tests each).
+New event assertions cover partial and ring-wrapping batches, final tail address,
+OWN/cache/barrier ordering before final notification, no notification when empty,
+and no advertising the unprepared second slot under pool pressure. Existing
+fault/reset/borrow-preservation tests also passed. The model cannot validate
+hardware cache or DMA behavior. Logs: target/mars-reference/20260917-rx-tail-batch-
+tests-final.log and20260917-rx-tail-batch-off-tests.log.
+
+Candidate build and ELF/image checks passed. RAM FIT SHA-256:
+b069176f533db670bd6187407b9b105b7f9458fc1f6b665896fb93bc5ad7d4ad,
+target/mars-boot-20260917-bootlog-tail/out/artifacts/vibeos.itb.
+Exact ELF: target/mars-reference/20260917-bootlog-tail.elf; feature map:
+bootlog-tail-features.json. Live RAM boot verified kernel/DTB hashes, readiness,
+1000Mbps link and bootlog readback. Build configuration was restored after
+packaging. Full-rate20s RX repeats measured948.577/948.229Mbps, approximately
+1.99338/1.98446 resident cores. TX945.802Mbps occupied1.91679 cores. Idle gaps
+and final bootlog queries completed without observed liveness loss. Full-rate
+occupancy alone does not establish small cost changes under a saturated load;
+matched910Mbps tests follow. Evidence: 20260917-bootlog-tail-residency/.
+
+Matched910Mbps RX comparison:
+- 910: 909.916Mbps, 1.94546 resident cores.
+- 910: 909.961Mbps, 1.92402 resident cores.
+- restored-910: 909.961Mbps, 1.94621 resident cores.
+- restored-910: 909.961Mbps, 1.94253 resident cores.
+
+Candidate and restored baseline remain near1.94 cores; the small varying
+difference does not establish a repeatable CPU benefit. Independent64MiB byte
+verification passed. Keep rx-tail-batch default-off; no one-core result or
+long-duration DMA qualification is claimed. The exact f8be52ec bootlog baseline
+is restored in RAM, with component hashes/readiness/link/bootlog verified.
+Evidence: 20260917-bootlog-tail-{910/,restored-910/,comparison.json,integrity.json,
+restore/}. No SD/SPI writes.
+
+### Receive callback stage sampling (2026-09-17)
+
+Added default-off Mars rx-callback-profile, sampling one in127 batch callbacks.
+Five consecutive elapsed scopes: readiness probe; engine detached-batch operation;
+frame validation; accepted-ticket metadata registration; final counter snapshot.
+A Drop recorder captures sampled empty/full/error returns too, with outcome and
+accepted-frame counts. No printing occurs in the hot path. nrpool emits cumulative
+RX_CALLBACK counters before taking the metadata lock. Timers/counter overhead,
+interrupts and waits are included; these are not exclusive CPU cycles. Relaxed
+snapshots can be transiently inconsistent if read during traffic; use deltas and
+validate completed snapshots. Existing rx-metadata-profile was enabled alongside
+it to observe descriptor metadata guards and stack-side borrow/release costs.
+
+Optimized baseline plus only these two diagnostic features built and passed
+image checks. FIT ab3f68304121b9ddf6febd5d65b17db5c1a52828790b902168a1c9a26958fe85,
+target/mars-boot-20260917-bootlog-callback/out/artifacts/vibeos.itb. Exact ELF and
+features: target/mars-reference/20260917-bootlog-callback.elf and
+bootlog-callback-features.json. No rx-tail-batch experiment. Normal feature
+selection restored after packaging. RAM boot checked both component hashes,
+readiness,1Gbps link and bootlog readback.
+
+Full20s RX948.332Mbps,1.98790 resident cores;910Mbps run909.961Mbps,1.88808
+cores. These are instrumented measurements, not an optimization comparison.
+Full callback deltas:926021 calls,7292 samples,6135 successful,1157 empty,
+zero sampled full/errors,13378 sampled accepted frames. At910Mbps:891794 calls,
+7022 samples,5854 successful,1168 empty,zero sampled full/errors. Both checked
+sample outcome conservation and one-in127 sampling count within rounding.
+Zero sampled failures does not prove zero unsampled failures.
+
+Elapsed phase shares were remarkably similar across these two runs:
+
+| scope | full |910Mbps |
+|---|---:|---:|
+| readiness probe |6.81% |6.87% |
+| detached-batch operation |69.70% |69.67% |
+| frame validation |9.03% |9.05% |
+| ticket metadata registration |9.19% |9.15% |
+| finish/snapshot |5.27% |5.27% |
+
+Descriptor-operation metadata guards (kind0) averaged0.551us acquisition and
+0.739us held at full load; kind1 registration0.557us/0.853us. Stack-side loan
+acquire0.594us/0.671us, release0.573us/0.496us. At910Mbps these means remained
+similar. Acquisition time includes the uncontended lock path and measurement
+cost, not only contention. Kind0 calls2207271 were exactly3x registration calls
+735757 during the full interval. Nested sampled lock times must not be added to
+callback scope time or subtracted as exact exclusive attribution.
+
+This narrows the next measurement target to ring receive_detached_batch's
+metadata lookup/preparation/publication, descriptor snapshots, DMA synchronization
+and rearming. It does not establish that cache operations, MMIO or locks dominate
+that inner scope. Prior tail batching failed to show a repeatable residency gain.
+Evidence: target/mars-reference/20260917-bootlog-callback-measure/ including
+attribution.json, raw logs, iperf and residency. Helper20260917-callback-measure.py
+and analyzer20260917-callback-analyze.py. Both phases and final bootlog completed;
+no loss of liveness was observed in this short run.
+
+Exact f8be52ec bootlog baseline RAM restoration completed with hashes, readiness,
+1Gbps and bootlog verified. Restore evidence:20260917-bootlog-callback-restore/.
+No SD/SPI writes; rx-callback-profile remains default-off.
+
+### Inner RX ring phase sampler (2026-09-17)
+
+Added default-off eqos-net rx-stage-profile, exposed by Mars rx-ring-profile.
+Ring receive_detached_batch samples one in131 invocations using the existing
+platform monotonic timer through its controller/backend. Seven consecutive
+elapsed scopes: metadata lookup; descriptor snapshot/validation; received-payload
+DMA synchronization; replacement preparation; descriptor rearm plus tail; ticket
+publication; finish. All normal Result returns, including early empty/error exits,
+finalize their current phase. A malformed first descriptor retains its existing
+scalar fallback, whose elapsed cost stays in the descriptor phase. Panics or
+nonlocal fault unwinds are not guaranteed to finalize this diagnostic record.
+
+No descriptor/cache/OWN/tail ordering changes. Diagnostic clock reads are compiled
+out without the feature; models default to a zero clock. nrpool emits cumulative
+RX_RING_STAGE counters outside the metadata lock. Interpret deltas outside traffic
+and check sample/outcome conservation; relaxed snapshots are not transactional.
+Times include sampling overhead, waits and interrupts, not exclusive CPU cycles.
+
+Driver suite passed with profiling (109 tests) and without (108 tests). A new
+unit test checks seven stage allocations, timer wrap, success/empty/error outcome
+accounting and each early-exit stage. Existing integration tests exercise ring
+error, quarantine, wrap and DMA ordering with profiling enabled. Logs:
+20260917-rx-ring-profile-tests-final.log and-rx-ring-profile-off-tests.log under
+target/mars-reference/. Models establish software behavior only, not hardware DMA.
+
+Inner sampler target build/image checks passed. FIT SHA-256
+be43b121f6fd3ab7208d0ba664bdd16424b9d76968e06e88e41b17b141aa5233,
+target/mars-boot-20260917-bootlog-ring/out/artifacts/vibeos.itb. Exact ELF and
+feature map:target/mars-reference/20260917-bootlog-ring.elf and
+bootlog-ring-features.json. Only rx-ring-profile was added to the optimized
+baseline (no outer/metadata samplers or tail experiment), and ordinary build
+features were restored after packaging. RAM boot hashes/link/readiness passed.
+
+Full RX948.237Mbps occupied1.99254 resident cores;910Mbps909.961Mbps occupied
+1.89405. These instrumented occupancy values are not optimization comparisons.
+Full ring deltas:700455 calls,5347 samples,12758 sampled frames, all sampled
+returns nonempty successes. At910Mbps:672241 calls,5131 samples,12241 frames,
+all sampled returns nonempty successes. Outcome conservation and one-in131
+sample count within rounding passed. Empty readiness probes occur above this
+function, so this does not establish an absence of empty driver polling.
+
+| phase | full share |910Mbps share | full mean us/sample |
+|---|---:|---:|---:|
+| metadata lookup |12.84% |12.82% |1.021 |
+| descriptor reads/validation |13.04% |13.04% |1.037 |
+| payload DMA sync |9.26% |9.27% |0.736 |
+| replacement preparation |17.03% |16.99% |1.354 |
+| rearm and tail |24.65% |24.69% |1.960 |
+| metadata ticket publication |11.55% |11.64% |0.918 |
+| finish |11.63% |11.55% |0.925 |
+
+Means include timer/control overhead and return-value construction/movement,
+not solely the named operation. In particular finish includes forming the Result
+and diagnostic closure boundary; it must not be called a measured hardware cost.
+Systematic sampling can be biased, and these numbers must not be extrapolated
+into exact exclusive core occupancy. Both rates sampled about2.386 frames/batch.
+
+The three metadata scopes sum to41.42% at full rate; rearm is the largest single
+scope but not a majority. Combined with the negative tail experiment, this does
+not support continuing to treat tail MMIO or payload sync as the dominant source
+of the entire near-two-core pipeline cost. Next work should target protocol-stack
+and task-handoff common paths as well as any amortization of descriptor metadata,
+with paired tests rather than assuming another small cache change will save a
+core. No CPU reduction or full physical stability qualification is claimed.
+
+Evidence:target/mars-reference/20260917-bootlog-ring-measure/ (raw counters,
+iperf/residency,attribution.json), helpers20260917-ring-measure.py and
+20260917-ring-analyze.py, build/package/ramboot artifacts. Final bootlog was
+readable; no liveness loss was observed during the short measurement sequence.
+
+All-features driver suite (tail experiment plus sampler) also passed109 tests,
+20260917-rx-ring-profile-all-tests.log. Exact f8be52ec baseline RAM restoration
+passed hashes, readiness,1Gbps and bootlog readback; evidence
+20260917-bootlog-ring-restore/. No SD/SPI writes. Diagnostics remain default-off.
+
+### Refreshed common-path timeline (2026-09-17)
+
+Built the optimized bootlog baseline plus existing network-profile only, without
+new ring/callback samplers or tail/atomic-ID experiments. Image checks passed;
+FIT0492dfcc69db6271cc739d883cd82e3bad2298f7cc705fb5ef1e7762e6479f91,
+target/mars-boot-20260917-bootlog-stack-profile/out/artifacts/vibeos.itb.
+Exact ELF and feature map:target/mars-reference/20260917-bootlog-stack-profile.elf
+and bootlog-stack-profile-features.json. Ordinary features restored after
+packaging. RAM boot verified hashes/readiness/1Gbps and bootlog readback.
+
+One serial session ran20s RX, armed the existing5s profiler at host elapsed
+5.013s, then dumped after traffic and expiry. Aggregate throughput948.028Mbps;
+fully interior one-second intervals6..9s were949.22,949.09,948.86Mbps (the9..10s
+interval949.55Mbps is also near the end boundary). No gross throughput collapse
+was observed. This is not proof that diagnostic overhead/cache effects are zero.
+The parser reconciled bucket/hart/lock totals and the127-call child-stage schema.
+
+Five-second window parent-exclusive elapsed scopes plus separately classified
+contended waits (sum across harts, not independent core measurements):
+- Frontend:1.80317s work +0.29987s contended wait.
+- Packet receive entry:1.78170s +0.07658s.
+- Driver remainder:1.51041s +0.02081s.
+- RX callback:1.33968s +0.04786s.
+- Protocol-poll remainder:1.24067s +0.00072s.
+- Executor remainder:0.84026s +0.00937s.
+- Application remainder:0.47832s +0.00011s.
+
+Frontend is cross-core: hart0/application-side0.75292s, hart1/network-side
+1.35013s. Packet receive entry and protocol remainder are on hart1. Unselected
+child work remains in parents: sampled rx_loan/rx_gro/tx_reserve/tx_flush and
+frontend sub-stages MUST NOT be multiplied and added into these totals. These
+scopes include instrumentation and interrupts, not hardware instruction cycles.
+Selected rx_loan3476 calls averaged1.654us including classified waits;
+rx_gro3613 calls averaged2.530us. Frontend RX selected1308 calls consumed0.008707s
+including waits, exceeding other sampled frontend children; it includes socket
+operations/authority checks and queue copying, not solely payload memcpy.
+
+Stack decisions:13814 runnable hints,15 empty retries,10 wait attempts;13811
+turns processed ingress and13809 made frontend progress. This does not support
+idle spinning as the dominant hart1 cost in this window. Inbound high water64
+with368 full retry attempts in3 of50 buckets; outbound high water1,zero full.
+Queue fullness is not a count of packet drops. Application had8511 empty retries,
+but their count alone cannot establish dominant CPU consumption.
+
+This reconfirms frontend receive transfer and packet receive construction as
+common-path targets. Existing negative results for empty-service skipping,
+one-copy removal, ordinary TX pooling and consumer queue batching remain relevant;
+do not re-propose those unchanged as new fixes. Any bulk loan or handoff change
+must preserve generation/revocation checks, borrower fault cleanup and bounded
+backpressure; it must reduce actual acquire/release or data movement work, not
+merely batch queue dequeue while retaining all per-frame work.
+
+Evidence:target/mars-reference/20260917-bootlog-stack-profile-measure/ contains
+raw profile, parsed analysis, iperf intervals, residency and before/after bootlog.
+Helper:20260917-stack-profile-measure.py. No liveness loss during this short run.
+
+Exact f8be52ec bootlog baseline RAM restoration passed hashes, readiness,1Gbps
+and bootlog; evidence20260917-bootlog-stack-profile-restore/. No SD/SPI writes.
+
+### GRO follower bulk release experiment (2026-09-17)
+
+Previous consumer batching still acquired/released metadata per frame. Added a
+separate default-off gro-batch-release path that actually shares one metadata
+guard across cleanup of merged GRO followers. Acquisition/dequeue policy is
+unchanged: every dequeued frame immediately becomes an exact-owner tracked
+loan. Raw ready tickets are never prefetched into a new untracked batch.
+
+HAL rx-batch-release adds optional unsafe bulk cleanup to Loan and a bounded
+ReleaseBatch holder. Only consumed followers are retained, for the synchronous
+GRO group (at most15 followers with16-segment limit). The first frame and failed
+merge/lookahead retain their existing lifetime. No await or public slice escapes
+the cleanup holder. Matching bulk callbacks consume each unique Borrow once;
+mixed/scalar providers fall back to existing per-loan Drop. Overflow returns the
+loan for normal cleanup. Hard-fault recovery still sees all outstanding borrowed
+slots under the original owner/incarnation; ordinary capability revocation is
+not treated as proof of owner death. The batch callback must not panic and must
+leave no unconsumed Borrow. Its metadata-only implementation takes no ENGINE
+borrow. Without the HAL feature, Loan's representation remains unchanged.
+
+Mars bulk cleanup holds RX_META once and releases validated Borrow records;
+release counters count successful releases. Additional under-lock integer
+counters report bulk calls/frames through nrpool after dropping RX_META, so no
+console/metadata lock inversion is introduced. Scalar acquisition/cleanup remain
+available. This defers some buffer availability by one GRO group, which requires
+hardware pool/backpressure validation; it is not automatically a performance win.
+
+HAL tests3 passed, including matching/mixed/scalar callback cleanup, bounded
+capacity, empty group and ordinary unwind. Protocol enabled tests5 unit+40
+integration passed, including real TCP data, merged-only bulk release (two
+followers under one callback), original/lookahead pinning and revocation cleanup.
+Disabled protocol tests and5 core receive tests passed, preserving existing
+queue retirement and exact-incarnation recovery. Logs under target/mars-reference/
+20260917-batch-release-{hal-tests,protocol-tests,protocol-off-tests,core-tests}.log.
+
+Candidate build/image checks passed. FIT SHA-256
+09c7e300303cf952ae2f73473526984dc92acab4f137bc0d53240c7007c9fed7,
+target/mars-boot-20260917-bootlog-release/out/artifacts/vibeos.itb; exact ELF
+20260917-bootlog-release.elf and feature map bootlog-release-features.json.
+Normal ethernet configuration restored after packaging. RAM boot verified both
+component hashes, readiness,1Gbps and bootlog. No SD/SPI writes.
+
+Live bulk cleanup operated as intended: full20s RX delivered948.661Mbps at
+1.98928 resident cores. Bulk counters advanced217541 calls/1390041 frames
+(6.390 followers/call), eliminating1172500 individual cleanup-guard acquisitions
+relative to releasing those same followers separately. Received/acquired/released
+all1624665 afterward; free128,ready0,borrowed0,full0,dropped0.
+
+Two910Mbps runs measured909.961/909.915Mbps at1.94010/1.94454 cores. Their bulk
+calls/frames were191415/1350887 and190294/1351314, respectively. These directly
+verify the intended reduction in cleanup operations, not CPU saving. Other loan,
+queue, protocol and scheduling work remains; deferring cleanup also changes batch
+and cache timing. Independent64MiB application byte verification passed, with
+67108864 bytes confirmed (not used as a throughput benchmark).
+
+Evidence:target/mars-reference/20260917-bootlog-release-measure/ (raw pool counts,
+release-deltas.json, throughput and residency),20260917-bootlog-release-integrity.json.
+The exact original f8be52ec bootlog baseline was RAM-restored with component hash,
+readiness,1Gbps and bootlog validation (20260917-bootlog-release-restore/).
+No SD/SPI writes. Matched restored-baseline910Mbps measurements follow.
+
+Restored baseline matched RX: 909.961Mbps/1.92465 cores, 909.916Mbps/1.93435 cores.
+Candidate1.94010/1.94454 cores did not improve these controls. Keep the feature
+default-off; fewer cleanup guards is demonstrated, a CPU benefit is not.
+Restored evidence:20260917-bootlog-release-restored-910/. No one-core or
+long-duration stability claim.
+
+### Drain-to-interrupt experiment (2026-09-17)
+
+Existing driver_turn returns historical immediate_work OR TX ownership sampled
+before RX service. Therefore even a turn ending with RX empty can yield back to
+an immediately runnable driver, and a completed ACK can retain a stale busy hint.
+Added default-off rx-progress-park for interrupt-capable devices only. It reports
+remaining private TX/RX/coalescer/prefetched work, retaining immediate service for
+these items. If the earlier TX sample was busy and no private work remains, it
+rechecks/reclaims TX ownership under CONTROL and updates cached tx_inflight and
+deadline consistently. It otherwise attempts the existing interrupt wait path.
+
+No delay constant, DMA interrupt mask policy, ring size or poll budget changed.
+The existing wait captures/registers TX and RX events before rechecking outbound
+and hardware RX ownership/arming, and retains its timer for bounded revalidation.
+Hardware work arriving after driver_turn is caught by that recheck. A wait that
+returns synchronously MUST still yield before the next turn; otherwise continuous
+arrivals could form an unbounded poll without an await suspension. The experiment
+adds that explicit yield on the wait branch. TX DMA still busy never parks.
+Fallback devices without RX interrupt operations retain the original policy.
+
+Added StampedBatch::has_pending for both sparse-ticket and publish-batch layouts.
+Tests cover empty, sparse, last-pop and exhaustion; core receive tests passed6
+without and8 with rx-publish-batch, including existing ownership/revocation tests.
+These host tests do not prove real interrupt transition behavior or performance.
+The experiment's network-profile worked hint now reflects pending work rather
+than historical progress; do not compare that field's meaning across builds.
+
+Candidate build/image checks passed. FIT SHA-256
+14e8ec370b7078b224229a28aee0d1538a078bbb0e336a8b88ae5d72cda01f69,
+target/mars-boot-20260917-bootlog-park/out/artifacts/vibeos.itb. Exact ELF and
+features:20260917-bootlog-park.elf and bootlog-park-features.json. RAM hashes,
+readiness/link and bootlog passed; ordinary build features restored after package.
+
+Live results: RX948.619Mbps/1.98838 resident cores; TX945.286Mbps/1.89248 cores;
+910Mbps RX909.961/909.916Mbps at1.94275/1.93100 cores. Full RX IRQ deltas:
+157 interrupts,116092 arm attempts,115797 busy rechecks (99.746%),175 timer
+returns,106641 TX wakes. At910Mbps,96.080%/96.116% of arm attempts found busy.
+Counts include the short snapshot edges, and TX wake branches and arm branches
+are different paths; do not add their percentages or infer exact sleep duration.
+The intended wait path is being attempted but overwhelmingly finds current work,
+so changing progress classification alone does not produce a useful idle window.
+
+Full RX pool afterward:received=acquired=released=1624494,full=dropped=0,
+free128,ready=borrowed=0. Independent64MiB byte verification passed. Final
+bootlog remained readable; no liveness loss in this short run. Exact f8be52ec
+baseline RAM restore passed hashes/readiness/1Gbps/bootlog. No SD/SPI writes.
+Evidence:20260917-bootlog-park-{measure/,integrity.json,restore/} under
+target/mars-reference/. irq-deltas.json records counters; helpers preserve raw
+serial and network output. Matched restored-baseline910Mbps repeats follow.
+
+Restored controls: 909.961Mbps/1.91393 resident cores, 909.961Mbps/1.92029 resident cores.
+The candidate did not reduce occupancy. Removed this experimental scheduler
+branch, feature wiring and helper/test from active source; archived exact patch
+in target/mars-reference/20260917-progress-park-experiment.patch. Reapplication
+check passed against current source. Existing unrelated changes were preserved.
+Board remains on f8be52ec bootlog baseline; matched data are under
+20260917-bootlog-park-restored-910/. No low-core or full stability claim.
+
+### 2026-09-17: active-load driver and protocol restart with continuous UART
+
+The bootlog baseline FIT (`f8be52ec4e9b3bf6ee32d1be56c6fb233a355eab17bb4e7e4153e3195a06429d`)
+was exercised with one continuously open serial descriptor per recovery test.
+After four seconds of host-to-board TCP traffic, the operator path cancelled
+and restarted `virtio-net`, then separately `net-stack`. Both advanced generation
+1 -> 2. The interrupted clients exited with errors without forced termination;
+those interrupted transfers are not counted as successful data tests.
+Host interval counters before cancellation show approximately 949 Mbps traffic.
+
+Each restart was followed by a fresh ten-second TCP connection and a separate
+64 MiB changing-pattern verification. Both integrity tests passed. The driver
+restart's fresh receive result was 947.514 Mbps. The subsequent protocol restart's
+result was only 678.876 Mbps: recovery restored functionality but did not preserve
+the original performance. The console restart factory creates its fresh arena
+on the caller hart, whereas initial network-pipeline setup explicitly constructs
+the protocol task on hart 1. Thus these results do not establish placement
+preservation, and no CPU-efficiency comparison is made from this changed state.
+Preserving the component's intended placement across operator restart remains a
+concrete recovery issue; it must preserve allocation-domain ownership rather than
+migrate an already constructed reclaimable arena.
+
+Both final RX pool snapshots had free=128, ready=0, borrowed=0, full=0 and
+dropped=0. After protocol restart, received exceeded acquired by 72; all acquired
+loans were released. Unacquired tickets during cancellation are not evidence of
+application delivery, and the pool snapshot alone is not a packet-loss audit.
+The same boot entry timestamp and advancing current timestamps were retained
+throughout both tests. No memory-domain assertion or serial silence was observed
+in these bounded runs; historical hangs and physical USB reconnect behavior
+remain unproven.
+
+Evidence: `target/mars-reference/20260917-bootlog-active-{driver,stack}-recovery/`
+contains continuous UART, interrupted/fresh client results, integrity results,
+bootlog snapshots and reproduction scripts. The parsed summary is
+`20260917-bootlog-active-recovery-summary.json`. The exact baseline FIT was then
+reloaded to RAM with verified component hashes and gigabit link, recorded under
+`20260917-bootlog-recovery-restore/`. No SD, SPI or saved boot environment writes
+were made. The >900 Mbps / <1 core objective remains open.
+
+### 2026-09-17: preserve home hart for shell restart
+
+The shell now awaits `World::restart_component_on_home`. Each component records
+its initial logical hart. A SYSTEM-owned pinned worker performs the audited
+restart factory on that hart, creating the new arena there; no existing arena
+is migrated. The requester releases its owner scope before awaiting completion,
+and no lifecycle lock crosses an await. The worker rechecks registry membership
+and the captured generation under the lifecycle lock, so a delayed request
+cannot replace a newer incarnation. Running components remain rejected.
+
+This change applies to the legacy shell `restart` entry. The synchronous
+`restart_component` and `vtop` control entry still use their caller's placement;
+they are not covered by this fix or these tests. Automatic network-stack
+supervision already runs on the designated pipeline hart. Full lifecycle-wide
+placement preservation remains separate work.
+
+Built and RAM-loaded FIT SHA-256:
+`918fdf3be9a1fe04eb62dba8d68d74a9628cd0d03a187da15f1af82713d600b6`.
+Two active-RX cancellations and shell restarts advanced protocol generation
+1 -> 2 and 2 -> 3. The fresh ten-second receive tests after those restarts
+measured 946.217 and 948.480 Mbps, respectively, versus the prior caller-hart
+replay's 678.876 Mbps. Each restart passed an independent 64 MiB pattern check.
+Each final pool had 128 free buffers, zero ready/borrowed, zero full/dropped,
+and acquired equalled released. Both attempts to restart a still-running stack
+were rejected. No memory-domain assertion or UART loss appeared in these runs.
+
+Between the two restarts, two twenty-second unpaced receive tests measured
+948.304/948.666 Mbps with total non-WFI residency of 1.98665/1.98953 cores.
+These results establish restoration of >900 Mbps after shell restart, not a
+reduction in steady-state CPU cost. Residency includes MMIO stalls and interrupt
+work; it is not an exclusive cycle profile. The <1 core effort target is unmet.
+
+Artifacts in `target/mars-reference/`:
+`20260917-bootlog-home-restart-{build2,package}.log`,
+`20260917-bootlog-home-restart-load/`,
+`20260917-bootlog-home-stack-recovery{,2}/`, and
+`20260917-bootlog-home-restart-rx/summary.json`.
+Reproduction scripts are `test-bootlog-home-stack-recovery{,2}.py`.
+The repaired image remains running in RAM at protocol generation 3. No SD/SPI
+writes or persistent U-Boot environment changes occurred. Physical cold-boot,
+long-duration stability, concurrent operator races and other control entries
+are not established by these bounded tests.
+
+### 2026-09-17: isolate receive queue dequeue from loan admission
+
+Source review corrects a possible attribution error: `Revocable::try_with`
+checks its node's atomic alive flag; it does not acquire a capability lock.
+The archived rx-consumer-batch experiment invoked `try_receive` repeatedly,
+so it did not combine queue lock operations. Popping a batch of raw tickets
+before recording borrower ownership would create an additional fault-recovery
+window and is not introduced by this diagnostic.
+
+Default-off `rx-queue-profile` samples one in 127 ReceiveEndpoint calls per
+logical hart. It measures the complete `Endpoint::try_recv` operation separately
+from the complete admission call, classifying success/empty/rejected outcomes.
+The queue duration includes lock acquisition, dequeue, unlock and any sender
+notification; it is not pure lock contention. The remainder includes owner and
+stamp validation, HAL acquisition, Result movement and sampling boundaries.
+Per-hart cumulative snapshots are printed by `nrpool` outside traffic. Normal
+images contain no counters/timer reads from this feature.
+
+Diagnostic FIT SHA-256:
+`bf01b77a88d898b2f0e2b905c29b6c5b7deef6081709d3ed3f8de4826d7b1866`.
+With the home-hart shell-restart correction retained, twenty-second RX runs
+measured 947.666 Mbps unpaced and 909.916 Mbps at 910M pacing. Non-WFI residency
+was 1.98352 and 1.90203 cores, respectively; these instrumented numbers are not
+an efficiency improvement claim.
+
+The full-rate interval counted 1,908,205 admission calls and 15,025 samples:
+12,836 successes and 2,189 empty results. Successful samples averaged 0.64769 us
+in queue dequeue and 1.41892 us in the remainder (queue 31.3407% of admission).
+At 910M, 1,731,256 calls yielded 13,632 samples, including 12,344 successes and
+1,288 empty results. Success averages were 0.64483/1.41875 us (queue 31.2481%).
+Neither interval sampled a rejection. Empty-result queue durations averaged
+0.54842/0.55842 us, with remainder 0.81042/0.80823 us. Sample-count deltas match
+the exact one-in-127 cadence; queue duration never exceeds its enclosing total.
+The 4 MHz timer and nested measurement overhead limit short-duration precision,
+and systematic sampling may alias traffic cadence. These nested durations must
+not be added to older profile scopes or extrapolated as exclusive core use.
+The observations do not establish queue locking as the dominant CPU bottleneck;
+the admission remainder is larger and warrants further decomposition.
+
+The existing five receive-contract tests passed with the feature enabled and
+disabled. Physical outputs, raw serial, pool state and parsed attribution are in
+`target/mars-reference/20260917-bootlog-queue-measure/`; the analyzer is
+`20260917-queue-analyze.py`. Build/package and load evidence uses the
+`20260917-bootlog-queue-*` prefix. The no-sampling home-restart FIT is restored
+after this measurement; no SD/SPI or persistent environment writes are made.
+
+### 2026-09-17: start extended RX recovery/stability coverage
+
+No new hot-path optimization is promoted from the queue admission review.
+Existing metadata samples already cover much of its remaining duration, and
+source inspection did not identify an ownership check that can safely be
+removed. A longer network-only run is used to investigate accumulated resource
+loss or UART disappearance beyond the previous short tests.
+
+The initial `iperf3 -t 3600` request was rejected during parameter exchange:
+`components/iperf3-server` explicitly bounds `MAX_TEST_SECONDS` to 60. The host
+reported a broken control pipe, with no data connection/traffic intervals, and
+UART recorded `iperf3 reset while reading parameters`. This is an unsupported
+test duration, not evidence of a board hang. Raw output is preserved under
+`target/mars-reference/20260917-network-soak/`; its summary is failed and must
+not be counted as a one-hour stress result.
+
+The replacement runner, `target/mars-reference/20260917-network-soak-rounds.py`,
+uses 60 consecutive 60-second single-flow RX sessions, one continuously open
+UART descriptor, per-round non-WFI residency and pool snapshots, and recorded
+connection gaps. Each complete round must exceed 900 Mbps; a client error,
+serial timeout or short transfer terminates the run with retained evidence.
+A final independent 64 MiB pattern check is required. Host en13 was verified at
+MTU 1500, 1000baseT full-duplex. The image provenance remains the no-sampling
+home-restart FIT, with the current boot entry matching its verified RAM reload.
+
+The run is in progress when this entry is written. Only a terminal
+`20260917-network-soak-rounds/summary.json` with `passed=true` establishes this
+bounded run's success. `live.json` is progress only. Even success does not prove
+a single TCP connection survived an hour, concurrent storage/WASM, cold boots,
+or the <1 core effort target.
+
+The running soak now has an independent read-only verifier:
+`python3 scripts/mars-soak-audit.py target/mars-reference/20260917-network-soak-rounds`.
+It compares each summary row with raw receiver JSON, four-hart NIDLE snapshots
+and pool output, verifies CPU sampling covers the transfer and that counters
+remain continuous between rounds, and requires all 60 rounds plus final boot
+continuity, complete 64 MiB verification and a fully returned pool before
+reporting `passed`. An unfinished run is `collecting`; terminal failure is not
+masked by earlier good rounds. The audit does not open UART or affect traffic.
+Five host tests cover partial-run status, raw/CPU mismatches, failed termination,
+incomplete terminal success, integrity/loan failure and reused CPU snapshots.
+Initial live evidence through round 4 was consistent (948.730–949.100 Mbps,
+1.99494–1.99594 cores, all buffers returned). This is partial evidence only;
+the runner session remains live and must be checked to completion.
+
+
+### 2026-09-17: compact borrower metadata prepared while soak continues
+
+Read-only disassembly of the exact home-restart ELF shows `acquire_rx_loan`
+occupies 0x202 bytes, uses a 160-byte stack frame, and calls memcpy for a
+72-byte successful result. Its slot addressing has a 48-byte stride and the
+u128-bearing state uses a two-word discriminant. Evidence is saved in
+`target/mars-reference/20260917-acquire-rx-loan.asm`. This identifies generated
+operations, not their exclusive CPU cost; the memcpy is not removed here.
+
+Added default-off driver feature `rx-compact-owner`, exposed by Mars as
+`rx-compact-owner-experiment`. The Borrowed variant stores the existing HAL
+Owner (two u64 fields) instead of the packed u128 key. Public ticket/borrow APIs,
+full owner/incarnation comparisons, release/reset and recovery rules remain the
+same. This reduces the measured 64-bit host Slot layout from 48 to 40 bytes;
+for 256 slots the nominal slot-array reduction is 2048 bytes. The existing
+RISC-V ELF establishes the old stride; the candidate's actual RISC-V layout and
+code generation still need a target build and inspection.
+
+A new recovery test uses identities sharing only the high or low 64-bit half,
+verifies zero-incarnation/nonmatching keys do not reclaim them, recovers one
+exact identity, rejects its stale release and frees the surviving loans. Both
+feature-on and feature-off metadata tests passed. All EQoS host tests with the
+feature enabled passed (110 tests). Logs:
+`20260917-compact-owner-host-{on,off,all}.log` under `target/mars-reference`.
+The soak audit gained a positive complete-evidence test, bringing its host
+suite to six passing tests.
+
+Only brief host tests ran while the network soak continued; no target firmware
+build, reset or competing traffic was launched. This remains an unmeasured
+candidate, not a retained performance optimization. The candidate feature
+manifest is `bootlog-compact-owner-features.json`; the ordinary ethernet feature
+line has not been changed. Wait for the live soak session to finish before
+building/loading a candidate and interleaving its 910 Mbps/full-rate controls.
+
+### 2026-09-17: completed RX soak, CPU target still unmet
+
+The unchanged home-restart FIT (`918fdf3be9a1fe04eb62dba8d68d74a9628cd0d03a187da15f1af82713d600b6`)
+completed all 60 sequential 60-second RX connections. The runner exited 0;
+`scripts/mars-soak-audit.py` independently reports `passed` for the raw records
+in `target/mars-reference/20260917-network-soak-rounds/audit-final.json`.
+Mean receiver throughput was 948.756 Mbps (range 944.498–949.202 Mbps), with
+mean four-hart non-WFI residency 1.996112 cores. No idle-baseline subtraction
+was applied. This establishes the throughput target for this RX test, not the
+sub-one-core goal.
+
+Every per-round pool snapshot was quiescent. The final snapshot, after a
+separate complete 64 MiB pattern verification, showed received/acquired/released
+all 292481912, free 128, ready/borrowed/full/dropped zero. These are software
+pool counts, not complete MAC/DMA error counters. The pattern check covers its
+own transfer, not all iperf payload. Serial commands remained responsive.
+Boot entry ticks remained 42520122, with time advancing from 1257001921 to
+15703114522 ticks at 4 MHz; per-hart counters also remained continuous. The
+retained boot prefix reached 32 KiB and reported truncation as designed; the
+host-side continuous serial capture remains available.
+
+This is accumulated one-hour traffic across separate connections with measured
+short gaps, not one uninterrupted TCP connection, simultaneous storage/WASM
+qualification, or a cold-boot campaign. It did not reproduce the historic
+serial loss and does not establish its root cause. The test process has ended;
+subsequent diagnostic builds and RAM loads are separate from these results.

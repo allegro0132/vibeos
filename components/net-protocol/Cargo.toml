@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-batch-release = ["bounded-gro", "pooled-rx", "vibeos-core/rx-batch-release"]
 # Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
 gro-atomic-id = ["bounded-gro"]
 gro-end-profile = ["bounded-gro"]

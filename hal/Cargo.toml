@@ -10,4 +10,5 @@ test = true
 vibeos-driver-virtio-core = { path = "../drivers/virtio-core" }
 
 [features]
+rx-batch-release = []
 runtime-platform = []

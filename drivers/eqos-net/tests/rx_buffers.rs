@@ -130,3 +130,26 @@ fn repeated_ring_wraps_preserve_disjoint_hardware_and_consumer_slots() {
         assert_eq!(p.stats().dma, 4);
     }
 }
+
+#[test]
+fn recovery_distinguishes_both_halves_of_full_borrower_identity() {
+    let mut p = Buffers::<2, 6>::new().unwrap();
+    p.attach(0).unwrap(); p.attach(1).unwrap();
+    let keys = [(7u128 << 64) | 11, (8u128 << 64) | 11, (7u128 << 64) | 12];
+    let mut borrows = Vec::new();
+    for (index, key) in keys.into_iter().enumerate() {
+        let ticket = ready(&mut p, index % 2);
+        borrows.push(p.borrow(ticket, key).unwrap());
+    }
+    // An invalid zero incarnation cannot alias a valid owner with the same
+    // high word. Neither may a zero high word alias a valid low word alone.
+    assert_eq!(unsafe { p.recover_borrower(7u128 << 64) }, 0);
+    assert_eq!(unsafe { p.recover_borrower(11) }, 0);
+    assert_eq!(unsafe { p.recover_borrower(keys[0]) }, 1);
+    assert_eq!(p.stats().borrowed, 2);
+    let recovered = borrows.remove(0);
+    assert_eq!(p.release(recovered), Err(Error::Stale));
+    for borrow in borrows { p.release(borrow).unwrap(); }
+    assert_eq!(p.stats().borrowed, 0);
+    assert_eq!(p.stats().free, 4);
+}

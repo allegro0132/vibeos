@@ -104,6 +104,12 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         #[cfg(feature = "pooled-rx")]
         "nrpool" => if let Some(ops) = &vibeos_hal::network::device().receive_buffers {
             println!("RX_POOL {:?}", (ops.stats)());
+            #[cfg(feature = "rx-queue-profile")]
+            for hart in 0..exec::MAX_HARTS {
+                if let Some((calls, rows)) = vibeos_core::net_receive::queue_profile::snapshot(hart) {
+                    println!("RX_QUEUE_SAMPLE hart={} calls={} interval=127 rows=success,empty,rejected fields=samples,queue_ticks,total_ticks values={:?}", hart, calls, rows);
+                }
+            }
         },
         #[cfg(feature = "rx-interrupt-poll")]
         "nrxirq" => println!("RX_IRQ fields=[interrupts,arms,busy_rechecks,timers,tx_wakes] values={:?}",
@@ -188,8 +194,127 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             println!("TXLEASE_END");
         }
         #[cfg(feature = "counter-probe")]
+        "npmuevents" => {
+            // Diagnostic shell is the sole PMU owner. Never auto-start, and do
+            // not probe fixed counters: older SBI implementations can select
+            // them regardless of a requested mask for cycle/instret events.
+            const EVENTS: [(usize, &str); 10] = [(3, "cache_references"), (4, "cache_misses"),
+                (5, "branches"), (6, "branch_misses"), (8, "frontend_stalls"), (9, "backend_stalls"),
+                (0x10001, "l1d_read_miss"), (0x10009, "l1i_read_miss"),
+                (0x10019, "dtlb_read_miss"), (0x10021, "itlb_read_miss")];
+            println!("PMU_EVENTS started=false counters=3,4");
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { continue; }
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(u64::MAX) }; 1 + 2 * EVENTS.len() * 5]);
+                    for slot in 0..2 * EVENTS.len() { result[5 + slot * 5].store(0, Ordering::Relaxed); }
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "pmu-event-probe", async move {
+                        output[0].store(ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64), Ordering::Release);
+                        for counter in 3..=4 {
+                            let (error, info) = sbi::pmu_counter_info_raw(counter);
+                            // Restrict this experiment to the verified Mars CSR layout.
+                            if error != 0 || info != (0x27c00 | counter) { return; }
+                            for (event_index, (event, _)) in EVENTS.iter().enumerate() {
+                                let offset = 1 + ((counter - 3) * EVENTS.len() + event_index) * 5;
+                                output[offset + 4].store(1, Ordering::Release);
+                                let (error, selected) = unsafe { sbi::pmu_counter_config_raw(counter, 1, 0, *event, 0) };
+                                output[offset].store(error as u64, Ordering::Release);
+                                output[offset + 1].store(selected as u64, Ordering::Release);
+                                if error != 0 { continue; }
+                                if selected != counter { return; }
+                                output[offset + 4].store(3, Ordering::Release);
+                                let (error, value) = unsafe { sbi::pmu_counter_stop_raw(counter, 1, 1) };
+                                output[offset + 2].store(error as u64, Ordering::Release);
+                                output[offset + 3].store(value as u64, Ordering::Release);
+                                // OpenSBI v1.2 resets the mapping even when the
+                                // counter was already stopped (-8). Preserve it.
+                                if error != 0 && error != -8 { return; }
+                            }
+                        }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                if exit.state() != exec::TaskState::Exited || result[0].load(Ordering::Acquire) != index as u64 {
+                    println!("PMU_EVENTS_FAILED h={}", index); continue;
+                }
+                for counter in 3..=4 {
+                    for (event_index, (event, name)) in EVENTS.iter().enumerate() {
+                        let offset = 1 + ((counter - 3) * EVENTS.len() + event_index) * 5;
+                        let row = core::array::from_fn::<_, 4, _>(|i| result[offset + i].load(Ordering::Acquire));
+                        println!("PMU_EVENT h={} counter={} event={:#x} name={} config_error={} selected={} cleanup_error={} cleanup_value={} attempted_mask={}",
+                            index, counter, event, name, row[0] as i64, row[1], row[2] as i64, row[3], result[offset + 4].load(Ordering::Acquire));
+                    }
+                }
+            }
+            println!("PMU_EVENTS_END");
+        }
+        #[cfg(feature = "counter-probe")]
+        "npmu" => {
+            const LIMIT: usize = 64;
+            println!("PMU_INVENTORY limit={} readonly=true", LIMIT);
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { println!("PMU_OFFLINE h={}", index); continue; }
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(0) }; 5 + LIMIT * 2]);
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "pmu-inventory", async move {
+                        let observed = ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64);
+                        let (probe_error, probe_value) = sbi::probe_extension_raw(0x504d55);
+                        let (error, count) = if probe_error == 0 && probe_value != 0 {
+                            sbi::pmu_num_counters_raw()
+                        } else { (-2, 0) };
+                        for (cell, value) in output.iter().zip([observed, probe_error as u64,
+                            probe_value as u64, error as u64, count as u64]) {
+                            cell.store(value, Ordering::Release);
+                        }
+                        if error == 0 {
+                            for counter in 0..count.min(LIMIT) {
+                                let (error, info) = sbi::pmu_counter_info_raw(counter);
+                                output[5 + counter * 2].store(error as u64, Ordering::Release);
+                                output[6 + counter * 2].store(info as u64, Ordering::Release);
+                            }
+                        }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                if exit.state() != exec::TaskState::Exited || result[0].load(Ordering::Acquire) != index as u64 {
+                    println!("PMU_FAILED h={}", index); continue;
+                }
+                let error = result[3].load(Ordering::Acquire) as i64;
+                let count = result[4].load(Ordering::Acquire) as usize;
+                println!("PMU_HART h={} probe_error={} probe_value={} count_error={} count={} truncated={}",
+                    index, result[1].load(Ordering::Acquire) as i64, result[2].load(Ordering::Acquire),
+                    error, count, count > LIMIT);
+                if error != 0 { continue; }
+                for counter in 0..count.min(LIMIT) {
+                    let error = result[5 + counter * 2].load(Ordering::Acquire) as i64;
+                    let info = result[6 + counter * 2].load(Ordering::Acquire);
+                    if error != 0 {
+                        println!("PMU_COUNTER h={} index={} error={} raw={:#x}", index, counter, error, info);
+                    } else if info >> 63 != 0 {
+                        println!("PMU_COUNTER h={} index={} error=0 raw={:#x} type=firmware", index, counter, info);
+                    } else {
+                        println!("PMU_COUNTER h={} index={} error=0 raw={:#x} type=hardware csr={:#x} width={}",
+                            index, counter, info, info & 0xfff, ((info >> 12) & 0x3f) + 1);
+                    }
+                }
+            }
+            println!("PMU_END");
+        }
+        #[cfg(feature = "counter-probe")]
         "ncounters" => {
             println!("NCOUNTERS hz={} units=hardware_counters", exec::timebase_hz());
+            // Base-extension query only: no PMU event or counter is configured.
+            let (error, value) = sbi::probe_extension_raw(0x504d55);
+            println!("NCOUNTERS_SBI pmu_probe_error={} pmu_probe_value={} pmu_probe_supported={}",
+                error, value, error == 0 && value != 0);
             for index in 0..exec::MAX_HARTS {
                 let hart = exec::HartId::new(index).unwrap();
                 if !ipi::is_online(hart) { println!("NCOUNTERS_OFFLINE h={}", index); continue; }
@@ -587,7 +712,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 println!("  usage: restart <component>");
                 return;
             };
-            match world().restart_component(name) {
+            match world().restart_component_on_home(name).await {
                 Ok(report) => {
                     println!(
                         "  restarted {}  generation {} -> {}",

@@ -184,10 +184,21 @@ pub fn mxr_enabled() -> bool {
 }
 
 pub fn probe_extension(extension_id: usize) -> bool {
+    let (error, value) = probe_extension_raw(extension_id);
+    error == 0 && value != 0
+}
+
+pub fn probe_extension_raw(extension_id: usize) -> (isize, usize) {
     LAST_PROBED_EXTENSION.store(extension_id, Ordering::Relaxed);
     PROBE_ATTEMPTS.fetch_add(1, Ordering::Release);
-    extension_id == RFENCE_EXTENSION_ID && RFENCE_SUPPORTED.load(Ordering::Acquire)
+    (0, usize::from(extension_id == RFENCE_EXTENSION_ID && RFENCE_SUPPORTED.load(Ordering::Acquire)))
 }
+
+// The host model has no PMU; do not invent hardware inventory for diagnostics.
+pub fn pmu_num_counters_raw() -> (isize, usize) { (-2, 0) }
+pub fn pmu_counter_info_raw(_index: usize) -> (isize, usize) { (-2, 0) }
+pub unsafe fn pmu_counter_config_raw(_base: usize, _mask: usize, _flags: usize, _event: usize, _data: u64) -> (isize, usize) { (-2, 0) }
+pub unsafe fn pmu_counter_stop_raw(_base: usize, _mask: usize, _flags: usize) -> (isize, usize) { (-2, 0) }
 
 pub fn remote_fence_i(hart_mask: usize, hart_mask_base: usize) -> Result<(), IpiError> {
     REMOTE_FENCE_I_MASK.store(hart_mask, Ordering::Relaxed);

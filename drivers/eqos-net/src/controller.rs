@@ -364,6 +364,9 @@ impl<R: Io> Controller<R> {
         }
         Ok(())
     }
+    #[cfg(feature = "rx-stage-profile")]
+    pub(crate) fn profile_ticks(&mut self) -> u64 { self.io.ticks() }
+
     pub fn tail(&mut self, rx: bool, address: u64) -> Result<(), Error> {
         let l = self.layout.ok_or(Error::NotReady)?;
         let base = if rx {

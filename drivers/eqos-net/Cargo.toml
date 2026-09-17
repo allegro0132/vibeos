@@ -3,6 +3,13 @@ name = "vibeos-eqos-net"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Experiment: avoid u128 alignment in per-slot borrower metadata.
+rx-compact-owner = []
+# Experimental: notify RX DMA once per bounded replenishment batch.
+rx-tail-batch = []
+rx-stage-profile = []
+
 [dependencies]
 vibeos-ethernet = { path = "../ethernet" }
 vibeos-hal = { path = "../../hal" }

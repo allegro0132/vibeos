@@ -559,11 +559,16 @@ struct RxMetadata {
     buffers: Option<vibeos_eqos_net::rx_buffers::Buffers<COUNT, RX_COUNT>>,
     lengths: [usize; RX_COUNT],
     counts: [u64; 5],
+    #[cfg(feature = "gro-batch-release")]
+    batch_releases: [u64; 2],
     view: Option<vibeos_eqos_net::pool::RxView>,
 }
 #[cfg(feature = "rx-pool-experiment")]
 static RX_META: vibeos_core::sync::SpinLock<RxMetadata> = vibeos_core::sync::SpinLock::new_recoverable(
-    RxMetadata { buffers: None, lengths: [0; RX_COUNT], counts: [0; 5], view: None });
+    RxMetadata { buffers: None, lengths: [0; RX_COUNT], counts: [0; 5], view: None,
+        #[cfg(feature = "gro-batch-release")]
+        batch_releases: [0; 2],
+    });
 // Only the four hot metadata paths below are sampled. Timer intervals include
 // lock bookkeeping; nested work is inclusive and must not be summed with the
 // existing network stage profile. No packet contents or MMIO are recorded.
@@ -664,19 +669,75 @@ unsafe fn poll_rx_ticket() -> Result<Option<vibeos_hal::network_rx::Ticket>, Err
 #[cfg(feature = "rx-batch-profile")]
 static RX_BATCH_HIST: [AtomicU64; ring::RX_BATCH + 1] =
     [const { AtomicU64::new(0) }; ring::RX_BATCH + 1];
+// Sample complete callback scopes, including early exits. No printing in the
+// receive path. Times include waits/preemption, not exclusive CPU cycles.
+#[cfg(feature = "rx-callback-profile")]
+static RX_CALLBACK: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+#[cfg(feature = "rx-callback-profile")]
+struct RxCallbackSample {
+    sampled: bool, phase: usize, last: u64, ticks: [u64; 5],
+    frames: usize, outcome: usize,
+}
+#[cfg(feature = "rx-callback-profile")]
+impl RxCallbackSample {
+    fn new() -> Self {
+        let sampled = RX_CALLBACK[0].fetch_add(1, Ordering::Relaxed) % 127 == 0;
+        Self { sampled, phase: 0, last: if sampled { profile_time() } else { 0 },
+            ticks: [0; 5], frames: 0, outcome: 3 }
+    }
+    fn next(&mut self) {
+        if self.sampled {
+            let now = profile_time();
+            self.ticks[self.phase] += now.wrapping_sub(self.last);
+            self.last = now;
+        }
+        self.phase += 1;
+    }
+}
+#[cfg(feature = "rx-callback-profile")]
+impl Drop for RxCallbackSample {
+    fn drop(&mut self) {
+        if !self.sampled { return; }
+        self.ticks[self.phase] += profile_time().wrapping_sub(self.last);
+        RX_CALLBACK[1].fetch_add(1, Ordering::Relaxed);
+        for (counter, ticks) in RX_CALLBACK[2..7].iter().zip(self.ticks) {
+            counter.fetch_add(ticks, Ordering::Relaxed);
+        }
+        RX_CALLBACK[7].fetch_add(self.frames as u64, Ordering::Relaxed);
+        RX_CALLBACK[8 + self.outcome].fetch_add(1, Ordering::Relaxed);
+    }
+}
 #[cfg(feature = "rx-batch-experiment")]
 unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> {
+    #[cfg(feature = "rx-callback-profile")]
+    let mut profile = RxCallbackSample::new();
     let mut output = [None; ring::RX_BATCH];
-    if !engine().receive_pending() { return Ok(output); }
+    if !engine().receive_pending() {
+        #[cfg(feature = "rx-callback-profile")]
+        { profile.outcome = 1; }
+        return Ok(output);
+    }
+    #[cfg(feature = "rx-callback-profile")]
+    profile.next();
     let mut access = RxAccess { view: None };
     let frames = match engine().receive_detached_batch(&mut access) {
         Ok(frames) => frames,
-        Err(EngineError::Ring(ring::Error::Full)) => { RX_META.lock().counts[3] += 1; return Ok(output); }
+        Err(EngineError::Ring(ring::Error::Full)) => {
+            #[cfg(feature = "rx-callback-profile")]
+            { profile.outcome = 2; }
+            RX_META.lock().counts[3] += 1; return Ok(output);
+        }
         Err(e) => return Err(error(e)),
     };
+    #[cfg(feature = "rx-callback-profile")]
+    profile.next();
     #[cfg(feature = "rx-batch-profile")]
     RX_BATCH_HIST[frames.iter().flatten().count()].fetch_add(1, Ordering::Relaxed);
-    if frames.iter().all(Option::is_none) { return Ok(output); }
+    if frames.iter().all(Option::is_none) {
+        #[cfg(feature = "rx-callback-profile")]
+        { profile.outcome = 1; }
+        return Ok(output);
+    }
     let view = access.view.expect("admitted permanent RX view");
     let mut accepted = [false; ring::RX_BATCH];
     for (i, frame) in frames.iter().enumerate() {
@@ -685,6 +746,8 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
                 |bytes| engine().validate_rx_frame(bytes, frame.checksum)).expect("validated RX span");
         }
     }
+    #[cfg(feature = "rx-callback-profile")]
+    profile.next();
     let mut count = 0;
     with_rx_metadata(1, |metadata| {
         for (i, frame) in frames.into_iter().enumerate() {
@@ -701,6 +764,8 @@ unsafe fn poll_rx_batch() -> Result<vibeos_hal::network_rx::TicketBatch, Error> 
             }
         }
     });
+    #[cfg(feature = "rx-callback-profile")]
+    { profile.next(); profile.frames = count; profile.outcome = 0; }
     let engine = engine(); engine.rx_packets = engine.rx_packets.saturating_add(count as u64);
     snapshot();
     Ok(output)
@@ -711,6 +776,18 @@ unsafe fn release_rx_borrow(borrow: vibeos_hal::network_rx::Borrow) {
     with_rx_metadata(3, |metadata| {
         if metadata.buffers.as_mut().is_some_and(|buffers| buffers.release(borrow).is_ok()) {
             metadata.counts[2] += 1;
+        }
+    });
+}
+#[cfg(feature = "gro-batch-release")]
+unsafe fn release_rx_borrows(borrows: &mut [Option<vibeos_hal::network_rx::Borrow>]) {
+    with_rx_metadata(3, |metadata| {
+        metadata.batch_releases[0] += 1;
+        for borrow in borrows.iter_mut().filter_map(Option::take) {
+            if metadata.buffers.as_mut().is_some_and(|buffers| buffers.release(borrow).is_ok()) {
+                metadata.counts[2] += 1;
+                metadata.batch_releases[1] += 1;
+            }
         }
     });
 }
@@ -728,7 +805,11 @@ unsafe fn acquire_rx_loan(ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_
             Err(_) => { let _ = buffers.release(borrow); return Err(Error::InvalidDescription); }
         };
         match vibeos_hal::network_rx::Loan::new(borrow, pointer, bytes, release_rx_borrow) {
-            Ok(loan) => { metadata.counts[1] += 1; Ok(loan) },
+            Ok(loan) => {
+                #[cfg(feature = "gro-batch-release")]
+                let loan = loan.with_batch_release(release_rx_borrows);
+                metadata.counts[1] += 1; Ok(loan)
+            },
             Err(borrow) => { let _ = buffers.release(borrow); Err(Error::InvalidDescription) }
         }
     })
@@ -748,6 +829,12 @@ unsafe fn recover_rx_borrower(owner: vibeos_hal::network_rx::Owner) -> usize {
 
 #[cfg(feature = "rx-pool-experiment")]
 fn rx_pool_stats() -> vibeos_hal::network_rx::Stats {
+    #[cfg(feature = "rx-ring-profile")]
+    report(format_args!("RX_RING_STAGE interval=131 fields=[calls,samples,lookup,descriptor,sync,prepare,rearm,publish,finish,frames,ok,empty,error] values={:?}\n",
+        ring::rx_stage_profile::snapshot()));
+    #[cfg(feature = "rx-callback-profile")]
+    report(format_args!("RX_CALLBACK interval=127 fields=[calls,samples,probe,detach,validate,metadata,finish,frames,ok,empty,full,error] values={:?}\n",
+        RX_CALLBACK.each_ref().map(|v| v.load(Ordering::Relaxed))));
     #[cfg(feature = "rx-metadata-profile")]
     for (hart, counters) in METADATA_COUNTERS.iter().enumerate() {
         for (kind, row) in counters.0.iter().enumerate() {
@@ -763,7 +850,13 @@ fn rx_pool_stats() -> vibeos_hal::network_rx::Stats {
             RX_BATCH_HIST[i].load(Ordering::Relaxed))));
     let metadata = RX_META.lock();
     let slots = metadata.buffers.as_ref().map(|b| b.stats()).unwrap_or_default();
-    vibeos_hal::network_rx::Stats { received: metadata.counts[0], acquired: metadata.counts[1],
+    let stats = vibeos_hal::network_rx::Stats { received: metadata.counts[0], acquired: metadata.counts[1],
         released: metadata.counts[2], full: metadata.counts[3], dropped: metadata.counts[4],
-        free: slots.free, ready: slots.ready, borrowed: slots.borrowed }
+        free: slots.free, ready: slots.ready, borrowed: slots.borrowed };
+    #[cfg(feature = "gro-batch-release")]
+    let batch = metadata.batch_releases;
+    drop(metadata);
+    #[cfg(feature = "gro-batch-release")]
+    report(format_args!("RX_RELEASE_BATCH fields=[calls,frames] values={:?}\n", batch));
+    stats
 }

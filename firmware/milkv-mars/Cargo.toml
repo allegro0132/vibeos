@@ -5,6 +5,9 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+rx-compact-owner-experiment = ["vibeos-eqos-net/rx-compact-owner"]
+rx-queue-profile = ["vibeos-kernel?/rx-queue-profile"]
+gro-batch-release = ["bounded-gro", "rx-pool-experiment", "vibeos-hal/rx-batch-release", "vibeos-kernel?/gro-batch-release"]
 # Diagnostic only: report prolonged spinlock waits through SBI.
 lock-stall-probe = ["vibeos-kernel?/lock-stall-probe"]
 # Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
@@ -21,8 +24,11 @@ pc-sample = ["dep:vibeos-kernel", "vibeos-kernel/pc-sample"]
 # GMAC front-port coherency experiment; other devices keep cache maintenance.
 gmac-coherent-experiment = ["ethernet-device"]
 rx-batch-experiment = ["rx-pool-experiment"]
+rx-tail-batch-experiment = ["rx-batch-experiment", "vibeos-eqos-net/rx-tail-batch"]
 # On-demand occupancy counters; no periodic logging or per-packet clock reads.
 rx-batch-profile = ["rx-batch-experiment"]
+rx-callback-profile = ["rx-batch-experiment"]
+rx-ring-profile = ["rx-batch-experiment", "vibeos-eqos-net/rx-stage-profile"]
 # Explicit controller timing and periodic register/checksum reports.
 controller-profile = ["ethernet-device"]
 driver-stage-profile = ["dep:vibeos-kernel", "vibeos-kernel/driver-stage-profile", "rx-pool-experiment"]

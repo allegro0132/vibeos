@@ -1791,7 +1791,7 @@ mod pooled_receive {
     use std::{collections::BTreeMap, sync::{Mutex, OnceLock, atomic::{AtomicU64, Ordering}}};
     use vibeos_core::{heap::{AllocationDomain, OwnerId, ArenaId}, net_receive::*};
     use vibeos_net_protocol::{PacketReceive, PacketRxToken};
-    struct Record { bytes: &'static [u8], borrower: Option<Owner>, released: bool }
+    struct Record { batch_size: usize, bytes: &'static [u8], borrower: Option<Owner>, released: bool }
     fn records() -> &'static Mutex<BTreeMap<u64, Record>> {
         static R: OnceLock<Mutex<BTreeMap<u64, Record>>> = OnceLock::new();
         R.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1801,6 +1801,15 @@ mod pooled_receive {
         let record = records.get_mut(&borrow.ticket().pool()).unwrap();
         assert_eq!(record.borrower, Some(borrow.owner()));
         record.borrower = None; record.released = true;
+    }
+    #[cfg(feature = "gro-batch-release")]
+    unsafe fn release_many(borrows: &mut [Option<Borrow>]) {
+        let size = borrows.len(); let mut records = records().lock().unwrap();
+        for b in borrows.iter_mut().filter_map(Option::take) {
+            let r = records.get_mut(&b.ticket().pool()).unwrap();
+            assert_eq!(r.borrower, Some(b.owner())); assert!(!r.released);
+            r.borrower=None; r.released=true; r.batch_size=size;
+        }
     }
     static OPS: Operations = Operations {
         poll_batch: None,
@@ -1813,7 +1822,10 @@ mod pooled_receive {
                 return Err(DeviceError::Busy);
             }
             r.borrower = Some(owner);
-            Ok(unsafe { Loan::new(Borrow::from_owned(ticket, owner), r.bytes.as_ptr(), r.bytes.len(), release).unwrap() })
+            let loan = unsafe { Loan::new(Borrow::from_owned(ticket, owner), r.bytes.as_ptr(), r.bytes.len(), release).unwrap() };
+            #[cfg(feature = "gro-batch-release")]
+            let loan = unsafe { loan.with_batch_release(release_many) };
+            Ok(loan)
         },
         discard: |ticket| {
             let mut records = records().lock().unwrap();
@@ -1828,7 +1840,7 @@ mod pooled_receive {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         // Synthetic DMA reception happens here; no copy is allowed after acquire.
         let bytes = Box::leak(bytes.to_vec().into_boxed_slice());
-        records().lock().unwrap().insert(id, Record { bytes, borrower: None, released: false });
+        records().lock().unwrap().insert(id, Record { batch_size: 0, bytes, borrower: None, released: false });
         let ticket = Ticket::from_parts(id, 0, 1);
         q.try_send(Stamped::new(ticket, session_stamp())).unwrap(); ticket
     }
@@ -1837,6 +1849,24 @@ mod pooled_receive {
         let authority = space.lookup_revocable::<ReceiveEndpoint>(cap, Rights::RECV).unwrap();
         (cap, PacketReceive::Pooled { authority,
             domain: AllocationDomain::new(OwnerId::new(33), ArenaId::new(44)) })
+    }
+    #[cfg(feature = "gro-batch-release")]
+    #[test]
+    fn gro_batches_only_merged_followers_and_revocation_releases_retained_loans() {
+        let q=unsafe { ReceiveEndpoint::new("bulk-gro",16,&OPS).unwrap() };
+        let out=Endpoint::new("bulk-out",16);let mut cs=CSpace::new("bulk");
+        let (root,rx)=receive(&mut cs,q.clone());let (_,tx)=authority(&mut cs,&out,Rights::SEND);
+        let mut device=PacketDevice::new(session_stamp(),rx,tx);device.set_rx_checksum_offload(true);
+        let tickets:Vec<_>=[0,100,200,500].map(|seq|inject(&q,&gro_test_data(seq))).into();
+        let (rx,tx)=device.receive(Instant::ZERO).unwrap();drop(tx);
+        rx.consume(|bytes| assert_eq!(bytes.len(),54+300));
+        {
+            let r=records().lock().unwrap();
+            assert!(!r[&tickets[0].pool()].released);assert!(!r[&tickets[3].pool()].released);
+            for ticket in &tickets[1..3] { assert!(r[&ticket.pool()].released);assert_eq!(r[&ticket.pool()].batch_size,2); }
+        }
+        cs.revoke(root).unwrap();assert!(device.receive(Instant::from_millis(1)).is_none());
+        let r=records().lock().unwrap();for t in tickets { assert!(r[&t.pool()].released);assert!(r[&t.pool()].borrower.is_none()); }
     }
     #[test]
     fn pooled_token_is_a_slice_of_original_storage_and_revocation_releases_it() {

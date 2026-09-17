@@ -130,6 +130,7 @@ pub struct Component {
     lifecycle: SpinLock<()>,
     memory_owner: OwnerId,
     memory_budget: usize,
+    home_hart: exec::HartId,
 }
 
 struct ComponentInstance {
@@ -324,6 +325,8 @@ pub enum RestartError {
     NotRestartable,
     StillRunning,
     GenerationExhausted,
+    GenerationChanged,
+    DispatchFailed,
 }
 
 impl fmt::Display for RestartError {
@@ -333,6 +336,8 @@ impl fmt::Display for RestartError {
             Self::NotRestartable => "component has no audited restart template",
             Self::StillRunning => "component is still running; cancel it first",
             Self::GenerationExhausted => "component generation space exhausted",
+            Self::GenerationChanged => "component generation changed before restart",
+            Self::DispatchFailed => "restart worker exited without a result",
         })
     }
 }
@@ -824,6 +829,7 @@ impl World {
             }),
             memory_owner,
             memory_budget,
+            home_hart: vibeos_core::ipi::current_logical_hart().expect("component creation hart"),
         });
         let mut components = self.components.lock();
         // There is no yield between the two checks on the single-hart executor,
@@ -1481,12 +1487,45 @@ impl World {
     }
 
     /// Replace a terminal task incarnation while retaining stable component,
-    /// memory-owner, Space, and supervisor-route identities.
+    /// memory-owner, Space, and supervisor-route identities. This synchronous
+    /// factory uses the caller hart; cross-hart operator callers should await
+    /// `restart_component_on_home` to preserve the initial placement.
     pub fn restart_component(&self, name: &str) -> Result<RestartReport, RestartError> {
         let component = self.component_named(name).ok_or(RestartError::NotFound)?;
         let _lifecycle = component.lifecycle.lock();
         if !self.components.lock().contains_key(&component.id) { return Err(RestartError::NotFound); }
         self.restart_component_locked(&component)
+    }
+
+    /// Operator restart: construct the fresh arena on the original hart.
+    /// No lifecycle guard or allocation-owner override crosses an await.
+    pub async fn restart_component_on_home(self: &Arc<Self>, name: &str) -> Result<RestartReport, RestartError> {
+        let component = self.component_named(name).ok_or(RestartError::NotFound)?;
+        let generation = component.snapshot().generation;
+        let (result, worker) = {
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            let result = Arc::new(SpinLock::new(None));
+            let output = result.clone();
+            let world = self.clone();
+            let worker = exec::spawn_pinned_on(component.home_hart, "component-restart", async move {
+                let reply = {
+                    let _lifecycle = component.lifecycle.lock();
+                    if !world.components.lock().contains_key(&component.id) {
+                        Err(RestartError::NotFound)
+                    } else if component.snapshot().generation != generation {
+                        Err(RestartError::GenerationChanged)
+                    } else {
+                        world.restart_component_locked(&component)
+                    }
+                };
+                *output.lock() = Some(reply);
+            });
+            system.restore();
+            (result, worker)
+        };
+        worker.join().await;
+        let reply = result.lock().take().unwrap_or(Err(RestartError::DispatchFailed));
+        reply
     }
 
     fn restart_component_locked(&self, component: &Arc<Component>) -> Result<RestartReport, RestartError> {
@@ -1570,6 +1609,8 @@ impl World {
             RestartError::NotRestartable => "read-only: no audited restart template",
             RestartError::StillRunning => "service is still running",
             RestartError::GenerationExhausted => "service generation exhausted",
+            RestartError::GenerationChanged => "service generation changed",
+            RestartError::DispatchFailed => "restart worker failed",
         })?;
         Ok(Control::Done)
     }

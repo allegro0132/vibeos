@@ -34,8 +34,27 @@ enum State {
     Dma,
     Detached,
     Ready,
+    #[cfg(not(feature = "rx-compact-owner"))]
     Borrowed(u128),
+    #[cfg(feature = "rx-compact-owner")]
+    Borrowed(vibeos_hal::network_rx::Owner),
     Retired,
+}
+impl State {
+    #[inline(always)]
+    fn borrowed(owner: vibeos_hal::network_rx::Owner) -> Self {
+        #[cfg(not(feature = "rx-compact-owner"))]
+        { Self::Borrowed(owner.key()) }
+        #[cfg(feature = "rx-compact-owner")]
+        { Self::Borrowed(owner) }
+    }
+    #[inline(always)]
+    fn owned_by(self, owner: u128) -> bool {
+        #[cfg(not(feature = "rx-compact-owner"))]
+        { self == Self::Borrowed(owner) }
+        #[cfg(feature = "rx-compact-owner")]
+        { matches!(self, Self::Borrowed(identity) if identity.key() == owner) }
+    }
 }
 #[derive(Clone, Copy)]
 struct Slot {
@@ -239,13 +258,13 @@ impl<const D: usize, const N: usize> Buffers<D, N> {
         if self.slots[index].state != State::Ready {
             return Err(Error::Busy);
         }
-        self.slots[index].state = State::Borrowed(owner);
+        self.slots[index].state = State::borrowed(identity);
         Ok(unsafe { Borrow::from_owned(ticket, identity) })
     }
     /// End the immutable byte borrow before calling this method.
     pub fn release(&mut self, borrow: Borrow) -> Result<(), Error> {
         let index = self.validate(borrow.ticket())?;
-        if self.slots[index].state != State::Borrowed(borrow.owner().key()) {
+        if self.slots[index].state != State::borrowed(borrow.owner()) {
             return Err(Error::Stale);
         }
         self.recycle(index);
@@ -287,7 +306,7 @@ impl<const D: usize, const N: usize> Buffers<D, N> {
         }
         let mut count = 0;
         for index in 0..N {
-            if self.slots[index].state == State::Borrowed(owner) {
+            if self.slots[index].state.owned_by(owner) {
                 self.recycle(index);
                 count += 1;
             }
@@ -321,6 +340,14 @@ impl<const D: usize, const N: usize> Buffers<D, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn slot_layout_budget() {
+        #[cfg(feature = "rx-compact-owner")]
+        assert_eq!(core::mem::size_of::<Slot>(), 40);
+        #[cfg(not(feature = "rx-compact-owner"))]
+        assert_eq!(core::mem::size_of::<Slot>(), 48);
+    }
     #[test]
     fn a_generation_does_not_prove_initial_cache_preparation() {
         let mut p = Buffers::<2, 4>::new().unwrap();

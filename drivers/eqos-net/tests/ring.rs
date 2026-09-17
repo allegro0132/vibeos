@@ -894,8 +894,12 @@ fn batch_pool_pressure_returns_prefix_then_retries_without_losing_completion() {
     let (mut ring, state, mut buffers) = pooled::<5>();
     let base = layout().rx_descriptors;
     for i in 0..2 { state.borrow_mut().words.insert((base + i * 64, 3), 0x30000040); }
+    state.borrow_mut().events.clear();
     let first = ring.receive_detached_batch(&mut buffers).unwrap();
     assert_eq!(first.iter().flatten().count(), 1);
+    let tails: Vec<_> = state.borrow().events.iter().filter_map(|e|
+        if let Event::Tail(true, a) = e { Some(*a) } else { None }).collect();
+    assert_eq!(tails, vec![base]); // Never advertise the unprepared second slot.
     let old = buffers.descriptor_buffer(1);
     state.borrow_mut().events.clear();
     assert_eq!(ring.receive_detached_batch(&mut buffers), Err(Error::Full));
@@ -958,4 +962,38 @@ fn batch_bound_is_eight_and_advances_a_larger_ring_without_skipping() {
         }
     }
     assert_eq!(ring.receive_detached_batch(&mut buffers).unwrap(), [None; RX_BATCH]);
+}
+
+#[test]
+fn batch_tail_notifies_only_replenished_prefix_after_ownership_visibility() {
+    let (mut ring, state, mut buffers) = pooled::<8>();
+    let base = layout().rx_descriptors;
+    // First advance to index 3; the next batch straddles the ring boundary.
+    for indexes in [&[0usize, 1, 2][..], &[3usize, 0][..]] {
+        state.borrow_mut().events.clear();
+        for &i in indexes { state.borrow_mut().words.insert((base + i as u64 * 64, 3), 0x30000040); }
+        let frames = ring.receive_detached_batch(&mut buffers).unwrap();
+        assert_eq!(frames.iter().flatten().count(), indexes.len());
+        let state_ref = state.borrow();
+        let events = &state_ref.events;
+        let tails: Vec<_> = events.iter().enumerate().filter_map(|(pos, e)|
+            if let Event::Tail(true, address) = e { Some((pos, *address)) } else { None }).collect();
+        let expected: Vec<_> = if cfg!(feature = "rx-tail-batch") {
+            vec![base + *indexes.last().unwrap() as u64 * 64]
+        } else { indexes.iter().map(|i| base + *i as u64 * 64).collect() };
+        assert_eq!(tails.iter().map(|(_, a)| *a).collect::<Vec<_>>(), expected);
+        let final_tail = tails.last().unwrap().0;
+        for &i in indexes {
+            let address = base + i as u64 * 64;
+            let own = events.iter().position(|e| matches!(e, Event::Word(a, 3, v) if *a == address && v & descriptor::OWN != 0)).unwrap();
+            assert_eq!(events[own + 1], Event::Device(address, STRIDE, Direction::Bidirectional));
+            assert_eq!(events[own + 2], Event::Barrier);
+            assert!(own + 2 < final_tail);
+        }
+        drop(state_ref);
+        for frame in frames.into_iter().flatten() { buffers.discard(frame.ticket).unwrap(); }
+    }
+    state.borrow_mut().events.clear();
+    assert_eq!(ring.receive_detached_batch(&mut buffers).unwrap(), [None; RX_BATCH]);
+    assert!(!state.borrow().events.iter().any(|e| matches!(e, Event::Tail(..))));
 }

@@ -177,8 +177,42 @@ fn ecall(eid: usize, fid: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> 
 
 /// Probe one standardized SBI extension through the mandatory Base extension.
 pub fn probe_extension(extension_id: usize) -> bool {
-    let (error, value) = ecall(SBI_EXT_BASE, SBI_EXT_BASE_PROBE, extension_id, 0, 0, 0);
+    let (error, value) = probe_extension_raw(extension_id);
     error == 0 && value != 0
+}
+
+/// Preserve both SBI return registers for diagnostics. A failed query is not
+/// evidence that the queried extension is absent; value is meaningful on success.
+pub fn probe_extension_raw(extension_id: usize) -> (isize, usize) {
+    ecall(SBI_EXT_BASE, SBI_EXT_BASE_PROBE, extension_id, 0, 0, 0)
+}
+
+/// Read-only PMU inventory for the calling hart. Preserve SBI errors verbatim.
+pub fn pmu_num_counters_raw() -> (isize, usize) {
+    ecall(0x504d55, 0, 0, 0, 0, 0)
+}
+
+/// Read counter metadata, without configuring, starting or reading its CSR.
+pub fn pmu_counter_info_raw(index: usize) -> (isize, usize) {
+    ecall(0x504d55, 1, index, 0, 0, 0)
+}
+
+/// Configure a PMU event on the calling hart, preserving raw SBI results.
+/// # Safety
+/// Caller exclusively owns the selected counters and must stop/reset mappings
+/// before relinquishing that ownership. RV64 event_data is passed in a4.
+pub unsafe fn pmu_counter_config_raw(base: usize, mask: usize, flags: usize, event: usize, data: u64) -> (isize, usize) {
+    let (error, value);
+    asm!("ecall", inlateout("a0") base => error, inlateout("a1") mask => value,
+        in("a2") flags, in("a3") event, in("a4") data,
+        in("a6") 2usize, in("a7") 0x504d55usize, options(nostack));
+    (error, value)
+}
+
+/// # Safety
+/// Caller exclusively owns the selected counters on the calling hart.
+pub unsafe fn pmu_counter_stop_raw(base: usize, mask: usize, flags: usize) -> (isize, usize) {
+    ecall(0x504d55, 4, base, mask, flags, 0)
 }
 
 /// Ask selected physical harts to synchronize their instruction streams.

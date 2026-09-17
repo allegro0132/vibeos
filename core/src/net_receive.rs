@@ -7,6 +7,8 @@ use crate::{cap::Resource, chan::Endpoint, heap::{self, AllocationDomain, OwnerI
     net::{PacketStamp, PacketStampMismatch}};
 pub use vibeos_hal::network_rx::{Borrow, Loan, Operations, Owner, Ticket};
 pub use vibeos_hal::network::Error as DeviceError;
+#[cfg(feature = "rx-batch-release")]
+pub use vibeos_hal::network_rx::ReleaseBatch;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stamped { ticket: Ticket, stamp: PacketStamp }
@@ -113,17 +115,32 @@ impl ReceiveEndpoint {
     /// allocation domain. The returned loan retains already-admitted ownership;
     /// dropping it is cleanup, not a new capability invocation.
     pub fn try_receive(&self, expected: PacketStamp, domain: AllocationDomain) -> Result<Option<Loan>, Error> {
-        let owner = Owner::new(domain.owner.get(), domain.arena.get()).ok_or(Error::UntrackedOwner)?;
-        let Some(frame) = self.queue.try_recv() else { return Ok(None); };
-        if frame.stamp != expected {
-            self.discard(frame);
-            return Err(Error::Session(PacketStampMismatch { expected, observed: frame.stamp }));
-        }
-        match unsafe { (self.operations.acquire)(frame.ticket, owner) } {
-            Ok(loan) => Ok(Some(loan)),
-            Err(error) => { self.discard(frame); Err(Error::Device(error)) }
-        }
+        #[cfg(feature = "rx-queue-profile")]
+        let sample = queue_profile::begin();
+        #[cfg(feature = "rx-queue-profile")]
+        let mut queue_ticks = 0;
+        let result = (|| {
+            let owner = Owner::new(domain.owner.get(), domain.arena.get()).ok_or(Error::UntrackedOwner)?;
+            #[cfg(feature = "rx-queue-profile")]
+            let queue_start = sample.as_ref().map(|_| crate::arch::time());
+            let frame = self.queue.try_recv();
+            #[cfg(feature = "rx-queue-profile")]
+            if let Some(start) = queue_start { queue_ticks = crate::arch::time().wrapping_sub(start); }
+            let Some(frame) = frame else { return Ok(None); };
+            if frame.stamp != expected {
+                self.discard(frame);
+                return Err(Error::Session(PacketStampMismatch { expected, observed: frame.stamp }));
+            }
+            match unsafe { (self.operations.acquire)(frame.ticket, owner) } {
+                Ok(loan) => Ok(Some(loan)),
+                Err(error) => { self.discard(frame); Err(Error::Device(error)) }
+            }
+        })();
+        #[cfg(feature = "rx-queue-profile")]
+        queue_profile::finish(sample, queue_ticks, &result);
+        result
     }
+
     /// Caller holds the session publication barrier; producers cannot refill
     /// this queue during retirement. In-flight loans remain pinned separately.
     pub fn retire_queued(&self) -> usize {
@@ -142,4 +159,36 @@ impl ReceiveEndpoint {
 impl Resource for ReceiveEndpoint {
     fn kind(&self) -> &'static str { "detached-receive-endpoint" }
     fn as_any(&self) -> &dyn Any { self }
+}
+
+/// Diagnostic only: separate queue dequeue from the complete loan admission.
+/// Rows are success, empty, rejection; samples are systematic, not exclusive CPU.
+#[cfg(feature = "rx-queue-profile")]
+pub mod queue_profile {
+    use super::{Error, Loan};
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    const INTERVAL: u64 = 127;
+    #[repr(align(64))]
+    struct Counters { calls: AtomicU64, rows: [[AtomicU64; 3]; 3] }
+    static COUNTERS: [Counters; crate::exec::MAX_HARTS] = [const { Counters {
+        calls: AtomicU64::new(0), rows: [const { [const { AtomicU64::new(0) }; 3] }; 3],
+    } }; crate::exec::MAX_HARTS];
+    pub(super) fn begin() -> Option<(usize, u64)> {
+        let hart = crate::ipi::current_logical_hart()?.index();
+        let count = COUNTERS[hart].calls.fetch_add(1, Relaxed);
+        (count % INTERVAL == 0).then(|| (hart, crate::arch::time()))
+    }
+    pub(super) fn finish(sample: Option<(usize, u64)>, queue: u64, result: &Result<Option<Loan>, Error>) {
+        let Some((hart, start)) = sample else { return; };
+        let total = crate::arch::time().wrapping_sub(start);
+        let row = match result { Ok(Some(_)) => 0, Ok(None) => 1, Err(_) => 2 };
+        for (counter, value) in COUNTERS[hart].rows[row].iter().zip([1, queue, total]) {
+            counter.fetch_add(value, Relaxed);
+        }
+    }
+    pub fn snapshot(hart: usize) -> Option<(u64, [[u64; 3]; 3])> {
+        let counters = COUNTERS.get(hart)?;
+        Some((counters.calls.load(Relaxed), core::array::from_fn(|row|
+            core::array::from_fn(|column| counters.rows[row][column].load(Relaxed)))))
+    }
 }

@@ -5,6 +5,8 @@ edition = "2021"
 autobins = false
 
 [features]
+rx-queue-profile = ["vibeos-core/rx-queue-profile"]
+gro-batch-release = ["vibeos-netstack/gro-batch-release"]
 # Diagnostic only: report prolonged spinlock waits through SBI.
 lock-stall-probe = ["vibeos-core/lock-stall-probe"]
 # Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.

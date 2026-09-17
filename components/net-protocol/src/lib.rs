@@ -775,6 +775,8 @@ impl phy::Device for PacketDevice {
             let loan = self.receive_pooled()?;
             #[cfg(feature = "bounded-gro")]
             if self.gro.begin(loan.as_bytes(), self.rx_checksum_offload) {
+                #[cfg(feature = "gro-batch-release")]
+                let mut releases = vibeos_core::net_receive::ReleaseBatch::<{ gro::MAX_SEGMENTS }>::new();
                 for _ in 1..gro::MAX_SEGMENTS {
                     if self.gro.finished() { break; }
                     let Some(next) = self.receive_pooled() else {
@@ -787,7 +789,10 @@ impl phy::Device for PacketDevice {
                         break;
                     }
                     // Merged bytes now belong to the bounded aggregation buffer.
-                    // Dropping this loan returns its DMA slot immediately.
+                    // Default cleanup is immediate. The experiment retains only
+                    // merged followers until this group ends (no await/prefetch).
+                    #[cfg(feature = "gro-batch-release")]
+                    if let Err(loan) = releases.push(next) { drop(loan); }
                 }
             }
             #[cfg(feature = "gro-end-profile")]

@@ -29,6 +29,13 @@ impl ProbePlatform {
 }
 
 impl Platform for ProbePlatform {
+    #[cfg(feature = "application-event-poll")]
+    fn tcp_activity(&self, listener: Cap) -> Result<Option<vibeos_core::chan::MessageEvent>, SocketError> {
+        self.listener(listener, Rights::RECV)?
+            .try_with(|listener| Some(listener.network_event()))
+            .map_err(|_| SocketError::AuthorityRevoked)
+    }
+
     fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, SocketError> {
         self.listener(listener, Rights::RECV)?
             .try_with(TcpListener::try_accept)

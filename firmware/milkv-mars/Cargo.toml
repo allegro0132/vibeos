@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+gro-checked = ["gro-scatter", "vibeos-kernel?/gro-checked"]
 gro-scatter = ["gro-batch-release", "vibeos-kernel?/gro-scatter"]
 frontend-rx-batch = ["vibeos-kernel?/frontend-rx-batch"]
 network-service-peer = ["network-inline-rx", "vibeos-kernel?/network-service-peer"]

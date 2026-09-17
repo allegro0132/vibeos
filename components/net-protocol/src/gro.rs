@@ -175,6 +175,19 @@ impl Buffer {
         self.profile[self.profile_reason] += 1;
         self.profile[9 + self.segments] += 1;
     }
+    /// Accounting only: validation belongs to smoltcp's immutable builder.
+    #[cfg(feature = "gro-checked")]
+    pub fn record_checked(&mut self, segments: usize, _reason: usize) {
+        if segments >= 2 {
+            self.aggregates += 1;
+            self.merged_segments += (segments - 1) as u64;
+        }
+        #[cfg(feature = "gro-end-profile")]
+        {
+            self.profile[_reason] += 1;
+            self.profile[9 + segments] += 1;
+        }
+    }
     pub fn has_aggregate(&self) -> bool { self.segments >= 2 }
     pub fn finished(&self) -> bool { self.done }
     pub fn finish(&mut self, trusted: bool) {

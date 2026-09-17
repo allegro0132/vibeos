@@ -21,6 +21,10 @@ pub enum SocketError {
 
 /// The adapter checks the listener capability on every operation.
 pub trait Platform: Sync {
+    #[cfg(feature = "event-driven")]
+    fn tcp_activity(&self, _listener: Cap) -> Result<Option<vibeos_core::chan::MessageEvent>, SocketError> {
+        Ok(None)
+    }
     fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, SocketError>;
     fn tcp_recv(
         &self,
@@ -205,7 +209,26 @@ pub async fn task(p: &dyn Platform, listeners: [Cap; FLOW_COUNT]) {
     // Allocate after the supervised task starts, charged to its arena.
     let mut flows: Vec<Flow> = (0..FLOW_COUNT).map(|_| Flow::new()).collect();
     let mut budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
+    #[cfg(feature = "event-driven")]
+    let notifications = {
+        let mut events: [Option<vibeos_core::chan::MessageEvent>; FLOW_COUNT] = core::array::from_fn(|_| None);
+        for (slot, listener) in events.iter_mut().zip(listeners) {
+            match p.tcp_activity(listener) {
+                Ok(event) => *slot = event,
+                Err(_) => return,
+            }
+        }
+        if events.iter().all(Option::is_some) { Some(events.map(Option::unwrap)) } else { None }
+    };
+    #[cfg(feature = "event-driven")]
+    let mut armed = false;
     loop {
+        // Prepare listeners before the second complete idle check. Busy turns
+        // avoid queue registration; notifications carry no data authority.
+        #[cfg(feature = "event-driven")]
+        let waits = if armed {
+            notifications.as_ref().map(|events| events.each_ref().map(|event| event.wait()))
+        } else { None };
         let mut worked = false;
         for (flow, listener) in flows.iter_mut().zip(listeners) {
             match flow.drive(p, listener) {
@@ -222,6 +245,30 @@ pub async fn task(p: &dyn Platform, listeners: [Cap; FLOW_COUNT]) {
                 }
             }
         }
+        #[cfg(feature = "event-driven")]
+        if notifications.is_some() {
+            vibeos_core::net_profile::poll_decision(worked, worked || waits.is_none());
+            if worked {
+                armed = false;
+                vibeos_core::exec::yield_now().await;
+            } else if let Some(mut waits) = waits {
+                use core::{future::{poll_fn, Future}, pin::{pin, Pin}, task::Poll};
+                // Keep deadline and revocation observation bounded even if
+                // a notification is unavailable because its producer retired.
+                let mut timer = pin!(vibeos_core::exec::sleep_ms(1));
+                poll_fn(|cx| {
+                    if timer.as_mut().poll(cx).is_ready() { return Poll::Ready(()); }
+                    for waiter in &mut waits {
+                        if Pin::new(waiter).poll(cx).is_ready() { return Poll::Ready(()); }
+                    }
+                    Poll::Pending
+                }).await;
+                armed = false;
+            } else {
+                armed = true;
+            }
+            continue;
+        }
         if budget.runnable(p.now_ms(), worked) {
             vibeos_core::exec::yield_now().await;
         } else {
@@ -236,6 +283,40 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
     use vibeos_core::cap::{CSpace, Rights};
     use vibeos_net_api::{TcpListener, TcpListenerId, TcpStreamState};
+    #[cfg(feature = "event-driven")]
+    #[test]
+    fn idle_task_checks_twice_then_observes_revocation_on_notification() {
+        use core::{future::Future, pin::pin, sync::atomic::AtomicBool, task::{Context, Waker}};
+        struct Idle {
+            listener: alloc::sync::Arc<TcpListener>,
+            calls: AtomicU64,
+            revoked: AtomicBool,
+        }
+        impl Platform for Idle {
+            fn tcp_activity(&self, _: Cap) -> Result<Option<vibeos_core::chan::MessageEvent>, SocketError> {
+                Ok(Some(self.listener.network_event()))
+            }
+            fn tcp_accept(&self, _: Cap) -> Result<Option<TcpConnectionToken>, SocketError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                if self.revoked.load(Ordering::Relaxed) { Err(SocketError::AuthorityRevoked) } else { Ok(None) }
+            }
+            fn tcp_recv(&self, _: Cap, _: TcpConnectionToken, _: &mut [u8]) -> Result<TcpIoResult, SocketError> { unreachable!() }
+            fn tcp_send(&self, _: Cap, _: TcpConnectionToken, _: &[u8]) -> Result<TcpIoResult, SocketError> { unreachable!() }
+            fn tcp_close(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { unreachable!() }
+            fn tcp_reset(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { unreachable!() }
+            fn now_ms(&self) -> u64 { 0 }
+        }
+        let (model, cap) = Model::new();
+        let p = Idle { listener: model.listener, calls: AtomicU64::new(0), revoked: AtomicBool::new(false) };
+        let mut future = pin!(task(&p, [cap; FLOW_COUNT]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(p.calls.load(Ordering::Relaxed), (FLOW_COUNT * 2) as u64);
+        p.revoked.store(true, Ordering::Relaxed);
+        p.listener.network_update_state(TcpStreamState::PeerClosed).unwrap();
+        assert!(future.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(p.calls.load(Ordering::Relaxed), (FLOW_COUNT * 2 + 1) as u64);
+    }
     struct Model {
         listener: alloc::sync::Arc<TcpListener>,
         now: AtomicU64,

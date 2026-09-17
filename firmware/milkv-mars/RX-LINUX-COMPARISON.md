@@ -5714,3 +5714,416 @@ Evidence under `target/mars-reference/`: `20260917-scatter-tcp-only.patch`
 (relative to the preserved pre-existing smoltcp edits), saved original files,
 TCP contiguous/scatter logs, full smoltcp tests, protocol regressions and checks.
 No SD/SPI or board changes were made during this step.
+
+### 2026-09-17: borrowed GRO ingress wired through Interface and DMA loans
+
+The previous storage groundwork is now connected by opt-in `gro-scatter`
+(VibeOS) / `tcp-gro-receive` (smoltcp). An RxToken can synchronously supply
+the original Ethernet frames, including the first frame, as borrowed slices.
+The checked `TcpGro` representation validates every frame and the complete
+group before socket mutation: checksum policy, addresses/ports, sequential
+sequence numbers, ACK/window/options, flags, lengths and bounded group size.
+It accepts at most 16 frames / 32 KiB. Ordinary Ethernet/IPv4 admission and
+the existing TCP state machine remain shared with contiguous reception.
+Ineligible frames use the existing single-frame path. Invalid externally
+supplied groups are dropped atomically. Builds with raw sockets materialize
+a complete bounded packet and use ordinary raw delivery; their bytes and
+checksums are covered by an actual raw-socket test.
+
+PacketDevice retains all follower DMA loans through synchronous consumption,
+then releases them in a batch on the next receive (or individually on device
+destruction). Revocation after collection releases followers, lookahead and
+the remaining admission batch. No fragment reference survives in the TCP
+socket. TCP copies accepted ranges directly from the retained fragments into
+its receive ring, avoiding the intermediate GRO payload buffer; frontend
+delivery still copies. There is no new unchecked lifetime extension, domain
+switch or bypass of capability checks.
+
+Validation: smoltcp ingress/TCP configuration passed 390 tests; raw-socket
+configuration passed 384; the broader IPv4/IPv6, fragmentation, multicast,
+UDP, DHCP, raw, segmentation and buffer-exchange configuration passed 527.
+The initial broader test command omitted `multicast` and failed to compile
+existing IPv6 multicast tests; that failed invocation is preserved separately
+and is not counted as passing. VibeOS protocol passed 6 unit + 42 integration
+tests with scatter, 6 + 41 with legacy GRO, and 6 + 49 with scatter plus buffer
+exchange. Both candidate and same-source contiguous control firmware built
+and packaged successfully. Existing build warnings remain.
+
+Candidate FIT SHA256:
+`dafb5f55d56534b25286fbe157ed2dcf10d57d2b7122cb55e8a10c37722b6eea`.
+Same-source contiguous control:
+`4b61686f344e1f3c5fbe089f25c118592d030573cd081b922af5ed06672109e1`.
+All other experimental firmware features match. The source archive
+`20260917-gro-scatter-source.zip` records root HEAD
+`1315c16b0b36d26b78034ca332dfdb2e345bc20e`, submodule HEAD, complete dirty
+submodule sources including new files, and checksums. Archive SHA256:
+`0ff3bbc416820f07ceea8a7e941653fec6c7ef05a8ae9e9a4d14682fae055cdb`.
+
+Following physical recovery, the candidate was loaded into RAM with image
+hashes, initialization and gigabit link verified. The earlier silent-board
+load attempt failed at its first command, before any reboot or transfer; it
+did not run this candidate. No SD/SPI changes were made. Benchmarks ran with
+no concurrent compilation, MTU 1500, identical clients and 20-second windows.
+
+| Image | Full-rate TCP RX, Mbps | Total non-WFI cores |
+| --- | --- | --- |
+| Contiguous, round 1 | 874.363 | 1.26487 |
+| Contiguous, round 2 | 874.777 | 1.26199 |
+| Scatter, round 1 | 913.742 | 1.29129 |
+| Scatter, round 2 | 913.462 | 1.28424 |
+
+Mean throughput improved 4.463%; CPU time per received gigabit improved
+2.429%. Total full-rate occupancy is slightly higher because more traffic
+is processed. These measurements do not establish lower CPU at equal load.
+Full-rate scatter aggregates averaged 15.990 / 15.988 original segments,
+with over 99.8% of multi-frame groups reaching 16 segments. In this workload,
+poor aggregate fill does not explain the remaining cost. Counters describe
+attempted adapter aggregates and are approximate, not an instruction profile.
+
+At equal 600 Mbps load, three 20-second samples were:
+
+| Image | Total non-WFI cores, each sample | Mean |
+| --- | --- | --- |
+| Contiguous | 1.01243, 1.03401, 1.06103 | 1.03582 |
+| Scatter | 1.04197, 1.01623, 1.03350 | 1.03057 |
+
+The ranges overlap and the mean difference is only 0.51%. This does not
+establish a repeatable equal-load CPU reduction. The first paced comparison
+alone actually favored contiguous GRO, which is why it was repeated. All
+repeat runs passed another 64 MiB integrity precheck and finished with the
+entire pool free. The useful demonstrated result of this experiment is the
+full-rate throughput increase, not the requested substantial CPU reduction.
+Before another optimization, resample the remaining receive-entry, protocol
+and frontend scopes on this wired implementation. Do not infer that copying
+dominates the remaining cost from the fact that one copy was removed.
+
+Both images passed 64 MiB application-visible pattern verification before
+performance testing. Candidate cancellation under active traffic retired the
+old grants and advanced the stack generation 1 -> 2; the interrupted client
+exited without forced termination. A fresh TCP test and another 64 MiB check
+passed. At the recovery checkpoint all 5,350,347 received/acquired loans were
+released; free=128, ready=borrowed=full=dropped=0. This is cooperative component
+cancellation/restart evidence, not injected hard-fault qualification.
+
+Raw evidence under `target/mars-reference/`: `20260917-gro-{scatter,contiguous}-measure/`,
+`20260917-gro-scatter-stack-recovery/`, corresponding load/build/package/test
+logs, feature maps and ELF/FIT files. `20260917-gro-scatter-comparison.json`
+records matched-run metrics and aggregate sizes. The new path stays default
+off; the effort target of total occupancy below one core is still unmet.
+`20260917-gro-{scatter,contiguous}-paced-repeat/` and
+`20260917-gro-scatter-paced-comparison.json` retain the additional equal-load
+samples and their summary. These short runs do not qualify the new path for
+the earlier one-hour stability or full board acceptance requirements.
+
+Finally restored stable FIT
+`918fdf3be9a1fe04eb62dba8d68d74a9628cd0d03a187da15f1af82713d600b6`
+through RAM boot, checking component hashes, network initialization and
+1000 Mbps link. Evidence: `20260917-gro-scatter-baseline-restore/`. SD/SPI
+contents remain unchanged.
+
+### 2026-09-17: profile wired scatter and batch TCP ring writes
+
+Resampled the wired scatter implementation before further changes. Diagnostic
+FIT `f9581436d1786f9df70620b0cdd48d195c3cb9913a83eae2b71f77aa0c6e7096`
+completed a reconciled five-second capture. On hart 0, parent-exclusive
+elapsed scopes (including separately classified waits) were protocol poll
+1.40004 s, frontend 1.00132 s, packet receive entry 0.89178 s, RX callback
+0.61944 s and driver remainder 0.54193 s. Protocol/frontend/packet contended
+waits were only 0.000341 / 0.000334 / 0.000157 s. Inbound high water was 32,
+outbound 3, with no full retries. There were 10844 ingress turns and 21705
+post-GRO ingress objects, no empty stack retries. These timer scopes include
+interrupts and instrumentation, and sampled children must not be extrapolated
+and added to parents.
+
+Compared with the earlier contiguous diagnostic capture, packet entry is
+smaller and protocol processing larger. Work volume and instrumentation differ;
+this alone cannot assign the difference specifically to validation or copying.
+The new scatter representation performs per-fragment ring writes inside the
+protocol scope. Inspection of the actual unprofiled ELF found an out-of-line
+`write_unallocated` invocation for every fragment; its two ring lookups each
+execute `remu` and each calls memcpy, including a zero-length second copy on
+the usual non-wrapping path.
+
+Changed only the internal scattered payload writer to traverse the at most two
+contiguous destination ring regions for the whole accepted logical range,
+copying the source fragments into each region. No ring publication, sequence,
+assembler, checksum, capability, or DMA lifetime policy changes. The accepted
+range is clipped to the available window before writing. It remains a copy
+into socket-owned storage, not zero-copy delivery.
+
+A new differential test compares the complete resulting ring contents against
+the contiguous writer across zero/small/large capacities, read positions,
+allocated lengths, offsets including beyond the free window, clipped source
+ranges, empty fragments and ring wrap. Together with existing exhaustive
+fragment-range, TCP sequence/window and ingress tests, the broad configuration
+passed 528 tests. The first test compile required an explicit `usize` literal
+in its capacity matrix; that fixture typing issue was fixed before the pass.
+Generated candidate code has one `remu` in the destination-region loop and
+one memcpy site in the fragment-copy loop; it no longer calls the per-fragment
+ring writer. These are static code observations, not measured cycle savings.
+
+Candidate FIT:
+`114e3f368c5e0642ce22e52b94f71d0b4f744f75ad5bbec48a3b6898312e8448`.
+Control is the preceding scatter FIT `dafb5f55…b6eea`, with identical firmware
+features and the original fragment writer. Source delta and code evidence:
+`20260917-scatter-write-only.patch`, `20260917-scatter-write-before.rs`, and
+`20260917-scatter-write-{before-caller,before-ring,after}.asm` under
+`target/mars-reference/`. Raw profile, reconciled totals and attribution are
+in `20260917-scatter-profile-measure/`.
+
+Adjacent unprofiled A/B results, MTU 1500, each sample 20 seconds, with no
+concurrent builds:
+
+| Writer | Full-rate Mbps | Total non-WFI cores | 600 Mbps total cores (three runs) |
+| --- | --- | --- | --- |
+| Original per-fragment | 914.659, 913.027 | 1.29002, 1.28669 | 0.99067, 1.09050, 0.98913 |
+| Batched ring regions | 931.259, 930.930 | 1.28602, 1.28770 | 0.98366, 0.98682, 1.08623 |
+
+Mean full-rate throughput improved 1.888%, with 1.967% less total CPU time
+per received gigabit. The batch writer is retained within the still-default-off
+scatter path. Equal-load mean CPU differed by only 0.443%, with heavily
+overlapping ranges; substantial equal-load CPU reduction remains unproven.
+The high-occupancy batch run had 12.82 segments per aggregate, versus 13.48
+in the other two paced runs. This correlation is not a causal attribution;
+it motivates paced profiling of wakeups, empty retries and batch termination
+before changing scheduling or batching policy.
+
+Both images passed their 64 MiB pattern check and ended all five tests with
+free=128, ready=borrowed=full=dropped=0. This change does not alter ownership
+or component recovery; the earlier scatter cancellation test remains relevant
+but was not repeated for this writer. No new long-duration qualification is
+claimed. Results and all samples, including the high-CPU paced runs, are in
+`20260917-scatter-write{,-control}-measure/` and
+`20260917-scatter-write-comparison.json`. The source delta, prior source archive
+hash and changed file hash are recorded by `20260917-scatter-write-manifest.json`.
+
+Stable FIT `918fdf3b…600b6` was restored with component hashes, successful
+initialization and 1000 Mbps link verified in
+`20260917-scatter-write-baseline-restore/`. No SD/SPI writes. The active
+below-one-core effort target remains unmet at full rate.
+
+### 2026-09-17: paced scatter profile and independent-service cross-check
+
+Built the retained batched ring writer with network-profile. Diagnostic FIT
+`8fd02fc0157216d9f81af124e7866dc235c58ba8dcc66f1698aa5fa31994c7cd`
+passed RAM boot/hash/link checks. Captured a ten-second profile beginning five
+seconds into a 30-second 600 Mbps RX workload, without concurrent compilation.
+The complete dump passed bucket/hart and lock-total reconciliation. Raw files,
+analysis and explicit interval metadata: `20260917-scatter-paced-profile-measure/`
+under `target/mars-reference/`.
+
+Hart-0 parent-exclusive elapsed seconds, including separately measured waits:
+protocol 2.16288, frontend 1.62992, packet receive entry 1.47773, driver remainder
+1.13170, RX callbacks 0.99006, stack remainder 0.57639 and executor 0.38536.
+Protocol/frontend/packet waits were 0.000790 / 0.002942 / 0.000393 seconds.
+Inbound/outbound high water remained 32/3 with zero full retries.
+Of 25507 stack turns, 19840 reported ingress (38603 post-GRO objects), so
+22.217% of turns had no ingress. No-ingress does not imply no useful work:
+ACK/TX, timers and frontend progress still need service. Recorded decisions
+were 20768 runnable-work hints, 3293 idle rechecks and 1445 wait attempts.
+Application-side decisions included 21313 idle rechecks and 31072 wait attempts;
+these are counts, not elapsed-time attribution.
+
+The separate whole-workload IRQ snapshots span approximately 30 seconds, not
+the ten-second profile: 4954 interrupts, 76046 arm attempts and 22962 busy
+rechecks. The legacy timers/tx-wakes counters did not advance; they do not
+measure the inline lifecycle task's one-millisecond fallback. Do not infer
+zero timer wakeups from these counters or correlate their totals with individual
+profile buckets. The 30-second WFI proxy was about 1.067 total cores and includes
+the active instrumentation window, so it is not an unprofiled comparison.
+
+The capture establishes extra empty checking at paced load, but protocol and
+frontend work remain substantial and neither queue saturation nor contended
+locking explains most time. Earlier receive-side TX-only attribution found no
+such turns; this new capture does not separately classify TX-only ownership and
+does not justify changing completion/interrupt policy. Before modifying shared
+reception again, cross-check the current unprofiled image through the independent
+TCP sink so the iperf3 service is not silently treated as the network itself.
+
+On unprofiled FIT `114e3f36…e8448`, independent single-flow sink tests measured
+867.193 / 867.626 Mbps, four flows 759.914 Mbps. The initial CPU brackets also
+included roughly ten seconds of service admission before the explicit GO;
+those diluted CPU averages are invalid for comparison, retained with
+`20260917-scatter-independent-measure/exclusion.json`, and are not used below.
+Revised capture waits until every V2 connection has received R, records NIDLE,
+then releases all host senders through one barrier. It records NIDLE again at
+confirmed completion and rejects an interval more than one second longer than
+the actual data phase. It sends 2 GiB total with no post-test sleep inside the
+CPU bracket. The gated results were 867.326 Mbps / 1.65219 cores for one flow
+and 761.683 Mbps / 1.63067 cores for four flows. Application hart 1 consumed
+65.736% / 63.365%, versus approximately 28.8% during the recent iperf workload.
+Counts are verified by the board, but this throughput mode is not a byte-pattern
+integrity test. The separate preceding 64 MiB pattern check passed.
+
+Thus the independent service is not a faster reference implementation here;
+its different scheduling and four-listener scan add substantial application
+work. Source inspection found it still uses the short polling grace after each
+progress event, whereas the iperf service already uses activity notifications.
+Added opt-in `event-driven` to tcp-probe, propagated through the existing
+`application-event-poll` experiment. It acquires notification-only handles via
+RECV authority, prepares epochs before a second complete idle check, and waits
+on all four events with the existing one-millisecond deadline/revocation
+fallback. All data operations keep their capability checks and bounds; busy
+turns still yield. No per-turn Vec allocation or new worker task is introduced.
+An unsupported notification backend retains ordinary polling.
+
+Event configuration passed six component tests, including a new task-level
+check of exactly two complete idle scans before parking and authority rejection
+after notification. Original polling configuration passed five tests. Candidate
+build/package passed; FIT
+`36ada02371db45a3faaf2d6dc2ec40d2d417781925e9671e20dd3ce0b7e536dd`.
+Unmodified sources are archived in `20260917-probe-events-original/`.
+
+The candidate passed the same admission-gated 2 GiB total-byte tests:
+
+| Independent TCP sink | Polling Mbps / total cores | Events Mbps / total cores |
+| --- | --- | --- |
+| One flow | 867.326 / 1.65219 | 936.416 / 1.34159 |
+| Four flows | 761.683 / 1.63067 | 809.512 / 1.31381 |
+
+Total CPU occupancy fell 18.80% / 19.43%, while throughput rose 7.97% / 6.28%.
+Application hart 1 fell to 34.259% / 31.735%. These are different workloads
+at their respective maximum rates; CPU time per received gigabit fell about
+24.79% / 24.19%. The change is retained as part of the default-off application
+event experiment. It improves the independent service's polling behavior, not
+the driver's per-packet execution cost. Four-flow throughput remains below
+single-flow throughput and is not a completed scaling qualification.
+
+The unchanged iperf service measured 931.429 Mbps / 1.29122 cores, and
+599.995 Mbps / 1.01244 cores at fixed rate. This is consistent with the earlier
+iperf result; no additional common-path CPU improvement is claimed. Another
+64 MiB byte-pattern verification passed. After these tests, received/acquired/
+released all matched at 5,613,260, with free128 and ready/borrowed/full/dropped0.
+The independent throughput tests themselves only validate byte counts.
+
+Evidence: `20260917-{scatter-independent,probe-events}-gated-measure/`,
+`20260917-probe-events-iperf-measure/`, `20260917-probe-events-comparison.json`,
+`20260917-probe-events-only.patch` and source manifest under
+`target/mars-reference/`. Both throughput and CPU are bracketed after readiness;
+the earlier ungated CPU results remain explicitly excluded.
+
+Idle cancellation/restart of the event-waiting tcp-probe also passed: restarting
+a running component was rejected, cancellation completed, generation advanced
+1 -> 2 with fresh grants, and a new 64 MiB verified transfer succeeded. All
+5,659,233 loans were released and the pool was entirely free afterward. Evidence:
+`20260917-probe-events-recovery/`. This verifies normal supervised cancellation,
+not a forced fault or a long-duration stability run. No one-core completion
+claim is made; the iperf common-path occupancy remains about 1.29 cores.
+
+Stable `918fdf3b…600b6` was RAM-restored with hashes, initialization and gigabit
+link verified in `20260917-probe-events-baseline-restore/`. SD/SPI contents
+remain unchanged. Normal firmware feature selection is restored; this service
+change is enabled only by the opt-in application event configuration.
+
+### 2026-09-17: incremental checked GRO handoff groundwork
+
+The current adapter parses each candidate to choose a compatible group, then
+Interface validates that complete group again. Removing checks based on an
+untyped “already checked” flag would weaken the boundary. Added
+`TcpGroBuilder` in smoltcp to validate an immutable borrowed prefix incrementally,
+with captured checksum policy, transactional append, bounded byte/segment counts,
+and explicit incompatible/ineligible/capacity/finished rejection reasons. A
+rejected frame never mutates the accepted prefix. PSH/short segments terminate
+the prefix, sequence arithmetic wraps as TCP requires, and a singleton is not
+returned as an aggregate. Existing `TcpGro::new` now uses that common validator;
+the first frame is no longer parsed twice inside that constructor.
+
+Added `RxToken::consume_gro_checked` with a compatible default for existing
+single-frame/group tokens. An override can hand off `TcpGroRx::Group` built
+while selecting its frames. Group fields remain private and are constructible
+only through validation. Interface checks that the group's recorded IPv4 and
+TCP checksum verification each cover its own current policy, then uses the
+existing MAC/IP admission and TCP dispatch. Weaker policy is rejected rather
+than silently accepted. Original immutable bytes remain borrowed through the
+callback; raw-socket builds retain their complete-packet materialization.
+Ordinary non-GRO receive behavior and existing token implementations remain
+compatible. No unchecked lifetime extension or kernel/driver dependency was
+introduced.
+
+Tests cover failed append followed by retry, sequence wrap, the exact 32 KiB
+boundary, 16/17 segments, short/PSH termination, the four checksum-policy
+combinations, and an overridden checked token through real Interface admission.
+A compile-fail example verifies original storage cannot be mutated while its
+validation remains live. Broader smoltcp configuration passed 532 tests; direct
+non-raw GRO configuration passed 395;
+ordinary non-GRO configuration passed 376. Doc tests passed five regular and
+one compile-fail test. VibeOS protocol passed six unit and 42 integration tests,
+and the Mars RISC-V no_std release check with scatter/front-end/admission
+features passed. Initial checked-token fixture failures came from counting
+background multicast/ARP output as TCP resets; the fixture now seeds the peer
+neighbor and checks actual TCP RST output, including negative admission cases.
+
+This is checked-handoff groundwork, not completed removal of cross-layer
+duplicate parsing. VibeOS PacketDevice still constructs its old group and uses
+the compatible default checked entry. Next integration must store pending DMA
+loans in stable bounded slots so the builder can borrow them while choosing a
+prefix, return a checked token directly, preserve rejected lookahead/order and
+batch cleanup, and revalidate capabilities before delivery. It must preserve
+ordinary short/ineligible traffic and all revoke/restart semantics. Do not
+replace this with unsafe lifetime extension or a caller-forgeable validation
+claim. Hardware integrity, performance and recovery comparisons are required
+after that wiring; no new throughput/CPU result is claimed here.
+
+Evidence under `target/mars-reference/`: `20260917-gro-builder-original/`,
+`20260917-gro-checked-only.patch`, source manifest and the corresponding
+ingress/direct/legacy/protocol/doc test and firmware-check logs. No image was
+loaded and no SD/SPI/board changes were made in this step.
+
+### 2026-09-17: checked GRO interface hardware regression and paired control
+
+After the requested power cycle, the serial prompt responded on
+`/dev/cu.usbmodem54340134951`. Built the current checked-interface groundwork
+with the same feature list as the preceding probe-events experiment. RAM FIT
+SHA-256: `7e282ca49da7d75595cddb536d90cf57b7ec53ea930d8ff620ed081f6f104c80`.
+U-Boot verified kernel and DTB hashes; the board initialized and negotiated
+1000 Mbps. Host en13 used MTU 1500 and gigabit full duplex. Normal Cargo feature
+selection was restored after packaging. This still uses PacketDevice's legacy
+selection and the default checked-token adapter, not the proposed device-side
+single-validation handoff.
+
+Repeated the prior probe-events FIT (`36ada023…6dd`) in this same session as
+control. Each image received an independent 64 MiB pattern verification, two
+20-second full-rate iperf RX runs, and three 20-second 600 Mbps runs. UART was
+captured continuously by one reader. CPU below is summed non-WFI residency of
+all four harts, with no idle subtraction; these are not instruction-cycle
+measurements. No builds ran during measurements.
+
+| Image | Full RX Mbps | Full resident cores | 600 Mbps resident cores |
+| --- | --- | --- | --- |
+| Checked interface | 925.891, 927.646 | 1.29288, 1.29085 | 1.03061, 1.07364, 1.05976 |
+| Prior control | 933.776, 931.758 | 1.29287, 1.29255 | 1.04929, 0.99281, 1.07159 |
+
+The checked image averaged 926.768 Mbps versus 932.767 Mbps (-0.643%), at
+1.29187 versus 1.29271 cores. CPU per delivered bit was 0.582% higher. Paced
+sample ranges overlap; their averages were 1.05467 and 1.03790 cores. This small
+sequential experiment does not establish a statistically significant regression,
+but provides no evidence of a CPU improvement. Do not advertise the groundwork
+as an optimization or enable it as a production performance change on this
+basis. The next implementation remains direct device-side checked grouping,
+with preserved rejected lookahead, capabilities and bounded loan lifetimes.
+
+Checked-image full-rate GRO groups averaged 15.946 and 15.998 segments; the
+16-segment shares were 98.856% and 99.955%. Paced averages were 13.193, 12.855
+and 12.892 segments. Thus aggregation was active; this is not evidence that
+turning on GRO alone can remove the remaining CPU cost. At measurement end,
+all 6,310,223 checked-image and 6,330,734 control loans were released, with
+free=128, ready=borrowed=full=dropped=0 in both runs.
+
+Also cancelled net-stack during an active TCP transfer. Restart while running
+was correctly refused; cooperative cancellation permitted generation 1 -> 2,
+retired nine old capabilities and installed fresh grants. The interrupted
+client exited without forced termination. A new 10-second flow reached
+930.669 Mbps, and another independent 64 MiB content verification passed.
+All 7,474,629 acquired loans were released, with the entire pool free afterward.
+This is cooperative restart coverage, not forced-fault recovery or one-hour
+qualification. The one-core full-rate objective remains unmet.
+
+Evidence under `target/mars-reference/`: `20260917-gro-checked-measure/`,
+`20260917-gro-checked-control-measure/`, `20260917-gro-checked-stack-recovery/`,
+`20260917-gro-checked-hardware-comparison.json`, build/package logs, load logs,
+and `20260917-gro-checked-hardware-source.zip` with its source manifest. The
+source archive includes the untracked smoltcp GRO and scatter source files.
+
+Stable FIT `918fdf3b…600b6` was RAM-restored after both runs, with hashes,
+network initialization and gigabit link verified in
+`20260917-gro-checked-baseline-restore/`. No SD or SPI contents were changed.

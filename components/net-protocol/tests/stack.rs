@@ -1899,6 +1899,7 @@ mod pooled_receive {
     }
     #[test]
     fn pooled_token_is_a_slice_of_original_storage_and_revocation_releases_it() {
+        #[cfg(not(feature = "gro-checked"))]
         assert_eq!(core::mem::size_of::<PacketRxToken<'_>>(),
             (if cfg!(feature = "gro-scatter") { 4 } else { 2 }) * core::mem::size_of::<usize>());
         let q = unsafe { ReceiveEndpoint::new("loan-token", 4, &OPS).unwrap() };
@@ -2050,6 +2051,91 @@ mod pooled_receive {
         assert_eq!(after.gro_end_profile[..9].iter().sum::<u64>(),
                    after.gro_end_profile[9..26].iter().sum::<u64>());
         drop(stack);
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
+    #[cfg(feature = "gro-checked")]
+    #[test]
+    fn checked_window_wraps_preserves_rejected_prefixes_and_dropped_tokens() {
+        use smoltcp::phy::{ChecksumCapabilities, TcpGroRx};
+        let q = unsafe { ReceiveEndpoint::new("checked-window", 64, &OPS).unwrap() };
+        let out = Endpoint::new("checked-out", 64);
+        let mut cs = CSpace::new("checked-window");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let mut d = PacketDevice::new(session_stamp(), rx, tx);
+        d.set_rx_checksum_offload(true);
+        // Each three-frame group is a separate sequence range, so the next
+        // frame must survive rejection. PSH ends alternating groups. Include
+        // ordinary frames and enough traffic for several slot-array wraps.
+        let mut expected = Vec::new();
+        for group in 0..12 {
+            if group % 3 == 0 { expected.push(vec![vec![0x39; 64]]); }
+            let mut frames: Vec<_> = (0..3).map(|i| gro_test_data(group * 1000 + i * 100)).collect();
+            if group % 2 == 0 { frames[2][47] |= 8; }
+            expected.push(frames);
+        }
+        let tickets: Vec<_> = expected.iter().flatten().map(|f| inject(&q, f)).collect();
+        let mut delivered = 0;
+        for (index, group) in expected.iter().enumerate() {
+            let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+            if index == 0 {
+                // Dropping the ordinary token must neither retry that frame
+                // nor discard any prefetched followers.
+                drop(rx); delivered += 1; continue;
+            }
+            rx.consume_gro_checked(&ChecksumCapabilities::ignored(), |received| {
+                match received {
+                    TcpGroRx::Frame(frame) => {
+                        assert_eq!(group.len(), 1); assert_eq!(frame, group[0]);
+                    }
+                    TcpGroRx::Group(gro) => {
+                        assert_eq!(gro.payloads().len(), group.len());
+                        for (i, bytes) in gro.payloads().iter().enumerate() {
+                            assert_eq!(*bytes, &group[i][54..]);
+                            let records = records().lock().unwrap();
+                            let record = &records[&tickets[delivered + i].pool()];
+                            assert!(!record.released);
+                            assert_eq!(bytes.as_ptr(), record.bytes[54..].as_ptr());
+                        }
+                    }
+                    TcpGroRx::Invalid => panic!("valid checked prefix rejected"),
+                }
+            });
+            delivered += group.len();
+            assert_eq!(d.has_immediate_work().unwrap(), delivered < tickets.len());
+        }
+        assert_eq!(delivered, tickets.len());
+        assert!(d.receive(Instant::ZERO).is_none());
+        drop(d);
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
+    #[cfg(feature = "gro-checked")]
+    #[test]
+    fn checked_token_obeys_consumer_checksum_policy_and_drops_pending_window() {
+        use smoltcp::phy::{ChecksumCapabilities, TcpGroRx};
+        let q = unsafe { ReceiveEndpoint::new("checked-policy", 16, &OPS).unwrap() };
+        let out = Endpoint::new("checked-policy-out", 16);
+        let mut cs = CSpace::new("checked-policy");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let mut d = PacketDevice::new(session_stamp(), rx, tx);
+        d.set_rx_checksum_offload(true);
+        // These fixture frames deliberately lack valid checksums. Even when
+        // the adapter advertises offload, the requested software policy wins.
+        let tickets: Vec<_> = (0..5).map(|i| inject(&q, &gro_test_data(i * 100))).collect();
+        let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume_gro_checked(&ChecksumCapabilities::default(), |received| {
+            assert!(matches!(received, TcpGroRx::Frame(_)));
+        });
+        let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume_gro_checked(&ChecksumCapabilities::ignored(), |received| {
+            let TcpGroRx::Group(group) = received else { panic!("offloaded group expected"); };
+            assert_eq!(group.payloads().len(), 4);
+            assert!(!group.satisfies_checksum_policy(&ChecksumCapabilities::default()));
+        });
+        drop(d);
         for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
     }
 

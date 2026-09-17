@@ -5,6 +5,7 @@ edition = "2021"
 autobins = false
 
 [features]
+gro-checked = ["gro-scatter", "vibeos-netstack/gro-checked"]
 gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]
 frontend-rx-batch = ["vibeos-netstack?/frontend-rx-batch"]
 network-service-peer = ["network-inline-rx"]
@@ -27,7 +28,7 @@ pc-sample = ["vibeos-core/pc-sample"]
 driver-stage-profile = ["tx-wait-profile", "pooled-rx"]
 tx-wait-profile = ["packet-network"]
 idle-profile = ["vibeos-core/idle-profile"]
-application-event-poll = ["vibeos-iperf3-server?/event-driven", "vibeos-net-api/activity-events"]
+application-event-poll = ["vibeos-iperf3-server?/event-driven", "vibeos-tcp-probe?/event-driven", "vibeos-net-api/activity-events"]
 network-event-poll = ["vibeos-netstack?/event-driven"]
 pooled-rx = ["vibeos-netstack?/pooled-rx"]
 rx-interrupt-poll = []

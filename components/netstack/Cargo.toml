@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-checked = ["vibeos-net-protocol/gro-checked"]
 gro-scatter = ["vibeos-net-protocol/gro-scatter"]
 frontend-rx-batch = ["vibeos-net-protocol/frontend-rx-batch"]
 inline-device-service = []

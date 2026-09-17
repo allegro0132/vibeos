@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-checked = ["gro-scatter", "gro-atomic-id"]
 gro-scatter = ["gro-batch-release", "smoltcp/tcp-gro-receive"]
 frontend-rx-batch = []
 rx-admission-batch = ["pooled-rx", "bounded-gro", "vibeos-core/rx-admission-batch"]

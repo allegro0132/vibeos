@@ -24,6 +24,8 @@ pub use receive::PacketReceive;
 pub use transmit::PacketTransmit;
 #[cfg(feature = "bounded-gro")]
 mod gro;
+#[cfg(feature = "gro-checked")]
+mod checked_gro;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -272,6 +274,8 @@ pub struct PacketDeviceStats {
 /// until that packet is accepted. This preserves TCP retransmission semantics
 /// without growing an unbounded second queue.
 pub struct PacketDevice {
+    #[cfg(feature = "gro-checked")]
+    checked_rx: checked_gro::Window,
     #[cfg(feature = "rx-admission-batch")]
     rx_batch: vibeos_core::net_receive::LoanBatch,
     stamp: PacketStamp,
@@ -313,6 +317,8 @@ impl PacketDevice {
     ) -> Self {
         Self {
             stamp,
+            #[cfg(feature = "gro-checked")]
+            checked_rx: checked_gro::Window::new(),
             #[cfg(feature = "rx-admission-batch")]
             rx_batch: vibeos_core::net_receive::LoanBatch::empty(),
             inbound: inbound.into(),
@@ -479,6 +485,8 @@ impl PacketDevice {
         if self.pending_segments.is_some() || self.pending_pooled.is_some() { return Ok(true); }
         #[cfg(feature = "bounded-gro")]
         if self.pending_ingress.is_some() { return Ok(true); }
+        #[cfg(feature = "gro-checked")]
+        if self.checked_rx.has_pending() { return Ok(true); }
         #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
         if self.pending_rx_loan.is_some() { return Ok(true); }
         match self.inbound.has_message() {
@@ -660,10 +668,31 @@ fn coalesced_rx(bytes: &[u8]) -> RxBytes<'_> {
     { RxBytes::Coalesced(bytes) }
 }
 pub struct PacketRxToken<'a>(RxBytes<'a>,
-    #[cfg(feature = "gro-scatter")] Option<&'a [Option<vibeos_core::net_receive::Loan>]>);
+    #[cfg(feature = "gro-scatter")] Option<&'a [Option<vibeos_core::net_receive::Loan>]>,
+    #[cfg(feature = "gro-checked")] Option<checked_gro::Token<'a>>);
 impl phy::RxToken for PacketRxToken<'_> {
+    #[cfg(feature = "gro-checked")]
+    fn consume_gro_checked<R, F>(mut self, caps: &phy::ChecksumCapabilities, f: F) -> R
+    where F: FnOnce(phy::TcpGroRx<'_>) -> R {
+        if let Some(token) = self.2.take() {
+            return token.consume(caps, |received, _| f(received));
+        }
+        self.consume_gro(|frames| match frames {
+            [frame] => f(phy::TcpGroRx::Frame(frame)),
+            _ => f(match phy::TcpGro::new(frames, caps) {
+                Some(group) => phy::TcpGroRx::Group(group),
+                None => phy::TcpGroRx::Invalid,
+            }),
+        })
+    }
     #[cfg(feature = "gro-scatter")]
-    fn consume_gro<R, F>(self, f: F) -> R where F: FnOnce(&[&[u8]]) -> R {
+    #[allow(unused_mut)]
+    fn consume_gro<R, F>(mut self, f: F) -> R where F: FnOnce(&[&[u8]]) -> R {
+        #[cfg(feature = "gro-checked")]
+        if let Some(token) = self.2.take() {
+            let caps = token.caps.clone();
+            return token.consume(&caps, |_, frames| f(frames));
+        }
         let mut frames = [&[][..]; gro::MAX_SEGMENTS];
         frames[0] = self.0;
         let mut count = 1;
@@ -675,7 +704,17 @@ impl phy::RxToken for PacketRxToken<'_> {
         }
         f(&frames[..count])
     }
-    fn consume<R, F>(self, f: F) -> R where F: FnOnce(&[u8]) -> R {
+    #[allow(unused_mut)]
+    fn consume<R, F>(mut self, f: F) -> R where F: FnOnce(&[u8]) -> R {
+        #[cfg(feature = "gro-checked")]
+        if let Some(token) = self.2.take() {
+            let caps = token.caps.clone();
+            return token.consume(&caps, |received, _| match received {
+                phy::TcpGroRx::Frame(frame) => f(frame),
+                phy::TcpGroRx::Group(group) => f(&group.materialize()),
+                phy::TcpGroRx::Invalid => f(&[]),
+            });
+        }
         #[cfg(feature = "gro-scatter")]
         if self.1.is_some() {
             return self.consume_gro(|frames| {
@@ -819,12 +858,16 @@ impl phy::Device for PacketDevice {
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::PacketQueue);
         #[cfg(feature = "gro-scatter")]
         self.clear_gro_loans();
+        #[cfg(feature = "gro-checked")]
+        self.checked_rx.retire();
         // Previous tokens cannot coexist with this mutable device invocation.
         // Dropping an admitted loan releases storage even after revocation.
         #[cfg(feature = "pooled-rx")]
         { self.rx_loan = None; }
         #[cfg(feature = "bounded-gro")]
         if self.revalidate_authority().is_err() {
+            #[cfg(feature = "gro-checked")]
+            self.checked_rx.clear();
             #[cfg(feature = "pooled-rx")]
             { self.pending_rx_loan = None; }
             #[cfg(feature = "rx-admission-batch")]
@@ -836,6 +879,45 @@ impl phy::Device for PacketDevice {
         }
         #[cfg(feature = "native-tcp-segmentation")]
         let reservation = self.reserve_transmit()?;
+        #[cfg(feature = "gro-checked")]
+        if matches!(&self.inbound, PacketReceive::Pooled { .. }) {
+            while self.checked_rx.len() < gro::MAX_SEGMENTS {
+                let Some(loan) = self.receive_pooled() else { break; };
+                self.checked_rx.push(loan);
+            }
+            if self.authority_revoked || self.revalidate_authority().is_err() {
+                self.checked_rx.clear();
+                #[cfg(feature = "rx-admission-batch")]
+                { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
+                return None;
+            }
+            if self.checked_rx.len() == 0 { return None; }
+            let caps = self.capabilities().checksum;
+            return Some((
+                PacketRxToken(&[], None, Some(checked_gro::Token {
+                    window: &mut self.checked_rx,
+                    stats: &mut self.gro,
+                    caps,
+                    #[cfg(feature = "gro-end-profile")]
+                    no_input: self.gro_last_none,
+                })),
+                PacketTxToken {
+                    stamp: self.stamp,
+                    outbound: &self.outbound,
+                    pending_egress: &mut self.pending_egress,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_segments: &mut self.pending_segments,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    segment_size: None,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    reservation,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_pooled: &mut self.pending_pooled,
+                    stats: &mut self.stats,
+                    authority_revoked: &mut self.authority_revoked,
+                },
+            ));
+        }
         #[cfg(feature = "pooled-rx")]
         if matches!(&self.inbound, PacketReceive::Pooled { .. }) {
             #[cfg(feature = "bounded-gro")]
@@ -898,7 +980,8 @@ impl phy::Device for PacketDevice {
             return Some((
                 PacketRxToken(bytes,
                     #[cfg(feature = "gro-scatter")]
-                    if self.gro_loan_count == 0 { None } else { Some(&self.gro_loans[..self.gro_loan_count]) }),
+                    if self.gro_loan_count == 0 { None } else { Some(&self.gro_loans[..self.gro_loan_count]) },
+                    #[cfg(feature = "gro-checked")] None),
                 PacketTxToken {
                     stamp: self.stamp,
                     outbound: &self.outbound,
@@ -952,7 +1035,8 @@ impl phy::Device for PacketDevice {
         #[cfg(not(feature = "bounded-gro"))]
         let bytes = { single_rx(packet, &mut self.rx_packet) };
         Some((
-            PacketRxToken(bytes, #[cfg(feature = "gro-scatter")] None),
+            PacketRxToken(bytes, #[cfg(feature = "gro-scatter")] None,
+                #[cfg(feature = "gro-checked")] None),
             PacketTxToken {
                 stamp: self.stamp,
                 outbound: &self.outbound,

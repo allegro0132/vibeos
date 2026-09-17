@@ -17,6 +17,8 @@ pub(crate) fn create(depth: usize) -> Arc<ReceiveEndpoint> {
 fn queue() -> Option<&'static ReceiveEndpoint> {
     unsafe { QUEUE.load(Ordering::Acquire).as_ref() }
 }
+#[cfg(feature = "network-inline-rx")]
+pub(crate) fn notify_input() { if let Some(queue) = queue() { queue.notify_input(); } }
 pub(crate) fn retire_queued() { if let Some(queue) = queue() { queue.retire_queued(); } }
 /// # Safety
 /// All tasks in this exact allocation domain have been quiesced permanently.

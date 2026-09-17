@@ -34,6 +34,7 @@ mod batch {
     use std::sync::Mutex;
     static EVENTS: Mutex<Vec<(usize, Vec<usize>)>> = Mutex::new(Vec::new());
     unsafe fn scalar(b: Borrow) { EVENTS.lock().unwrap().push((0, vec![b.index()])); }
+    unsafe fn scalar_other(b: Borrow) { EVENTS.lock().unwrap().push((3, vec![b.index()])); }
     unsafe fn bulk(bs: &mut [Option<Borrow>]) {
         EVENTS.lock().unwrap().push((1, bs.iter_mut().filter_map(Option::take).map(|b| b.index()).collect()));
     }
@@ -64,6 +65,19 @@ mod batch {
             drop(group); assert_eq!(*EVENTS.lock().unwrap(),vec![(0,vec![0]),(0,vec![1])]);
             EVENTS.lock().unwrap().clear();
         }
+        // A scalar-only first entry must keep later bulk-capable entries on
+        // their individual provider callbacks, including distinct providers.
+        let mut group = ReleaseBatch::<2>::new();
+        let first = unsafe {
+            Loan::new(Borrow::from_owned(Ticket::from_parts(11,7,1), Owner::new(5,6).unwrap()),
+                BYTES.as_ptr(), 64, scalar_other).unwrap()
+        };
+        assert!(group.push(first).is_ok());
+        assert!(group.push(loan(8, Some(bulk))).is_ok());
+        assert!(EVENTS.lock().unwrap().is_empty());
+        drop(group);
+        assert_eq!(*EVENTS.lock().unwrap(), vec![(3,vec![7]),(0,vec![8])]);
+        EVENTS.lock().unwrap().clear();
         let result=std::panic::catch_unwind(|| {
             let mut group=ReleaseBatch::<2>::new();assert!(group.push(loan(4,Some(bulk))).is_ok());
             panic!("caller unwinds after consuming bytes");

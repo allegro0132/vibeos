@@ -155,6 +155,36 @@ pub struct TcpFrontendDriveState {
     pub queued_send_bytes: usize,
 }
 
+/// Synchronous, bounded receive transaction. The adapter must not await or
+/// re-enter this listener while the transaction holds its metadata guard.
+/// The queue storage and guard never escape the callback.
+pub struct TcpReceiveBatch<'a> {
+    inner: &'a mut Inner,
+    capacity: usize,
+    became_readable: bool,
+}
+
+impl TcpReceiveBatch<'_> {
+    pub fn receive(&mut self, input: &[u8]) -> usize {
+        if !matches!(self.inner.state,
+            TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return 0;
+        }
+        let length = input.len().min(MAX_TCP_IO_BYTES_PER_CALL)
+            .min(self.capacity.saturating_sub(self.inner.received_len()));
+        let was_empty = self.inner.received_len() == 0;
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut self.inner.receive_exchange {
+            let accepted = queue.push_copy(&input[..length]);
+            self.became_readable |= was_empty && accepted != 0;
+            return accepted;
+        }
+        self.inner.receive.extend(&input[..length]);
+        self.became_readable |= was_empty && length != 0;
+        length
+    }
+}
+
 struct Inner {
     state: TcpStreamState,
     generation: u64,
@@ -167,6 +197,31 @@ struct Inner {
 }
 
 impl Inner {
+    fn publish_state(&mut self, state: TcpStreamState) -> Result<bool, TcpFrontendError> {
+        let changed = self.state != state;
+        let was_active = is_connection_state(self.state);
+        let becomes_active = is_connection_state(state);
+        if !was_active && becomes_active {
+            self.generation = self
+                .generation
+                .checked_add(1)
+                .ok_or(TcpFrontendError::GenerationExhausted)?;
+            self.accepted = false;
+            self.clear_receive()?;
+            self.transmit.clear();
+            self.close_request = None;
+        }
+        if matches!(state, TcpStreamState::Listening | TcpStreamState::Reset) {
+            self.clear_receive()?;
+            self.transmit.clear();
+            self.close_request = None;
+            if state == TcpStreamState::Listening {
+                self.accepted = false;
+            }
+        }
+        self.state = state;
+        Ok(changed)
+    }
     fn received_len(&self) -> usize {
         #[cfg(feature = "receive-buffer-exchange")]
         if let Some(queue) = &self.receive_exchange { return queue.len(); }
@@ -551,28 +606,7 @@ impl TcpListener {
         -> Result<TcpFrontendDriveState, TcpFrontendError>
     {
         let mut inner = self.inner.lock();
-        let changed = inner.state != state;
-        let was_active = is_connection_state(inner.state);
-        let becomes_active = is_connection_state(state);
-        if !was_active && becomes_active {
-            inner.generation = inner
-                .generation
-                .checked_add(1)
-                .ok_or(TcpFrontendError::GenerationExhausted)?;
-            inner.accepted = false;
-            inner.clear_receive()?;
-            inner.transmit.clear();
-            inner.close_request = None;
-        }
-        if matches!(state, TcpStreamState::Listening | TcpStreamState::Reset) {
-            inner.clear_receive()?;
-            inner.transmit.clear();
-            inner.close_request = None;
-            if state == TcpStreamState::Listening {
-                inner.accepted = false;
-            }
-        }
-        inner.state = state;
+        let changed = inner.publish_state(state)?;
         let drive = TcpFrontendDriveState {
             receive_capacity: self.receive_capacity.saturating_sub(inner.received_len()),
             queued_send_bytes: inner.transmit.len(),
@@ -580,6 +614,28 @@ impl TcpListener {
         drop(inner);
         self.notify_network_progress(changed);
         Ok(drive)
+    }
+
+    /// Publish state and deliver a bounded receive batch under one guard.
+    /// Notification happens after all committed bytes are visible and the
+    /// guard is released. Returning an error from the callback does not roll
+    /// back bytes already accepted, matching ordinary network_receive calls.
+    pub fn network_receive_drive<R>(&self, state: TcpStreamState,
+        receive: impl FnOnce(TcpFrontendDriveState, &mut TcpReceiveBatch<'_>) -> R,
+    ) -> Result<(TcpFrontendDriveState, R), TcpFrontendError> {
+        let mut inner = self.inner.lock();
+        let changed = inner.publish_state(state)?;
+        let drive = TcpFrontendDriveState {
+            receive_capacity: self.receive_capacity.saturating_sub(inner.received_len()),
+            queued_send_bytes: inner.transmit.len(),
+        };
+        let mut batch = TcpReceiveBatch { inner: &mut inner,
+            capacity: self.receive_capacity, became_readable: false };
+        let result = receive(drive, &mut batch);
+        let notify = changed || batch.became_readable;
+        drop(inner);
+        self.notify_network_progress(notify);
+        Ok((drive, result))
     }
 
     /// Netstack side: copy received transport bytes toward the application.

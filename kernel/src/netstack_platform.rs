@@ -28,6 +28,13 @@ impl NetstackPlatform {
 }
 
 impl Platform for NetstackPlatform {
+    #[cfg(feature = "network-inline-rx")]
+    fn service_device(&self, control: Cap, receive: bool) -> Result<bool, NetworkBindError> {
+        let lease = self.space.0.lock()
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
+            .map_err(|_| NetworkBindError::Denied)?;
+        crate::dwmac_net::service_inline_with(&lease, receive).map_err(|_| NetworkBindError::Failed)
+    }
     fn packet_endpoints(
         &self,
         outbound: Cap,

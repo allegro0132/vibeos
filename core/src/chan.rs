@@ -64,6 +64,9 @@ impl<T: Send + 'static> Endpoint<T> {
     /// Signals empty-to-nonempty transitions, not individual messages.
     /// Construct its listener before checking has_message under live authority.
     pub fn message_event(&self) -> MessageEvent { MessageEvent(self.on_message.clone()) }
+    /// Producer-side hint that external input may be ready. Consumers must
+    /// still check their capability and queue; this does not publish a message.
+    pub(crate) fn notify_input(&self) { self.on_message.wake_all(); }
     pub fn has_message(&self) -> bool { !self.inner.lock().queue.is_empty() }
 
     pub fn try_send(&self, msg: T) -> Result<(), T> {

@@ -49,6 +49,8 @@ pub struct Buffer {
     #[cfg(feature = "gro-end-profile")]
     profile_reason: usize,
     data: Vec<u8>,
+    #[cfg(feature = "gro-scatter")]
+    deferred_length: Option<usize>,
     header: usize,
     mss: usize,
     next_seq: u32,
@@ -65,6 +67,8 @@ impl Buffer {
             profile: [0; 31],
             #[cfg(feature = "gro-end-profile")]
             profile_reason: 0,
+            #[cfg(feature = "gro-scatter")]
+            deferred_length: None,
             data: Vec::with_capacity(MAX_BYTES), header: 0, mss: 0,
             next_seq: 0, last_id: 0, done: true, segments: 0,
             merged_segments: 0, aggregates: 0 }
@@ -74,6 +78,8 @@ impl Buffer {
         #[cfg(feature = "gro-end-profile")]
         { self.profile_reason = 0; }
         self.data.clear();
+        #[cfg(feature = "gro-scatter")]
+        { self.deferred_length = None; }
         self.segments = 0;
         self.done = true;
         let Some((header, end)) = eligible(b, trusted) else { return false; };
@@ -88,6 +94,12 @@ impl Buffer {
         { self.profile_reason = if self.done { 1 } else { 7 }; }
         true
     }
+    #[cfg(feature = "gro-scatter")]
+    pub fn begin_scattered(&mut self, b: &[u8], trusted: bool) -> bool {
+        if !self.begin(b, trusted) { return false; }
+        self.deferred_length = Some(self.header + self.mss);
+        true
+    }
     /// `original` is the same immutable frame passed to begin, still owned by
     /// the receive token builder. Materialize it only on the first actual merge.
     pub fn append(&mut self, original: &[u8], b: &[u8], trusted: bool) -> bool {
@@ -99,17 +111,17 @@ impl Buffer {
             return false;
         };
         let payload = end - header;
-        let first = if self.segments == 1 {
-            let Some(first) = original.get(..self.header + self.mss) else {
-                #[cfg(feature = "gro-end-profile")]
-                { self.profile_reason = 8; }
-                return false;
-            };
-            first
-        } else { &self.data };
+        let Some(first) = original.get(..self.header + self.mss) else {
+            #[cfg(feature = "gro-end-profile")]
+            { self.profile_reason = 8; }
+            return false;
+        };
+        let current_length = if self.segments == 1 { first.len() } else { self.data.len() };
+        #[cfg(feature = "gro-scatter")]
+        let current_length = self.deferred_length.unwrap_or(current_length);
         let id = u16_at(b, 18);
         if header != self.header || payload > self.mss
-            || first.len() + payload > MAX_BYTES || u32_at(b, 38) != self.next_seq
+            || current_length + payload > MAX_BYTES || u32_at(b, 38) != self.next_seq
             || b[..16] != first[..16] || b[20..24] != first[20..24] || b[26..38] != first[26..38]
             || b[42..47] != first[42..47] || b[48..50] != first[48..50]
             || b[54..header] != first[54..header] {
@@ -126,11 +138,19 @@ impl Buffer {
             { self.profile_reason = 6; }
             return false;
         }
+        #[cfg(feature = "gro-scatter")]
+        let copy_payload = self.deferred_length.is_none();
+        #[cfg(not(feature = "gro-scatter"))]
+        let copy_payload = true;
+        if copy_payload {
         if self.segments == 1 {
             self.data.extend_from_slice(&original[..self.header + self.mss]);
         }
         self.data.extend_from_slice(&b[header..end]);
         self.data[47] = b[47];
+        }
+        #[cfg(feature = "gro-scatter")]
+        if let Some(length) = &mut self.deferred_length { *length += payload; }
         self.next_seq = self.next_seq.wrapping_add(payload as u32);
         self.last_id = id;
         self.done = b[47] & 8 != 0 || payload < self.mss;
@@ -161,6 +181,8 @@ impl Buffer {
         let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxGro);
         if self.segments < 2 { return; }
         self.aggregates += 1;
+        #[cfg(feature = "gro-scatter")]
+        if self.deferred_length.is_some() { return; }
         let len = (self.data.len() - 14) as u16;
         self.data[16..18].copy_from_slice(&len.to_be_bytes());
         // Hardware-verified ingress is consumed with software RX checking off.

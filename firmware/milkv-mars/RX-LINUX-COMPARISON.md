@@ -5235,3 +5235,482 @@ promoting the feature. Hardware restart/fault-injection acceptance of the new
 admission-lock recovery path has not been performed. Next structural work must
 address per-frame ownership-object construction and the remaining task/queue
 handoff, rather than merely increasing the batch limit or changing hart affinity.
+
+### 2026-09-17: exclusive driver service context
+
+`DriverWork` now owns the pending TX/RX work, link polling state, TX deadline
+and the sole `DriverSession`. The bounded synchronous service turn receives
+this context rather than separate task locals. The session is the last field,
+so pending software ownership drops before device shutdown. The async task
+still owns and schedules the context; every turn retains the existing MMIO,
+DMA and control capability checks. No second Engine, protocol-side DMA access,
+owner-domain switching or task co-location has been introduced.
+
+This is preparation for a combined receive/protocol execution path, not that
+path's implementation or evidence of a CPU improvement. A future shared pump
+must also specify exclusive invocation, IRQ dispatch, capability revocation,
+task cancellation and exact-domain fault recovery before replacing the task
+boundary. Merely calling this function from the protocol task would not meet
+those requirements.
+
+The same batch experiment features compiled for Mars and were loaded by
+hash-verified TFTP into RAM. FIT SHA-256:
+`3000f3ed08ffb8a7311d6dc381abb8301a3f2ed7310cfba10668dbf4b458e112`.
+One 20-second full RX smoke test measured 948.894 Mbps and 1.98664 resident
+cores across all four harts. Separate 64 MiB pattern verification passed;
+final pool counters were received/acquired/released = 1671010, free = 128,
+ready/borrowed/full/dropped = 0. This is functional smoke coverage only;
+it does not test faults during a pending batch or establish a performance gain.
+
+Evidence: `target/mars-reference/20260917-rx-context-smoke/`, especially
+`summary.json`, `integrity.json`, `pool-final.log` and `serial-full.log`;
+build/package logs are `20260917-bootlog-rx-context-{build,package}.log`.
+After the smoke test, baseline FIT `918fdf3b…600b6` was restored and reached
+1 Gbps link readiness; evidence is `20260917-rx-context-control-restore/`.
+No SD or SPI contents were changed.
+
+### 2026-09-17: consumed-loan cleanup representation (rejected)
+
+Tested storing only Borrow cleanup credentials and scalar callback slots in
+`ReleaseBatch`, instead of retaining complete Loans and constructing a second
+Borrow array on Drop. Common-provider bulk cleanup and mixed-provider FIFO
+scalar fallback were preserved. This changes metadata movement within GRO;
+it does not remove individual admission objects or the driver/protocol handoff.
+
+Three HAL ownership tests, six protocol unit tests and 41 protocol integration
+tests passed. An added mixed-provider test checks that a scalar-only first
+entry cannot accidentally select a later entry's bulk callback, and that each
+entry retains its own scalar release operation. It remains after reverting
+the experiment and passes with the original implementation.
+
+Two 20-second runs per load, candidate followed by matching feature/control
+image (both include DriverWork, batch admission/publication, batch release and
+GRO diagnostics):
+
+| Implementation | Full RX Mbps | Resident cores | 910M RX Mbps | Resident cores |
+| --- | ---: | ---: | ---: | ---: |
+| Cleanup credentials only | 948.781 | 1.99344 | 909.938 | 1.94397 |
+| Original Loan holder | 948.983 | 1.99102 | 909.938 | 1.94349 |
+
+No CPU benefit: the source change was reverted, with the patch archived at
+`target/mars-reference/20260917-rx-cleanup-experiment.patch`. Candidate FIT:
+`2603c9a50860539d37a6f560d4ab55c35fcce8ff53306473e362d8228dbd7035`;
+control FIT: `3000f3ed…58e112` (full hash in the previous section).
+Both passed a separate 64 MiB pattern check. All 128 buffers were free with
+ready/borrowed/full/dropped zero; received/acquired/released matched (candidate
+6420425, control 6421059). This rules out promoting this representation as a
+measured CPU optimization; it does not quantify all ownership-management cost.
+
+Evidence: `20260917-rx-cleanup-{measure,control}/` and
+`20260917-rx-cleanup-comparison.json` under `target/mars-reference/`.
+
+### 2026-09-17: synchronous controller/protocol service prototype
+
+Default-off Mars `network-inline-rx` puts the stack on the dispatch hart and
+calls a bounded controller service before and after each protocol batch. RX
+publication, loan admission, GRO and protocol execution can now proceed in one
+stack task poll. Ticket queues and individual Loans remain; this does not yet
+eliminate all per-frame objects or queue transactions. The driver lifecycle
+task retains its own CSpace, task domain and restart template, with a 1 ms
+bounded fallback for TX progress and normal stack retirement.
+
+One permanent recoverable gate owns DriverWork and the sole Engine. The stack
+supplies control invocation authority and must match the active allocation
+incarnation; it never receives the driver's capabilities or changes allocation
+domain. Service removal/shutdown holds the same gate. Pending data is fixed
+storage or permanent pool tickets; the task-arena TX coalescer combination is
+explicitly rejected. A faulting synchronous caller is recorded in the gate.
+Exact-domain fault recovery first recovers pool/control guards, then excludes
+all service invocations and retires the Engine through firmware hard recovery.
+This fault branch has not yet been physically injected and is not qualified.
+
+The RX top half additionally signals the permanent inbound notification without
+publishing a ticket. Protocol idle completion masks/acknowledges, arms and
+rechecks OWN on the dispatch hart. The stack retains its register-listener then
+repeat-work-check protocol, and a 1 ms fallback remains. A new host test covers
+notification before/after waiter registration, empty queue after a hint and no
+stale wake for a newly created waiter. Nine core receive tests and seven existing
+netstack tests passed; these do not model the complete hardware service gate.
+
+Mars build and hash-verified RAM loading passed. FIT:
+`a5d6a39bf99931215c00e9a4f49604a733a8e0427dd434cf0f9815a116826111`.
+The initial 20-second RX run measured **636.711 Mbps / 0.99574 resident cores**,
+with the work concentrated on hart 0. Thus this prototype does not meet the
+throughput requirement and is not a replacement for the 949 Mbps baseline.
+The test service also remains on hart 0; the result alone cannot isolate its
+contribution from controller/protocol work. Separate 64 MiB verification passed
+and all 128 buffers returned; initial received/acquired/released = 1136321.
+
+Lifecycle checks under traffic passed for both independent components:
+- Stack cancellation/restart: generation 1 -> 2, nine retired capabilities;
+  old connection reset, fresh 10-second iperf and 64 MiB integrity passed.
+- Driver cancellation/restart: generation 1 -> 2, five retired capabilities,
+  device epoch 1 -> 2, 1 Gbps link restored; fresh iperf and integrity passed.
+Final received=2759512, acquired=released=2759452, free=128,
+ready/borrowed/full/dropped=0. The 60 received-but-not-acquired frames span
+session retirement; no outstanding loans remain. These are cancellation tests,
+not hard-fault recovery, latency or long-duration stability qualification.
+
+Evidence under `target/mars-reference/`: `20260917-inline-rx-smoke/`,
+`20260917-inline-rx-{stack,driver}-recovery/`, associated scripts and build/test
+logs. The experiment stays default-off. Next investigation must separate the
+test-service CPU work and reduce remaining synchronous path cost while retaining
+the >900 Mbps requirement; simply reporting one busy core is insufficient.
+Stable FIT `918fdf3b…600b6` was restored with component hashes and link readiness
+verified in `20260917-inline-rx-baseline-restore/`. No SD or SPI writes.
+
+### 2026-09-17: isolate test-service CPU from synchronous RX
+
+Default-off `network-service-peer` selects inline RX and creates iperf3 and
+tcp-probe components on logical hart 1, leaving synchronous driver/GRO/protocol
+work on dispatch hart 0. Each component's owner/arena is created on its home
+hart; existing tracked tasks are not migrated. World publication precedes
+remote initialization, and boot waits for component publication before installing
+the supervisor. Ordinary restart retains the recorded home hart. Remote service
+restart/fault recovery has not been physically tested in this configuration.
+
+FIT `209d87c2a9c462745b77682fa0f38ce8a5676d884a1040115d15d181cd4ded12`
+built and passed hash-verified RAM loading. Two 20-second full RX runs measured
+756.264/756.468 Mbps and 1.25824/1.25656 resident cores. Hart 0 occupied
+99.53/99.42%, hart 1 occupied 26.25/26.20%; other harts were nearly idle.
+The test service contributed to the prior 637 Mbps ceiling, but moving it off
+the RX hart still leaves that hart saturated below 900 Mbps.
+
+The immediately restored same-hart inline control reproduced 636.711 Mbps.
+Its NIDLE interval was 21.118 seconds around a 20.002-second transfer; reported
+0.95600 residency is diluted by this extra idle edge and must not be presented
+as a reduction from the preceding 0.99574 measurement. Active core time was
+20.189 seconds. At the matched 600 Mbps offer, separated services measured
+599.995 Mbps / 1.17379 cores (20.086-second CPU window); same-hart control
+599.965 Mbps / 0.95077 cores (20.176-second window). Thus separation increased
+the throughput ceiling but did not reduce total CPU cost in this comparison.
+
+Both images passed independent 64 MiB verification and ended with all 128
+buffers free, ready/borrowed/full/dropped zero, and matching receive/acquire/
+release counts (peer 3666633, control 2166327). No claim of full system or
+long-duration qualification follows from these short tests.
+
+GRO/admission deltas reveal a useful next target. At full rate, peer admission
+averaged 7.998 frames; eligible GRO attempts averaged 10.659/10.664 segments.
+Sizes 3, 13 and 16 dominated almost equally (first run 39193/39180/39247);
+IP-ID endings, ingress-budget endings and max-group endings each accounted for
+about one third. At 600 Mbps, peer/control eligible GRO means were 10.146/10.219
+and nonempty admission means 7.430/7.494. These approximate counter snapshots
+include singletons and are not merged-only aggregate means. The fixed 3/13/16
+pattern justifies testing existing atomic-IP-ID handling in this new execution
+context, while retaining earlier negative results for the separate-task path.
+It does not by itself prove that eliminating IP-ID endings will meet 900 Mbps.
+
+Evidence: `target/mars-reference/20260917-inline-peer-{measure,control}/`,
+`20260917-inline-peer-comparison.json`, archived FIT/ELF and feature maps,
+build logs and RAM load scripts. The configuration remains default-off.
+Stable baseline `918fdf3b…600b6` was restored with hashes/readiness/link checked
+in `20260917-inline-peer-baseline-restore/`; no SD/SPI writes.
+
+### 2026-09-17: atomic IP ID in the synchronous RX context
+
+Added only the existing `gro-atomic-id` feature to the inline-RX/peer-service
+experiment. No GRO size/budget, ring, interrupt or clock parameter changed.
+Existing tests still exclude fragmentation and validate sequence/header policy,
+payload and synthetic checksums. Six protocol unit tests and 41 integration
+tests passed. Mars build and hash-verified RAM loading passed; candidate FIT:
+`262c9a3979df4b0ad7b6f5d312ecce79d665392f8465d87dd1fd8eb4c4f1dfa6`.
+
+Two 20-second full RX runs measured 786.065 and 782.625 Mbps, occupying
+1.26724 and 1.26289 resident cores. The immediately restored strict-ID peer
+control (`209d87c2…4ded12`) reproduced 756.338 Mbps / 1.25945 cores. Mean full
+throughput improved about 3.7%, but remains below 900 Mbps. At a 600 Mbps offer,
+candidate/control measured 599.965/599.995 Mbps and 1.14161/1.14434 cores;
+that small occupancy difference does not establish a meaningful load reduction.
+
+GRO counters confirm the intended mechanism: full-rate eligible attempted groups
+averaged 15.992/15.987 segments, versus control 10.658. Candidate IP-ID endings
+were zero; almost all full-rate groups reached 16 segments. At 600 Mbps the
+means were 12.976 versus 10.259. Increasing actual aggregation by roughly 50%
+at full rate produced only about 4% throughput improvement, so removing this
+cutoff is useful but cannot account for the remaining synchronous-path cost.
+These histogram means include singleton eligible attempts, and counter snapshots
+are approximate rather than exact CPU-window packet counts.
+
+Both images passed separate 64 MiB integrity checks. Final pools were all 128
+free, ready/borrowed/full/dropped zero; receive/acquire/release matched at
+3762504 for the candidate and 2371289 for the control. No new hard-fault or
+long-duration acceptance is claimed. All experimental features remain default-off.
+
+Evidence under `target/mars-reference/`: `20260917-inline-atomic-{measure,control}/`,
+`20260917-inline-atomic-comparison.json`, build/test/package logs, feature map,
+ELF and RAM-load scripts. Next attribution should separate synchronous device
+service from protocol work before changing remaining per-frame operations.
+Stable FIT `918fdf3b…600b6` was restored with hashes and link readiness checked
+in `20260917-inline-atomic-baseline-restore/`. No SD/SPI contents changed.
+
+### 2026-09-17: attribute inline work and coordinate one RX budget
+
+Added a nested Driver profile scope around synchronous service. Previously its
+policy/gate remainder would have been charged to the enclosing stack task. RX,
+TX and completion children retain their own parent-exclusive scopes; the scope
+compiles out without network-profile. Five parser regressions passed.
+
+The first 5-second capture found an actual scheduling imbalance: each protocol
+turn consumed at most 32 original frames, but both its before/after service
+calls admitted RX, and the lifecycle fallback also added RX work. Queue high
+water was 64, with 13948 full retry attempts across all 50 buckets. Stack turns
+still processed ingress; this was not evidence of mostly idle stack spinning.
+Capture FIT: `6d7892a77749908fedd2266e4649dc5836559b211b2928fdddeb4be1d0e3fdf4`.
+
+The default-off inline path now requests RX only before protocol processing.
+Its final service call drains TX/completions, and the bound driver's 1 ms
+fallback also services TX only. Idle fallback still arms/rechecks RX interrupts.
+Before a stack binds, the driver retains its normal RX behavior. All legacy
+driver turns still request their original receive budget. Seven existing
+netstack tests passed after extending the platform service contract.
+
+Unprofiled candidate FIT:
+`c795b40078a215e01b2fcc69405267ec73ae93e780473d6360482a8d7bd66017`.
+Two full RX runs: 796.442/796.030 Mbps, 1.27904/1.28151 resident cores.
+Immediately restored prior atomic-ID control: 785.349 Mbps, 1.26746 cores.
+At 600 Mbps, candidate/control occupancy was 1.11923/1.11705 cores. This is
+about a 1.4% full-throughput gain, not a verified reduction at the matched
+offered load. Both passed 64 MiB verification and had all 128 buffers free;
+receive/acquire/release matched at 3803208 and 2420973 respectively.
+
+Matched diagnostic capture after the change used FIT
+`7b77f437786e513c691e98382c169cd5c99c73eeb7bc5e64bc998450cb89ff5f`:
+inbound high water fell to 32 and full retry attempts to zero. Outbound high
+water was 3 with zero full attempts. No empty stack retries were recorded.
+Thus the scheduling imbalance is resolved, even though its performance impact
+is small. Instrumentation materially perturbs this CPU-limited path: interior
+active-capture intervals were about 698 Mbps before and 694 Mbps after, versus
+roughly 760–767 Mbps outside the active window in those diagnostic images.
+Do not use the diagnostic throughput as an optimization A/B result.
+
+Post-change hart-0 elapsed scopes over the 5-second capture, including each
+scope's separately classified waits: packet receive entry 1.37467 s, frontend
+1.18120 s, protocol-poll remainder 0.90990 s, RX callback 0.53407 s, driver
+remainder 0.48552 s. These scopes include instrumentation/interrupts and are
+not exclusive instruction cycles. Selected child samples must not be scaled
+and added to their parents. Receive entry and frontend delivery remain useful
+targets; the removed queue retries do not explain the remaining gap to 900 Mbps.
+
+Traffic-time stack cancellation/restart also passed on the post-change
+diagnostic image: generation 1 -> 2, nine capabilities retired; fresh iperf and
+64 MiB verification succeeded, final receive/acquire/release 2233584, free128,
+ready/borrowed/full/dropped zero. This does not qualify hard-fault recovery.
+
+Evidence under `target/mars-reference/`: `20260917-inline-profile-measure/`,
+`20260917-budget-profile-measure/` (raw profile plus reconciled analysis),
+`20260917-inline-budget-{measure,control,stack-recovery}/`, archived feature
+maps, ELFs, build and host-test logs. The inline configuration stays default-off.
+The ordinary image/ethernet/trng-probe configuration passed release cargo check
+with experiments disabled (`20260917-inline-budget-default-check.log`). Stable
+FIT `918fdf3b…600b6` was restored with hashes and link readiness verified in
+`20260917-inline-budget-baseline-restore/`; no SD/SPI writes.
+
+### 2026-09-17: refill admission batches in place
+
+The protocol device now refills its empty LoanBatch through receive authority
+instead of returning and assigning the large batch through nested result
+wrappers. The old return-by-value API remains available. A nonempty destination
+is rejected before dequeue; owner validation, per-frame session rejection and
+firmware ownership tracking remain in the admission path. Queue tickets remain
+present until firmware records the admitted owner. This removes metadata
+movement, not packet payload copies or per-frame loan tracking.
+
+In archived release ELFs, PacketDevice::receive_pooled shrank from 6586 to
+5550 bytes, its stack frame from 4336 to 2464 bytes, and static memcpy call sites
+from 20 to 17. The removed sites used 592-byte lengths. These are static sites,
+not evidence that every refill previously executed three such copies.
+
+Unprofiled candidate FIT:
+`ac41d8f7a79bfec9475be817cad39c0562e387e28541ec142ede312faab95161`.
+Two 20-second full RX runs measured 807.157/808.830 Mbps at 1.28495/1.28444
+resident cores. Adjacent prior inline-budget control (`c795b400…66017`) measured
+797.697 Mbps at 1.28175 cores. At matched 600 Mbps, candidate/control measured
+1.08647/1.12486 cores, about 3.4% lower occupancy in this short comparison.
+The roughly 1.3% full-rate throughput gain remains far short of 900 Mbps;
+the protocol hart is still about 99.7% busy. Occupancy sums all four harts'
+non-WFI time and does not subtract idle baseline work.
+
+Both images passed 64 MiB pattern verification. Candidate/control final pools
+had 128 free buffers, zero ready/borrowed/full/dropped, and matching
+receive/acquire/release counts of 3843437/2442064. On the candidate, cancellation
+during traffic and net-stack restart advanced generation 1 to 2 and retired
+nine capabilities. Fresh iperf and 64 MiB verification passed; final pool counts
+matched at 1019882 with all 128 free. This checks ordinary cancellation/restart,
+not injected hard-fault recovery or long-duration acceptance.
+
+Host checks: 12 core receive tests, six protocol unit tests and 41 protocol
+integration tests passed, including destination reuse/rejection, stale sessions
+and exact-owner recovery with loans in both popped and refilled storage. Mars
+release build passed. Experimental configurations remain default-off.
+
+Evidence under `target/mars-reference/`: `20260917-inplace-rx-comparison.json`,
+`20260917-inplace-rx-{measure,control,stack-recovery}/`, before/after assembly,
+feature map, archived ELF, build and host-test logs. Stable FIT
+`918fdf3b…600b6` was restored; component hashes and gigabit link readiness were
+verified in `20260917-inplace-rx-baseline-restore/`. No SD/SPI writes.
+
+### 2026-09-17: one frontend transaction for state and RX delivery
+
+Added default-off `frontend-rx-batch` through firmware/kernel/netstack/protocol.
+The ordinary copied frontend publishes transport state and drains its bounded
+socket receive work under one frontend metadata guard. Wrapped socket fragments
+share that guard; application notification occurs only after the batch commits
+and unlocks. Existing four-chunk and 32 KiB per-chunk limits, receive capacity,
+connection generations, per-chunk device authority checks and socket-owned
+storage remain intact. TX and close reconciliation remain separate. The
+receive-buffer-exchange configuration retains its existing path.
+
+The net-api transaction borrows queue metadata synchronously; it neither lends
+socket storage to applications nor changes driver ownership. Tests cover queue
+wrap, capacity exhaustion, a callback error after committed bytes, reset/reuse,
+and a reentrant wake callback reading the whole batch after unlock. API checks
+passed 16 unit, 12 frontend, nine exchange frontend and one allocation test.
+Candidate protocol checks passed six unit and 41 integration tests; combined
+exchange fallback checks passed five unit and 40 integration tests. Mars build
+and the ordinary image/ethernet/trng-probe release check passed.
+
+Candidate FIT:
+`85b761c8a0d482090b40908b8c41a6ebc8cbc2855bbc82595c010b473fd9e9ee`.
+Two 20-second full RX tests measured 875.148/876.581 Mbps with
+1.27374/1.27484 total non-WFI cores. At 599.935 Mbps occupancy was 1.04307 cores.
+The adjacent in-place-admission control measured 809.769 Mbps at 1.28796 cores.
+Its first 600 Mbps attempt failed with repeated link down/up and a broken
+iperf control connection; it is excluded. A separate paced retry completed at
+599.995 Mbps and 1.11845 cores. Thus this short comparison shows about 8.2%
+more full-rate throughput and 6.7% lower occupancy at matched 600 Mbps.
+These are 20-second samples, not an endurance or variance qualification.
+Main protocol hart remains about 99.6–99.8% busy at full rate; neither 900 Mbps
+nor sub-core occupancy is proved for this configuration.
+
+Candidate 64 MiB integrity verification passed; receive/acquire/release matched
+at 4075989, free128, ready/borrowed/full/dropped zero. Traffic-time net-stack
+cancellation/restart advanced generation 1 to 2, retired nine capabilities,
+then fresh iperf and another 64 MiB verification passed. Final pool counts
+matched at 5174642, all 128 free. Hard-fault and endurance qualification remain
+outstanding.
+
+The adjacent control RAM load verified both component hashes for FIT
+`ac41d8f7…5161`, then stopped before shell at MARS_TRNG_PROBE FAIL,
+prepare/start=Err(Protocol), read=Err(DriverRestarted), cause=Initialize(Mode),
+followed by `pmic_ops: cannot read pmic power register`. The loader exited with
+failure. After a user power cycle, the old SD firmware responded; the same
+control FIT then loaded with hashes and gigabit readiness verified. This was a
+boot-probe failure before network initialization, not evidence of a frontend
+transaction hang. The successful paced control also passed 64 MiB verification;
+final receive/acquire/release matched at 2935469, free128, other counts zero.
+No SD/SPI writes or entropy-gate bypass occurred.
+
+Evidence: `target/mars-reference/20260917-frontend-batch-{measure,stack-recovery,control-load,control-cold-load,control,control-paced-retry}/`,
+comparison JSON retaining the failed control attempt, archived ELF, feature map,
+worktree patch and build/test/check logs. The transaction remains opt-in pending
+longer qualification.
+Stable FIT `918fdf3b…600b6` was subsequently restored with component hashes and
+gigabit readiness verified in `20260917-frontend-batch-baseline-restore/`.
+
+### 2026-09-17: close snapshot experiment rejected after adjacent comparison
+
+Tested capturing the close request with the existing frontend drive snapshot,
+removing the separate end-of-drive metadata lock. A new deterministic event
+test covered a close arriving after the snapshot but before wait registration,
+and preservation of a later reset when clearing a captured graceful close.
+The send-drain barrier and listener reconciliation remained unchanged. Host
+checks passed (API 16+13+9+1, protocol 6+41, exchange fallback 5+40), as did the
+Mars build and ordinary release check.
+
+Candidate FIT `a6defe7a666984f2c63fbacd5ec44ab61b8c1665c0dcc0cbff5ece006372b84d`
+measured 877.414/876.469 Mbps at 1.26831/1.27031 cores, versus adjacent RX-batch
+control `85b761c8…9e9ee` at 874.290 Mbps and 1.26552 cores. At 600 Mbps,
+candidate/control occupancy was 1.07587/1.09006 cores. Less than 0.4% full-rate
+throughput difference and about 1.3% paced occupancy difference do not establish
+a material, repeatable benefit given prior short-run variation. Both images
+passed 64 MiB integrity checks; candidate pool counts matched at 4080195 with
+free128 and no ready/borrowed/full/dropped buffers.
+
+The close snapshot API, feature and test were reverted to the exact saved
+pre-experiment sources; the useful frontend RX transaction remains. The
+experiment is reproducible from `20260917-frontend-close-only.patch` and the
+archived feature map/ELF/FIT. Raw tests and comparison JSON are under
+`target/mars-reference/20260917-frontend-close-{measure,control}/`. This rules
+out adopting this particular extra fast path on current evidence; it does not
+prove all remaining frontend synchronization is negligible.
+
+### 2026-09-17: resample the retained frontend RX transaction
+
+After reverting the close snapshot, built the retained RX transaction with
+network-profile. Diagnostic FIT:
+`a066185564cb9f06471e3535ac54314a349229247996540128112f1632d3f259`.
+A complete five-second capture reconciled all bucket/hart totals through
+scripts/mars-network-profile.py. Main-hart parent-exclusive elapsed scopes,
+including their separately classified waits: packet receive entry 1.42755 s,
+protocol poll remainder 0.98454 s, frontend remainder 0.95312 s, RX callback
+0.60342 s, and driver remainder 0.51782 s. Frontend contended wait on hart 0
+was 0.000235 s (hart 1: 0.000090 s), compared with 0.28215/0.06974 s in the
+earlier inline-budget capture. The workload progresses faster in this capture,
+so raw absolute times are not a matched-work CPU comparison.
+
+Inbound high water was 32 with zero full retries; outbound high water was 3,
+also zero full retries. Stack recorded 10480 ingress turns, 20974 aggregate
+ingress objects and no empty retries. Selected GRO samples numbered 2806;
+they are not a count of all input packets and must not be scaled and added to
+the enclosing packet scope. The remaining large receive-entry and protocol
+scopes motivate examining GRO payload materialization and subsequent buffer
+delivery, rather than another small metadata-lock shortcut. This capture does
+not separately prove the cost of copying versus parsing/ownership checks.
+
+Instrumentation perturbs throughput: active-capture intervals were about
+783–787 Mbps, versus about 839–857 Mbps outside the window in this diagnostic
+image. Do not substitute these numbers for unprofiled A/B results. Timer-based
+elapsed scopes include instrumentation and interrupts; they are not instruction
+cycles. Evidence: `20260917-frontend-profile-measure/` contains raw serial,
+iperf, profile, reconciled analysis and compact attribution JSON.
+
+Stable FIT `918fdf3b…600b6` was restored with hashes and gigabit link verified
+in `20260917-frontend-close-baseline-restore/`. No SD/SPI writes. The retained
+unprofiled RX transaction remains approximately 875 Mbps / 1.27 cores and has
+not reached the requested performance target.
+
+### 2026-09-17: TCP receive storage groundwork for scatter GRO
+
+The current RxToken contract supplies a contiguous slice. Removing GRO's
+materialization without changing the consumer would either expose incomplete
+payloads or bypass ordinary receive validation. Started the necessary TCP
+storage abstraction in the existing smoltcp submodule, preserving its previous
+buffer-exchange changes. New internal `tcp-scatter-receive` support borrows up
+to 16 payload slices for one invocation, clips their logical range using the
+same TCP window/sequence logic, and writes fragments directly into the socket
+ring. It allocates no aggregate buffer and retains no fragment reference in
+the socket after the call. SYN reset replies use the logical payload length,
+not the deliberately empty payload field of header-only metadata.
+
+Both contiguous and scattered storage instantiate one TCP state machine; this
+does not duplicate sequence, ACK, retransmission or assembler policy. With the
+feature enabled, the existing TCP send fixture splits payloads (including an
+empty fragment) so the established golden tests exercise this new path. New
+differential coverage checks all 49 split points of a 48-byte payload, six
+sequence displacements and two sequence bases (including signed wrap), with
+window clipping, ring wrap and later filling of out-of-order gaps. Separate
+coverage clips every range across 16 fragments into a wrapped, capacity-limited
+ring, and rejects excessive fragment counts, excessive lengths and ambiguous
+contiguous-plus-scattered input before socket mutation.
+
+Results: 195 TCP tests passed with scatter enabled; 193 passed with contiguous
+storage. The combined smoltcp configuration (scatter, buffer exchange and TCP
+segmentation) passed 388 tests. Existing VibeOS protocol checks passed six unit
+and 41 integration tests. IPv6 no_std checking, scatter-enabled RISC-V no_std
+release checking and the ordinary Mars release check passed. Earlier zero-test output was a test-filter/configuration
+mistake (TCP unit tests require medium-ip), not counted as verification.
+
+This is internal groundwork, NOT a wired GRO optimization: no firmware feature
+enables it, no device token/Interface path supplies fragments yet, and no new
+image was loaded or performance gain measured. Next work must connect a
+validated segmented receive representation through ordinary Ethernet/IP
+admission, preserve checksum policy and exceptional-packet fallback, retain
+all DMA loans until synchronous TCP consumption completes, then repeat
+integrity, recovery and unprofiled performance comparisons. The active goal
+remains unfulfilled.
+
+Evidence under `target/mars-reference/`: `20260917-scatter-tcp-only.patch`
+(relative to the preserved pre-existing smoltcp edits), saved original files,
+TCP contiguous/scatter logs, full smoltcp tests, protocol regressions and checks.
+No SD/SPI or board changes were made during this step.

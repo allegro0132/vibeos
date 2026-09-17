@@ -52,6 +52,25 @@ fn frame(stamp: PacketStamp) -> Stamped {
 fn stamp() -> PacketStamp { PacketStamp::new(1, 1).unwrap() }
 fn domain(n: u64) -> AllocationDomain { AllocationDomain::new(OwnerId::new(n), ArenaId::new(n)) }
 #[test]
+fn external_input_hint_closes_wait_races_without_publishing_a_ticket() {
+    use std::{future::Future, pin::pin, task::{Context, Waker}};
+    let q = unsafe { ReceiveEndpoint::new("irq-rx", 2, &OPS).unwrap() };
+    let event = q.message_event();
+    let mut before_registration = pin!(event.wait());
+    q.notify_input();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(before_registration.as_mut().poll(&mut cx).is_ready());
+    assert!(!q.has_message());
+    assert!(q.try_receive(stamp(), domain(90)).unwrap().is_none());
+    let mut after_registration = pin!(event.wait());
+    assert!(after_registration.as_mut().poll(&mut cx).is_pending());
+    q.notify_input();
+    assert!(after_registration.as_mut().poll(&mut cx).is_ready());
+    assert!(!q.has_message());
+    let mut next = pin!(event.wait());
+    assert!(next.as_mut().poll(&mut cx).is_pending());
+}
+#[test]
 fn queue_backpressure_preserves_ticket_and_acquisition_reads_original_storage() {
     let q = unsafe { ReceiveEndpoint::new("rx", 1, &OPS).unwrap() };
     let a = frame(stamp()); let b = frame(stamp());
@@ -162,6 +181,40 @@ fn revoked_batch_sender_cannot_move_pending_tickets() {
     assert!(authority.try_with(|q|q.try_send_batch(&mut batch,32)).is_err());
     assert_eq!(batch.remaining(),1);assert!(!q.has_message());
     assert_eq!(batch.pop(),Some(f));assert!(q.discard(f));
+}
+
+#[cfg(feature = "rx-admission-batch")]
+#[test]
+fn inplace_refill_preserves_live_destination_and_tracks_reused_storage() {
+    let q = unsafe { ReceiveEndpoint::new("inplace-rx", 4, &OPS).unwrap() };
+    let a = frame(stamp()); let b = frame(stamp());
+    let stale = frame(stamp().next_stack_generation().unwrap()); let c = frame(stamp());
+    for f in [a, b, stale, c] { q.try_send(f).unwrap(); }
+    let owner = domain(880);
+    let mut batch = LoanBatch::empty();
+    assert_eq!(q.try_receive_batch_into(stamp(), owner, 1, &mut batch), Ok(1));
+    assert_eq!(q.try_receive_batch_into(stamp(), owner, 4, &mut batch), Err(Error::Capacity));
+    assert_eq!(q.try_receive_batch_into(stamp(), AllocationDomain::SYSTEM, 4, &mut batch), Err(Error::UntrackedOwner));
+    assert_eq!(batch.len(), 1);
+    let first = batch.pop().unwrap().unwrap();
+    assert_eq!(first.as_bytes().as_ptr(), records().lock().unwrap()[&a.ticket().pool()].bytes.as_ptr());
+    assert_eq!(q.try_receive_batch_into(stamp(), owner, 0, &mut batch), Ok(0));
+    assert!(q.has_message());
+    assert_eq!(q.try_receive_batch_into(stamp(), owner, 2, &mut batch), Ok(2));
+    let second = batch.pop().unwrap().unwrap();
+    assert_eq!(second.as_bytes().as_ptr(), records().lock().unwrap()[&b.ticket().pool()].bytes.as_ptr());
+    assert!(matches!(batch.pop(), Some(Err(Error::Session(_)))));
+    drop(second);
+    assert_eq!(q.try_receive_batch_into(stamp(), owner, 8, &mut batch), Ok(1));
+    assert!(!q.has_message());
+    // Simulate permanent domain quiescence with loans in both popped and
+    // refilled storage. Recovery must see both under the original incarnation.
+    std::mem::forget(first); std::mem::forget(batch);
+    assert_eq!(unsafe { q.recover(domain(881)) }, 0);
+    assert_eq!(unsafe { q.recover(owner) }, 2);
+    for f in [a, b, stale, c] {
+        assert_eq!(records().lock().unwrap()[&f.ticket().pool()].state, State::Released);
+    }
 }
 
 #[cfg(feature = "rx-admission-batch")]

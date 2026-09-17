@@ -279,6 +279,10 @@ pub struct PacketDevice {
     rx_packet: Option<Packet>,
     #[cfg(feature = "pooled-rx")]
     rx_loan: Option<vibeos_core::net_receive::Loan>,
+    #[cfg(feature = "gro-scatter")]
+    gro_loans: [Option<vibeos_core::net_receive::Loan>; gro::MAX_SEGMENTS - 1],
+    #[cfg(feature = "gro-scatter")]
+    gro_loan_count: usize,
     #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
     pending_rx_loan: Option<vibeos_core::net_receive::Loan>,
     outbound: PacketTransmit,
@@ -315,6 +319,10 @@ impl PacketDevice {
             rx_packet: None,
             #[cfg(feature = "pooled-rx")]
             rx_loan: None,
+            #[cfg(feature = "gro-scatter")]
+            gro_loans: core::array::from_fn(|_| None),
+            #[cfg(feature = "gro-scatter")]
+            gro_loan_count: 0,
             #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
             pending_rx_loan: None,
             outbound: outbound.into(),
@@ -340,6 +348,17 @@ impl PacketDevice {
 
     pub const fn set_tx_checksum_offload(&mut self, enabled: bool) {
         self.tx_checksum_offload = enabled;
+    }
+
+    #[cfg(feature = "gro-scatter")]
+    fn clear_gro_loans(&mut self) {
+        let mut releases = vibeos_core::net_receive::ReleaseBatch::<{ gro::MAX_SEGMENTS }>::new();
+        for slot in &mut self.gro_loans[..self.gro_loan_count] {
+            if let Some(loan) = slot.take() {
+                if let Err(loan) = releases.push(loan) { drop(loan); }
+            }
+        }
+        self.gro_loan_count = 0;
     }
 
     pub const fn set_rx_checksum_offload(&mut self, enabled: bool) {
@@ -512,10 +531,9 @@ impl PacketDevice {
         let received = if self.rx_batch.len() != 0 {
             Some(Ok(self.rx_batch.pop().unwrap().map(Some)))
         } else {
-            self.inbound.receive_batch(self.stamp, self.ingress_remaining.min(8)).map(|result| match result {
-                Ok(Ok(batch)) => {
-                    self.stats.rx_admission_sizes[batch.len()] += 1;
-                    self.rx_batch = batch;
+            self.inbound.receive_batch_into(self.stamp, self.ingress_remaining.min(8), &mut self.rx_batch).map(|result| match result {
+                Ok(Ok(count)) => {
+                    self.stats.rx_admission_sizes[count] += 1;
                     Ok(self.rx_batch.pop().map_or(Ok(None), |r| r.map(Some)))
                 },
                 Ok(Err(error)) => Ok(Err(error)),
@@ -641,9 +659,32 @@ fn coalesced_rx(bytes: &[u8]) -> RxBytes<'_> {
     #[cfg(not(feature = "pooled-rx"))]
     { RxBytes::Coalesced(bytes) }
 }
-pub struct PacketRxToken<'a>(RxBytes<'a>);
+pub struct PacketRxToken<'a>(RxBytes<'a>,
+    #[cfg(feature = "gro-scatter")] Option<&'a [Option<vibeos_core::net_receive::Loan>]>);
 impl phy::RxToken for PacketRxToken<'_> {
+    #[cfg(feature = "gro-scatter")]
+    fn consume_gro<R, F>(self, f: F) -> R where F: FnOnce(&[&[u8]]) -> R {
+        let mut frames = [&[][..]; gro::MAX_SEGMENTS];
+        frames[0] = self.0;
+        let mut count = 1;
+        if let Some(loans) = self.1 {
+            for loan in loans {
+                frames[count] = loan.as_ref().expect("admitted GRO loan").as_bytes();
+                count += 1;
+            }
+        }
+        f(&frames[..count])
+    }
     fn consume<R, F>(self, f: F) -> R where F: FnOnce(&[u8]) -> R {
+        #[cfg(feature = "gro-scatter")]
+        if self.1.is_some() {
+            return self.consume_gro(|frames| {
+                match phy::TcpGro::new(frames, &phy::ChecksumCapabilities::ignored()) {
+                    Some(gro) => f(&gro.materialize()),
+                    None => f(&[]),
+                }
+            });
+        }
         #[cfg(feature = "pooled-rx")]
         { f(self.0) }
         #[cfg(not(feature = "pooled-rx"))]
@@ -776,6 +817,8 @@ impl phy::Device for PacketDevice {
         // The guard ends before token consumption, leaving TCP/IP work in its
         // parent protocol scope. TX reservation/flush inside receive is included.
         let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::PacketQueue);
+        #[cfg(feature = "gro-scatter")]
+        self.clear_gro_loans();
         // Previous tokens cannot coexist with this mutable device invocation.
         // Dropping an admitted loan releases storage even after revocation.
         #[cfg(feature = "pooled-rx")]
@@ -799,9 +842,13 @@ impl phy::Device for PacketDevice {
             let loan = self.pending_rx_loan.take().or_else(|| self.receive_pooled())?;
             #[cfg(not(feature = "bounded-gro"))]
             let loan = self.receive_pooled()?;
+            #[cfg(feature = "gro-scatter")]
+            let began = self.gro.begin_scattered(loan.as_bytes(), self.rx_checksum_offload);
+            #[cfg(all(feature = "bounded-gro", not(feature = "gro-scatter")))]
+            let began = self.gro.begin(loan.as_bytes(), self.rx_checksum_offload);
             #[cfg(feature = "bounded-gro")]
-            if self.gro.begin(loan.as_bytes(), self.rx_checksum_offload) {
-                #[cfg(feature = "gro-batch-release")]
+            if began {
+                #[cfg(all(feature = "gro-batch-release", not(feature = "gro-scatter")))]
                 let mut releases = vibeos_core::net_receive::ReleaseBatch::<{ gro::MAX_SEGMENTS }>::new();
                 for _ in 1..gro::MAX_SEGMENTS {
                     if self.gro.finished() { break; }
@@ -814,10 +861,15 @@ impl phy::Device for PacketDevice {
                         self.pending_rx_loan = Some(next);
                         break;
                     }
-                    // Merged bytes now belong to the bounded aggregation buffer.
-                    // Default cleanup is immediate. The experiment retains only
-                    // merged followers until this group ends (no await/prefetch).
-                    #[cfg(feature = "gro-batch-release")]
+                    // Copied GRO can release followers now. Scatter GRO retains
+                    // each original loan through synchronous token consumption;
+                    // the next receive or device destruction releases it.
+                    #[cfg(feature = "gro-scatter")]
+                    {
+                        self.gro_loans[self.gro_loan_count] = Some(next);
+                        self.gro_loan_count += 1;
+                    }
+                    #[cfg(all(feature = "gro-batch-release", not(feature = "gro-scatter")))]
                     if let Err(loan) = releases.push(next) { drop(loan); }
                 }
             }
@@ -825,6 +877,8 @@ impl phy::Device for PacketDevice {
             self.gro.profile_record();
             #[cfg(feature = "bounded-gro")]
             if self.authority_revoked || self.revalidate_authority().is_err() {
+                #[cfg(feature = "gro-scatter")]
+                self.clear_gro_loans();
                 self.pending_rx_loan = None;
                 #[cfg(feature = "rx-admission-batch")]
                 { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
@@ -834,12 +888,17 @@ impl phy::Device for PacketDevice {
             #[cfg(feature = "bounded-gro")]
             let bytes = if self.gro.has_aggregate() {
                 self.gro.finish(self.rx_checksum_offload);
-                self.gro.bytes()
+                #[cfg(feature = "gro-scatter")]
+                { self.rx_loan.as_ref()?.as_bytes() }
+                #[cfg(not(feature = "gro-scatter"))]
+                { self.gro.bytes() }
             } else { self.rx_loan.as_ref()?.as_bytes() };
             #[cfg(not(feature = "bounded-gro"))]
             let bytes = self.rx_loan.as_ref()?.as_bytes();
             return Some((
-                PacketRxToken(bytes),
+                PacketRxToken(bytes,
+                    #[cfg(feature = "gro-scatter")]
+                    if self.gro_loan_count == 0 { None } else { Some(&self.gro_loans[..self.gro_loan_count]) }),
                 PacketTxToken {
                     stamp: self.stamp,
                     outbound: &self.outbound,
@@ -893,7 +952,7 @@ impl phy::Device for PacketDevice {
         #[cfg(not(feature = "bounded-gro"))]
         let bytes = { single_rx(packet, &mut self.rx_packet) };
         Some((
-            PacketRxToken(bytes),
+            PacketRxToken(bytes, #[cfg(feature = "gro-scatter")] None),
             PacketTxToken {
                 stamp: self.stamp,
                 outbound: &self.outbound,
@@ -1480,10 +1539,42 @@ impl SharedIpv4TcpStack {
             }
         }
         let transport = self.tcp_stream_status(listener)?;
+        #[cfg(all(feature = "frontend-rx-batch", not(feature = "receive-buffer-exchange")))]
+        let drive = {
+            let entry = self.listener(listener)?;
+            let socket = entry.socket;
+            let reset_requested = entry.reset_requested;
+            let (drive, result) = frontend.network_receive_drive(transport.state, |drive, batch| {
+                let _phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
+                let mut budget = drive.receive_capacity.min(transport.readable_bytes);
+                for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
+                    let capacity = budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
+                    if capacity == 0 || reset_requested { break; }
+                    self.device.revalidate_authority()?;
+                    match self.sockets.get_mut::<tcp::Socket>(socket).recv(|input| {
+                        let length = batch.receive(&input[..input.len().min(capacity)]);
+                        (length, length)
+                    }) {
+                        Ok(0) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
+                        Ok(length) => {
+                            report.received_bytes += length;
+                            budget -= length;
+                        }
+                    }
+                }
+                Ok::<(), TcpFrontendDriveError>(())
+            })?;
+            result?;
+            drive
+        };
+        #[cfg(any(not(feature = "frontend-rx-batch"), feature = "receive-buffer-exchange"))]
         let drive = frontend.network_begin_drive(transport.state)?;
         drop(phase);
         // Conservative turn-local budgets. Concurrent application progress may
         // add work, but cannot cause over-consumption; next drive rechecks it.
+        #[cfg(all(feature = "frontend-rx-batch", not(feature = "receive-buffer-exchange")))]
+        let mut receive_budget: usize = 0;
+        #[cfg(any(not(feature = "frontend-rx-batch"), feature = "receive-buffer-exchange"))]
         let mut receive_budget = drive.receive_capacity.min(transport.readable_bytes);
         let mut transmit_budget = drive.queued_send_bytes;
         // Borrow transport storage only for the synchronous copy. No socket

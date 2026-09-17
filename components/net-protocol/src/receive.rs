@@ -14,10 +14,11 @@ impl From<Revocable<Endpoint<StampedPacket>>> for PacketReceive {
 }
 impl PacketReceive {
     #[cfg(feature = "rx-admission-batch")]
-    pub(crate) fn receive_batch(&self, stamp: PacketStamp, limit: usize) -> Option<Result<Result<vibeos_core::net_receive::LoanBatch, ReceiveError>, CapError>> {
+    pub(crate) fn receive_batch_into(&self, stamp: PacketStamp, limit: usize,
+        batch: &mut vibeos_core::net_receive::LoanBatch) -> Option<Result<Result<usize, ReceiveError>, CapError>> {
         match self {
             Self::Raw(_) => None,
-            Self::Pooled { authority, domain } => Some(authority.try_with(|q| q.try_receive_batch(stamp, *domain, limit))),
+            Self::Pooled { authority, domain } => Some(authority.try_with(|q| q.try_receive_batch_into(stamp, *domain, limit, batch))),
         }
     }
     /// Notification only; callers must revalidate all device/session authority.

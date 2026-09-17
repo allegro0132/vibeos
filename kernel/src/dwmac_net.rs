@@ -18,6 +18,9 @@ use crate::net::{
 use crate::sync::SpinLock;
 use crate::world::Space;
 
+#[cfg(all(feature = "network-inline-rx", feature = "network-tso-coalesce"))]
+compile_error!("inline RX does not admit task-arena TX coalescer storage");
+
 #[cfg(feature = "direct-tcp-segmentation")]
 type OutboundResource = vibeos_core::net_transmit::TransmitEndpoint;
 #[cfg(not(feature = "direct-tcp-segmentation"))]
@@ -509,12 +512,14 @@ pub async fn driver_task(
         engine.tx_checksum_offload(),
         engine.rx_checksum_offload(),
     );
-    let mut session = DriverSession {
-        engine: Some(engine),
-    };
-
-    #[cfg(feature = "network-tso-coalesce")]
-    let mut tx_batch = vibeos_core::net_tx_coalesce::TxCoalescer::new();
+    #[cfg(not(feature = "network-inline-rx"))]
+    let mut work = DriverWork::new(engine);
+    #[cfg(feature = "network-inline-rx")]
+    let _registration = InlineRegistration::install(InlineService {
+        owner: domain, caller: None, work: DriverWork::new(engine),
+        mmio: mmio.clone(), dma: dma.clone(), control: control.clone(),
+        outbound: outbound.clone(), inbound: inbound.clone(),
+    });
     #[cfg(feature = "rx-interrupt-poll")]
     if device().rx_interrupts.is_some() {
         if !crate::plic::is_dispatch_hart()
@@ -527,12 +532,6 @@ pub async fn driver_task(
         RX_IRQ_FAULT.store(false, Ordering::Release);
         if crate::plic::enable(device().irq).is_err() { return; }
     }
-    let mut pending_tx = None;
-    let mut pending_rx = None;
-    #[cfg(feature = "pooled-rx")]
-    let mut pending_rx_batch = vibeos_core::net_receive::StampedBatch::empty();
-    let mut tx_deadline = 0;
-    let mut link_poll = None;
     #[cfg(feature = "driver-stage-profile")]
     let mut stage_turn = 0u64;
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(crate::exec::timebase_hz() / 1000, 64);
@@ -545,25 +544,40 @@ pub async fn driver_task(
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
         }
+        #[cfg(feature = "network-inline-rx")]
+        {
+            if INLINE_SERVICE.lock().as_ref().is_none_or(|s| s.owner != domain) { return; }
+            // Once bound, the protocol task drives each controller turn. This
+            // lifecycle task retains independent cancellation/restart authority.
+            let bound = with_device_authority(&mmio, &dma, &control, ||
+                Ok(CONTROL.lock().active_stack_domain.is_some()));
+            match bound {
+                Ok(true) => {
+                    // Bounded fallback also drains TX if a stack retires
+                    // normally before a replacement can bind its session.
+                    if inline_turn(false, false).is_err() { return; }
+                    crate::exec::sleep_ms(1).await;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
         #[cfg(feature = "driver-stage-profile")]
         let sample_stage = { stage_turn = stage_turn.wrapping_add(1); stage_turn & 63 == 0 };
+        #[cfg(not(feature = "network-inline-rx"))]
         let turn = with_device_authority(&mmio, &dma, &control, || {
             driver_turn(
-                session.engine_mut(),
+                &mut work,
+                true,
                 #[cfg(feature = "driver-stage-profile")]
                 sample_stage,
                 &outbound,
                 &inbound,
-                &mut pending_tx,
-                #[cfg(feature = "network-tso-coalesce")]
-                &mut tx_batch,
-                &mut pending_rx,
-                #[cfg(feature = "pooled-rx")]
-                &mut pending_rx_batch,
-                &mut tx_deadline,
-                &mut link_poll,
             )
         });
+        #[cfg(feature = "network-inline-rx")]
+        let turn = inline_turn(false, true);
         match turn {
             Ok(worked) => {
                 #[cfg(feature = "rx-interrupt-poll")]
@@ -620,6 +634,8 @@ fn rx_top_half(_: usize, _: u64) {
         }
         RX_INTERRUPTS.fetch_add(1, Ordering::Relaxed);
         RX_WAIT.wake_all();
+        #[cfg(feature = "network-inline-rx")]
+        crate::detached_rx::notify_input();
     }
 }
 #[cfg(feature = "rx-interrupt-poll")]
@@ -695,12 +711,10 @@ impl DriverSession {
 
 impl Drop for DriverSession {
     fn drop(&mut self) {
+        let Some(engine) = self.engine.take() else { return; };
         #[cfg(feature = "rx-interrupt-poll")]
         stop_rx_interrupts();
-        let reset = self
-            .engine
-            .take()
-            .is_some_and(Engine::shutdown);
+        let reset = engine.shutdown();
         shutdown_driver_policy(reset);
     }
 }
@@ -717,19 +731,133 @@ fn with_device_authority<R>(
     }
 }
 
+/// Exclusive state of one bounded controller service turn. It is independent
+/// of the async scheduling loop so a future receive/protocol pump can drive the
+/// same state synchronously without inventing a second Engine owner. This
+/// context never awaits; callers retain live device capabilities for each turn.
+/// Keep the session last: pending software state is dropped before reset.
+struct DriverWork {
+    pending_tx: Option<PendingTx>,
+    #[cfg(feature = "network-tso-coalesce")]
+    tx_batch: vibeos_core::net_tx_coalesce::TxCoalescer,
+    pending_rx: Option<PendingRx>,
+    #[cfg(feature = "pooled-rx")]
+    pending_rx_batch: vibeos_core::net_receive::StampedBatch,
+    tx_deadline: u64,
+    link_poll: Option<u64>,
+    session: DriverSession,
+}
+impl DriverWork {
+    fn new(engine: Engine) -> Self {
+        Self {
+            pending_tx: None,
+            #[cfg(feature = "network-tso-coalesce")]
+            tx_batch: vibeos_core::net_tx_coalesce::TxCoalescer::new(),
+            pending_rx: None,
+            #[cfg(feature = "pooled-rx")]
+            pending_rx_batch: vibeos_core::net_receive::StampedBatch::empty(),
+            tx_deadline: 0, link_poll: None,
+            session: DriverSession { engine: Some(engine) },
+        }
+    }
+}
+
+// Permanent kernel policy storage, never a pointer into either task's arena.
+// The gate covers every use of the sole Engine, including removal/reset. All
+// pending data in the admitted configuration is fixed storage or pool tickets.
+#[cfg(feature = "network-inline-rx")]
+struct InlineService {
+    owner: AllocationDomain,
+    caller: Option<AllocationDomain>,
+    work: DriverWork,
+    mmio: Revocable<MmioWindow>,
+    dma: Revocable<DmaRegion>,
+    control: Revocable<NetDevice>,
+    outbound: Revocable<OutboundResource>,
+    inbound: Revocable<InboundResource>,
+}
+#[cfg(feature = "network-inline-rx")]
+static INLINE_SERVICE: SpinLock<Option<InlineService>> = SpinLock::new_recoverable(None);
+#[cfg(feature = "network-inline-rx")]
+struct InlineRegistration(AllocationDomain);
+#[cfg(feature = "network-inline-rx")]
+impl InlineRegistration {
+    fn install(service: InlineService) -> Self {
+        let mut slot = INLINE_SERVICE.lock();
+        assert!(slot.is_none(), "exclusive packet service already installed");
+        let owner = service.owner;
+        *slot = Some(service);
+        Self(owner)
+    }
+}
+#[cfg(feature = "network-inline-rx")]
+impl Drop for InlineRegistration {
+    fn drop(&mut self) {
+        let mut slot = INLINE_SERVICE.lock();
+        if slot.as_ref().is_some_and(|s| s.owner == self.0) {
+            // Keep the gate through shutdown: a new claim must not overlap it.
+            drop(slot.take());
+        }
+    }
+}
+#[cfg(feature = "network-inline-rx")]
+pub(crate) fn service_inline_with(lease: &InvocationLease<NetDevice>, receive: bool) -> Result<bool, NetError> {
+    if !lease.authorizes(Rights::INVOKE) { return Err(NetError::PermissionDenied); }
+    lease.with(|_| inline_turn(true, receive))
+}
+#[cfg(feature = "network-inline-rx")]
+fn inline_turn(protocol: bool, receive: bool) -> Result<bool, NetError> {
+    // Synchronous device work now runs inside the stack task. Give it its own
+    // nested stage so protocol attribution does not absorb controller policy,
+    // capability checks and gate waits. Compiles out without network-profile.
+    let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Driver);
+    if !crate::plic::is_dispatch_hart() { return Err(NetError::PermissionDenied); }
+    let mut slot = INLINE_SERVICE.lock();
+    let Some(s) = slot.as_mut() else { return Ok(false); };
+    let domain = crate::heap::current_domain();
+    // The stack gets invocation authority, never the driver's capabilities or
+    // Engine. Validate its exact active incarnation at each synchronous call.
+    if protocol && CONTROL.lock().active_stack_domain != Some(domain) { return Ok(false); }
+    if !protocol && s.owner != domain { return Err(NetError::PermissionDenied); }
+    s.caller = Some(domain);
+    let result = with_device_authority(&s.mmio, &s.dma, &s.control, || {
+        if let Some(irq) = &device().rx_interrupts { unsafe { (irq.mask)(); } }
+        let worked = driver_turn(&mut s.work, receive,
+            #[cfg(feature = "driver-stage-profile")] false,
+            &s.outbound, &s.inbound)?;
+        if !worked && (protocol || !receive) {
+            // Receiver registers its notification before repeating its full
+            // input check. Arm and OWN recheck share the dispatch-hart guard.
+            let _state = CONTROL.lock();
+            let irq = device().rx_interrupts.as_ref().ok_or(NetError::DriverFault)?;
+            if !unsafe { (irq.acknowledge)() } { return Err(NetError::DriverFault); }
+            RX_ARMS.fetch_add(1, Ordering::Relaxed);
+            let idle = unsafe { (irq.arm)() && !(irq.pending)() };
+            if !idle {
+                unsafe { (irq.mask)(); }
+                RX_BUSY_RECHECKS.fetch_add(1, Ordering::Relaxed);
+                return Ok(true);
+            }
+        }
+        Ok(worked)
+    });
+    s.caller = None;
+    result
+}
+
 fn driver_turn(
-    engine: &mut Engine,
+    work: &mut DriverWork,
+    receive: bool,
     #[cfg(feature = "driver-stage-profile")] sample_stage: bool,
     outbound: &Revocable<OutboundResource>,
     inbound: &Revocable<InboundResource>,
-    pending_tx: &mut Option<PendingTx>,
-    #[cfg(feature = "network-tso-coalesce")]
-    tx_batch: &mut vibeos_core::net_tx_coalesce::TxCoalescer,
-    pending_rx: &mut Option<PendingRx>,
-    #[cfg(feature = "pooled-rx")] pending_rx_batch: &mut vibeos_core::net_receive::StampedBatch,
-    tx_deadline: &mut u64,
-    link_poll: &mut Option<u64>,
 ) -> Result<bool, NetError> {
+    let DriverWork { pending_tx,
+        #[cfg(feature = "network-tso-coalesce")] tx_batch,
+        pending_rx,
+        #[cfg(feature = "pooled-rx")] pending_rx_batch,
+        tx_deadline, link_poll, session } = work;
+    let engine = session.engine_mut();
     #[cfg(feature = "tx-wait-profile")]
     let turn_started = crate::sbi::time();
     // Observe cable/negotiation changes even when a queued DHCP packet is
@@ -906,9 +1034,10 @@ fn driver_turn(
         now
     } else { 0 };
 
+    let rx_budget = if receive { DRIVER_BATCH_PACKETS } else { 0 };
     #[cfg(feature = "rx-publish-batch")]
     {
-        let mut budget = DRIVER_BATCH_PACKETS;
+        let mut budget = rx_budget;
         while budget != 0 {
             let state = CONTROL.lock();
             if pending_rx_batch.remaining() == 0 {
@@ -958,7 +1087,7 @@ fn driver_turn(
         }
     }
     #[cfg(all(feature = "pooled-rx", not(feature = "rx-publish-batch")))]
-    for _ in 0..DRIVER_BATCH_PACKETS {
+    for _ in 0..rx_budget {
         let state = CONTROL.lock();
         let frame = if let Some(frame) = pending_rx.take().or_else(|| pending_rx_batch.pop()) {
             frame
@@ -1006,7 +1135,7 @@ fn driver_turn(
         }
     }
     #[cfg(not(feature = "pooled-rx"))]
-    for _ in 0..DRIVER_BATCH_PACKETS {
+    for _ in 0..rx_budget {
         // Consume, stamp, publish and rearm one RX frame under the same
         // barrier. Rebinding between frames cannot relabel a consumed frame.
         let state = CONTROL.lock();
@@ -1185,6 +1314,22 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     #[cfg(all(feature = "network-status-snapshot", not(feature = "universal")))]
     let _ = unsafe { RUNTIME_INFO.recover_after_fault(domain) };
     let _ = unsafe { CONTROL.recover_after_fault(domain) };
+    #[cfg(feature = "network-inline-rx")]
+    {
+        let _ = unsafe { INLINE_SERVICE.recover_after_fault(domain) };
+        let mut slot = INLINE_SERVICE.lock();
+        if slot.as_ref().is_some_and(|s| s.owner == domain || s.caller == Some(domain)) {
+            let mut abandoned = slot.take().unwrap();
+            // A fault may have interrupted a controller operation. Retire the
+            // token without normal shutdown, then use the firmware's hard-fault
+            // recovery contract while every other invocation remains excluded.
+            let _ = abandoned.work.session.engine.take();
+            stop_rx_interrupts();
+            let reset = unsafe { (device().recover)() };
+            shutdown_driver_policy(reset);
+            drop(abandoned);
+        }
+    }
     {
         let mut state = CONTROL.lock();
         if state.active_stack_domain == Some(domain) {

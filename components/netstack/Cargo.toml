@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-scatter = ["vibeos-net-protocol/gro-scatter"]
+frontend-rx-batch = ["vibeos-net-protocol/frontend-rx-batch"]
+inline-device-service = []
 rx-admission-batch = ["vibeos-net-protocol/rx-admission-batch"]
 gro-batch-release = ["vibeos-net-protocol/gro-batch-release"]
 # Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.

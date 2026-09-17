@@ -1865,14 +1865,42 @@ mod pooled_receive {
         {
             let r=records().lock().unwrap();
             assert!(!r[&tickets[0].pool()].released);assert!(!r[&tickets[3].pool()].released);
-            for ticket in &tickets[1..3] { assert!(r[&ticket.pool()].released);assert_eq!(r[&ticket.pool()].batch_size,2); }
+            for ticket in &tickets[1..3] {
+                assert_eq!(r[&ticket.pool()].released, !cfg!(feature = "gro-scatter"));
+                if !cfg!(feature = "gro-scatter") { assert_eq!(r[&ticket.pool()].batch_size,2); }
+            }
         }
         cs.revoke(root).unwrap();assert!(device.receive(Instant::from_millis(1)).is_none());
         let r=records().lock().unwrap();for t in tickets { assert!(r[&t.pool()].released);assert!(r[&t.pool()].borrower.is_none()); }
     }
+    #[cfg(feature = "gro-scatter")]
+    #[test]
+    fn scattered_token_retains_original_dma_slices_through_revocation() {
+        let q = unsafe { ReceiveEndpoint::new("scatter-loans", 16, &OPS).unwrap() };
+        let out = Endpoint::new("scatter-out", 16); let mut cs = CSpace::new("scatter");
+        let (root, receive) = receive(&mut cs, q.clone());
+        let (_, transmit) = authority(&mut cs, &out, Rights::SEND);
+        let mut device = PacketDevice::new(session_stamp(), receive, transmit);
+        device.set_rx_checksum_offload(true);
+        let tickets = [0, 100, 200, 500].map(|seq| inject(&q, &gro_test_data(seq)));
+        let pointers: Vec<_> = tickets.iter().map(|t| records().lock().unwrap()[&t.pool()].bytes.as_ptr()).collect();
+        let (rx, tx) = device.receive(Instant::ZERO).unwrap(); drop(tx);
+        rx.consume_gro(|frames| {
+            assert_eq!(frames.len(), 3);
+            cs.revoke(root).unwrap();
+            for (i, bytes) in frames.iter().enumerate() {
+                assert_eq!(bytes.as_ptr(), pointers[i]);
+                assert_eq!(*bytes, gro_test_data(i as u32 * 100));
+                assert!(!records().lock().unwrap()[&tickets[i].pool()].released);
+            }
+        });
+        assert!(device.receive(Instant::from_millis(1)).is_none());
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
     #[test]
     fn pooled_token_is_a_slice_of_original_storage_and_revocation_releases_it() {
-        assert_eq!(core::mem::size_of::<PacketRxToken<'_>>(), 2 * core::mem::size_of::<usize>());
+        assert_eq!(core::mem::size_of::<PacketRxToken<'_>>(),
+            (if cfg!(feature = "gro-scatter") { 4 } else { 2 }) * core::mem::size_of::<usize>());
         let q = unsafe { ReceiveEndpoint::new("loan-token", 4, &OPS).unwrap() };
         let out = Endpoint::new("loan-out", 4); let mut cs = CSpace::new("loan-test");
         let (cap, rx) = receive(&mut cs, q.clone());
@@ -1949,7 +1977,7 @@ mod pooled_receive {
             assert_eq!(&bytes[54..154], &[0; 100]);
             assert_eq!(&bytes[154..], &[100; 100]);
         });
-        assert!(records().lock().unwrap()[&tickets[1].pool()].released);
+        assert_eq!(records().lock().unwrap()[&tickets[1].pool()].released, !cfg!(feature = "gro-scatter"));
         assert!(!records().lock().unwrap()[&tickets[2].pool()].released);
         assert!(d.has_immediate_work().unwrap());
         let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);

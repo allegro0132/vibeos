@@ -5,6 +5,10 @@ edition = "2021"
 autobins = false
 
 [features]
+gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]
+frontend-rx-batch = ["vibeos-netstack?/frontend-rx-batch"]
+network-service-peer = ["network-inline-rx"]
+network-inline-rx = ["packet-network", "pooled-rx", "rx-interrupt-poll", "vibeos-netstack/inline-device-service"]
 rx-admission-batch = ["pooled-rx", "vibeos-netstack/rx-admission-batch"]
 rx-queue-profile = ["vibeos-core/rx-queue-profile"]
 gro-batch-release = ["vibeos-netstack/gro-batch-release"]

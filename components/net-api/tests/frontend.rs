@@ -296,3 +296,69 @@ fn drive_snapshot_is_conservative_and_rechecked_after_application_progress() {
     f.network_begin_drive(TcpStreamState::Established).unwrap();
     assert_eq!(f.try_recv(token, &mut bytes), Err(TcpFrontendError::StaleConnection));
 }
+
+#[test]
+fn receive_drive_preserves_wrap_backpressure_and_generation() {
+    let f = listener("batch", 91, 5191, 8);
+    f.network_receive_drive(TcpStreamState::Established, |drive, batch| {
+        assert_eq!(drive.receive_capacity, 8);
+        assert_eq!(batch.receive(b"abcd"), 4);
+        assert_eq!(batch.receive(b"ef"), 2);
+    }).unwrap();
+    let token = f.try_accept().unwrap();
+    let mut out = [0; 8];
+    assert_eq!(f.try_recv(token, &mut out[..5]), Ok(TcpIoResult::Progress(5)));
+    assert_eq!(&out[..5], b"abcde");
+    let (_, result) = f.network_receive_drive(TcpStreamState::Established, |drive, batch| {
+        assert_eq!(drive.receive_capacity, 7);
+        assert_eq!(batch.receive(b"ghij"), 4);
+        assert_eq!(batch.receive(b"klmn"), 3);
+        assert_eq!(batch.receive(b"overflow"), 0);
+        Err::<(), _>("committed prefix remains readable")
+    }).unwrap();
+    assert!(result.is_err());
+    assert_eq!(f.try_recv(token, &mut out), Ok(TcpIoResult::Progress(8)));
+    assert_eq!(&out, b"fghijklm");
+    f.network_receive_drive(TcpStreamState::Reset, |_, batch| {
+        assert_eq!(batch.receive(b"old"), 0);
+    }).unwrap();
+    f.network_receive_drive(TcpStreamState::Established, |_, batch| {
+        assert_eq!(batch.receive(b"new"), 3);
+    }).unwrap();
+    assert_eq!(f.try_recv(token, &mut out), Err(TcpFrontendError::StaleConnection));
+    let next = f.try_accept().unwrap();
+    assert_eq!(f.try_recv(next, &mut out), Ok(TcpIoResult::Progress(3)));
+    assert_eq!(&out[..3], b"new");
+}
+
+#[cfg(feature = "activity-events")]
+#[test]
+fn receive_drive_notifies_once_after_entire_batch_and_unlock() {
+    use std::{future::Future, pin::pin, sync::{Arc, atomic::{AtomicUsize, Ordering}}, task::{Context, Wake, Waker}};
+    struct ReadOnWake { listener: Arc<TcpListener>, token: vibeos_net_api::TcpConnectionToken, wakes: AtomicUsize }
+    impl Wake for ReadOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+            let mut bytes = [0; 4];
+            assert_eq!(self.listener.try_recv(self.token, &mut bytes), Ok(TcpIoResult::Progress(4)));
+            assert_eq!(&bytes, b"abcd");
+        }
+    }
+    let f = listener("batch-wake", 92, 5192, 4);
+    f.network_update_state(TcpStreamState::Established).unwrap();
+    let token = f.try_accept().unwrap();
+    let event = f.network_event();
+    let reader = Arc::new(ReadOnWake { listener: f.clone(), token, wakes: AtomicUsize::new(0) });
+    let waker = Waker::from(reader.clone());
+    let mut cx = Context::from_waker(&waker);
+    let mut wait = pin!(event.wait());
+    assert!(wait.as_mut().poll(&mut cx).is_pending());
+    f.network_receive_drive(TcpStreamState::Established, |_, batch| {
+        assert_eq!(batch.receive(b"ab"), 2);
+        assert_eq!(batch.receive(b"cd"), 2);
+        assert_eq!(reader.wakes.load(Ordering::Relaxed), 0);
+    }).unwrap();
+    assert_eq!(reader.wakes.load(Ordering::Relaxed), 1);
+    assert!(wait.as_mut().poll(&mut cx).is_ready());
+    assert_eq!(f.snapshot().readable_bytes, 0);
+}

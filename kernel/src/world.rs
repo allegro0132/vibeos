@@ -3651,22 +3651,32 @@ pub fn build() {
         );
     }
 
+    // Remote test-service initialization may execute before boot continues.
+    // Publish the complete world before allowing that hart to run its tasks.
+    #[cfg(feature = "network-service-peer")]
+    { *WORLD.lock() = Some(world.clone()); }
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     if let (Some(space), Some((control, data))) = (iperf3_app_space, iperf3_app_grants) {
-        world.spawn_component_inner(
-            "iperf3-server",
-            space.clone(),
-            IPERF3_SERVER_MEMORY_BUDGET,
-            Some(ComponentTemplate::Iperf3Server),
-            crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
-        );
+        let service_world = world.clone();
+        start_network_test_service(move || {
+            service_world.spawn_component_inner(
+                "iperf3-server",
+                space.clone(),
+                IPERF3_SERVER_MEMORY_BUDGET,
+                Some(ComponentTemplate::Iperf3Server),
+                crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
+            );
+        });
     }
 
     #[cfg(feature = "tcp-throughput-probe")]
     if let (Some(space), Some(listeners)) = (tcp_probe_space, tcp_probe_grants) {
-        world.spawn_component_inner("tcp-probe", space.clone(), 512 * 1024,
-            Some(ComponentTemplate::TcpProbe),
-            crate::tcp_probe_platform::task(SpaceRef::new(&space).get(), listeners));
+        let service_world = world.clone();
+        start_network_test_service(move || {
+            service_world.spawn_component_inner("tcp-probe", space.clone(), 512 * 1024,
+                Some(ComponentTemplate::TcpProbe),
+                crate::tcp_probe_platform::task(SpaceRef::new(&space).get(), listeners));
+        });
     }
 
     *WORLD.lock() = Some(world.clone());
@@ -3691,7 +3701,7 @@ pub fn build() {
             );
         };
         #[cfg(feature = "network-pipeline")]
-        if crate::online_hart_mask() & 2 != 0 {
+        if !cfg!(feature = "network-inline-rx") && crate::online_hart_mask() & 2 != 0 {
             // Construct a fresh arena on its eventual home hart. No existing
             // reclaimable task or arena is migrated. Publish the component
             // before allowing boot to install its supervisor.
@@ -3711,6 +3721,31 @@ pub fn build() {
             start();
         }
     }
+}
+
+/// Construct each test component and its arena on its eventual home hart.
+/// Existing tasks/arenas are never migrated; ordinary restart uses that home.
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server", feature = "tcp-throughput-probe"))]
+fn start_network_test_service(start: impl FnOnce() + Send + 'static) {
+    #[cfg(feature = "network-service-peer")]
+    if crate::online_hart_mask() & 2 != 0 {
+        // Boot calls this serially, waiting for publication before the next
+        // service. The initializer itself has only SYSTEM lifetime storage.
+        static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        READY.store(false, Ordering::Release);
+        exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "net-test-init", async move {
+            start();
+            READY.store(true, Ordering::Release);
+        });
+        let began = crate::sbi::time();
+        while !READY.load(Ordering::Acquire) {
+            assert!(crate::sbi::time().wrapping_sub(began) < exec::timebase_hz() * 5,
+                "network test-service publication timed out");
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    start();
 }
 
 /// Samples a (fake) thermometer and publishes it. Holds SEND and nothing else —

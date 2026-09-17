@@ -83,6 +83,12 @@ pub type PacketEndpoints = (
 
 /// Privileged packet and network-control operations consumed by this component.
 pub trait Platform: Sync {
+    /// One bounded synchronous device turn. No device reference escapes this
+    /// call. Implementations retain device authority and exclusive ownership.
+    /// `receive` is true before protocol processing; the final false turn
+    /// services generated TX/completions and idle notification arming only.
+    #[cfg(feature = "inline-device-service")]
+    fn service_device(&self, _control: Cap, _receive: bool) -> Result<bool, NetworkBindError> { Ok(false) }
     fn packet_endpoints(&self, outbound: Cap, inbound: Cap) -> Option<PacketEndpoints>;
     fn bind_stack(&self, control: Cap) -> Result<PacketStamp, NetworkBindError>;
     fn network_info(&self, control: Cap) -> Option<NetworkInfo>;
@@ -439,6 +445,8 @@ struct InterfaceTask {
 
 impl InterfaceTask {
     fn poll(&mut self, space: &Space, now_ms: u64) -> Result<InterfacePollReport, InterfaceError> {
+        #[cfg(feature = "inline-device-service")]
+        let device_work = space.service_device(self.control, true).map_err(|_| InterfaceError::Retired)?;
         let Some(info) = device_info(space, self.control) else {
             return Err(InterfaceError::Retired);
         };
@@ -545,6 +553,10 @@ impl InterfaceTask {
             .poll_network(now_ms)
             .map_err(|_| InterfaceError::Retired)?;
         frontend_work |= drive_frontends(active_stack).map_err(|_| InterfaceError::Retired)?;
+        #[cfg(feature = "inline-device-service")]
+        // Drain generated ACK/TX work without admitting a second RX budget.
+        // The next protocol turn owns the next receive batch.
+        let device_work = device_work | space.service_device(self.control, false).map_err(|_| InterfaceError::Retired)?;
         vibeos_core::net_profile::stack_activity(report.ingress_frames, frontend_work);
         config::publish_stack_status(
             self.interface,
@@ -552,7 +564,13 @@ impl InterfaceTask {
             active_stack.core.ipv4_status(),
         );
         Ok(InterfacePollReport {
-            more_work: report.more_work || report.ingress_frames != 0 || frontend_work,
+            more_work: report.more_work || report.ingress_frames != 0 || frontend_work
+                || {
+                    #[cfg(feature = "inline-device-service")]
+                    { device_work }
+                    #[cfg(not(feature = "inline-device-service"))]
+                    { false }
+                },
             next_poll_delay_ms: report
                 .next_poll_delay_ms
                 .unwrap_or(IDLE_POLL_CEILING_MS)

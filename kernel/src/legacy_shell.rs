@@ -193,6 +193,10 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             }
             println!("TXLEASE_END");
         }
+        #[cfg(feature = "rx-admission-batch")]
+        "nrxbat" => {
+            println!("RX_ADMISSION sizes=0..8 values={:?} approximate=true", vibeos_netstack::rx_admission_sizes());
+        }
         #[cfg(feature = "counter-probe")]
         "npmuevents" => {
             // Diagnostic shell is the sole PMU owner. Never auto-start, and do

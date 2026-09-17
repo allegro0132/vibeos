@@ -15,6 +15,8 @@ unsafe fn release(b: Borrow) {
     assert_eq!(record.state, State::Borrowed(b.owner())); record.state = State::Released;
 }
 static OPS: Operations = Operations {
+        #[cfg(feature = "rx-admission-batch")]
+        acquire_batch: None,
         poll_batch: None,
         stats: Default::default,
     poll: || Ok(None),
@@ -160,4 +162,72 @@ fn revoked_batch_sender_cannot_move_pending_tickets() {
     assert!(authority.try_with(|q|q.try_send_batch(&mut batch,32)).is_err());
     assert_eq!(batch.remaining(),1);assert!(!q.has_message());
     assert_eq!(batch.pop(),Some(f));assert!(q.discard(f));
+}
+
+#[cfg(feature = "rx-admission-batch")]
+#[test]
+fn admitted_batch_preserves_order_budget_and_per_frame_rejection() {
+    let q = unsafe { ReceiveEndpoint::new("rx-batch", 8, &OPS).unwrap() };
+    let a = frame(stamp());
+    let stale = frame(stamp().next_stack_generation().unwrap());
+    let b = frame(stamp());
+    for f in [a, stale, b] { q.try_send(f).unwrap(); }
+    assert!(matches!(q.try_receive_batch(stamp(), AllocationDomain::SYSTEM, 8), Err(Error::UntrackedOwner)));
+    assert_eq!(q.try_receive_batch(stamp(), domain(800), 0).unwrap().len(), 0);
+    let mut batch = q.try_receive_batch(stamp(), domain(800), 2).unwrap();
+    assert_eq!(batch.len(), 2); assert!(q.has_message());
+    let loan = batch.pop().unwrap().unwrap();
+    assert_eq!(loan.as_bytes().as_ptr(), records().lock().unwrap()[&a.ticket().pool()].bytes.as_ptr());
+    assert!(matches!(batch.pop(), Some(Err(Error::Session(_)))));
+    assert!(batch.pop().is_none());
+    assert_eq!(records().lock().unwrap()[&stale.ticket().pool()].state, State::Released);
+    drop(loan);
+    let remaining = q.try_receive_batch(stamp(), domain(800), 8).unwrap();
+    assert_eq!(remaining.len(), 1); assert!(!q.has_message()); drop(remaining);
+    assert_eq!(records().lock().unwrap()[&b.ticket().pool()].state, State::Released);
+}
+
+#[cfg(feature = "rx-admission-batch")]
+#[test]
+fn batched_duplicate_cannot_release_a_live_loan_and_fault_reclaims_all() {
+    let q = unsafe { ReceiveEndpoint::new("rx-batch-fault", 8, &OPS).unwrap() };
+    let a = frame(stamp()); let b = frame(stamp());
+    for f in [a, a, b] { q.try_send(f).unwrap(); }
+    let mut batch = q.try_receive_batch(stamp(), domain(801), 8).unwrap();
+    let loan = batch.pop().unwrap().unwrap();
+    assert!(matches!(batch.pop(), Some(Err(Error::Device(_)))));
+    assert_eq!(loan.as_bytes(), &[0x39; 64]);
+    let other = AllocationDomain::new(OwnerId::new(801), ArenaId::new(802));
+    assert_eq!(unsafe { q.recover(other) }, 0);
+    // No references may survive recovery of this permanently stopped owner.
+    std::mem::forget(loan); std::mem::forget(batch);
+    assert_eq!(unsafe { q.recover(domain(801)) }, 2);
+    assert_eq!(unsafe { q.recover(domain(801)) }, 0);
+    assert_eq!(records().lock().unwrap()[&a.ticket().pool()].state, State::Released);
+    assert_eq!(records().lock().unwrap()[&b.ticket().pool()].state, State::Released);
+}
+
+#[cfg(feature = "rx-admission-batch")]
+#[test]
+fn bulk_operation_is_invoked_once_and_never_acquires_wrong_session() {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BULK: Operations = Operations {
+        stats: OPS.stats, poll: OPS.poll, poll_batch: None,
+        acquire: OPS.acquire, discard: OPS.discard, recover: OPS.recover,
+        acquire_batch: Some(|tickets, owner| {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            core::array::from_fn(|i| tickets[i].map(|ticket| unsafe { (OPS.acquire)(ticket, owner) }))
+        }),
+    };
+    let q = unsafe { ReceiveEndpoint::new("bulk-operation", 8, &BULK).unwrap() };
+    let a = frame(stamp()); let b = frame(stamp().next_stack_generation().unwrap());
+    let c = frame(stamp());
+    for f in [a, b, c] { q.try_send(f).unwrap(); }
+    let mut batch = q.try_receive_batch(stamp(), domain(803), 8).unwrap();
+    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    assert_eq!(batch.len(), 3);
+    assert!(batch.pop().unwrap().is_ok());
+    assert!(matches!(batch.pop(), Some(Err(Error::Session(_)))));
+    assert!(batch.pop().unwrap().is_ok());
+    assert_eq!(records().lock().unwrap()[&b.ticket().pool()].state, State::Released);
 }

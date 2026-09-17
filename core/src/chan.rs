@@ -139,6 +139,31 @@ impl<T: Send + 'static> Endpoint<T> {
         Some(msg)
     }
 
+    /// Keep identifiers queued until durable DMA ownership has been recorded.
+    /// Callback must not allocate, await, reenter a queue, or reverse lock order.
+    /// After a callback task fault, recover the lock only once its domain is
+    /// permanently quiescent; uncommitted identifiers remain in the queue.
+    #[cfg(feature = "rx-admission-batch")]
+    pub(crate) unsafe fn admit_prefix<R>(&self, limit: usize,
+        admit: impl FnOnce(&[Option<T>; 8], usize) -> R) -> Option<R> where T: Copy {
+        let mut inner = self.inner.lock();
+        let count = inner.queue.len().min(limit).min(8);
+        if count == 0 { return None; }
+        let was_full = inner.queue.len() == self.bound;
+        let prefix = core::array::from_fn(|i| if i < count { inner.queue.get(i).copied() } else { None });
+        let result = admit(&prefix, count);
+        for _ in 0..count { inner.queue.pop_front(); }
+        inner.received += count as u64;
+        drop(inner);
+        if was_full { self.on_space.wake_all(); }
+        Some(result)
+    }
+
+    #[cfg(feature = "rx-admission-batch")]
+    pub(crate) unsafe fn recover_admission(&self, domain: heap::AllocationDomain) {
+        let _ = self.inner.recover_after_fault(domain);
+    }
+
     pub async fn recv(&self) -> T {
         loop {
             // See send: listener-before-check closes the IRQ/producer race.

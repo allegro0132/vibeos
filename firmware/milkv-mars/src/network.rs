@@ -415,6 +415,8 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         poll_batch: Some(poll_rx_batch),
         #[cfg(not(feature = "rx-batch-experiment"))]
         poll_batch: None,
+        #[cfg(feature = "rx-admission-batch")]
+        acquire_batch: Some(acquire_rx_loans),
         stats: rx_pool_stats,
         poll: poll_rx_ticket, acquire: acquire_rx_loan, discard: discard_rx_ticket, recover: recover_rx_borrower,
     }),
@@ -795,7 +797,11 @@ unsafe fn release_rx_borrows(borrows: &mut [Option<vibeos_hal::network_rx::Borro
 unsafe fn acquire_rx_loan(ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_hal::network_rx::Owner)
     -> Result<vibeos_hal::network_rx::Loan, Error>
 {
-    with_rx_metadata(2, |metadata| {
+    with_rx_metadata(2, |metadata| acquire_rx_loan_locked(metadata, ticket, owner))
+}
+#[cfg(feature = "rx-pool-experiment")]
+unsafe fn acquire_rx_loan_locked(metadata: &mut RxMetadata, ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_hal::network_rx::Owner) -> Result<vibeos_hal::network_rx::Loan, Error> {
+
         let view = metadata.view.ok_or(Error::InvalidDescription)?;
         let bytes = *metadata.lengths.get(ticket.index()).ok_or(Error::InvalidDescription)?;
         let buffers = metadata.buffers.as_mut().ok_or(Error::InvalidDescription)?;
@@ -812,7 +818,11 @@ unsafe fn acquire_rx_loan(ticket: vibeos_hal::network_rx::Ticket, owner: vibeos_
             },
             Err(borrow) => { let _ = buffers.release(borrow); Err(Error::InvalidDescription) }
         }
-    })
+}
+
+#[cfg(feature = "rx-admission-batch")]
+unsafe fn acquire_rx_loans(tickets: &vibeos_hal::network_rx::TicketBatch, owner: vibeos_hal::network_rx::Owner) -> [Option<Result<vibeos_hal::network_rx::Loan, Error>>; vibeos_hal::network_rx::BATCH_SIZE] {
+    with_rx_metadata(2, |metadata| core::array::from_fn(|i| tickets[i].map(|ticket| acquire_rx_loan_locked(metadata, ticket, owner))))
 }
 #[cfg(feature = "rx-pool-experiment")]
 unsafe fn discard_rx_ticket(ticket: vibeos_hal::network_rx::Ticket) -> bool {

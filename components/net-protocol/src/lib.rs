@@ -248,6 +248,8 @@ impl fmt::Display for StackError {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PacketDeviceStats {
+    #[cfg(feature = "rx-admission-batch")]
+    pub rx_admission_sizes: [u64; 9],
     pub rx_frames: u64,
     pub tx_frames: u64,
     pub tx_segmented_requests: u64,
@@ -270,6 +272,8 @@ pub struct PacketDeviceStats {
 /// until that packet is accepted. This preserves TCP retransmission semantics
 /// without growing an unbounded second queue.
 pub struct PacketDevice {
+    #[cfg(feature = "rx-admission-batch")]
+    rx_batch: vibeos_core::net_receive::LoanBatch,
     stamp: PacketStamp,
     inbound: PacketReceive,
     rx_packet: Option<Packet>,
@@ -305,6 +309,8 @@ impl PacketDevice {
     ) -> Self {
         Self {
             stamp,
+            #[cfg(feature = "rx-admission-batch")]
+            rx_batch: vibeos_core::net_receive::LoanBatch::empty(),
             inbound: inbound.into(),
             rx_packet: None,
             #[cfg(feature = "pooled-rx")]
@@ -445,6 +451,8 @@ impl PacketDevice {
 
     pub fn has_immediate_work(&mut self) -> Result<bool, StackError> {
         self.authority_result()?;
+        #[cfg(feature = "rx-admission-batch")]
+        if self.rx_batch.len() != 0 { return Ok(true); }
         if self.pending_egress.is_some() {
             return Ok(true);
         }
@@ -500,7 +508,23 @@ impl PacketDevice {
             { self.gro_last_none = gro::NoInput::IngressBudget; }
             return None;
         }
-        let Some(result) = self.inbound.receive_loan(self.stamp) else {
+        #[cfg(feature = "rx-admission-batch")]
+        let received = if self.rx_batch.len() != 0 {
+            Some(Ok(self.rx_batch.pop().unwrap().map(Some)))
+        } else {
+            self.inbound.receive_batch(self.stamp, self.ingress_remaining.min(8)).map(|result| match result {
+                Ok(Ok(batch)) => {
+                    self.stats.rx_admission_sizes[batch.len()] += 1;
+                    self.rx_batch = batch;
+                    Ok(self.rx_batch.pop().map_or(Ok(None), |r| r.map(Some)))
+                },
+                Ok(Err(error)) => Ok(Err(error)),
+                Err(error) => Err(error),
+            })
+        };
+        #[cfg(not(feature = "rx-admission-batch"))]
+        let received = self.inbound.receive_loan(self.stamp);
+        let Some(result) = received else {
             #[cfg(feature = "gro-end-profile")]
             { self.gro_last_none = gro::NoInput::Unsupported; }
             return None;
@@ -760,6 +784,8 @@ impl phy::Device for PacketDevice {
         if self.revalidate_authority().is_err() {
             #[cfg(feature = "pooled-rx")]
             { self.pending_rx_loan = None; }
+            #[cfg(feature = "rx-admission-batch")]
+            { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
             return None;
         }
         if self.flush_egress() != Ok(true) {
@@ -800,6 +826,8 @@ impl phy::Device for PacketDevice {
             #[cfg(feature = "bounded-gro")]
             if self.authority_revoked || self.revalidate_authority().is_err() {
                 self.pending_rx_loan = None;
+                #[cfg(feature = "rx-admission-batch")]
+                { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
                 return None;
             }
             self.rx_loan = Some(loan);

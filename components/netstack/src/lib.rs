@@ -33,6 +33,13 @@ pub use vibeos_net_protocol::{PacketTransmit, PacketReceive};
 pub mod command;
 pub mod config;
 
+#[cfg(feature = "rx-admission-batch")]
+static RX_ADMISSION_SIZES: [core::sync::atomic::AtomicU64; 9] = [const { core::sync::atomic::AtomicU64::new(0) }; 9];
+#[cfg(feature = "rx-admission-batch")]
+pub fn rx_admission_sizes() -> [u64; 9] {
+    core::array::from_fn(|i| RX_ADMISSION_SIZES[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
 /// Approximate once-per-second totals for live stack instances; no hot-path
 /// atomic increments. Diagnostic only, not a lifetime delivery guarantee.
 #[cfg(feature = "gro-end-profile")]
@@ -346,6 +353,8 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
         #[cfg(feature = "bounded-gro")]
         if now_ms.saturating_sub(gro_last_ms) >= 1000 {
             let mut totals = [0u64; 3];
+            #[cfg(feature = "rx-admission-batch")]
+            let mut admission_sizes = [0u64; 9];
             #[cfg(feature = "gro-end-profile")]
             let mut end_totals = [0u64; 31];
             for interface in &interfaces {
@@ -354,6 +363,8 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                     totals[0] += stats.rx_frames;
                     totals[1] += stats.gro_merged_segments;
                     totals[2] += stats.gro_aggregates;
+                    #[cfg(feature = "rx-admission-batch")]
+                    for (total, value) in admission_sizes.iter_mut().zip(stats.rx_admission_sizes) { *total += value; }
                     #[cfg(feature = "gro-end-profile")]
                     for (total, value) in end_totals.iter_mut().zip(stats.gro_end_profile) {
                         *total += value;
@@ -368,6 +379,8 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                 slot.store(value, core::sync::atomic::Ordering::Relaxed);
             }
             gro_last_ms = now_ms;
+            #[cfg(feature = "rx-admission-batch")]
+            for (slot, value) in RX_ADMISSION_SIZES.iter().zip(admission_sizes) { slot.store(value, core::sync::atomic::Ordering::Relaxed); }
         }
 
         if live_interfaces == 0 {

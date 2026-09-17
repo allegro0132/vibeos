@@ -159,3 +159,34 @@ No live LSR/MCR value or trapped PC was captured. Do not label it as the root
 cause without further board evidence, or silently drop formal output records
 as a speculative workaround. The original boot journal remains RAM-only and
 cannot be retrieved while the console is unresponsive.
+
+## Recovery without a new kernel boot; event probe executed
+
+After the user's reconnect-ready reply, `bootlog` succeeded and both network
+pings replied (2.477/1.073 ms). The retained inventory boot entry was still
+42631616 ticks, identical to the original inventory load. Current ticks were
+68070336367 at 4 MHz, giving 17006.926 seconds since entry. The log still included
+the earlier PMU inventory. Raw recovery evidence:
+`target/mars-reference/20260917-pmu-user-reconnect.serial`. This supports recovery
+of the same kernel instance, not a new kernel boot. It does not prove scheduling
+continued throughout the loss or establish the UART unbounded wait as the cause.
+The retained prefix also includes link-down/up reports without timestamps.
+
+The event FIT `7fdcbef0...` was subsequently RAM-loaded successfully. A single
+serial session covered load, quieting background console output and the event
+probe. Evidence is in `20260917-bootlog-pmu-events-reconnected-load/`; events.log
+and its validated events.json contain all 80 expected (hart,counter,event) rows.
+For every hart and both indices 3/4:
+
+- Events 5, 6, 8 and 9 were accepted at the requested index and then reset;
+  cleanup returned already-stopped (-8), as expected without any start call.
+- Events 3, 4, 0x10001, 0x10009, 0x10019 and 0x10021 returned not-supported (-2).
+- 32 successful configurations/resets and 48 unsupported results; no missing,
+  duplicate or unattempted configurations. No counters were started.
+
+The accepted SBI labels are branches, branch misses, frontend and backend
+stalls. These are available measurement candidates, not measured bottlenecks.
+The kernel FIT DTB contains no riscv,pmu mapping node; it is not necessarily the
+DTB OpenSBI consumed. OpenSBI's event translation must still be established
+before assigning precise microarchitectural meaning. Next: bounded counter
+reads and start/stop measurement, preserving the raw event IDs and mappings.

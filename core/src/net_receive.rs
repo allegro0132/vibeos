@@ -88,6 +88,21 @@ pub enum Error {
     Capacity, UntrackedOwner, Session(PacketStampMismatch), Device(vibeos_hal::network::Error),
 }
 pub struct ReceiveEndpoint { queue: Arc<Endpoint<Stamped>>, operations: &'static Operations }
+#[cfg(feature = "rx-admission-batch")]
+pub struct LoanBatch {
+    entries: [Option<Result<Loan, Error>>; vibeos_hal::network_rx::BATCH_SIZE],
+    next: usize,
+    len: usize,
+}
+#[cfg(feature = "rx-admission-batch")]
+impl LoanBatch {
+    pub const fn empty() -> Self { Self { entries: [const { None }; 8], next: 0, len: 0 } }
+    pub fn len(&self) -> usize { self.len - self.next }
+    pub fn pop(&mut self) -> Option<Result<Loan, Error>> {
+        if self.next == self.len { return None; }
+        let i = self.next; self.next += 1; self.entries[i].take()
+    }
+}
 impl ReceiveEndpoint {
     /// # Safety
     /// The supervisor selects valid static operations for this DMA device.
@@ -111,6 +126,34 @@ impl ReceiveEndpoint {
     pub fn message_event(&self) -> crate::chan::MessageEvent { self.queue.message_event() }
     pub fn has_message(&self) -> bool { self.queue.has_message() }
     pub fn discard(&self, frame: Stamped) -> bool { unsafe { (self.operations.discard)(frame.ticket) } }
+    #[cfg(feature = "rx-admission-batch")]
+    pub fn try_receive_batch(&self, expected: PacketStamp, domain: AllocationDomain, limit: usize) -> Result<LoanBatch, Error> {
+        let owner = Owner::new(domain.owner.get(), domain.arena.get()).ok_or(Error::UntrackedOwner)?;
+        // Queue retains tickets until loans are tracked by firmware. A fault
+        // cannot strand dequeued Ready buffers outside recovery metadata.
+        Ok(unsafe { self.queue.admit_prefix(limit, |frames, count| {
+            let mut batch = LoanBatch::empty(); batch.len = count;
+            let tickets = core::array::from_fn(|i| frames[i].filter(|f| f.stamp == expected).map(|f| f.ticket));
+            let mut loans = match self.operations.acquire_batch {
+                Some(acquire) => acquire(&tickets, owner),
+                None => core::array::from_fn(|i| tickets[i].map(|t| (self.operations.acquire)(t, owner))),
+            };
+            for i in 0..count {
+                let frame = frames[i].unwrap();
+                batch.entries[i] = Some(if frame.stamp != expected {
+                    self.discard(frame);
+                    Err(Error::Session(PacketStampMismatch { expected, observed: frame.stamp }))
+                } else {
+                    match loans[i].take() {
+                        Some(Ok(loan)) => Ok(loan),
+                        Some(Err(error)) => { self.discard(frame); Err(Error::Device(error)) },
+                        None => { self.discard(frame); Err(Error::Device(DeviceError::InvalidDescription)) },
+                    }
+                });
+            }
+            batch
+        }) }.unwrap_or_else(LoanBatch::empty))
+    }
     /// Invoke only inside live receive authority, using the supervisor-derived
     /// allocation domain. The returned loan retains already-admitted ownership;
     /// dropping it is cleanup, not a new capability invocation.
@@ -152,6 +195,8 @@ impl ReceiveEndpoint {
     /// The exact allocation incarnation is quiescent and can never resume.
     /// Ordinary cancellation/revocation must release loans normally instead.
     pub unsafe fn recover(&self, domain: AllocationDomain) -> usize {
+        #[cfg(feature = "rx-admission-batch")]
+        unsafe { self.queue.recover_admission(domain); }
         let Some(owner) = Owner::new(domain.owner.get(), domain.arena.get()) else { return 0; };
         unsafe { (self.operations.recover)(owner) }
     }

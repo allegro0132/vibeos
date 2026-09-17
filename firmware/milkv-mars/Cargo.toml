@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+rx-admission-batch = ["rx-pool-experiment", "vibeos-hal/rx-admission-batch", "vibeos-kernel?/rx-admission-batch"]
 rx-compact-owner-experiment = ["vibeos-eqos-net/rx-compact-owner"]
 rx-queue-profile = ["vibeos-kernel?/rx-queue-profile"]
 gro-batch-release = ["bounded-gro", "rx-pool-experiment", "vibeos-hal/rx-batch-release", "vibeos-kernel?/gro-batch-release"]

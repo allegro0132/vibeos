@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+rx-admission-batch = ["vibeos-hal/rx-admission-batch"]
 rx-queue-profile = []
 rx-batch-release = ["vibeos-hal/rx-batch-release"]
 # Diagnostic only: report prolonged spinlock waits through SBI.

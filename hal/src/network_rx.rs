@@ -113,6 +113,11 @@ pub struct Operations {
     /// exposes no tickets; partial ownership must remain quarantined until reset.
     pub poll_batch: Option<unsafe fn() -> Result<TicketBatch, super::network::Error>>,
     pub acquire: unsafe fn(Ticket, Owner) -> Result<Loan, super::network::Error>,
+    /// Bounded acquisition under one metadata lock, preserving slot positions.
+    /// No allocation, engine access or runtime queue callbacks. Runtime may
+    /// hold its admission queue lock. Successful loans are owner-tracked.
+    #[cfg(feature = "rx-admission-batch")]
+    pub acquire_batch: Option<unsafe fn(&TicketBatch, Owner) -> [Option<Result<Loan, super::network::Error>>; BATCH_SIZE]>,
     pub discard: unsafe fn(Ticket) -> bool,
     pub recover: unsafe fn(Owner) -> usize,
 }

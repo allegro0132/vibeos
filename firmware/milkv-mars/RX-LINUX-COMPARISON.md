@@ -5179,3 +5179,59 @@ short gaps, not one uninterrupted TCP connection, simultaneous storage/WASM
 qualification, or a cold-boot campaign. It did not reproduce the historic
 serial loss and does not establish its root cause. The test process has ended;
 subsequent diagnostic builds and RAM loads are separate from these results.
+
+### 2026-09-17: batch publication, admission and GRO release experiment
+
+Default-off `rx-admission-batch` adds a bounded eight-frame admission path:
+one receive capability check per refill, one queue transaction, and one Mars
+RX metadata lock to acquire the matching loans. GRO consumes the prefetched
+FIFO without reacquiring queue/metadata locks for every follower. `nrxbat`
+exports once-per-second admission-size totals; GRO ending reasons remain
+available via `ngrodetail`. Queued tickets remain in place until ownership is
+recorded, closing the untracked-Ready-buffer window of naive batch dequeue.
+Fault cleanup may recover the admission lock only after the exact owner domain
+is permanently quiescent. The lock order is queue then RX metadata; the backend
+callback must not allocate, await, borrow ENGINE, or reenter runtime queues.
+Wrong-session entries and failed acquisitions retain per-frame rejection.
+Remaining prefetched loans are released on revocation and on device drop.
+
+This version still constructs an individual Loan for every frame and retains
+the separate driver/protocol tasks and their cross-hart boundary. It is not a
+fused NAPI-like execution context and should not be described as that completed
+architecture. The combined candidate also enables the existing batch publication
+and GRO batch-release features; fixed ring size, MTU and interrupt policy remain
+the same as the comparison image. GRO ending-profile diagnostics are enabled
+only in the candidate, so small differences cannot establish a performance win.
+
+Validation: eight core receive-contract tests; 32 protocol tests with batch
+admission; 41 protocol tests with admission + batch release + GRO diagnostics +
+native TCP segmentation. These include order/budget/session rejection, duplicate
+identifiers retaining live loans, exact-incarnation fault reclamation, actual
+bulk callback selection, capability revocation and real TCP payload paths.
+RISC-V target compilation and FIT hash-verified RAM loading succeeded.
+
+| Image | Full RX Mbps (two 20s runs, mean) | Resident cores | 910M offered Mbps | Resident cores |
+| --- | ---: | ---: | ---: | ---: |
+| Batch candidate | 948.963 | 1.98774 | 909.961 | 1.92895 |
+| Restored baseline | 948.541 | 1.99041 | 909.916 | 1.92349 |
+
+Candidate FIT: `80b5f95e428bb81ce0bfbf6cac28cfa9336d3215989fa2fa9312155241b141b6`.
+Baseline FIT: `918fdf3be9a1fe04eb62dba8d68d74a9628cd0d03a187da15f1af82713d600b6`.
+Both completed a separate 64 MiB pattern verification; final pools had all 128
+buffers free and no outstanding loans. Candidate nonempty admission batches
+averaged 4.72, 4.73, 5.19 and 5.75 frames. Eligible GRO attempt groups averaged
+7.68, 7.67, 7.79 and 8.18 segments; this histogram includes singleton attempts
+and is not interchangeable with the merged-only aggregate counter. Candidate
+final release counters reported 733225 batch calls covering 5603045 followers.
+Counter snapshots are approximate once-per-second totals outside CPU windows.
+Some saved GRO_NONE response snippets end mid-line; continuous raw serial was
+retained, and the numbers above use the complete GRO_SIZE/admission arrays.
+
+Evidence: `target/mars-reference/20260917-rx-admission-{measure,control}/`,
+`20260917-rx-admission-comparison.json`, and the associated build/test logs.
+The stable baseline was restored and is currently running. No SD/SPI writes.
+These short controls show no convincing CPU reduction and do not justify
+promoting the feature. Hardware restart/fault-injection acceptance of the new
+admission-lock recovery path has not been performed. Next structural work must
+address per-frame ownership-object construction and the remaining task/queue
+handoff, rather than merely increasing the batch limit or changing hart affinity.

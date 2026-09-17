@@ -1812,6 +1812,8 @@ mod pooled_receive {
         }
     }
     static OPS: Operations = Operations {
+        #[cfg(feature = "rx-admission-batch")]
+        acquire_batch: None,
         poll_batch: None,
         stats: Default::default,
         poll: || Ok(None),
@@ -2029,6 +2031,8 @@ mod pooled_receive {
         type Revoke = (u64, Arc<Mutex<CSpace>>, Cap);
         static ACTION: OnceLock<Mutex<Option<Revoke>>> = OnceLock::new();
         static REVOKING: Operations = Operations {
+        #[cfg(feature = "rx-admission-batch")]
+        acquire_batch: None,
         poll_batch: None,
             stats: Default::default,
             poll: || Ok(None),

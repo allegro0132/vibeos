@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+rx-boundary-profile = ["network-inline-rx", "rx-publish-batch", "vibeos-kernel?/rx-boundary-profile"]
 gro-checked = ["gro-scatter", "vibeos-kernel?/gro-checked"]
 gro-scatter = ["gro-batch-release", "vibeos-kernel?/gro-scatter"]
 frontend-rx-batch = ["vibeos-kernel?/frontend-rx-batch"]
@@ -77,7 +78,7 @@ image = ["sd-device", "dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibe
 # Hardware assembly is independent of the selected network service image.
 ethernet-device = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
 # Compatibility profile used by --ethernet build/package commands.
-ethernet = ["ethernet-device", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/executor-profile", "vibeos-kernel?/network-pipeline"]
+ethernet = ["rx-boundary-profile", "gro-checked", "gro-scatter", "frontend-rx-batch", "gro-atomic-id", "network-service-peer", "network-inline-rx", "rx-admission-batch", "rx-publish-batch", "gro-batch-release", "vibeos-kernel?/gro-end-profile", "gmac-coherent-experiment", "rx-batch-experiment", "bounded-gro", "application-event-experiment", "rx-interrupt-experiment", "rx-pool-experiment", "direct-tcp-segmentation", "ethernet-device", "tx-checksum-experiment", "rx-ipv4-checksum-experiment", "rx-error-forward-experiment", "rx-readonly-recycle-experiment", "dma-ring128-experiment", "tx-single-sync-experiment", "idle-profile", "tcp-throughput-probe", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/network-pipeline"]
 
 # Install a retained, unstarted native owner; source approval is separate.
 entropy-device = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]

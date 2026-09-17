@@ -23,6 +23,8 @@ pub mod ipi;
 pub mod mmu;
 pub mod net;
 pub mod net_profile;
+#[cfg(feature = "rx-boundary-profile")]
+pub mod net_rx_boundary;
 #[cfg(feature = "copy-profile")]
 pub mod copy_profile;
 #[cfg(feature = "pc-sample")]

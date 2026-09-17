@@ -6127,3 +6127,108 @@ source archive includes the untracked smoltcp GRO and scatter source files.
 Stable FIT `918fdf3b…600b6` was RAM-restored after both runs, with hashes,
 network initialization and gigabit link verified in
 `20260917-gro-checked-baseline-restore/`. No SD or SPI contents were changed.
+
+### 2026-09-17: device-side checked GRO prefix consumption
+
+Added default-off `gro-checked`, forwarded from Mars through kernel/netstack to
+net-protocol. It implies scatter storage and atomic IPv4 ID handling. The
+pooled device retains up to 16 admitted loans in a bounded ring. It refills
+through the existing capability/stamp/domain-aware receive operations, retaining
+the existing admission budget and revalidating authority before token delivery.
+Consumed slots are released as one bounded batch at the next receive; device
+Drop also batch-releases the window. Remaining prefetched slots participate in
+`has_immediate_work`, so short/incompatible prefixes cannot strand work.
+
+Token consumption builds the maximal compatible prefix directly with smoltcp's
+`TcpGroBuilder`, and calls the checked Interface entry with that exact borrowed
+object. This removes the old VibeOS eligibility/append pass and subsequent
+whole-group reconstruction for pooled ingress. First-ineligible frames use
+ordinary receive processing, rejected lookahead remains ordered in the ring,
+and PSH/short/size boundaries still stop the prefix. A discarded, unconsumed
+token retires one frame while preserving all prefetched followers. Original
+frames remain pinned throughout callbacks, including a callback that revokes
+capabilities. No unsafe lifetime extension or caller-forgeable validation bit
+was added. Legacy whole-frame and scatter callbacks remain supported; copied
+endpoints retain their existing path.
+
+The requested consumer checksum policy is used during construction, even if
+it is stronger than the adapter's advertised offload setting. Tests cover
+multi-wrap ring order with incompatible prefixes, PSH, ordinary frames and an
+unconsumed token; original DMA pointer identity; stronger consumer policy; and
+full cleanup. Existing revoke-during-gather, revoke-in-callback, wire-admission
+budget and real TCP data tests also pass. Full optional configuration passed
+6 unit + 52 integration tests, minimal checked configuration 5 + 36, and the
+legacy scatter control 6 + 50. The Mars RISC-V release build passed. The
+implementation stays experimental until hardware and long-duration evidence
+justify production enablement.
+
+GRO selection now occurs synchronously inside token consumption instead of
+inside `Device::receive`; stage-level profiles must account for this scope
+change. The historical PacketQueue/RxGro timing buckets cannot be compared as
+if their attribution were unchanged. GRO termination/size counters still
+record each consumed prefix; dropped tokens and authority failures before
+consumption do not count as delivered checked groups.
+
+Hardware candidate FIT:
+`cb7f27ec5beb512d7e16d49cece2d2368f4cd77aa40fefc8aa924cc88f344cbd`.
+Rebuilt control from the same source files, excluding only `gro-checked` from
+the selected features:
+`8c35085d8d7087dc024d674f92564576ad2c77c30d25813297b5096a78b59c2d`.
+All archived code-file hashes were checked again after the control build. The
+root changed from `1315c16` to `9d50dda` during this work because the changes
+were committed externally; the code hashes still matched. Each FIT's kernel
+and DTB hashes, boot and gigabit link were checked before measurement. Default
+non-GRO protocol tests also passed (24 integration tests).
+
+| Path | Full RX Mbps (two 20 s samples) | Full resident cores | Paced 600 Mbps resident cores (three samples) |
+| --- | --- | --- | --- |
+| Device checked | 948.636, 948.734 | 1.29575, 1.29096 | 1.03438, 1.03514, 1.06272 |
+| Same-source control | 925.522, 927.339 | 1.28975, 1.29224 | 0.99390, 1.04730, 0.99455 |
+
+Full-rate averages: 948.685 versus 926.431 Mbps (+2.402%), at 1.29335 versus
+1.29099 cores. CPU per delivered bit decreased 2.167%. At fixed 600 Mbps,
+checked averaged 1.04408 cores versus control's 1.01191 (+3.175% per bit).
+Ranges overlap, and this sequential small sample does not establish a general
+paced regression, but it emphatically does not show a fixed-load CPU win.
+The one-core goal remains unmet. Keep the feature opt-in.
+
+Independent TCP sink tests excluded connection admission from the CPU interval
+using the existing READY/GO gate. Single flow: checked 948.419 Mbps / 1.33996
+cores versus control 927.419 / 1.33671. Four flows: 820.905 / 1.31713 versus
+807.573 / 1.31123. Per-bit CPU decreased 1.976% and 1.181%, respectively; each
+is one sample, not a long-duration result. Thus the throughput improvement is
+not specific to the iperf service, and the four-flow limitation persists.
+
+Both images passed separate 64 MiB pattern verification. Candidate cooperative
+net-stack cancellation during active traffic, generation 1 -> 2 with fresh
+grants, reconnect and another 64 MiB verification passed. The post-restart
+10-second iperf flow reached 939.358 Mbps. All 10,507,644 acquired loans were
+released; free=128, ready=borrowed=full=dropped=0. This does not qualify forced
+fault recovery, a new one-hour soak, or the complete Mars port.
+
+There is a useful batching observation to investigate before more changes:
+checked full-rate GRO groups averaged 15.815 and 15.806 segments, with only
+83.984% and 83.426% filling all 16 slots. Control averaged 15.952 and 15.995,
+with 98.896% and 99.943% full groups. In the second full-rate sample, checked
+recorded 16,704 empty-endpoint endings versus control's 16. Most additional
+checked groups have 14 or 15 segments. At 600 Mbps checked averages were
+12.875, 12.908, 12.762 versus control 13.524, 13.197, 13.535. These counters
+show where grouping ends, not whether the physical RX ring is empty or which
+component causes it. Faster admission can change the timing of when it observes
+available frames; driver refill/queue state must be measured to test that
+hypothesis. Do not infer a need for larger constants or delayed ACK changes
+from these counters alone.
+
+Artifacts under `target/mars-reference/`: `20260917-device-checked-{measure,
+control-measure,gated-measure,control-gated-measure,stack-recovery}/`,
+`20260917-device-checked-comparison.json`, the independent/GRO comparison JSON,
+`20260917-device-checked-source.zip`, source manifests, original-file archive,
+focused patch, build/package/test logs, and load captures. Host builds were
+stopped before throughput measurements; CPU is summed non-WFI residency over
+all four harts with no idle subtraction. The new source file and untracked
+smoltcp files are included in the archive.
+
+After all measurements, stable FIT `918fdf3b…600b6` was RAM-restored; kernel/DTB
+hashes, network initialization and gigabit link passed in
+`20260917-device-checked-baseline-restore/`. SD/SPI were not modified. Normal
+firmware feature selection is restored.

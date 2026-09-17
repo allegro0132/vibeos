@@ -148,7 +148,7 @@ impl ReceiveEndpoint {
         batch.len = 0;
         // Queue retains tickets until loans are tracked by firmware. A fault
         // cannot strand dequeued Ready buffers outside recovery metadata.
-        Ok(unsafe { self.queue.admit_prefix(limit, |frames, count| {
+        let count = unsafe { self.queue.admit_prefix(limit, |frames, count| {
             batch.len = count;
             let tickets = core::array::from_fn(|i| frames[i].filter(|f| f.stamp == expected).map(|f| f.ticket));
             let mut loans = match self.operations.acquire_batch {
@@ -169,7 +169,10 @@ impl ReceiveEndpoint {
                 });
             }
             count
-        }) }.unwrap_or(0))
+        }) }.unwrap_or(0);
+        #[cfg(feature = "rx-boundary-profile")]
+        crate::net_rx_boundary::admission(count);
+        Ok(count)
     }
     /// Invoke only inside live receive authority, using the supervisor-derived
     /// allocation domain. The returned loan retains already-admitted ownership;

@@ -5,6 +5,7 @@ edition = "2021"
 autobins = false
 
 [features]
+rx-boundary-profile = ["network-inline-rx", "rx-publish-batch", "vibeos-core/rx-boundary-profile"]
 gro-checked = ["gro-scatter", "vibeos-netstack/gro-checked"]
 gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]
 frontend-rx-batch = ["vibeos-netstack?/frontend-rx-batch"]

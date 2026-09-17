@@ -93,6 +93,18 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
     match cmd {
         "bootlog" => crate::boot_log::dump(),
+        #[cfg(feature = "rx-boundary-profile")]
+        "nrboundary" => {
+            println!("RX_BOUNDARY_BEGIN hz={} sample_every=127 rows=budget,poll_zero,queue_full bins=published_0..32", crate::exec::timebase_hz());
+            for hart in 0..exec::MAX_HARTS {
+                if let Some((driver, empty, post, totals)) = vibeos_core::net_rx_boundary::snapshot(hart) {
+                    if driver.iter().flatten().any(|n| *n != 0) {
+                        println!("RX_BOUNDARY hart={} driver={:?} empty={:?} post_not_ready_ready={:?} totals_admitted_ticks={:?}", hart, driver, empty, post, totals);
+                    }
+                }
+            }
+            println!("RX_BOUNDARY_END");
+        },
         #[cfg(feature = "driver-stage-profile")]
         "ndrvstage" => println!("DRIVER_STAGE hz={} sample_every=64 fields=[turns,tx_ticks,rx_ticks,rx_hw_ticks,rx_acquired,rx_published,rx_full,rx_empty] values={:?}",
             crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),

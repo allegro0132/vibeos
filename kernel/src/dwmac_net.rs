@@ -825,6 +825,12 @@ fn inline_turn(protocol: bool, receive: bool) -> Result<bool, NetError> {
         let worked = driver_turn(&mut s.work, receive,
             #[cfg(feature = "driver-stage-profile")] false,
             &s.outbound, &s.inbound)?;
+        #[cfg(feature = "rx-boundary-profile")]
+        if protocol && !receive && vibeos_core::net_rx_boundary::is_sampled() {
+            if let Some(irq) = &device().rx_interrupts {
+                vibeos_core::net_rx_boundary::after_protocol(unsafe { (irq.pending)() });
+            }
+        }
         if !worked && (protocol || !receive) {
             // Receiver registers its notification before repeating its full
             // input check. Arm and OWN recheck share the dispatch-hart guard.
@@ -1038,6 +1044,8 @@ fn driver_turn(
     #[cfg(feature = "rx-publish-batch")]
     {
         let mut budget = rx_budget;
+        #[cfg(feature = "rx-boundary-profile")]
+        let (mut published, mut stop) = (0, 0);
         while budget != 0 {
             let state = CONTROL.lock();
             if pending_rx_batch.remaining() == 0 {
@@ -1051,7 +1059,11 @@ fn driver_turn(
                     stage[4] += count as u64;
                     if count == 0 { stage[7] += 1; }
                 }
-                if count == 0 { break; }
+                if count == 0 {
+                    #[cfg(feature = "rx-boundary-profile")]
+                    { stop = 1; }
+                    break;
+                }
                 immediate_work = true;
                 let Some(stamp) = state.sessions.active_stamp() else {
                     for ticket in tickets.into_iter().flatten() { engine.discard_ticket(ticket); }
@@ -1077,14 +1089,20 @@ fn driver_turn(
                 }
             };
             budget -= sent; immediate_work = true;
+            #[cfg(feature = "rx-boundary-profile")]
+            { published += sent; }
             #[cfg(feature = "driver-stage-profile")]
             if sample_stage { stage[5] += sent as u64; }
             if sent < wanted {
+                #[cfg(feature = "rx-boundary-profile")]
+                { stop = 2; }
                 #[cfg(feature = "driver-stage-profile")]
                 if sample_stage { stage[6] += 1; }
                 break;
             }
         }
+        #[cfg(feature = "rx-boundary-profile")]
+        if receive { vibeos_core::net_rx_boundary::driver(published, stop); }
     }
     #[cfg(all(feature = "pooled-rx", not(feature = "rx-publish-batch")))]
     for _ in 0..rx_budget {

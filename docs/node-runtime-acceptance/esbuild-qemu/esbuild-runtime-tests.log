@@ -1,0 +1,70 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+   Compiling vibeos-wasi-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasi-runtime)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.40s
+     Running unittests src/lib.rs (target/debug/build/vibeos-wasi-runtime/e37aa5a773e480f7/out/vibeos_wasi_runtime-e37aa5a773e480f7)
+
+running 7 tests
+test output_budget::tests::reservations_never_overdraw_or_wrap ... ok
+test validate_tests::atomics_need_the_threads_profile ... ok
+test validate_tests::threads_contract_requires_every_half ... ok
+test validate_tests::threads_contract_is_gated ... ok
+test validate_tests::shared_memory_must_be_imported_and_bounded ... ok
+test validate_tests::core_start_requires_the_complete_threads_contract ... ok
+test validate_tests::command_declaration_ceiling_is_enforced ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/runtime.rs (target/debug/build/vibeos-wasi-runtime/fd4bc0b3baa8caea/out/runtime-fd4bc0b3baa8caea)
+
+running 17 tests
+test genuine_standard_library ... ignored, run with WASI_EXAMPLE after building standard-library examples
+test closed_import_and_start_contract ... ok
+test embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta ... ok
+test cancellation_is_stable ... ok
+test exit_is_non_returning_and_preserves_u32 ... ok
+test bad_result_pointer_has_no_output ... ok
+test invalid_read_result_does_not_consume_input ... ok
+test clocks_are_not_ambient_in_standalone_embeddings ... ok
+test fuel_continuation_hint_excludes_host_calls_and_terminal_states ... ok
+test malicious_later_iovec_has_no_output ... ok
+test loop_and_growth_are_contained ... ok
+test pending_input_does_not_burn_fuel_and_can_be_denied ... ok
+test standard_descriptors_and_known_stubs ... ok
+test standard_streams_are_not_interactive_terminals ... ok
+test repeated_imports_share_a_definition_but_validate_each_signature ... ok
+test clocks_validate_pointers_and_preserve_full_nanoseconds ... ok
+test scalar_memory_helpers_preserve_unaligned_access_and_traps ... ok
+
+test result: ok. 16 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests vibeos_wasi_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
+# Opt-in ceilings for the pinned upstream esbuild WASI tool (18 MiB module).
+esbuild-wasi = []
 python-duo = ["python-wasi"]
 python-wasi = []
 instruction-profile = ["wasmi/instruction-profile"]

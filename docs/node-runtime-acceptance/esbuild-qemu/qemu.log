@@ -1,0 +1,244 @@
+wrote OpenSSH private key to /Users/ziangwang/Sources/vibeos/target/esbuild-qemu-qualified-2/id_ed25519
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x81062000..0xc0000000  (1031800 KiB)
+  traps     stvec armed, PLIC ctx S/hart0, IRQ 10 enabled
+  smp       1 hart(s) online
+  mmu       Sv39 single address space, hart mask 0x1
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x80962000..0x80b62000, MXR clear, RFENCE ready
+  read-only 492 KiB .rodata 0x805ff000..0x8067a000; 4096 KiB COW capability-table pool
+  net map   net0 <- mmio@0x10001000 (virtio-mmio)
+  world     19 capability spaces, 1 typed channel, 9 components
+  sched     async executor, no threads, no preemption
+ssh-test listening on 10.0.2.15:2222
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> [2KWASI upload receiving esbuild.wasm
+vsh> [2K[logger] reading #1 = 21.537 C
+vsh> [2K[logger] reading #2 = 21.574 C
+vsh> [2K[guest]  heartbeat 1
+vsh> [2K[logger] reading #3 = 21.611 C
+vsh> [2K[logger] reading #4 = 21.648 C
+vsh> [2K[logger] reading #5 = 21.685 C
+vsh> [2K[guest]  heartbeat 2
+vsh> [2K[logger] reading #6 = 21.722 C
+vsh> [2K[logger] reading #7 = 21.759 C
+vsh> [2K[logger] reading #8 = 21.796 C
+vsh> [2K[guest]  heartbeat 3
+vsh> [2K[logger] reading #9 = 21.833 C
+vsh> [2K[logger] reading #10 = 21.870 C
+vsh> [2K[logger] reading #11 = 21.907 C
+vsh> [2K[guest]  heartbeat 4
+vsh> [2K[logger] reading #12 = 21.944 C
+vsh> [2K[logger] reading #13 = 21.981 C
+vsh> [2K[logger] reading #14 = 22.018 C
+vsh> [2K[guest]  heartbeat 5
+vsh> [2K[logger] reading #15 = 22.055 C
+vsh> [2K[logger] reading #16 = 22.092 C
+vsh> [2K[logger] reading #17 = 22.129 C
+vsh> [2K[guest]  heartbeat 6
+vsh> [2K[logger] reading #18 = 22.166 C
+vsh> [2K[logger] reading #19 = 22.203 C
+vsh> [2K[logger] reading #20 = 22.240 C
+vsh> [2K[guest]  heartbeat 7
+vsh> [2K[logger] reading #21 = 22.277 C
+vsh> [2K[logger] reading #22 = 22.314 C
+vsh> [2K[logger] reading #23 = 22.351 C
+vsh> [2K[guest]  heartbeat 8
+vsh> [2K[logger] reading #24 = 22.388 C
+vsh> [2K[logger] reading #25 = 21.525 C
+vsh> [2K[logger] reading #26 = 21.562 C
+vsh> [2K[guest]  heartbeat 9
+vsh> [2K[logger] reading #27 = 21.599 C
+vsh> [2K[logger] reading #28 = 21.636 C
+vsh> [2K[logger] reading #29 = 21.673 C
+vsh> [2K[guest]  heartbeat 10
+vsh> [2K[logger] reading #30 = 21.710 C
+vsh> [2K[logger] reading #31 = 21.747 C
+vsh> [2K[logger] reading #32 = 21.784 C
+vsh> [2K[guest]  heartbeat 11
+vsh> [2K[logger] reading #33 = 21.821 C
+vsh> [2K[logger] reading #34 = 21.858 C
+vsh> [2K[logger] reading #35 = 21.895 C
+vsh> [2K[guest]  heartbeat 12
+vsh> [2K[logger] reading #36 = 21.932 C
+vsh> [2K[logger] reading #37 = 21.969 C
+vsh> [2K[logger] reading #38 = 22.006 C
+vsh> [2K[guest]  heartbeat 13
+vsh> [2K[logger] reading #39 = 22.043 C
+vsh> [2K[logger] reading #40 = 22.080 C
+vsh> [2K[logger] reading #41 = 22.117 C
+vsh> [2K[guest]  heartbeat 14
+vsh> [2K[logger] reading #42 = 22.154 C
+vsh> [2K[logger] reading #43 = 22.191 C
+vsh> [2K[logger] reading #44 = 22.228 C
+vsh> [2K[guest]  heartbeat 15
+vsh> [2K[logger] reading #45 = 22.265 C
+vsh> [2K[logger] reading #46 = 22.302 C
+vsh> [2K[logger] reading #47 = 22.339 C
+vsh> [2K[guest]  heartbeat 16
+vsh> [2K[logger] reading #48 = 22.376 C
+vsh> [2K[logger] reading #49 = 21.513 C
+vsh> [2K[logger] reading #50 = 21.550 C
+vsh> [2K[guest]  heartbeat 17
+vsh> [2K[logger] reading #51 = 21.587 C
+vsh> [2K[logger] reading #52 = 21.624 C
+vsh> [2K[logger] reading #53 = 21.661 C
+vsh> [2K[guest]  heartbeat 18
+vsh> [2K[logger] reading #54 = 21.698 C
+vsh> [2K[logger] reading #55 = 21.735 C
+vsh> [2K[logger] reading #56 = 21.772 C
+vsh> [2K[guest]  heartbeat 19
+vsh> [2K[logger] reading #57 = 21.809 C
+vsh> [2K[logger] reading #58 = 21.846 C
+vsh> [2K[logger] reading #59 = 21.883 C
+vsh> [2K[guest]  heartbeat 20
+vsh> [2K[logger] reading #60 = 21.920 C
+vsh> [2K[logger] reading #61 = 21.957 C
+vsh> [2K[logger] reading #62 = 21.994 C
+vsh> [2K[guest]  heartbeat 21
+vsh> [2K[logger] reading #63 = 22.031 C
+vsh> [2K[logger] reading #64 = 22.068 C
+vsh> [2K[logger] reading #65 = 22.105 C
+vsh> [2K[guest]  heartbeat 22
+vsh> [2K[logger] reading #66 = 22.142 C
+vsh> [2K[logger] reading #67 = 22.179 C
+vsh> [2K[logger] reading #68 = 22.216 C
+vsh> [2K[guest]  heartbeat 23
+vsh> [2K[logger] reading #69 = 22.253 C
+vsh> [2K[logger] reading #70 = 22.290 C
+vsh> [2K[logger] reading #71 = 22.327 C
+vsh> [2K[guest]  heartbeat 24
+vsh> [2K[logger] reading #72 = 22.364 C
+vsh> [2K[logger] reading #73 = 21.501 C
+vsh> [2K[logger] reading #74 = 21.538 C
+vsh> [2K[guest]  heartbeat 25
+vsh> [2K[logger] reading #75 = 21.575 C
+vsh> [2K[logger] reading #76 = 21.612 C
+vsh> [2K[logger] reading #77 = 21.649 C
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 26
+vsh> [2K[logger] reading #78 = 21.686 C
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 27
+vsh> [2K[logger] reading #79 = 21.723 C
+vsh> [2KWASI esbuild fuel=92702116 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96523904
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K  pgcache: 229 of 8192 page reads served from cache
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 28
+vsh> [2K[logger] reading #80 = 21.760 C
+vsh> [2KWASI esbuild fuel=1601229077 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96524032
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 29
+vsh> [2K[logger] reading #81 = 21.797 C
+vsh> [2KWASI esbuild fuel=1603334732 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96524032
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K  pgcache: 229 of 16398 page reads served from cache
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 30
+vsh> [2K[logger] reading #82 = 21.834 C
+vsh> [2KWASI esbuild fuel=1601693416 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96524160
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 31
+vsh> [2K[logger] reading #83 = 21.871 C
+vsh> [2KWASI esbuild fuel=1527443438 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96523904
+vsh> [2KWASI terminal=Exited(1) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 1
+vsh> [2K  pgcache: 229 of 24601 page reads served from cache
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 32
+vsh> [2K[logger] reading #84 = 21.908 C
+vsh> [2KWASI esbuild fuel=100755419 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96524032
+vsh> [2KWASI terminal=Exited(1) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 1
+vsh> [2KWASI running
+vsh> [2K[guest]  heartbeat 33
+vsh> [2K[logger] reading #85 = 21.945 C
+vsh> [2KWASI esbuild fuel=1599860082 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96524032
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> qemu-system-riscv64: terminating on signal 15 from pid 56782 (<unknown process>)

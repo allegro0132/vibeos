@@ -1,0 +1,2 @@
+const view = /* @__PURE__ */ h("box", { value: 42 });
+console.log(view);

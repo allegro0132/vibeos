@@ -1,0 +1,256 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+   Compiling vibeos-component-format v0.1.0 (/Users/ziangwang/Sources/vibeos/component-format)
+   Compiling vibeos-hal v0.1.0 (/Users/ziangwang/Sources/vibeos/hal)
+   Compiling vibeos-durable-format v0.1.0 (/Users/ziangwang/Sources/vibeos/durable-format)
+   Compiling vibeos-segment-format v0.1.0 (/Users/ziangwang/Sources/vibeos/segment-format)
+   Compiling vibeos-blob-format v0.1.0 (/Users/ziangwang/Sources/vibeos/blob-format)
+   Compiling vibeos-ssh-identity v0.1.0 (/Users/ziangwang/Sources/vibeos/services/ssh-identity)
+   Compiling vibeos-segment-store v0.1.0 (/Users/ziangwang/Sources/vibeos/segment-store)
+   Compiling vibeos-core v0.1.0 (/Users/ziangwang/Sources/vibeos/core)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `vibeos-durable-format` (lib) generated 1 warning (1 duplicate)
+   Compiling vibeos-wasm-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasm-runtime)
+   Compiling vibeos-wasi-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasi-runtime)
+   Compiling vibeos-component-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/component-runtime)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-core` (lib) generated 1 warning (1 duplicate)
+   Compiling vibeos-component-host v0.1.0 (/Users/ziangwang/Sources/vibeos/services/component-host)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+   Compiling vibeos-component-admission v0.1.0 (/Users/ziangwang/Sources/vibeos/services/component-admission)
+   Compiling vibeos-vsh v0.1.0 (/Users/ziangwang/Sources/vibeos/components/vsh)
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+   Compiling vibeos-image-policy v0.1.0 (/Users/ziangwang/Sources/vibeos/policy/image)
+   Compiling vibeos-file-store v0.1.0 (/Users/ziangwang/Sources/vibeos/services/file-store)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (2 duplicates)
+   Compiling vibeos-component-command v0.1.0 (/Users/ziangwang/Sources/vibeos/services/component-command)
+   Compiling vibeos-sshd v0.1.0 (/Users/ziangwang/Sources/vibeos/components/sshd)
+   Compiling vibeos-wasi-command v0.1.0 (/Users/ziangwang/Sources/vibeos/services/wasi-command)
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+    Finished `test` profile [optimized + debuginfo] target(s) in 10.29s
+     Running unittests src/lib.rs (target/debug/build/vibeos-net-protocol/d2a6f11ea7742f01/out/vibeos_net_protocol-d2a6f11ea7742f01)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/stack.rs (target/debug/build/vibeos-net-protocol/2a9616a944993f15/out/stack-2a9616a944993f15)
+
+running 24 tests
+test final_ack_and_queued_next_syn_keep_distinct_connection_edges ... ok
+test next_connection_waits_while_previous_peer_close_is_drained ... ok
+test explicit_port_group_accepts_two_simultaneous_tcp_connections ... ok
+test packet_device_only_suppresses_checksums_for_enabled_offloads ... ok
+test icmp_echo_preserves_changing_payloads_and_rejects_bad_checksums ... ok
+test frontend_reset_does_not_wait_for_queued_payload ... ok
+test one_interface_serves_two_independent_tcp_ports ... ok
+test packet_device_rejects_stale_ingress_without_blocking_fresh_traffic ... ok
+test idle_control_connection_survives_long_transfer_but_dead_peer_expires ... ok
+test packet_device_retains_one_frame_across_endpoint_backpressure ... ok
+test graceful_frontend_close_drains_bytes_behind_full_transport ... ok
+test peer_first_close_rearms_quickly_and_accepts_a_second_connection ... ok
+test raw_tcp_reset_is_terminal_until_a_network_poll_rearms_the_listener ... ok
+test stack_egress_is_stamped_and_a_rebound_driver_rejects_it ... ok
+test shared_stack_enforces_listener_budget ... ok
+test stack_revalidates_authority_and_monotonic_time ... ok
+test stack_switches_between_static_unconfigured_and_dhcp_discovery ... ok
+test transmit_token_cannot_outlive_revocation ... ok
+test static_ipv4_stack_resolves_arp_and_echoes_one_tcp_connection ... ok
+test two_capability_frontends_share_one_interface_without_crossing_streams ... ok
+test raw_tcp_stream_fragments_both_directions_and_reports_backpressure_and_eof ... ok
+test pending_handshake_can_precede_application_admission_during_time_wait ... ok
+test server_close_acknowledges_a_late_payload_and_fin_before_relisten ... ok
+test frontend_direct_transfer_preserves_bytes_across_wrap_and_backpressure ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/build/vibeos-sshd/15a85e0a671d139c/out/vibeos_sshd-15a85e0a671d139c)
+
+running 20 tests
+test tests::component_backend_fault_is_preserved_as_ssh_exit_125 ... ok
+test tests::capability_connection_generation_detects_replacement ... ok
+test tests::component_wake_protocol_errors_have_exact_fail_closed_diagnostics ... ok
+test tests::completed_component_transport_failure_never_repolls_execution ... ok
+test tests::capability_accept_rechecks_generation_before_starting_a_fresh_runner ... ok
+test tests::component_pump_cancels_prepared_stdout_when_terminal_wins_commit ... ok
+test tests::completion_winning_cancellation_keeps_the_exact_managed_terminal ... ok
+test tests::component_pump_preserves_depth_eight_backpressure_partial_writes_and_final_37 ... ok
+test tests::builtin_exec_carries_no_component_descriptor_or_installation ... ok
+test tests::default_platform_policy_installs_no_ssh_component_command ... ok
+test tests::accepted_component_policy_fails_closed_across_rotation_and_revocation ... ok
+test tests::malformed_completed_report_never_rewrites_an_immutable_stream_terminal ... ok
+test tests::nested_execution_wait_registers_the_current_task_without_self_waking ... ok
+test tests::rearm_hands_an_already_started_connection_to_the_fresh_runner ... ok
+test tests::ssh_component_request_requires_exact_profile_public_key_and_simple_syntax ... ok
+test tests::ssh_component_selector_keeps_two_exact_routes_and_rechecks_before_install ... ok
+test tests::ssh_component_session_policy_binds_profile_and_generation_exactly ... ok
+test tests::terminal_close_while_ninth_stdin_chunk_waits_stops_further_input ... ok
+test tests::stable_policy_for_a_different_artifact_is_not_installed ... ok
+test tests::image_pin_requires_explicit_ssh_policy_then_executes_stream_filter ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/vibeos-wasi-command/8a5b0e779a887d9d/out/vibeos_wasi_command-8a5b0e779a887d9d)
+
+running 6 tests
+test tests::pipe_backpressure_eof_and_cancel ... ok
+test tests::pinned_reader_survives_replacement_and_rejects_symlinks ... ok
+test tests::first_cancellation_reason_survives_teardown_revocation ... ok
+test tests::loader_uses_exact_snapshot_length_and_rejects_mismatch ... ok
+test tests::pipe_wakes_every_parked_writer_and_reader ... ok
+test tests::request_values_are_never_reparsed_as_authority ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vibeos_net_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vibeos_sshd
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vibeos_wasi_command
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

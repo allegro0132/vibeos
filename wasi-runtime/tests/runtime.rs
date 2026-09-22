@@ -52,6 +52,27 @@ fn exit_is_non_returning_and_preserves_u32() {
     );
     assert_eq!(terminal, WasiTerminal::Exited(u32::MAX));
 }
+
+#[test]
+fn repeated_imports_share_a_definition_but_validate_each_signature() {
+    let source = r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $a (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_write" (func $b (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "\10\00\00\00\02\00\00\00")
+        (data (i32.const 16) "ok")
+        (func (export "_start")
+            (drop (call $a (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 24)))
+            (drop (call $b (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 24)))))"#;
+    let mut io = Io::default();
+    assert_eq!(run(source, &mut io, WasiLimits::default()), WasiTerminal::Exited(0));
+    assert_eq!(io.out, b"okok");
+    let wrong = wat::parse_str(r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_write" (func (param i32) (result i32)))
+        (memory (export "memory") 1) (func (export "_start")))"#).unwrap();
+    assert!(matches!(WasiInvocation::new(&wrong, &["test".into()], WasiLimits::default()), Err(WasiError::Import)));
+}
 #[test]
 fn malicious_later_iovec_has_no_output() {
     let mut io = Io::default();
@@ -327,7 +348,7 @@ fn embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta() {
     let bytes = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "_start")))"#)
         .unwrap();
     assert_eq!(WasiLimits::default().total_fuel,
-        if cfg!(feature = "python-wasi") { 10_000_000_000 } else { 10_000_000 });
+        if cfg!(any(feature = "python-wasi", feature = "esbuild-wasi")) { 10_000_000_000 } else { 10_000_000 });
     for (fuel, quantum, valid) in [
         (100_000_000_000, 10_000, true),
         (100_000_000_001, 10_000, false),
@@ -362,6 +383,24 @@ fn clocks_are_not_ambient_in_standalone_embeddings() {
         WasiLimits::default(),
     );
     assert_eq!(terminal, WasiTerminal::Exited(0));
+}
+
+#[test]
+fn profile_declaration_ceilings_remain_enforced() {
+    let profile = vibeos_wasi_runtime::profile::DECLARATIONS;
+    // These inputs fit the byte-size ceiling. They must fail declaration
+    // admission before the engine allocates their code/data representations.
+    for body in [
+        "(data (i32.const 0) \"\")".repeat(profile.max_data_segments as usize + 1),
+        format!("(func {} {})", "block ".repeat(profile.max_core_nesting as usize + 1),
+                "end ".repeat(profile.max_core_nesting as usize + 1)),
+    ] {
+        let bytes = wat::parse_str(format!(
+            "(module (memory (export \"memory\") 1) (func (export \"_start\")) {body})"
+        )).unwrap();
+        assert!(bytes.len() < WasiLimits::default().module_bytes);
+        assert!(matches!(WasiInvocation::new(&bytes, &["test".into()], WasiLimits::default()), Err(WasiError::Limit)));
+    }
 }
 
 #[test]

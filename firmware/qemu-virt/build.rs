@@ -14,7 +14,8 @@ fn main() {
     // legitimately hold multi-MiB record streams in transit; the Python WASI
     // image boots with -m 1G. storage-bench-128m opts into 128 MiB.
     // OpenSBI occupies the first 2 MiB of each.
-    let ram_length = if env::var_os("CARGO_FEATURE_PYTHON_WASI").is_some() {
+    let ram_length = if env::var_os("CARGO_FEATURE_PYTHON_WASI").is_some()
+        || env::var_os("CARGO_FEATURE_ESBUILD_WASI").is_some() {
         "1022M"
     } else if env::var_os("CARGO_FEATURE_STORAGE_BENCH").is_some()
         && env::var_os("CARGO_FEATURE_STORAGE_BENCH_128M").is_none()

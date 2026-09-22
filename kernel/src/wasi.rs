@@ -34,6 +34,8 @@ use vibeos_wasi_runtime::{
     WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
 };
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(all(feature = "esbuild-wasi", any(feature = "wasmtime-command", feature = "wasi-rv64-cache", feature = "python-command")))]
+compile_error!("esbuild-wasi requires its independent bounded Wasmi profile");
 #[cfg(all(feature = "python-command", any(feature = "wasmtime-command", feature = "wasi-rv64-cache")))]
 compile_error!("python-wasi currently requires the bounded Wasmi interpreter backend");
 struct KernelIo<'a>(GuestIo<'a>);
@@ -172,6 +174,12 @@ impl Future for Guest {
                 .as_mut()
                 .unwrap()
                 .poll(cx, &mut KernelIo(GuestIo(&job.io)));
+            #[cfg(feature = "esbuild-wasi")]
+            if outcome.is_ready() {
+                let instance = this.instance.as_ref().unwrap();
+                crate::println!("WASI esbuild fuel={} max_required_fuel={}",
+                    instance.consumed_fuel(), instance.maximum_fuel_requirement());
+            }
             #[cfg(feature = "wasi-benchmark")]
             {
                 let now = crate::sbi::time();
@@ -382,6 +390,10 @@ fn launch_owned(
                 WasiTerminal::Cancelled
             },
         );
+        #[cfg(feature = "esbuild-wasi")]
+        if let Some(stats) = HEAP.account_stats(owner) {
+            crate::println!("WASI esbuild owner_peak_bytes={}", stats.peak_bytes);
+        }
         let leftover = HEAP.arena_stats(arena);
         let clean = if leftover.is_some() {
             HEAP.close_empty_domain(domain).is_ok()

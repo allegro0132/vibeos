@@ -1,0 +1,101 @@
+{
+  "backend": "VibeOS/QEMU/Wasmi",
+  "stage": "esbuild transforms (not Node/V8)",
+  "module_sha256": "5090d398c1b47b40fc708510d1a9bc11d5381c46de7ea2fac31ed008ef78ff78",
+  "kernel_sha256": "5f404c0bd4ffe271eecf833061cb565b2b308c75f45e043d045318c64e912d49",
+  "repository_commit": "42098ec106a627b2f717fbbfcb73cb810841f914",
+  "cases": [
+    {
+      "case": "version",
+      "argv": [
+        "--version"
+      ],
+      "exit_code": 0,
+      "seconds": 14.078,
+      "stdin_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "owner_peak_bytes": 96523904,
+      "consumed_fuel": 92702116,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "typescript",
+      "argv": [
+        "--loader=ts",
+        "--format=cjs"
+      ],
+      "exit_code": 0,
+      "seconds": 15.023,
+      "stdin_sha256": "a9c95c5e3d11a37f39746c131059aae753b0b13bf0a4db12b169c68581961189",
+      "owner_peak_bytes": 96524032,
+      "consumed_fuel": 1601229077,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "tsx",
+      "argv": [
+        "--loader=tsx",
+        "--jsx-factory=h"
+      ],
+      "exit_code": 0,
+      "seconds": 17.641,
+      "stdin_sha256": "2c43555f024ee53c2e40b973b21730b58874a8fe35c58f1125dc52fc1444f773",
+      "owner_peak_bytes": 96524032,
+      "consumed_fuel": 1603334732,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "source-map",
+      "argv": [
+        "--loader=ts",
+        "--sourcemap=inline",
+        "--sourcefile=example.ts"
+      ],
+      "exit_code": 0,
+      "seconds": 16.533,
+      "stdin_sha256": "a9c95c5e3d11a37f39746c131059aae753b0b13bf0a4db12b169c68581961189",
+      "owner_peak_bytes": 96524160,
+      "consumed_fuel": 1601693416,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "syntax-error",
+      "argv": [
+        "--loader=ts"
+      ],
+      "exit_code": 1,
+      "seconds": 16.314,
+      "stdin_sha256": "2ea162b6a4fb87d7cffe5fd521f3d1e8aea1f411e607e28215547d1f6c71ef58",
+      "owner_peak_bytes": 96523904,
+      "consumed_fuel": 1527443438,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "no-ambient-files",
+      "argv": [
+        "--loader=ts",
+        "--outfile=/outside.js"
+      ],
+      "exit_code": 1,
+      "seconds": 14.445,
+      "stdin_sha256": "a9c95c5e3d11a37f39746c131059aae753b0b13bf0a4db12b169c68581961189",
+      "owner_peak_bytes": 96524032,
+      "consumed_fuel": 100755419,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "reuse",
+      "argv": [
+        "--loader=ts",
+        "--format=cjs"
+      ],
+      "exit_code": 0,
+      "seconds": 14.104,
+      "stdin_sha256": "a9c95c5e3d11a37f39746c131059aae753b0b13bf0a4db12b169c68581961189",
+      "owner_peak_bytes": 96524032,
+      "consumed_fuel": 1599860082,
+      "maximum_fuel_requirement": 131072
+    }
+  ],
+  "status": "PASS",
+  "reclaimed_invocations": 7
+}

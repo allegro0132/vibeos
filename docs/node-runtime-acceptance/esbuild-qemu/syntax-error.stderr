@@ -1,0 +1,7 @@
+✘ [ERROR] Unexpected "="
+
+    <stdin>:1:13:
+      1 │ const value: = ;
+        ╵              ^
+
+1 error

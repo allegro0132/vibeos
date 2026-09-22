@@ -1,0 +1,5 @@
+# Preserve captured terminal/compiler bytes, including CRLF and blank lines.
+*.log -text -whitespace
+*.stderr -text -whitespace
+*.stdout -text -whitespace
+*.stdin -text -whitespace

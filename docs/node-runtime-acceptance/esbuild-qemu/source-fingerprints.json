@@ -1,0 +1,15 @@
+{
+  "boards/qemu-virt/Cargo.toml": "49961fed29d6ade5afc4eb83b7e2e7ef754b845ed4ec971b80c72048a367dcf6",
+  "boards/qemu-virt/src/lib.rs": "2a178fd193a9e92bfd444858a0495f3e0394a105ada54d451be87cd9ac547158",
+  "components/sshd/Cargo.toml": "e00d5cd59486b86bd1d0a0f370aeb47d9c0740d3cdc697e38e1b6e09818b58c6",
+  "components/sshd/src/lib.rs": "c0134c91b2e5ad026dfbd1be093ef2de5a8017fde62b4bab56583571a9816096",
+  "firmware/qemu-virt/Cargo.toml": "ab39f362357042a419af05278b72c3ee5a62c059394d4f6eb76a4feb72d3d582",
+  "firmware/qemu-virt/build.rs": "df433d9d69cda67c9636385948edba3c2ed77f4bbe11fe31c829cb39d84d4aed",
+  "firmware/qemu-virt/src/main.rs": "a596e621e981aa9567fd9d14121b0e84bfda5ac477b1ed21d04f27531167ed88",
+  "kernel/Cargo.toml": "07a999c7ce4dc57a4838e710e1a18a765c3609c1ddb443696c79b1ac561e00ff",
+  "kernel/src/wasi.rs": "549c1e759de72b6aa26d29e759391a40ff2a950401870fb95c40e66022ac4a98",
+  "wasi-runtime/Cargo.toml": "8d92841f4fe95515b7fbdb0e6ea8523c917d9fb258ab4ee75d7099a76ae5fa52",
+  "wasi-runtime/src/lib.rs": "bd06e9849ac0e3fe21e28692625f9241f5f3501d661cce3630bdfd47b82b3e57",
+  "wasi-runtime/src/profile.rs": "0df488d2ee4ba00a1e653ef8327000440d15f96d621edbd435c5bbed8ee96550",
+  "vendor/wasmi-softfloat/crates/wasmi/src/engine/limits/engine.rs": "986440e1f7ab010e44b560ff5e36aa90b33d67e828938c50ebf10772787daa84"
+}

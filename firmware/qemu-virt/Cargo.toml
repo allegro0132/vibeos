@@ -18,6 +18,7 @@ dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
 
 mmu-large-memory = ["legacy-shell", "vibeos-bsp-qemu-virt/mmu-large-memory", "vibeos-kernel/mmu-large-memory-test"]
 python-wasi = ["vibeos-kernel/python-wasi", "vibeos-bsp-qemu-virt/python-wasi"]
+esbuild-wasi = ["vibeos-kernel/esbuild-wasi", "vibeos-bsp-qemu-virt/esbuild-wasi"]
 # Research-only format admission; writes require runtime opt-in.
 experimental-authority-delta = ["vibeos-kernel/experimental-authority-delta"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]

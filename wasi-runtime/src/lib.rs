@@ -55,8 +55,11 @@ impl Default for WasiLimits {
             argument_bytes: 16 * 1024,
             arguments: 128,
             output_bytes: 64 * 1024,
-            total_fuel: if cfg!(feature = "python-wasi") { 10_000_000_000 } else { 10_000_000 },
-            poll_quantum: if cfg!(feature = "python-wasi") { 100_000 } else { 10_000 },
+            total_fuel: if cfg!(any(feature = "python-wasi", feature = "esbuild-wasi")) { 10_000_000_000 } else { 10_000_000 },
+            // Go's initial heap growth requires an indivisible 131,072-fuel
+            // operation. Keep a fixed ceiling rather than an unbounded retry.
+            poll_quantum: if cfg!(feature = "esbuild-wasi") { 262_144 }
+                else if cfg!(feature = "python-wasi") { 100_000 } else { 10_000 },
             threads: false,
         }
     }
@@ -160,6 +163,7 @@ enum Continuation {
 }
 
 pub struct WasiInvocation {
+    maximum_fuel_requirement: u64,
     store: Store<HostState>,
     memory: Memory,
     start: Func,
@@ -244,10 +248,19 @@ impl WasiInvocation {
             .set_max_stack_height(128 * 1024)
             .set_max_cached_stacks(0)
             .compilation_mode(wasmi::CompilationMode::Eager)
-            .enforced_limits(wasmi::EnforcedLimits::strict().with_max_functions(profile::DECLARATIONS.max_functions));
+            .enforced_limits({
+                let limits = wasmi::EnforcedLimits::strict()
+                    .with_max_functions(profile::DECLARATIONS.max_functions);
+                if cfg!(feature = "esbuild-wasi") {
+                    limits.with_max_data_segments(profile::DECLARATIONS.max_data_segments)
+                } else {
+                    limits
+                }
+            });
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|_| WasiError::Unsupported)?;
         let mut linker = Linker::new(&engine);
+        let mut linked_imports = alloc::collections::BTreeSet::new();
         for import in module.imports() {
             let signature = abi::signature(import.name()).ok_or(WasiError::Import)?;
             let ty = import.ty().func().ok_or(WasiError::Import)?;
@@ -271,6 +284,12 @@ impl WasiInvocation {
                 || ty.results() != results
             {
                 return Err(WasiError::Import);
+            }
+            // A valid module may import one host function at multiple indices
+            // (Go does this for fd_write and random_get). Validate every type,
+            // but define each linker name only once.
+            if !linked_imports.insert(import.name().to_string()) {
+                continue;
             }
             let name = import.name().to_string();
             linker
@@ -326,6 +345,7 @@ impl WasiInvocation {
             return Err(WasiError::Contract);
         }
         Ok(Self {
+            maximum_fuel_requirement: 0,
             store,
             memory,
             start,
@@ -350,6 +370,11 @@ impl WasiInvocation {
     }
     pub fn consumed_fuel(&self) -> u64 {
         self.limits.total_fuel - self.fuel
+    }
+    /// Largest indivisible engine block observed at a fuel yield.
+    /// Diagnostic only: callers cannot use this to increase the trusted budget.
+    pub fn maximum_fuel_requirement(&self) -> u64 {
+        self.maximum_fuel_requirement
     }
     pub fn cancel(&mut self) {
         let _ = self.finish(WasiTerminal::Cancelled);
@@ -434,6 +459,7 @@ impl WasiInvocation {
         match result {
             Ok(ResumableCall::Finished) => self.finish(WasiTerminal::Exited(0)),
             Ok(ResumableCall::OutOfFuel(c)) => {
+                self.maximum_fuel_requirement = self.maximum_fuel_requirement.max(c.required_fuel());
                 if c.required_fuel() > self.fuel || c.required_fuel() > self.limits.poll_quantum {
                     return self.finish(WasiTerminal::LimitExceeded);
                 }

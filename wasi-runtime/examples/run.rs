@@ -71,8 +71,9 @@ fn main() {
             break result;
         }
     };
+    let max_required_fuel = invocation.maximum_fuel_requirement();
     eprintln!(
-        "terminal={terminal:?} polls={polls} fuel={} seconds={:.6}",
+        "terminal={terminal:?} polls={polls} fuel={} seconds={:.6} max_required_fuel={max_required_fuel}",
         invocation.consumed_fuel(),
         io.0.elapsed().as_secs_f64()
     );

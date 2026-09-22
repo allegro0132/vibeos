@@ -15,16 +15,16 @@ pub const RAM_START: usize = 0x8020_0000;
 /// legitimately hold multi-MiB record streams in transit. The linker script
 /// variant selected by the same feature sizes the heap to match.
 /// storage-bench-128m instead qualifies the benchmark at 128 MiB.
-#[cfg(all(feature = "python-wasi", not(feature = "mmu-large-memory")))]
+#[cfg(all(any(feature = "python-wasi", feature = "esbuild-wasi"), not(feature = "mmu-large-memory")))]
 pub const RAM_END: usize = 0xc000_0000;
 #[cfg(all(
     feature = "storage-bench",
     not(feature = "storage-bench-128m"),
-    not(any(feature = "python-wasi", feature = "mmu-large-memory"))
+    not(any(feature = "python-wasi", feature = "esbuild-wasi", feature = "mmu-large-memory"))
 ))]
 pub const RAM_END: usize = 0xa000_0000;
 #[cfg(all(
-    not(any(feature = "python-wasi", feature = "mmu-large-memory")),
+    not(any(feature = "python-wasi", feature = "esbuild-wasi", feature = "mmu-large-memory")),
     any(not(feature = "storage-bench"), feature = "storage-bench-128m")
 ))]
 pub const RAM_END: usize = 0x8800_0000;

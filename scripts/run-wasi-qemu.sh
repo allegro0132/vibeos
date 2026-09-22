@@ -11,6 +11,15 @@ fi
 set -- -icount shift=0,align=off,sleep=off
 memory=128M
 harts=4
+if [ "${WASI_ESBUILD:-0}" = 1 ]; then
+  [ "${WASI_PYTHON:-0}" != 1 ] && [ "${WASI_WASMTIME:-0}" != 1 ] && [ "${WASI_RV64_CACHE:-0}" != 1 ] && [ "${WASI_BENCHMARK:-0}" != 1 ] || {
+    echo 'WASI_ESBUILD requires its independent interpreter profile' >&2; exit 2;
+  }
+  feature=esbuild-wasi
+  memory=1G
+  harts=1
+  set -- -rtc base=utc,clock=vm
+fi
 if [ "${WASI_PYTHON:-0}" = 1 ]; then
   [ "${WASI_WASMTIME:-0}" != 1 ] && [ "${WASI_RV64_CACHE:-0}" != 1 ] && [ "${WASI_BENCHMARK:-0}" != 1 ] || {
     echo 'WASI_PYTHON requires the interpreter profile, without benchmark/cache overrides' >&2; exit 2;
@@ -66,7 +75,11 @@ if [ "${WASI_FUEL_BATCH:-0}" = 1 ]; then
 fi
 mkdir -p "$work"
 if [ "${WASI_SKIP_BUILD:-0}" != 1 ]; then
-  (cd firmware/qemu-virt && cargo build --locked --offline --release --target "$target" --features "$feature")
+  toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
+  pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
+  pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
+  (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+    rustup run "$toolchain" cargo build --locked --offline --release --target "$target" --features "$feature")
 fi
 python3 - "$work" "$port" <<'PY'
 import importlib.util, pathlib, sys

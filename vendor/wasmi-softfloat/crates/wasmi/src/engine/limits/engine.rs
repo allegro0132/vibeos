@@ -200,6 +200,13 @@ impl EnforcedLimits {
         self
     }
 
+    /// Override the bounded data-segment count for a qualified large module.
+    /// All other strict limits remain in effect.
+    pub fn with_max_data_segments(mut self, maximum: u32) -> Self {
+        self.max_data_segments = Some(maximum);
+        self
+    }
+
     /// A strict set of limits that makes use of Wasmi implementation details.
     ///
     /// This set of strict enforced rules can be used by Wasmi users in order

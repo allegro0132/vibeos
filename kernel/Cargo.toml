@@ -59,6 +59,7 @@ provisioned-wasmtime = ["provisioned-command", "wasi-preview1", "vibeos-sshd/was
 experimental-authority-delta = ["vibeos-segment-store/experimental-authority-delta"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
 python-wasi = ["wasi-ssh-upload", "python-command"]
+esbuild-wasi = ["wasi-ssh-upload", "vibeos-wasi-runtime/esbuild-wasi", "vibeos-sshd/esbuild-wasi"]
 milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without

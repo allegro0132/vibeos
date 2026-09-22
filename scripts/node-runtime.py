@@ -137,6 +137,7 @@ def probe(args, lock):
     evidence = Path(tempfile.mkdtemp(prefix='probe-', dir=args.work))
     report = {'schema': 1, 'kind': 'prerequisites-only',
               'runtime_acceptance': 'NOT_RUN', 'qemu_execution': 'NOT_RUN',
+              'wasi_profile': args.wasi_profile,
               'source_lock_sha256': digest(LOCK),
               'esbuild_module_sha256': digest(module), 'checks': []}
     report['repository_commit'] = subprocess.check_output(
@@ -155,8 +156,10 @@ def probe(args, lock):
     checks.append(check('cxx-version', [args.cxx, '--version'], evidence))
     header = evidence / 'v8-header.cc'
     header.write_text('#include "v8.h"\nint main() { return v8::V8::GetVersion()[0] == 0; }\n')
-    command = [args.cxx, '--no-default-config', '--target=riscv64-unknown-elf',
-               '-march=rv64gc', '-mabi=lp64d', '-std=c++20', '-ferror-limit=3',
+    command = [args.cxx]
+    if args.cxx_kind == 'clang':
+        command += ['--no-default-config', '--target=riscv64-unknown-elf', '-ferror-limit=3']
+    command += ['-march=rv64gc', '-mabi=lp64d', '-std=c++20',
                '-fsyntax-only', '-I', str(node / 'deps/v8/include'), str(header)]
     if args.sysroot:
         command.append('--sysroot=' + str(args.sysroot.resolve(strict=True)))
@@ -172,7 +175,7 @@ def probe(args, lock):
         '[workspace]\n[[bin]]\nname="wasi-probe"\npath="main.rs"\n'
         '[dependencies]\nwasmparser="=0.255.0"\n'
         'vibeos-wasi-runtime={path=' + json.dumps(str(ROOT / 'wasi-runtime'))
-        + ',features=["python-wasi"]}\n')
+        + ',features=[' + json.dumps(args.wasi_profile) + ']}\n')
     # Seed the diagnostic workspace from the repository's versions. Cargo may
     # prune unrelated packages/add this probe, but cannot fetch new versions.
     (host / 'Cargo.lock').write_bytes((ROOT / 'Cargo.lock').read_bytes())
@@ -199,7 +202,9 @@ def main():
     parser.add_argument('--only', nargs='+', choices=['node', 'esbuild', 'typescript', 'tsx'])
     parser.add_argument('--offline', action='store_true')
     parser.add_argument('--cxx', default=os.environ.get('CXX', 'clang++'))
+    parser.add_argument('--cxx-kind', choices=['clang', 'gcc'], default='clang')
     parser.add_argument('--sysroot', type=Path)
+    parser.add_argument('--wasi-profile', choices=['python-wasi', 'esbuild-wasi'], default='esbuild-wasi')
     args = parser.parse_args()
     args.work = args.work.resolve()
     if not args.work.is_relative_to((ROOT / 'target').resolve()) or args.work == (ROOT / 'target').resolve():

@@ -10,5 +10,6 @@ vibeos-hal = { path = "../../hal" }
 mmu-large-memory = []
 python-wasi = []
 esbuild-wasi = []
+node-runtime = []
 storage-bench = []
 storage-bench-128m = ["storage-bench"]

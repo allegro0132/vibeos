@@ -1,0 +1,64 @@
+   Compiling bitflags v2.13.1
+   Compiling typenum v1.20.1
+   Compiling rustc_apfloat v0.2.3+llvm-462a31f5a5ab
+   Compiling libc v0.2.189
+   Compiling smallvec v1.15.2
+   Compiling wasmparser v0.239.0
+   Compiling cfg-if v1.0.4
+   Compiling leb128fmt v0.1.0
+   Compiling bumpalo v3.20.3
+   Compiling memchr v2.8.3
+   Compiling wasm-encoder v0.255.0
+   Compiling vibeos-wasmi-collections-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/collections)
+   Compiling unicode-width v0.2.2
+   Compiling spin v0.9.9
+   Compiling wasmparser v0.255.0
+   Compiling hybrid-array v0.4.14
+   Compiling vibeos-hal v0.1.0 (/Users/ziangwang/Sources/vibeos/hal)
+   Compiling wast v255.0.0
+   Compiling vibeos-durable-format v0.1.0 (/Users/ziangwang/Sources/vibeos/durable-format)
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling vibeos-wasmi-core-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/core)
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling vibeos-core v0.1.0 (/Users/ziangwang/Sources/vibeos/core)
+   Compiling cpufeatures v0.3.0
+   Compiling vibeos-wasmi-ir-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/ir)
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+   Compiling digest v0.11.3
+warning: `vibeos-durable-format` (lib) generated 1 warning
+   Compiling sha2 v0.11.0
+   Compiling vibeos-component-format v0.1.0 (/Users/ziangwang/Sources/vibeos/component-format)
+   Compiling vibeos-wasmi-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/wasmi)
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+   Compiling vibeos-wasi-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasi-runtime)
+   Compiling wat v1.255.0
+    Finished `dev` profile [optimized + debuginfo] target(s) in 21.99s
+     Running `target/debug/examples/fixtures /Users/ziangwang/Sources/vibeos/target/node-runtime/wasi-regression-2/fixtures`
+PASS standard Rust/C commands, arguments, binary stdin, stderr, exit
+wrote OpenSSH private key to /Users/ziangwang/Sources/vibeos/target/node-runtime/wasi-regression-2/rejected_key
+PASS upload failures, containment and disconnect recovery
+PASS local pipeline, post-boot compilation, 100 reclaimed invocations
+PASS WASI_QEMU: upload, execution, lifecycle, restart; evidence: /Users/ziangwang/Sources/vibeos/target/node-runtime/wasi-regression-2

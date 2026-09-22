@@ -1,0 +1,601 @@
+wrote OpenSSH private key to /Users/ziangwang/Sources/vibeos/target/node-runtime/wasi-regression-2/id_ed25519
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x0000000087e00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x80ea6000..0x88000000  (116072 KiB)
+NATIVE TLS identity physical=0 logical=0 PASS
+  traps     stvec armed, PLIC ctx S/hart0, IRQ 10 enabled
+NATIVE TLS identity physical=1 logical=1 PASS
+NATIVE TLS identity physical=2 logical=2 PASS
+NATIVE TLS identity physical=3 logical=3 PASS
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x807a6000..0x809a6000, MXR clear, RFENCE ready
+  read-only 492 KiB .rodata 0x80603000..0x8067e000; 4096 KiB COW capability-table pool
+  net map   net0 <- mmio@0x10001000 (virtio-mmio)
+  world     19 capability spaces, 1 typed channel, 9 components
+  sched     async executor, no threads, no preemption
+ssh-test listening on 10.0.2.15:2222
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI upload receiving rust.wasm
+vsh> [2K[logger] reading #1 = 21.537 C
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #2 = 21.574 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 1
+vsh> [2K[logger] reading #3 = 21.611 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(7) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 7
+vsh> [2K[logger] reading #4 = 21.648 C
+vsh> [2KWASI upload receiving c.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #5 = 21.685 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 2
+vsh> [2K[logger] reading #6 = 21.722 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #7 = 21.759 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(7) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 7
+vsh> [2Kssh-test connection reset: SSH peer disconnected before session start
+vsh> [2KWASI upload receiving c.wasm
+vsh> [2Kssh-test exec complete: status 2
+vsh> [2KWASI upload receiving c.wasm
+vsh> [2Kssh-test exec complete: status 2
+vsh> [2K[logger] reading #8 = 21.796 C
+vsh> [2KWASI upload receiving c.wasm
+vsh> [2Kssh-test exec complete: status 2
+vsh> [2KWASI upload receiving c.wasm
+vsh> [2K[guest]  heartbeat 3
+vsh> [2Kssh-test connection reset: WASI SSH channel closed
+vsh> [2K[logger] reading #9 = 21.833 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2Kssh-test connection reset: SSH peer disconnected before session start
+vsh> [2K[logger] reading #10 = 21.870 C
+vsh> [2KWASI upload receiving malformed.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI admission rejected: Malformed
+vsh> [2KWASI admission heap=HeapSnapshot { live_bytes: 3187712, peak_live_bytes: 3581696, bump_used_bytes: 3975808, bump_remaining_bytes: 114881920 } allocation_failure=None
+vsh> [2KWASI terminal=Denied reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 126
+vsh> [2K[logger] reading #11 = 21.907 C
+vsh> [2KWASI upload receiving copy.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 4
+vsh> [2K[logger] reading #12 = 21.944 C
+vsh> [2KWASI upload receiving bounds.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #13 = 21.981 C
+vsh> [2KWASI upload receiving memory.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=LimitExceeded reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 124
+vsh> [2K[logger] reading #14 = 22.018 C
+vsh> [2KWASI upload receiving trap.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Trapped reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 125
+vsh> [2KWASI upload receiving unknown.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 5
+vsh> [2K[logger] reading #15 = 22.055 C
+vsh> [2KWASI admission rejected: Import
+vsh> [2KWASI admission heap=HeapSnapshot { live_bytes: 5025536, peak_live_bytes: 5462784, bump_used_bytes: 5720704, bump_remaining_bytes: 113137024 } allocation_failure=None
+vsh> [2KWASI terminal=Denied reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 126
+vsh> [2KWASI upload receiving loop.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #16 = 22.092 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=LimitExceeded reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 124
+vsh> [2KWASI upload receiving output.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #17 = 22.129 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=LimitExceeded reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 124
+vsh> [2KWASI running
+vsh> wasm-run @home/wasm/c.wasm; echo BUSY_CHECK_DONE
+BUSY_CHECK_DONE
+  vsh job %1: Unavailable
+[2Kvsh> [2Kssh-test connection reset: WASI SSH channel closed
+vsh> [2KWASI terminal=Cancelled reclaimed=true caps=0 waiters=0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 6
+vsh> echo local-pipe | wasm-run @home/wasm/c.wasm filter; echo LOCAL_WASI_DONE
+[logger] reading #18 = 22.166 C
+WASI running
+LOCAL-PIPE
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+LOCAL_WASI_DONE
+[2Kvsh> wasm-run @home/wasm/rust.wasm loop
+WASI running
+^C
+  vsh job %5: Cancelled
+[2Kvsh> [2KWASI terminal=Cancelled reclaimed=true caps=0 waiters=0
+vsh> wasm-run @home/wasm/c.wasm; echo AFTER_CANCEL
+WASI running
+Hello from C WASI!WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+
+AFTER_CANCEL
+[2Kvsh> [2KWASI upload receiving changed.wasm
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #19 = 22.203 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #20 = 22.240 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 7
+vsh> [2K[logger] reading #21 = 22.277 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #22 = 22.314 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #23 = 22.351 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 8
+vsh> [2K[logger] reading #24 = 22.388 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #25 = 21.525 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #26 = 21.562 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 9
+vsh> [2KWASI running
+vsh> [2K[logger] reading #27 = 21.599 C
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #28 = 21.636 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #29 = 21.673 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 10
+vsh> [2K[logger] reading #30 = 21.710 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #31 = 21.747 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #32 = 21.784 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 11
+vsh> [2K[logger] reading #33 = 21.821 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #34 = 21.858 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #35 = 21.895 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 12
+vsh> [2KWASI running
+vsh> [2K[logger] reading #36 = 21.932 C
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #37 = 21.969 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #38 = 22.006 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 13
+vsh> [2K[logger] reading #39 = 22.043 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #40 = 22.080 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #41 = 22.117 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 14
+vsh> [2KWASI running
+vsh> [2K[logger] reading #42 = 22.154 C
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #43 = 22.191 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #44 = 22.228 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 15
+vsh> [2K[logger] reading #45 = 22.265 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #46 = 22.302 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #47 = 22.339 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 16
+vsh> [2K[logger] reading #48 = 22.376 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #49 = 21.513 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #50 = 21.550 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 17
+vsh> [2K[logger] reading #51 = 21.587 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #52 = 21.624 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #53 = 21.661 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 18
+vsh> [2K[logger] reading #54 = 21.698 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #55 = 21.735 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #56 = 21.772 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 19
+vsh> [2K[logger] reading #57 = 21.809 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #58 = 21.846 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #59 = 21.883 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 20
+vsh> [2K[logger] reading #60 = 21.920 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #61 = 21.957 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #62 = 21.994 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[guest]  heartbeat 21
+vsh> [2K[logger] reading #63 = 22.031 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #64 = 22.068 C
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2KWASI running
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2Kssh-test exec complete: status 0
+vsh> [2K[logger] reading #65 = 22.105 C
+vsh> qemu-system-riscv64: terminating on signal 15 from pid 55464 (<unknown process>)

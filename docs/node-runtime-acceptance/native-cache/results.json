@@ -1,0 +1,71 @@
+{
+  "scope": "hart identity under foreign tp; not full native TLS or V8 acceptance; protected native call/return, suspend/resume, Rust Drop and FCSR restoration; C++ RAII across suspension (no standard-library runtime)",
+  "kernel_sha256": "b916e298d8805af576d3f675f77b68f511c56fd7e62e1a2eb062d471d48c860b",
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-cache-qemu-1/kernel.elf",
+    "-net",
+    "none"
+  ],
+  "passed": true,
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "kernel/src/lib.rs": "fb0a3d69d4b7f8784f876c32923d2f6af2f82d45eb4911a8c4601d1d1c89b27d",
+    "kernel/Cargo.toml": "9b82ccfb6caf4c660019ef5d97006683290e4789b6401c91f9c295652cd5012c",
+    "firmware/qemu-virt/Cargo.toml": "ce7212ad8ecf45a9dfe5afaed06d15a401f52302e5da6fbb83d824c63b570248",
+    "kernel/src/mmu.rs": "134c96a1b4f93844f78d598cf136d4324c2ddae6a605b74d0c3f4ed32f8fe175",
+    "kernel/src/trap.rs": "dd212c0e2193c6c0569aa127a7e7e422544de767fcab6f4801fb1d06501ac698",
+    "kernel/src/native_call.rs": "dbe949c50d0ff5ef60044996b9783b8c9bdc8bea39472e9c81404a4a64587265",
+    "kernel/src/native_pages.rs": "c60bee39e6d57b96771fdbbc5916f8bf056e72fe05670fbc40ad26c6c13a0e4e",
+    "kernel/build.rs": "f2b593ffcc67215e87ffbfd51077ddbbb98de4e6bd741748dbc28879c9516697",
+    "tools/node-runtime/tests/native-cxx-probe.cc": "406a88992409fe00a369012c30f87448fd38cee121a9a0d0a97298b154285062",
+    "tools/node-runtime/toolchain.lock.json": "970f5c6019938f49297d5a6204d7fef3d20f6b3ecd8751dab9c7e97926203597",
+    "tools/node-runtime/platform/vibeos-cache.h": "9232e402dc237c8c1392a44c28ab6047152164ef2bbe31ab1a43cffdc554e1c3",
+    "scripts/test-native-tls-qemu.py": "70835647b3c38e1bbc6863f046e442f7b4ba538242e856d2f2f301931ae76c15"
+  },
+  "observed_checks": {
+    "harts": true,
+    "shell": true,
+    "call": true,
+    "suspend": true,
+    "cxx": true,
+    "park": true,
+    "pages": true,
+    "cache": true
+  },
+  "hart_pairs": [
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      1
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "native_call_passed": true,
+  "native_suspend_passed": true,
+  "native_cxx_passed": true,
+  "native_executor_parking_passed": true,
+  "native_page_permissions_passed": true,
+  "elapsed_seconds": 0.3870428749942221
+}

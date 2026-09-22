@@ -1,0 +1,11 @@
+--- a/tools/v8_gypfiles/features.gypi
++++ b/tools/v8_gypfiles/features.gypi
+@@ -88,7 +88,7 @@
+         'v8_enable_private_mapping_fork_optimization': 0,
+       }],
+ 
+-      ['OS in "aix os400"', {
++      ['OS in "aix os400 vibeos"', {
+         'v8_enable_leaptiering': 0,
+       }, {
+         'v8_enable_leaptiering': 1,

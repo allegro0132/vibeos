@@ -1,0 +1,1 @@
+Host regressions: `rustup run nightly-2026-08-01 cargo test --locked --offline -j2 -p vibeos-core -p vibeos-runtime-riscv --lib` passed. Exact counts are in tests.log. These tests cover core host-testable behavior and SBI mapping; the new target-only native modules and native ABI execution require QEMU evidence and are not covered by this result.

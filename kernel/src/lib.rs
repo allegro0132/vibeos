@@ -15,7 +15,7 @@
 
 #[cfg(feature = "wasi-preview1")]
 mod wasi;
-#[cfg(any(feature = "wasi-preview1", feature = "wasmtime-native"))]
+#[cfg(any(feature = "wasi-preview1", feature = "wasmtime-native", feature = "native-cxx-probe"))]
 mod wasi_clock;
 
 #[cfg(all(
@@ -1150,6 +1150,40 @@ mod segment_store_platform;
 mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
+#[cfg(feature = "native-memory")]
+mod native_pages;
+#[cfg(feature = "native-memory")]
+mod native_page_pool;
+#[cfg(feature = "native-call-probe")]
+mod native_call;
+#[cfg(feature = "native-cxx-probe")]
+mod native_tls;
+#[cfg(feature = "native-cxx-probe")]
+mod native_memory;
+#[cfg(feature = "native-cxx-probe")]
+mod native_notify;
+#[cfg(feature = "native-cxx-probe")]
+mod native_wait;
+#[cfg(feature = "native-cxx-probe")]
+mod native_semaphore;
+#[cfg(all(feature = "native-cxx-probe", feature = "queued-entropy"))]
+mod native_entropy;
+#[cfg(feature = "native-cxx-probe")]
+mod native_tcb_pages;
+#[cfg(feature = "native-cxx-probe")]
+mod native_libc_heap;
+#[cfg(feature = "native-cxx-probe")]
+mod native_stdio;
+#[cfg(feature = "native-cxx-probe")]
+mod native_process;
+#[cfg(feature = "native-cxx-probe")]
+mod native_files;
+#[cfg(feature = "native-cxx-probe")]
+mod native_clock;
+#[cfg(all(feature = "native-call-probe", not(target_feature = "d")))]
+compile_error!("native-call-probe requires the riscv64gc LP64D target");
+#[cfg(all(feature = "native-call-probe", feature = "wasmtime-async"))]
+compile_error!("native-call-probe owns the isolated test stack slots");
 mod trap;
 #[cfg(feature = "counter-probe")]
 mod counter_probe;
@@ -1414,8 +1448,12 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
 
     ipi::mark_online(exec::HartId::BOOT, boot_physical_hart)
         .expect("boot physical hart must have one logical scheduler identity");
+    #[cfg(feature = "native-runtime-probe")]
+    probe_native_tls_identity(boot_physical_hart, exec::HartId::BOOT.index());
     // Install the logical identity before any trap-local state can be used.
     trap::init_boot();
+    #[cfg(all(feature = "native-call-probe", not(feature = "node-runtime")))]
+    { native_call::probe(); native_call::suspend_probe(); }
     KERNEL_READY_HARTS.store(BOOT_HART_BIT, Ordering::Release);
     exec::set_ready_notify_hook(ipi::notify_ready);
     println!(
@@ -2061,6 +2099,11 @@ fn start_services(boot_time: u64) -> ! {
     println!("  image     isolated C8.10-S5 fixed-QEMU SIMD qualification");
     println!("  sched     async executor, no threads, no preemption");
 
+    #[cfg(all(feature = "native-cxx-probe", not(feature = "node-runtime")))]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "native-cxx-park", native_call::parking_probe());
+    #[cfg(feature = "node-runtime")]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "v8-gate", native_call::v8_gate());
+
     trap::enable_interrupts();
     uart::early_write("[VibeOS] interrupts enabled\r\n");
     let (busy, phantom_timeout) = uart::dw_irq_recoveries();
@@ -2180,6 +2223,8 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
     if ipi::mark_online(logical, physical_hart).is_err() {
         sbi::shutdown(true);
     }
+    #[cfg(feature = "native-runtime-probe")]
+    probe_native_tls_identity(physical_hart, logical.index());
     // Timer initialization uses hart-local allocation/recovery context and
     // therefore follows self-registration.
     trap::finish_secondary();
@@ -2187,6 +2232,39 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
     KERNEL_READY_HARTS.fetch_or(1usize << logical.index(), Ordering::Release);
     trap::enable_interrupts();
     exec::run()
+}
+
+/// Exercise kernel identity queries with a foreign TLS value in tp. This is
+/// only an ABI prerequisite probe, not a C++ TLS allocation/destruction test.
+#[cfg(feature = "native-runtime-probe")]
+fn probe_native_tls_identity(physical: usize, logical: usize) {
+    extern "C" fn check(_tls: usize, physical: usize, logical: usize) -> usize {
+        usize::from(sbi::current_hart_id() == physical
+            && sbi::cached_logical_hart_index() == Some(logical))
+    }
+    let passed: usize;
+    // Save/restore tp inside a single assembly block, across a real Rust call.
+    // The temporary value is deliberately unrelated to either hart identity.
+    // No memory is dereferenced through this synthetic TLS pointer.
+    unsafe {
+        core::arch::asm!(
+            "addi sp, sp, -16",
+            "sd ra, 0(sp)",
+            "sd tp, 8(sp)",
+            "mv tp, a0",
+            "call {check}",
+            "ld tp, 8(sp)",
+            "ld ra, 0(sp)",
+            "addi sp, sp, 16",
+            check = sym check,
+            inlateout("a0") 0x1234_5000usize => passed,
+            in("a1") physical,
+            in("a2") logical,
+            clobber_abi("C"),
+        );
+    }
+    assert_eq!(passed, 1, "native TLS corrupted hart identity");
+    println!("NATIVE TLS identity physical={} logical={} PASS", physical, logical);
 }
 
 /// Executor callback after every task and external registration in a tracked

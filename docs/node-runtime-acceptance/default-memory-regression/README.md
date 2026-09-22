@@ -1,0 +1,1 @@
+Non-Node IMAC baseline at 128 MiB: QEMU four-hart foreign-tp identity and VSH echo PASS. ELF heap end remains 0x88000000, with no V8 smoke or native libc initializer symbol. This checks the baseline memory/boot path after linker changes, not a complete WASI/files/MMU regression suite.

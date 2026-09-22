@@ -188,8 +188,8 @@ __trap_entry:
     .endif
 "#,
     fp_enabled = const cfg!(target_feature = "d") as usize,
-    independent_stack = const cfg!(feature = "wasmtime-async") as usize,
-    trap_bytes = const if cfg!(feature = "wasmtime-async") { 544 } else if cfg!(target_feature = "d") { 528 } else { 256 },
+    independent_stack = const cfg!(feature = "native-stacks") as usize,
+    trap_bytes = const if cfg!(feature = "native-stacks") { 544 } else if cfg!(target_feature = "d") { 528 } else { 256 },
 );
 
 extern "C" {

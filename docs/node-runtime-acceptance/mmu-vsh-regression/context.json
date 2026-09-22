@@ -1,0 +1,8 @@
+{
+  "kernel_sha256": "bafdbf28665e55bea713995f96c6b38704fae3c4c468cc61a03e71c678439e86",
+  "features": "legacy-shell",
+  "target": "riscv64imac-unknown-none-elf",
+  "mmu_exit": 0,
+  "vsh_initial_exit": 1,
+  "golden_correction": "Two preexisting output lines were missing: Ctrl-C echo (HEAD kernel/src/tty.rs:178) and vtop help (HEAD components/vsh/src/lib.rs:290). Runtime files unchanged by golden correction."
+}

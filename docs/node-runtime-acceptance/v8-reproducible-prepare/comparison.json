@@ -1,0 +1,7 @@
+{
+  "scope": "fresh locked-source patch/configuration check; not a clean full build or execution",
+  "patch_count": 26,
+  "compared_files": 64,
+  "all_match": true,
+  "mismatches": []
+}

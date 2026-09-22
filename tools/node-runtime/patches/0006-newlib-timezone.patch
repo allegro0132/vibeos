@@ -1,0 +1,43 @@
+--- a/deps/v8/third_party/abseil-cpp/absl/time/internal/cctz/src/time_zone_libc.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/time/internal/cctz/src/time_zone_libc.cc
+@@ -22,6 +22,11 @@
+ #include <ctime>
+ #include <limits>
+ #include <utility>
++#if defined(__vibeos__)
++extern "C" {
++#include <sys/_tz_structs.h>
++}
++#endif
+ 
+ #include "absl/base/config.h"
+ #include "absl/time/internal/cctz/include/cctz/civil_time.h"
+@@ -40,7 +45,16 @@
+ 
+ namespace {
+ 
+-#if defined(_WIN32) || defined(_WIN64)
++#if defined(__vibeos__)
++// The pinned newlib keeps POSIX seconds-west offsets in separate DST rules.
++// cctz expects seconds east. Preserve non-hour DST offsets as well.
++long tm_gmtoff(const std::tm& tm) {
++  return -__gettzinfo()->__tzrule[tm.tm_isdst > 0 ? 1 : 0].offset;
++}
++const char* tm_zone(const std::tm& tm) {
++  return tzname[tm.tm_isdst > 0 ? 1 : 0];
++}
++#elif defined(_WIN32) || defined(_WIN64)
+ // Uses the globals: '_timezone', '_dstbias' and '_tzname'.
+ auto tm_gmtoff(const std::tm& tm) -> decltype(_timezone + _dstbias) {
+   const bool is_dst = tm.tm_isdst > 0;
+@@ -229,7 +243,9 @@
+   const year_t year = tmp->tm_year + year_t{1900};
+   al.cs = civil_second(year, tmp->tm_mon + 1, tmp->tm_mday, tmp->tm_hour,
+                        tmp->tm_min, tmp->tm_sec);
+-  al.offset = static_cast<int>(tm_gmtoff(*tmp));
++  // A UTC conversion has zero offset even on libc implementations whose
++  // struct tm lacks an offset field (and whose lookup uses global rules).
++  al.offset = local_ ? static_cast<int>(tm_gmtoff(*tmp)) : 0;
+   al.abbr = local_ ? tm_zone(*tmp) : "UTC";  // as expected by cctz
+   al.is_dst = tmp->tm_isdst > 0;
+   return al;

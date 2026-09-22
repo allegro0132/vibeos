@@ -1,0 +1,309 @@
+--- a/deps/v8/src/compiler/backend/riscv/instruction-selector-riscv.h
++++ b/deps/v8/src/compiler/backend/riscv/instruction-selector-riscv.h
+@@ -124,6 +124,7 @@
+                  g.UseRegister(selector->input_at(node, 0)));
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ static void VisitRRI(InstructionSelectorT* selector, ArchOpcode opcode,
+                      OpIndex node) {
+   RiscvOperandGeneratorT g(selector);
+@@ -156,6 +157,8 @@
+   selector->Emit(opcode, g.DefineAsRegister(node), g.UseRegister(op.input(0)),
+                  g.UseImmediate(op.lane), g.UseUniqueRegister(op.input(1)));
+ }
++
++#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+ void VisitRRR(InstructionSelectorT* selector, InstructionCode opcode,
+               OpIndex node,
+@@ -291,6 +294,7 @@
+        g.UseFixed(this->input_at(node, 0), a0));
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void EmitS128Load(InstructionSelectorT* selector, OpIndex node,
+                   InstructionCode opcode, VSew sew, Vlmul lmul);
+ 
+@@ -389,6 +393,8 @@
+   }
+ }
+ 
++#endif  // V8_ENABLE_WEBASSEMBLY
++
+ // Shared routine for multiple compare operations.
+ 
+ static Instruction* VisitCompare(InstructionSelectorT* selector,
+@@ -816,6 +822,7 @@
+   VisitRRO(this, kRiscvSar32, node);
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void InstructionSelectorT::VisitI32x4ExtAddPairwiseI16x8S(OpIndex node) {
+   RiscvOperandGeneratorT g(this);
+   InstructionOperand src1 = g.TempSimd128Register();
+@@ -1670,6 +1677,8 @@
+        g.UseImmediate(m1));
+ }
+ 
++#endif  // V8_ENABLE_WEBASSEMBLY
++
+ void InstructionSelectorT::VisitSignExtendWord8ToInt32(OpIndex node) {
+   RiscvOperandGeneratorT g(this);
+   Emit(kRiscvSignExtendByte, g.DefineAsRegister(node),
+@@ -1686,6 +1695,7 @@
+   VisitRR(this, kRiscvClz32, node);
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ #define VISIT_EXT_MUL(OPCODE1, OPCODE2, TYPE)                                \
+                                                                              \
+   void InstructionSelectorT::Visit##OPCODE1##ExtMulLow##OPCODE2##S(          \
+@@ -1757,6 +1767,8 @@
+   VisitUniqueRRR(this, kRiscvF64x2Pmax, node);
+ }
+ 
++#endif  // V8_ENABLE_WEBASSEMBLY
++
+ void InstructionSelectorT::VisitTruncateFloat64ToFloat16RawBits(OpIndex node) {
+   UNIMPLEMENTED();
+ }
+--- a/deps/v8/src/compiler/backend/riscv/instruction-selector-riscv64.cc
++++ b/deps/v8/src/compiler/backend/riscv/instruction-selector-riscv64.cc
+@@ -228,6 +228,7 @@
+   }
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void InstructionSelectorT::VisitStoreLane(OpIndex node) {
+   const Simd128LaneMemoryOp& store = Get(node).Cast<Simd128LaneMemoryOp>();
+   InstructionCode opcode = kRiscvS128StoreLane;
+@@ -269,6 +270,8 @@
+        g.UseRegister(this->input_at(node, 2)), g.UseImmediate(load.lane),
+        addr_reg, g.TempImmediate(0));
+ }
++
++#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+ namespace {
+ ArchOpcode GetLoadOpcode(MemoryRepresentation loaded_rep,
+@@ -600,9 +603,12 @@
+   }
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void InstructionSelectorT::VisitSimd128ReverseBytes(OpIndex node) {
+   UNREACHABLE();
+ }
++
++#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+ void InstructionSelectorT::VisitWord32Ctz(OpIndex node) {
+   RiscvOperandGeneratorT g(this);
+@@ -2219,6 +2225,7 @@
+   EmitSignExtendWord(this, node);
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void InstructionSelectorT::VisitF64x2Min(OpIndex node) {
+   RiscvOperandGeneratorT g(this);
+   InstructionOperand temp1 = g.TempFpRegister(v0);
+@@ -2270,6 +2277,7 @@
+ }
+ 
+ //
++#endif  // V8_ENABLE_WEBASSEMBLY
+ // void InstructionSelectorT::Comment(const std::string msg){
+ //     RiscvOperandGeneratorT g(this);
+ //     if (!v8_flags.code_comments) return;
+--- a/deps/v8/src/compiler/backend/riscv/code-generator-riscv.cc
++++ b/deps/v8/src/compiler/backend/riscv/code-generator-riscv.cc
+@@ -789,6 +789,7 @@
+       frame_access_state()->ClearSPDelta();
+       break;
+     }
++#if V8_ENABLE_WEBASSEMBLY
+     case kArchCallWasmFunction:
+     case kArchCallWasmFunctionIndirect: {
+       if (instr->InputAt(0)->IsImmediate()) {
+@@ -807,6 +808,7 @@
+       frame_access_state()->ClearSPDelta();
+       break;
+     }
++#endif  // V8_ENABLE_WEBASSEMBLY
+     case kArchTailCallCodeObject: {
+       if (instr->InputAt(0)->IsImmediate()) {
+         __ Jump(i.InputCode(0), RelocInfo::CODE_TARGET);
+@@ -823,6 +825,7 @@
+       frame_access_state()->SetFrameAccessToDefault();
+       break;
+     }
++#if V8_ENABLE_WEBASSEMBLY
+     case kArchTailCallWasm:
+     case kArchTailCallWasmIndirect: {
+       if (instr->InputAt(0)->IsImmediate()) {
+@@ -845,6 +848,7 @@
+       frame_access_state()->SetFrameAccessToDefault();
+       break;
+     }
++#endif  // V8_ENABLE_WEBASSEMBLY
+     case kArchTailCallAddress: {
+       CHECK(!instr->InputAt(0)->IsImmediate());
+       Register reg = i.InputOrZeroRegister(0);
+@@ -4387,18 +4391,23 @@
+ 
+   if (frame_access_state()->has_frame()) {
+     if (call_descriptor->IsCFunctionCall()) {
++#if V8_ENABLE_WEBASSEMBLY
+       if (info()->GetOutputStackFrameType() == StackFrame::C_WASM_ENTRY) {
+         __ StubPrologue(StackFrame::C_WASM_ENTRY);
+         // Reserve stack space for saving the c_entry_fp later.
+         __ SubWord(sp, sp, Operand(kSystemPointerSize));
+       } else {
++#endif  // V8_ENABLE_WEBASSEMBLY
+         __ Push(ra, fp);
+         __ Move(fp, sp);
+-      }
++#if V8_ENABLE_WEBASSEMBLY
++      }
++#endif  // V8_ENABLE_WEBASSEMBLY
+     } else if (call_descriptor->IsJSFunctionCall()) {
+       __ Prologue();
+     } else {
+       __ StubPrologue(info()->GetOutputStackFrameType());
++#if V8_ENABLE_WEBASSEMBLY
+       if (call_descriptor->IsAnyWasmFunctionCall() ||
+           call_descriptor->IsWasmImportWrapper() ||
+           call_descriptor->IsWasmCapiFunction()) {
+@@ -4408,6 +4417,7 @@
+         // Reserve space for saving the PC later.
+         __ SubWord(sp, sp, Operand(kSystemPointerSize));
+       }
++#endif  // V8_ENABLE_WEBASSEMBLY
+     }
+   }
+ 
+@@ -4442,6 +4452,7 @@
+ 
+   if (required_slots > 0) {
+     DCHECK(frame_access_state()->has_frame());
++#if V8_ENABLE_WEBASSEMBLY
+     if (info()->IsWasm() && required_slots > 128) {
+       // For WebAssembly functions with big frames we have to do the stack
+       // overflow check before we construct the frame. Otherwise we may not
+@@ -4493,6 +4504,7 @@
+       }
+       __ bind(&done);
+     }
++#endif  // V8_ENABLE_WEBASSEMBLY
+   }
+ 
+   const int returns = frame()->GetReturnSlotCount();
+--- a/deps/v8/src/compiler/backend/riscv/instruction-scheduler-riscv.cc
++++ b/deps/v8/src/compiler/backend/riscv/instruction-scheduler-riscv.cc
+@@ -1078,10 +1078,14 @@
+   // numbers).
+   switch (instr->arch_opcode()) {
+     case kArchCallCodeObject:
++#if V8_ENABLE_WEBASSEMBLY
+     case kArchCallWasmFunction:
++#endif
+       return CallLatency();
+     case kArchTailCallCodeObject:
++#if V8_ENABLE_WEBASSEMBLY
+     case kArchTailCallWasm:
++#endif
+     case kArchTailCallAddress:
+       return JumpLatency();
+     case kArchCallJSFunction: {
+--- a/deps/v8/src/codegen/riscv/macro-assembler-riscv.cc
++++ b/deps/v8/src/codegen/riscv/macro-assembler-riscv.cc
+@@ -25,7 +25,9 @@
+ #include "src/objects/heap-number.h"
+ #include "src/runtime/runtime.h"
+ #include "src/snapshot/snapshot.h"
++#if V8_ENABLE_WEBASSEMBLY
+ #include "src/wasm/wasm-code-manager.h"
++#endif
+ 
+ // Satisfy cpplint check, but don't include platform-specific header. It is
+ // included recursively via macro-assembler.h.
+@@ -644,11 +646,14 @@
+   // need to be caller saved.
+   DCHECK_EQ(WriteBarrierDescriptor::ObjectRegister(), object);
+   DCHECK_EQ(WriteBarrierDescriptor::SlotAddressRegister(), slot_address);
++#if V8_ENABLE_WEBASSEMBLY
+   if (mode == StubCallMode::kCallWasmRuntimeStub) {
+     auto wasm_target =
+         static_cast<Address>(wasm::WasmCode::GetRecordWriteBuiltin(fp_mode));
+     Call(wasm_target, RelocInfo::WASM_STUB_CALL);
+-  } else {
++  } else
++#endif
++  {
+     CallBuiltin(Builtins::RecordWrite(fp_mode));
+   }
+ }
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/poison.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/poison.cc
+@@ -56,19 +56,20 @@
+ }  // namespace
+ 
+ void* InitializePoisonedPointerInternal() {
++  void* data = nullptr;
+   const size_t block_size = GetPageSize();
+ #if defined(ABSL_HAVE_ADDRESS_SANITIZER)
+-  void* data = malloc(block_size);
++  data = malloc(block_size);
+   ASAN_POISON_MEMORY_REGION(data, block_size);
+ #elif defined(ABSL_HAVE_MEMORY_SANITIZER)
+-  void* data = malloc(block_size);
++  data = malloc(block_size);
+   __msan_poison(data, block_size);
+ #elif defined(ABSL_HAVE_MMAP)
+-  void* data = DirectMmap(nullptr, block_size, PROT_NONE,
++  data = DirectMmap(nullptr, block_size, PROT_NONE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+   if (data == MAP_FAILED) return GetBadPointerInternal();
+ #elif defined(_WIN32)
+-  void* data = VirtualAlloc(nullptr, block_size, MEM_RESERVE | MEM_COMMIT,
++  data = VirtualAlloc(nullptr, block_size, MEM_RESERVE | MEM_COMMIT,
+                             PAGE_NOACCESS);
+   if (data == nullptr) return GetBadPointerInternal();
+ #else
+--- a/deps/v8/src/builtins/riscv/builtins-riscv.cc
++++ b/deps/v8/src/builtins/riscv/builtins-riscv.cc
+@@ -3127,6 +3127,7 @@
+ 
+ #endif  // V8_ENABLE_WEBASSEMBLY
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ namespace {
+ void SwitchSimulatorStackLimit(MacroAssembler* masm) {
+   if (masm->options().enable_simulator_code) {
+@@ -3219,6 +3220,8 @@
+   __ bind(&no_stack_change);
+ }
+ }  // namespace
++
++#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+ void Builtins::Generate_CEntry(MacroAssembler* masm, int result_size,
+                                ArgvMode argv_mode, bool builtin_exit_frame,
+@@ -3540,6 +3543,7 @@
+   __ Ret();
+ }
+ 
++#if V8_ENABLE_WEBASSEMBLY
+ void Builtins::Generate_WasmToJsWrapperAsm(MacroAssembler* masm) {
+   int required_stack_space = arraysize(wasm::kFpParamRegisters) * kDoubleSize;
+   __ SubWord(sp, sp, Operand(required_stack_space));
+@@ -4593,6 +4597,8 @@
+                      kWasmImplicitArgRegister, t1, t2));
+   JSToWasmWrapperHelper(masm, wasm::kStressSwitch);
+ }
++
++#endif  // V8_ENABLE_WEBASSEMBLY
+ 
+ void Builtins::Generate_CallApiCallbackImpl(MacroAssembler* masm,
+                                             CallApiCallbackMode mode) {

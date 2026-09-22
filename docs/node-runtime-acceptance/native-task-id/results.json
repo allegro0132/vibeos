@@ -1,0 +1,84 @@
+{
+  "scope": "hart identity under foreign tp; not full native TLS or V8 acceptance; protected native call/return, suspend/resume, Rust Drop and FCSR restoration; C++ RAII, per-context GCC emutls across suspension, dynamic TLS initialization and LIFO exit destructors (not the full static C++ runtime)",
+  "kernel_sha256": "db1f0cf722bba4c1e04e4fda65fc58e7a9bf0aa965d35e0f915cfca674fc33c9",
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-task-id-qemu-1/kernel.elf",
+    "-net",
+    "none"
+  ],
+  "passed": true,
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "kernel/src/lib.rs": "d5d289ebbf7987b832e72f1bfef825f43f777f0baac1a784f2f091b58fcfa1aa",
+    "kernel/Cargo.toml": "9b82ccfb6caf4c660019ef5d97006683290e4789b6401c91f9c295652cd5012c",
+    "firmware/qemu-virt/Cargo.toml": "ce7212ad8ecf45a9dfe5afaed06d15a401f52302e5da6fbb83d824c63b570248",
+    "kernel/src/mmu.rs": "134c96a1b4f93844f78d598cf136d4324c2ddae6a605b74d0c3f4ed32f8fe175",
+    "kernel/src/trap.rs": "dd212c0e2193c6c0569aa127a7e7e422544de767fcab6f4801fb1d06501ac698",
+    "kernel/src/native_call.rs": "f3527ccbedd3abe5529f437c53255fc21a8c700f67985a7c0327ab3dc8a19e9b",
+    "kernel/src/native_clock.rs": "59455406375cd6518d5804a6c1dd5aea1713814134abc208cb21d796b2773270",
+    "kernel/src/wasi_clock.rs": "21b51f59482cfb9e7b7f1d6a1a26446d95fdb6eb2ea75cf74c5d1076bd8803d1",
+    "kernel/src/native_pages.rs": "c60bee39e6d57b96771fdbbc5916f8bf056e72fe05670fbc40ad26c6c13a0e4e",
+    "kernel/src/native_tcb_pages.rs": "b3eb67f0816c4393a66127160d25684fc54e5b994a3932d712383de0df6f152f",
+    "kernel/src/native_tls.rs": "b85b7184a8ea77c47f4bd8a6803760b9746f5a7da0d120af0503243909d3a617",
+    "firmware/qemu-virt/linker.ld": "f5ff421c40b115a7a82d04955a0d8468a62876c59fffb14f45c6b420d2329904",
+    "firmware/qemu-virt/build.rs": "df433d9d69cda67c9636385948edba3c2ed77f4bbe11fe31c829cb39d84d4aed",
+    "kernel/build.rs": "17b2adf2b91d7e5c051151d553d5fa63d517590e0e1d5f928b63dd60d26e8db6",
+    "tools/node-runtime/tests/native-cxx-probe.cc": "f269d0b67c110f957aa41243e98ee90f65e3bf2e5459c4cf01ca132dc6a28182",
+    "tools/node-runtime/toolchain.lock.json": "970f5c6019938f49297d5a6204d7fef3d20f6b3ecd8751dab9c7e97926203597",
+    "tools/node-runtime/platform/vibeos-sync.h": "1a821c64e331ad4622525991cc0639e127f53e940ce557864b1243a26a3fc845",
+    "tools/node-runtime/platform/vibeos-time.h": "c9c85d9b60b6ab8248c65826ef9d42be51c384d02cc6bed16f96cce64d1a4138",
+    "tools/node-runtime/platform/vibeos-cache.h": "9232e402dc237c8c1392a44c28ab6047152164ef2bbe31ab1a43cffdc554e1c3",
+    "tools/node-runtime/platform/vibeos-stack.h": "b4897aea4c341f79767bbee292635282cc22ca40892deb258ba0672111b8eb23",
+    "tools/node-runtime/platform/vibeos-tcb-pages.h": "0522287fb01e2821c4168304809f9c2f23a739d43a08f64db094cf4675c34e7d",
+    "scripts/test-native-tls-qemu.py": "d43932194d63045de44fd8626c56d1aad5e8eaa390293fbeef893534e7dd0754"
+  },
+  "observed_checks": {
+    "harts": true,
+    "shell": true,
+    "call": true,
+    "suspend": true,
+    "cxx": true,
+    "park": true,
+    "pages": true,
+    "cache": true,
+    "cxx_tls": true,
+    "tls_dtor": true,
+    "tcb_pages": true
+  },
+  "hart_pairs": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      2
+    ],
+    [
+      2,
+      0
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "native_call_passed": true,
+  "native_suspend_passed": true,
+  "native_cxx_passed": true,
+  "native_executor_parking_passed": true,
+  "native_page_permissions_passed": true,
+  "elapsed_seconds": 0.3740671669947915
+}

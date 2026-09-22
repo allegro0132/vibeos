@@ -1,0 +1,11 @@
+000000008061043c t vibeos_v8_smoke
+0000000081500e92 t __libc_fini
+0000000081500ea4 t vibeos_native_runtime_initialize
+00000000815aa440 T __libc_fini_array
+000000008180baa0 D __init_array_start
+000000008180baa0 D __preinit_array_end
+000000008180baa0 D __preinit_array_start
+000000008180baf8 D __fini_array_end
+000000008180baf8 D __fini_array_start
+000000008180baf8 D __init_array_end
+0000000081842a78 b _ZZ32vibeos_native_runtime_initializeE5state

@@ -1,0 +1,144 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling vibeos-runtime-riscv v0.1.0 (/Users/ziangwang/Sources/vibeos/runtime/riscv)
+warning: `vibeos-durable-format` (lib) generated 1 warning
+   Compiling vibeos-core v0.1.0 (/Users/ziangwang/Sources/vibeos/core)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib test) generated 1 warning (run `cargo fix --lib -p vibeos-core --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.93s
+     Running unittests src/lib.rs (target/debug/build/vibeos-core/67688d288c91fec8/out/vibeos_core-67688d288c91fec8)
+
+running 101 tests
+test boot_log::tests::retains_prefix_and_reports_truncation_without_overwriting ... ok
+test boot_log::tests::unpublished_writer_never_blocks_reader_or_exposes_later_fragment ... ok
+test cap::supervised_transfer_tests::revocable_proxy_request_rejects_wrong_type_and_administrative_rights ... ok
+test cap::tests::persistent_witness_consumption_checks_delivery_then_scopes_the_lease ... ok
+test cap::supervised_transfer_tests::supervised_transfer_values_are_opaque_and_debug_redacted ... ok
+test cap::supervised_transfer_tests::internal_proxy_relocation_preserves_node_and_fails_atomically ... ok
+test boot_log::tests::concurrent_fragments_are_complete_and_reads_are_repeatable ... ok
+test cap::supervised_transfer_tests::internal_grant_move_is_strict_atomic_and_keeps_revocation_ancestry ... ok
+test cap::tests::persistent_witness_rechecks_rights_and_complete_ancestry ... ok
+test exec::one_shot_wait_tests::allocation_identity_uses_running_domain_across_temporary_owner_scopes ... ok
+test exec::one_shot_wait_tests::prepared_detach_and_wait_capacity_exist_before_publication ... ok
+test exec::one_shot_wait_tests::prepared_six_edge_wait_uses_only_prepublication_registration_capacity ... ok
+test exec::one_shot_wait_tests::task_detach_is_exact_bounded_and_runs_after_ordinary_wait_cleanup ... ok
+test exec::one_shot_wait_tests::one_shot_wait_is_bounded_generation_safe_and_task_owned ... ok
+test exec::one_shot_wait_tests::one_shot_wake_and_replaced_waker_drop_reenter_outside_the_lock ... ok
+test exec::reclaimable_domain_tests::failed_staged_batch_admission_does_not_advance_the_live_table ... ok
+test exec::one_shot_wait_tests::continuation_probe_tracks_ready_work_and_cancellation_without_locks ... ok
+test exec::reclaimable_domain_tests::full_staged_domain_table_fails_without_touching_the_source_copy ... ok
+test exec::one_shot_wait_tests::bounded_continuation_yields_to_ready_work_and_cancellation ... ok
+test exec::one_shot_wait_tests::never_staged_exclusive_drop_drains_prepared_detach_as_cancelled ... ok
+test exec::reclaimable_domain_tests::parallel_fault_teardown_accounts_for_completing_siblings ... ok
+test exec::reclaimable_domain_tests::prepared_binding_rejects_a_same_number_counterfeit_status ... ok
+test exec::reclaimable_domain_tests::releasing_a_hidden_managed_slot_does_not_burn_its_generation ... ok
+test exec::reclaimable_domain_tests::managed_task_ledgers_move_into_exact_statuses_before_publication ... ok
+test exec::reclaimable_domain_tests::stale_domain_generation_cannot_resolve_a_reused_slot ... ok
+test exec::reclaimable_domain_tests::managed_reservation_installs_exact_inbound_join_capacity_before_publication ... ok
+test heap::fresh_domain_batch_tests::fresh_owner_identity_exhaustion_mutates_nothing ... ok
+test heap::fresh_domain_batch_tests::fresh_arena_identity_exhaustion_mutates_nothing ... ok
+test instance::tests::activation_failure_quarantines_the_whole_batch_without_publication ... ok
+test instance::tests::bind_batch_preserves_order_and_is_compatible_with_atomic_activation ... ok
+test instance::tests::bind_batch_late_mismatch_never_leaves_a_bound_prefix ... ok
+test instance::tests::atomic_header_mismatch_is_sticky_quarantine ... ok
+test instance::tests::bind_batch_rejects_oversize_before_candidate_scan_or_mutation ... ok
+test instance::tests::corrupt_header_cannot_hide_a_retained_arena_from_duplicate_scan ... ok
+test instance::tests::continuation_fault_gate_rejects_every_frozen_projection_mismatch ... ok
+test instance::tests::cooperative_cancel_after_payload_drop_is_inert_and_does_not_reset ... ok
+test instance::tests::cooperative_cancel_loses_to_payload_dropping_without_mutation ... ok
+test instance::tests::cooperative_cancel_drops_a_parked_payload_without_quarantine ... ok
+test instance::tests::cooperative_cancel_mismatched_handle_quarantines_both_without_cspace_change ... ok
+test instance::tests::cooperative_cancel_tombstones_and_drops_on_next_exact_child_poll ... ok
+test instance::tests::fault_after_real_pending_quantum_abandons_without_payload_drop ... ok
+test instance::tests::exact_fault_abandons_payload_without_drop_and_retires_owner_before_reset ... ok
+test instance::tests::expected_payload_completion_mismatch_never_publishes_retires_or_resets ... ok
+test instance::tests::explicit_quarantine_never_vacates_or_resets_the_space ... ok
+test instance::tests::external_continuation_parks_without_spinning_and_resumes_on_exact_task_hart ... ok
+test instance::tests::fault_reclaim_space_callback_runs_unlocked_before_reclaim_and_reset ... ok
+test instance::tests::failed_terminal_publication_quarantines_without_retire_or_cspace_reset ... ok
+test instance::tests::consumed_continuation_survives_payload_drop_fault_without_second_drop ... ok
+test instance::tests::fault_detach_drains_a_parked_continuation_before_raw_reclaim_and_reset ... ok
+test instance::tests::fault_gate_rejects_every_mismatched_identity_projection_before_reclaim ... ok
+test instance::tests::fault_identity_mismatch_keeps_payload_and_never_polls_or_reclaims ... ok
+test instance::tests::named_batch_skips_an_early_exhausted_cspace_for_a_later_viable_slot ... ok
+test instance::tests::failed_normal_retire_does_not_reset_after_child_drop ... ok
+test instance::tests::fault_replay_after_reclaimed_never_invokes_raw_reclaim_or_reset_twice ... ok
+test instance::tests::fixed_table_never_allocates_a_seventeenth_slot ... ok
+test instance::tests::opaque_tokens_expose_only_stable_slot_alias_rejection ... ok
+test instance::tests::fault_reclaiming_is_an_unperturbed_cross_hart_lease ... ok
+test instance::tests::missing_token_scan_checks_task_and_prepared_domain_projections ... ok
+test instance::tests::named_batch_reservation_is_ordered_distinct_and_atomically_abortable ... ok
+test instance::tests::named_batch_validation_capacity_and_generation_failures_mutate_nothing ... ok
+test instance::tests::payload_normal_completion_drops_once_in_child_poll_and_detaches_word ... ok
+test instance::tests::normal_finalize_rejects_projection_mismatches_before_close_or_reset ... ok
+test instance::tests::quantum_continuation_self_wakes_once_and_uses_two_exact_polls ... ok
+test instance::tests::real_terminal_lifecycle_resets_once_then_invalidates_the_old_token ... ok
+test instance::tests::refused_fault_space_cleanup_quarantines_before_any_reset ... ok
+test instance::tests::payload_drop_fault_reaches_exact_dropping_gate_without_second_drop ... ok
+test instance::tests::reserved_batch_abort_rejects_the_complete_set_before_mutation ... ok
+test instance::tests::prepared_binding_mismatch_is_sticky_quarantine ... ok
+test instance::tests::one_arena_cannot_be_registered_again_under_a_different_owner ... ok
+test instance::tests::only_non_system_tracked_domains_are_admitted ... ok
+test instance::tests::out_of_range_token_quarantines_the_exact_terminal_handle_slot ... ok
+test instance::tests::reserved_space_pair_gate_quarantines_both_on_exact_incarnation_fault ... ok
+test instance::tests::reserved_space_pair_gate_rejects_same_slot_and_stale_token_without_mutation ... ok
+test instance::tests::repeated_fault_generations_reuse_one_slot_without_registry_leaks ... ok
+test instance::tests::fault_linearization_quarantines_a_retained_arena_alias_in_another_slot ... ok
+test instance::tests::reserved_space_configuration_is_system_stable_and_resets_after_terminal_publication ... ok
+test instance::tests::refused_raw_reclaim_quarantines_without_close_or_cspace_reset ... ok
+test instance::tests::reserved_space_pair_gate_rejects_an_exact_owner_alias ... ok
+test instance::tests::stale_continuation_cannot_wake_a_reused_instance_slot ... ok
+test instance::tests::reserved_space_pair_gate_runs_in_caller_order_and_is_read_only ... ok
+test instance::tests::stale_generation_quarantines_the_new_occupant_without_aliasing_it ... ok
+test instance::tests::reserved_space_pair_transfer_capability_error_rolls_back_without_mutation ... ok
+test instance::tests::stale_poll_witness_quarantines_without_poll_or_payload_tombstone ... ok
+test instance::tests::terminal_continuation_mismatch_never_retires_or_resets_cspace ... ok
+test instance::tests::second_install_validation_mismatch_leaks_without_payload_drop ... ok
+test instance::tests::reserve_checks_bound_task_and_prepared_domains_when_record_domain_disagrees ... ok
+test instance::tests::reserved_space_pair_transfer_executes_after_postflight_and_finalizes_once ... ok
+test net_segment_pool::tests::abandoned_slot_guard_is_recovered_before_buffer_reuse ... ok
+test instance::tests::structural_observation_checks_status_domain_and_space_without_touching_cspace ... ok
+test instance::tests::reserved_space_pair_transfer_rolls_back_without_finalize_on_postflight_failure ... ok
+test instance::tests::structural_observation_rejects_a_different_status_handle_without_reset ... ok
+test net_segment_pool::tests::exhausted_generation_never_reserves_or_wraps ... ok
+test instance::tests::running_finalize_is_inert_and_terminal_finalize_resets_exactly_once ... ok
+test poll_budget::tests::idle_has_no_grace_and_empty_polls_do_not_renew_it ... ok
+test instance::tests::terminal_publication_projection_mismatch_never_retires_or_resets ... ok
+test poll_budget::tests::stopped_clock_is_bounded_and_progress_rearms ... ok
+test poll_budget::tests::wrapping_clock_preserves_bounded_elapsed_time ... ok
+test sync::tests::stale_recovery_snapshot_cannot_claim_a_reacquired_lock ... ok
+test instance::tests::terminal_retirement_phases_are_unperturbed_cross_hart_leases ... ok
+test instance::tests::token_loss_with_an_arena_owner_alias_quarantines_without_legacy_reclaim ... ok
+test instance::tests::wrong_in_range_token_quarantines_the_exact_terminal_handle_slot ... ok
+
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/vibeos-runtime-riscv/8d0d9f3bf598a77e/out/vibeos_runtime_riscv-8d0d9f3bf598a77e)
+
+running 2 tests
+test mapping::tests::standardized_hsm_states_map_exactly_and_preserve_unknown_values ... ok
+test mapping::tests::standardized_sbi_errors_map_exactly_and_preserve_unknown_values ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

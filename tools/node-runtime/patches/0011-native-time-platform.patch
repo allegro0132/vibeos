@@ -1,0 +1,14 @@
+--- a/tools/v8_gypfiles/v8.gyp
++++ b/tools/v8_gypfiles/v8.gyp
+@@ -1423,7 +1423,10 @@
+           'defines': ["BUILDING_V8_BASE_SHARED"],
+         }],
+         ['OS=="vibeos" and _toolset=="target"', {
+-          'sources': ['<(V8_ROOT)/src/base/platform/platform-vibeos-memory.cc'],
++          'sources': [
++            '<(V8_ROOT)/src/base/platform/platform-vibeos-memory.cc',
++            '<(V8_ROOT)/src/base/platform/platform-vibeos-time.cc',
++          ],
+         }],
+         ['is_posix or is_fuchsia or (_toolset=="host" and host_os in "mac linux")', {
+           'sources': [

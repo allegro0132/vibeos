@@ -1,0 +1,22 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "v8_libbase"
+  ],
+  "exit_code": 0,
+  "seconds": 4.46848704200238,
+  "runtime_acceptance": "NOT_RUN",
+  "configuration": {
+    "OS": "vibeos",
+    "target_arch": "riscv64",
+    "host_arch": "x64",
+    "v8_enable_lite_mode": 1,
+    "v8_enable_webassembly": 0,
+    "v8_enable_i18n_support": 0,
+    "v8_enable_pointer_compression": 0,
+    "v8_enable_pointer_compression_shared_cage": 0,
+    "v8_enable_sandbox": 0
+  }
+}

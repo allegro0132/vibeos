@@ -1,0 +1,1 @@
+Native fixture QEMU regression after linker-array layout changes: PASS. This image does not link V8/newlib archives or execute their static constructors. It proves the pre-existing native fixtures still boot and pass with the new layout.

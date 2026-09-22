@@ -1,0 +1,18 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "v8_snapshot",
+    "v8_base",
+    "v8_libbase",
+    "v8_libplatform",
+    "abseil",
+    "v8_zlib",
+    "simdutf",
+    "highway"
+  ],
+  "exit_code": 2,
+  "seconds": 877.5675956669729,
+  "runtime_acceptance": "NOT_RUN"
+}

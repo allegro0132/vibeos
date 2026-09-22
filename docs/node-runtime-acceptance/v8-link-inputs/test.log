@@ -1,0 +1,2 @@
+/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/bin/riscv-none-elf-ar: /var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/vibeos-link-inputs-y1tlbalm/thin.a: No such file or directory
+PASS: member mutation detected with unchanged thin index; regular archive self-contained; missing member rejected

@@ -1,0 +1,30 @@
+--- a/deps/v8/src/codegen/riscv/cpu-riscv.cc
++++ b/deps/v8/src/codegen/riscv/cpu-riscv.cc
+@@ -4,16 +4,24 @@
+ 
+ // CPU specific code for arm independent of OS goes here.
+ 
++#include "src/codegen/cpu-features.h"
++
++#if V8_OS_VIBEOS
++#include "src/base/platform/vibeos-cache.h"
++#else
+ #include <sys/syscall.h>
+ #include <unistd.h>
+-
+-#include "src/codegen/cpu-features.h"
++#endif
+ 
+ namespace v8 {
+ namespace internal {
+ 
+ void CpuFeatures::FlushICache(void* start, size_t size) {
+-#if !defined(USE_SIMULATOR)
++#if V8_OS_VIBEOS
++  // Jitless builtins are statically linked, but any requested synchronization
++  // still performs the real all-hart fence; no Linux syscall is available.
++  vibeos_native_flush_instruction_cache();
++#elif !defined(USE_SIMULATOR)
+   char* end = reinterpret_cast<char*>(start) + size;
+   // SYS_riscv_flush_icache is a symbolic constant used in user-space code to
+   // identify the flush_icache system call, while __NR_riscv_flush_icache is the

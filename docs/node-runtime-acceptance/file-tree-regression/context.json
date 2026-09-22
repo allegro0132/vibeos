@@ -1,0 +1,8 @@
+{
+  "kernel_sha256": "af25cde0af2b0d1b17adf3f15cfd9315c8f7eecf40a1ee8e5439571df932681b",
+  "frozen_kernel": "/Users/ziangwang/Sources/vibeos/target/node-runtime/file-tree-regression.elf",
+  "features": "file-tree",
+  "runner": "scripts/qemu-file-tree-test.sh",
+  "qemu_smp": 4,
+  "qemu_memory_mib": 128
+}

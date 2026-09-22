@@ -1,0 +1,68 @@
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/low_level_alloc.h
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/low_level_alloc.h
+@@ -36,7 +36,7 @@
+ // LowLevelAlloc.
+ #ifdef ABSL_LOW_LEVEL_ALLOC_MISSING
+ #error ABSL_LOW_LEVEL_ALLOC_MISSING cannot be directly set
+-#elif !defined(ABSL_HAVE_MMAP) && !defined(_WIN32)
++#elif !defined(ABSL_HAVE_MMAP) && !defined(_WIN32) && !defined(__vibeos__)
+ #define ABSL_LOW_LEVEL_ALLOC_MISSING 1
+ #endif
+ 
+@@ -47,7 +47,7 @@
+ #ifdef ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING
+ #error ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING cannot be directly set
+ #elif defined(_WIN32) || defined(__asmjs__) || defined(__wasm__) || \
+-    defined(__hexagon__)
++    defined(__hexagon__) || defined(__vibeos__)
+ #define ABSL_LOW_LEVEL_ALLOC_ASYNC_SIGNAL_SAFE_MISSING 1
+ #endif
+ 
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/low_level_alloc.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/low_level_alloc.cc
+@@ -33,7 +33,9 @@
+ // LowLevelAlloc.
+ #ifndef ABSL_LOW_LEVEL_ALLOC_MISSING
+ 
+-#ifndef _WIN32
++#if defined(__vibeos__)
++#include "../../../../../src/base/platform/vibeos-tcb-pages.h"
++#elif !defined(_WIN32)
+ #include <pthread.h>
+ #include <signal.h>
+ #include <sys/mman.h>
+@@ -325,7 +327,9 @@
+ 
+ namespace {
+ size_t GetPageSize() {
+-#ifdef _WIN32
++#if defined(__vibeos__)
++  return 4096;
++#elif defined(_WIN32)
+   SYSTEM_INFO system_info;
+   GetSystemInfo(&system_info);
+   return std::max(system_info.dwPageSize, system_info.dwAllocationGranularity);
+@@ -402,7 +406,10 @@
+     ABSL_RAW_CHECK(reinterpret_cast<uintptr_t>(region) % arena->pagesize == 0,
+                    "empty arena has non-page-aligned block");
+     int munmap_result;
+-#ifdef _WIN32
++#if defined(__vibeos__)
++    munmap_result = vibeos_tcb_pages_release(region, size);
++    ABSL_RAW_CHECK(munmap_result == 0, "VibeOS TCB page release failed");
++#elif defined(_WIN32)
+     munmap_result = VirtualFree(region, 0, MEM_RELEASE);
+     ABSL_RAW_CHECK(munmap_result != 0,
+                    "LowLevelAlloc::DeleteArena: VitualFree failed");
+@@ -548,7 +555,10 @@
+       // the chances/impact of fragmentation:
+       size_t new_pages_size = RoundUp(req_rnd, arena->pagesize * 16);
+       void *new_pages;
+-#ifdef _WIN32
++#if defined(__vibeos__)
++      new_pages = vibeos_tcb_pages_allocate(new_pages_size);
++      ABSL_RAW_CHECK(new_pages != nullptr, "VibeOS TCB page allocation failed");
++#elif defined(_WIN32)
+       new_pages = VirtualAlloc(nullptr, new_pages_size,
+                                MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+       ABSL_RAW_CHECK(new_pages != nullptr, "VirtualAlloc failed");

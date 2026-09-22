@@ -210,7 +210,7 @@ def main():
         stop();start(2)
         ssh(['wasm-run','rust.wasm'],out=b'Hello from Rust WASI!\n');ssh(['wasm-run','changed.wasm'],out=b'Updated after boot!\n')
         stop()
-        record={'profile':'wasi-preview1-command-v1','cycles':args.cycles,'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'dirty_diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff'])).hexdigest(),'qemu':subprocess.check_output(['qemu-system-riscv64','--version'],text=True).splitlines()[0],'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'examples':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'target/wasi-examples').glob('*-hello.wasm')},'results':results}
+        record={'profile':'wasi-preview1-command-v1','cycles':args.cycles,'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'dirty_diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff'])).hexdigest(),'qemu':subprocess.check_output(['qemu-system-riscv64','--version'],text=True).splitlines()[0],'rustc':subprocess.check_output([os.environ.get('RUSTC', 'rustc'),'-Vv'],text=True),'examples':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'target/wasi-examples').glob('*-hello.wasm')},'results':results}
         paths=subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard','-z']).decode().split('\0')
         record['source_files_sha256']={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in paths if p and (ROOT/p).is_file()}
         record['kernel_sha256']=hashlib.sha256(frozen.read_bytes()).hexdigest()

@@ -1,0 +1,5 @@
+{
+  "actual_RUSTC_environment": "/Users/ziangwang/.rustup/toolchains/nightly-2026-08-01-aarch64-apple-darwin/bin/rustc",
+  "actual_compiler_version": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)\nbinary: rustc\ncommit-hash: ad3d0bc141a02cf446e384136d250a1f6950fed5\ncommit-date: 2026-07-31\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n",
+  "note": "Original results.json rustc field queried PATH rustc instead of explicit RUSTC. Kept unchanged; subsequent harness runs query RUSTC. Kernel frozen from default-memory-regression."
+}

@@ -1,0 +1,48 @@
+{
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-exit-qemu-2/kernel.elf",
+    "-net",
+    "none",
+    "-object",
+    "rng-random,id=native_rng,filename=/dev/urandom",
+    "-device",
+    "virtio-rng-device,rng=native_rng",
+    "-global",
+    "virtio-mmio.force-legacy=false"
+  ],
+  "passed": true,
+  "scope": "fatal exit from protected native stack; no recovery or V8 acceptance",
+  "kernel_sha256": "e03453006e5feb22b280bdb593f361810e56ea87546f0e4837a96695736352a4",
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "kernel/src/native_process.rs": "de69ef1dd0844d7d6327e0c4215df81f8e04c76b6475f04b498b09cf322b6829",
+    "kernel/src/native_call.rs": "d72f06faf458149f0cf67637ea56ddad59b2c797224d94af4173db064a7212af",
+    "kernel/src/lib.rs": "a4d7a86ee405f22b2cd6fc02a9ff96d5cfb09f53f2bc3d7fba22b4925ce6433f",
+    "kernel/Cargo.toml": "5a1dcd27c82294ee6bf4b092ade173bf54affca17e237b30acf657195d52cbaf",
+    "firmware/qemu-virt/Cargo.toml": "222768caa295cf4ffc6263747822179e2d2ad6cb703444473c77fb8da55230c9",
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "scripts/test-native-exit-qemu.py": "a22f469f7e135d4d8cd7172d9b09b9a5d3e4b058a4b7a63a769ddc1bd97316ae"
+  },
+  "exit_code": 0,
+  "native_status": 42,
+  "native_status_propagated_to_host": false,
+  "checks": {
+    "qemu_shutdown": true,
+    "native_exit": true,
+    "prior_normal_return": true,
+    "no_return": true,
+    "no_panic": true
+  },
+  "seconds": 0.23748349997913465
+}

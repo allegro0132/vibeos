@@ -1,0 +1,19 @@
+FAIL vsh
+--- tests/golden/vsh.txt	2026-08-14 10:58:52
++++ /var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/tmp.EJMkrh5Dpr/actual	2026-09-22 14:47:28
+@@ -4,6 +4,7 @@
+ vibe> echo hello | wc > @console
+ 1 1 6
+ vibe> spin
++^C
+   vsh job %2: Cancelled
+ vibe> vsh if false; then echo hidden > @console; else echo branch > @console; fi
+ branch
+@@ -38,6 +39,7 @@
+   jobs            list session jobs
+   wait %N         join a job
+   cancel %N       cancel a job
++  vtop            live resources and service management (--help)
+   ps              component lifecycle snapshots
+   caps [space]    sanitized capability summary
+   mem             bounded-memory accounts

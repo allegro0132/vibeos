@@ -1,0 +1,66 @@
+--- a/deps/v8/third_party/abseil-cpp/absl/time/clock.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/time/clock.cc
+@@ -28,6 +28,12 @@
+ #include <ctime>
+ #include <limits>
+ 
++#if defined(__vibeos__)
++#include "../../../../src/base/platform/vibeos-time.h"
++#include "../../../../src/base/platform/vibeos-sync.h"
++#include "absl/base/internal/raw_logging.h"
++#endif
++
+ #include "absl/base/internal/spinlock.h"
+ #include "absl/base/internal/unscaledcycleclock.h"
+ #include "absl/base/macros.h"
+@@ -59,7 +65,20 @@
+ #define ABSL_USE_CYCLECLOCK_FOR_GET_CURRENT_TIME_NANOS 0
+ #endif
+ 
+-#if defined(__APPLE__) || defined(_WIN32)
++#if defined(__vibeos__)
++namespace absl {
++ABSL_NAMESPACE_BEGIN
++namespace time_internal {
++int64_t GetCurrentTimeNanosFromSystem() {
++  const int64_t us = vibeos_native_realtime_us();
++  ABSL_RAW_CHECK(us >= 0 && us <= INT64_MAX / 1000,
++                 "native realtime clock unavailable or out of range");
++  return us * 1000;
++}
++}  // namespace time_internal
++ABSL_NAMESPACE_END
++}  // namespace absl
++#elif defined(__APPLE__) || defined(_WIN32)
+ #include "absl/time/internal/get_current_time_chrono.inc"
+ #else
+ #include "absl/time/internal/get_current_time_posix.inc"
+@@ -564,7 +583,9 @@
+ 
+ // Returns the maximum duration that SleepOnce() can sleep for.
+ constexpr absl::Duration MaxSleep() {
+-#ifdef _WIN32
++#if defined(__vibeos__)
++  return absl::Microseconds(INT64_MAX);
++#elif defined(_WIN32)
+   // Windows Sleep() takes unsigned long argument in milliseconds.
+   return absl::Milliseconds(
+       std::numeric_limits<unsigned long>::max());  // NOLINT(runtime/int)
+@@ -576,7 +597,16 @@
+ // Sleeps for the given duration.
+ // REQUIRES: to_sleep <= MaxSleep().
+ void SleepOnce(absl::Duration to_sleep) {
+-#ifdef _WIN32
++#if defined(__vibeos__)
++  int64_t us = absl::ToInt64Microseconds(to_sleep);
++  if (to_sleep > absl::Microseconds(us)) ++us;
++  // A private wait key with a permanently false predicate only completes at
++  // its deadline. The bridge parks this execution; it must not busy-wait.
++  char key;
++  const int result = vibeos_native_wait_until_context(
++      &key, [](void*) -> int { return 0; }, nullptr, us);
++  ABSL_RAW_CHECK(result == 0, "native timed sleep failed");
++#elif defined(_WIN32)
+   Sleep(static_cast<DWORD>(to_sleep / absl::Milliseconds(1)));
+ #else
+   struct timespec sleep_time = absl::ToTimespec(to_sleep);

@@ -3914,3 +3914,14 @@ fn new_shared_network_listener(name: &str, id: vibeos_net_api::TcpListenerId, po
     #[cfg(not(feature = "receive-buffer-exchange"))]
     vibeos_net_api::TcpListener::new_shared(name, id, port, receive, transmit, group)
 }
+
+#[cfg(all(feature = "native-cxx-probe", feature = "queued-entropy"))]
+impl World {
+    pub(super) fn native_entropy_probe_grant(&self) -> Option<crate::native_entropy::EntropyGrant> {
+        let policy = self.rng_policy.as_ref()?.0.lock();
+        let source = self.rng_source_root?;
+        let target = Space::new("native-entropy-probe");
+        let granted = cap::grant(&policy, source, Rights::READ, &mut target.0.lock()).ok()?;
+        crate::native_entropy::EntropyGrant::new(target, granted)
+    }
+}

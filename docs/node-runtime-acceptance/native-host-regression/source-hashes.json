@@ -1,0 +1,8 @@
+{
+  "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+  "runtime/riscv/src/lib.rs": "7ae276c6ca5c1786de5105473e5e7a0d294280a6265bc5df94ffa1e0e1e4d1d8",
+  "runtime/riscv/src/mapping.rs": "8913dc57508af7fb55fdeb53ccccba381b21b873ecf70f33acb9b4514ef1ff53",
+  "core/src/heap.rs": "8b122a77e2245e2ecc3b3b25fac617fc6a43cd0c04fdad36921512cd3c4eea62",
+  "core/src/cap.rs": "444275ca556682a10d103c83bc67eafa94b4c789572d73b4b44d943faea80ea5",
+  "core/src/exec.rs": "5c8535ebdd76d505673b13b4440dc3ab6a6392a40aa48f7bfb74aa5e4118ef25"
+}

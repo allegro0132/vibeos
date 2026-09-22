@@ -5,6 +5,11 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+node-runtime = ["vibeos-kernel/node-runtime", "vibeos-bsp-qemu-virt/node-runtime"]
+native-exit-probe = ["vibeos-kernel/native-exit-probe"]
+native-cxx-probe = ["vibeos-kernel/native-cxx-probe"]
+native-call-probe = ["vibeos-kernel/native-call-probe"]
+native-runtime-probe = ["vibeos-kernel/native-runtime-probe"]
 # Suppress legacy exports when these source modules are embedded by universal firmware.
 universal = []
 entropy-diagnostic-only = []

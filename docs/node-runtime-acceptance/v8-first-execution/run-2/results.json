@@ -1,0 +1,39 @@
+{
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "1G",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/v8-gate-qemu-2/kernel.elf",
+    "-net",
+    "none",
+    "-object",
+    "rng-random,id=v8_rng,filename=/dev/urandom",
+    "-device",
+    "virtio-rng-device,rng=v8_rng",
+    "-global",
+    "virtio-mmio.force-legacy=false"
+  ],
+  "passed": false,
+  "kernel_sha256": "217155b63630ce51649ba76568c23581cf1a3f3aa59624bebe6e69ce47155ac1",
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "scope": "Real V8 on VibeOS RV64GC; no Node/TypeScript compatibility claim",
+  "qemu_exit_code": 0,
+  "checks": {
+    "expression": false,
+    "exception": false,
+    "gc": false,
+    "teardown": false,
+    "returned": false,
+    "no_fatal": false,
+    "qemu_shutdown": true
+  },
+  "seconds": 0.23798033298226073
+}

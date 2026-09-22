@@ -1,0 +1,31 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "v8_snapshot",
+    "v8_base",
+    "v8_libbase",
+    "v8_libplatform",
+    "abseil",
+    "v8_zlib",
+    "simdutf",
+    "highway"
+  ],
+  "exit_code": 0,
+  "seconds": 15.783438541984651,
+  "runtime_acceptance": "NOT_RUN",
+  "config_before": "798ac865fda2ce0e474d133fa2585111b266bf31699a6e93426c5225f6fee517",
+  "config_after": "798ac865fda2ce0e474d133fa2585111b266bf31699a6e93426c5225f6fee517",
+  "configuration": {
+    "OS": "vibeos",
+    "target_arch": "riscv64",
+    "host_arch": "x64",
+    "v8_enable_lite_mode": 1,
+    "v8_enable_webassembly": 0,
+    "v8_enable_i18n_support": 0,
+    "v8_enable_pointer_compression": 0,
+    "v8_enable_pointer_compression_shared_cage": 0,
+    "v8_enable_sandbox": 0
+  }
+}

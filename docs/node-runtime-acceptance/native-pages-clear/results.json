@@ -1,0 +1,69 @@
+{
+  "scope": "hart identity under foreign tp; not full native TLS or V8 acceptance; protected native call/return, suspend/resume, Rust Drop and FCSR restoration; C++ RAII across suspension (no standard-library runtime)",
+  "kernel_sha256": "baae27ee1bbfafd4f49c5226f75d912a38599d472073c0c21dfe72a0bd236067",
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-pages-clear-qemu-1/kernel.elf",
+    "-net",
+    "none"
+  ],
+  "passed": true,
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "kernel/src/lib.rs": "fb0a3d69d4b7f8784f876c32923d2f6af2f82d45eb4911a8c4601d1d1c89b27d",
+    "kernel/Cargo.toml": "9b82ccfb6caf4c660019ef5d97006683290e4789b6401c91f9c295652cd5012c",
+    "firmware/qemu-virt/Cargo.toml": "ce7212ad8ecf45a9dfe5afaed06d15a401f52302e5da6fbb83d824c63b570248",
+    "kernel/src/mmu.rs": "6f248924cbee02bacaece00bd37e26542210d131d4fce3adbb3e94841366e481",
+    "kernel/src/trap.rs": "dd212c0e2193c6c0569aa127a7e7e422544de767fcab6f4801fb1d06501ac698",
+    "kernel/src/native_call.rs": "e37fd4688f2a0379710e55035bfcd4473e2fb5a9a39db34f88ab7900ab374313",
+    "kernel/src/native_pages.rs": "c60bee39e6d57b96771fdbbc5916f8bf056e72fe05670fbc40ad26c6c13a0e4e",
+    "kernel/build.rs": "25585eb68e023650f2fb1f1e1cf7171b771e2ac57e4ce9b4f200c514841c5378",
+    "tools/node-runtime/tests/native-cxx-probe.cc": "72c27a022cf990e2484ac73c7c1b2af7bb25eaffb53c07967b471c6064cf2878",
+    "tools/node-runtime/toolchain.lock.json": "970f5c6019938f49297d5a6204d7fef3d20f6b3ecd8751dab9c7e97926203597",
+    "scripts/test-native-tls-qemu.py": "be8249c23884ea17aac73b4003375ab32f83eeec82741a2a2c32c00eb62b7435"
+  },
+  "observed_checks": {
+    "harts": true,
+    "shell": true,
+    "call": true,
+    "suspend": true,
+    "cxx": true,
+    "park": true,
+    "pages": true
+  },
+  "hart_pairs": [
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      1
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "native_call_passed": true,
+  "native_suspend_passed": true,
+  "native_cxx_passed": true,
+  "native_executor_parking_passed": true,
+  "native_page_permissions_passed": true,
+  "elapsed_seconds": 0.4493792499997653
+}

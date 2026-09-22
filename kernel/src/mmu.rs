@@ -76,13 +76,13 @@ struct AddressSpace {
     guest_level1: PageTable,
     #[cfg(feature = "wasmtime-guarded-memory")]
     guest_level0: [PageTable; 8],
-    #[cfg(feature = "wasmtime-async")]
+    #[cfg(feature = "native-stacks")]
     trap_level1: [PageTable; exec::MAX_HARTS],
-    #[cfg(feature = "wasmtime-async")]
+    #[cfg(feature = "native-stacks")]
     trap_level0: [PageTable; exec::MAX_HARTS],
-    #[cfg(feature = "wasmtime-async")]
+    #[cfg(feature = "native-stacks")]
     fiber_level1: PageTable,
-    #[cfg(feature = "wasmtime-async")]
+    #[cfg(feature = "native-stacks")]
     fiber_level0: PageTable,
 }
 
@@ -96,13 +96,13 @@ impl AddressSpace {
             guest_level1: PageTable::empty(),
             #[cfg(feature = "wasmtime-guarded-memory")]
             guest_level0: [const { PageTable::empty() }; 8],
-            #[cfg(feature = "wasmtime-async")]
+            #[cfg(feature = "native-stacks")]
             trap_level1: [const { PageTable::empty() }; exec::MAX_HARTS],
-            #[cfg(feature = "wasmtime-async")]
+            #[cfg(feature = "native-stacks")]
             trap_level0: [const { PageTable::empty() }; exec::MAX_HARTS],
-            #[cfg(feature = "wasmtime-async")]
+            #[cfg(feature = "native-stacks")]
             fiber_level1: PageTable::empty(),
-            #[cfg(feature = "wasmtime-async")]
+            #[cfg(feature = "native-stacks")]
             fiber_level0: PageTable::empty(),
         }
     }
@@ -252,7 +252,7 @@ pub fn init_boot(boot_physical_hart: usize) {
         }
     }
 
-    #[cfg(feature = "wasmtime-async")]
+    #[cfg(feature = "native-stacks")]
     {
         let root = sv39::vpn_index(NATIVE_FIBER_BASE, 2);
         assert!(!tables.root.entries[root].is_valid());
@@ -832,6 +832,12 @@ fn synchronize_tlbs(start: usize, size: usize) {
     REMOTE_SFENCES.fetch_add(1, Ordering::Release);
 }
 
+#[cfg(feature = "native-memory")]
+#[no_mangle]
+pub extern "C" fn vibeos_native_flush_instruction_cache() {
+    synchronize_instruction_caches();
+}
+
 fn synchronize_instruction_caches() {
     crate::sbi::local_fence_i();
     let Some(remote) = remote_hart_mask() else {
@@ -1040,26 +1046,26 @@ pub unsafe fn unmap_wasm_memory(size: usize) {
 // Independent trap stacks are mapped below 17, 18, ... GiB. The entry assembly
 // computes the top from the encoded sscratch hart id using only t0, preserving
 // every interrupted register without touching the interrupted stack first.
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub const NATIVE_TRAP_STACK_SIZE: usize = 64 * 1024;
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub const fn native_trap_stack_top(hart: usize) -> usize { (17 + hart) << 30 }
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 #[repr(C, align(4096))]
 struct NativeTrapStacks(UnsafeCell<[[u8; NATIVE_TRAP_STACK_SIZE]; exec::MAX_HARTS]>);
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 unsafe impl Sync for NativeTrapStacks {}
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 static TRAP_STACKS: NativeTrapStacks = NativeTrapStacks(UnsafeCell::new([[0; NATIVE_TRAP_STACK_SIZE]; exec::MAX_HARTS]));
 
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub const NATIVE_FIBER_BASE: usize = 0x20_0000_0000;
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub const NATIVE_FIBER_STRIDE: usize = 512 * 1024;
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub const NATIVE_FIBER_SLOTS: usize = 4;
 /// Caller exclusively owns this stack slot and no fiber is accessing it.
-#[cfg(feature = "wasmtime-async")]
+#[cfg(feature = "native-stacks")]
 pub unsafe fn replace_native_fiber(slot: usize, old: usize, old_size: usize, new: usize, new_size: usize) {
     assert!(slot < NATIVE_FIBER_SLOTS);
     for (base, size) in [(old, old_size), (new, new_size)] {
@@ -1088,4 +1094,144 @@ pub unsafe fn replace_native_fiber(slot: usize, old: usize, old_size: usize, new
         entries[1 + offset / sv39::PAGE_SIZE] = ram_leaf(new + offset, STACK_PERMISSIONS).unwrap();
     }
     publish_pte_writes(); synchronize_tlbs(start, NATIVE_FIBER_STRIDE);
+}
+
+/// Native data pages cannot acquire executable permission through this API.
+#[cfg(feature = "native-memory")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NativeDataPermission { Inaccessible = 0, ReadOnly = 1, ReadWrite = 2 }
+#[cfg(feature = "native-memory")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeDataError { InvalidRange, Unavailable, PermissionMismatch }
+
+/// Change exclusively owned native heap pages after validating every old PTE.
+///
+/// # Safety
+/// Caller owns the complete page-aligned allocation and excludes all users
+/// during the transition. The expected slice must describe that ownership;
+/// this MMU seam alone does not establish allocation or invocation authority.
+#[cfg(feature = "native-memory")]
+pub unsafe fn protect_native_data(
+    start: usize, expected: &[NativeDataPermission], target: NativeDataPermission,
+) -> Result<(), NativeDataError> {
+    unsafe { update_native_data(start, expected, Some(target), false) }
+}
+
+/// Destroy contents of owned pages, preserving permissions for discard or
+/// leaving them inaccessible for decommit. Physical backing stays reserved.
+///
+/// # Safety
+/// Same ownership and exclusion requirements as `protect_native_data`. All
+/// checks precede the first mutation; no fallible work follows that point.
+#[cfg(feature = "native-memory")]
+pub unsafe fn clear_native_data(
+    start: usize, expected: &[NativeDataPermission], decommit: bool,
+) -> Result<(), NativeDataError> {
+    let target = decommit.then_some(NativeDataPermission::Inaccessible);
+    unsafe { update_native_data(start, expected, target, true) }
+}
+
+#[cfg(feature = "native-memory")]
+unsafe fn update_native_data(
+    start: usize, expected: &[NativeDataPermission],
+    target: Option<NativeDataPermission>, clear: bool,
+) -> Result<(), NativeDataError> {
+    use NativeDataError as E;
+    use NativeDataPermission as P;
+    if expected.is_empty() || start % sv39::PAGE_SIZE != 0 { return Err(E::InvalidRange); }
+    let size = expected.len().checked_mul(sv39::PAGE_SIZE).ok_or(E::InvalidRange)?;
+    let end = start.checked_add(size).ok_or(E::InvalidRange)?;
+    if start < core::ptr::addr_of!(crate::__heap_start) as usize
+        || end > crate::platform::description().heap_end { return Err(E::InvalidRange); }
+    if !TABLES_READY.load(Ordering::Acquire)
+        || crate::platform::mmu().ram_granularity != MappingGranularity::Page4K {
+        return Err(E::Unavailable);
+    }
+    fn entry(address: usize, permission: P) -> PageTableEntry {
+        match permission {
+            P::Inaccessible => PageTableEntry::EMPTY,
+            P::ReadOnly => ram_leaf(address, READ_ONLY_PERMISSIONS).unwrap(),
+            P::ReadWrite => ram_leaf(address, WRITABLE_PERMISSIONS).unwrap(),
+        }
+    }
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    for (index, permission) in expected.iter().enumerate() {
+        let address = start + index * sv39::PAGE_SIZE;
+        if *ram_leaf_mut(tables, address) != entry(address, *permission) {
+            return Err(E::PermissionMismatch);
+        }
+    }
+    // Break before make, as for the existing W^X and capability-table pools.
+    for address in (start..end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = PageTableEntry::EMPTY;
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+    if clear {
+        // The caller excludes native pointer users. Temporarily grant RW/NX
+        // only to this owned range so inaccessible and read-only pages can
+        // also be cleared without creating an executable alias.
+        for address in (start..end).step_by(sv39::PAGE_SIZE) {
+            *ram_leaf_mut(tables, address) = entry(address, P::ReadWrite);
+        }
+        publish_pte_writes();
+        synchronize_tlbs(start, size);
+        unsafe { core::ptr::write_bytes(start as *mut u8, 0, size); }
+        for address in (start..end).step_by(sv39::PAGE_SIZE) {
+            *ram_leaf_mut(tables, address) = PageTableEntry::EMPTY;
+        }
+        publish_pte_writes();
+        synchronize_tlbs(start, size);
+    }
+    for (index, old_permission) in expected.iter().enumerate() {
+        let address = start + index * sv39::PAGE_SIZE;
+        *ram_leaf_mut(tables, address) = entry(address, target.unwrap_or(*old_permission));
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+    Ok(())
+}
+
+/// Freeze only the complete linker-admitted V8 flag section. This entry cannot
+/// thaw pages and does not share the invocation heap mutation interface.
+#[cfg(feature = "native-cxx-probe")]
+pub(super) fn freeze_native_flags(start: usize, size: usize) -> Result<(), NativeDataError> {
+    unsafe extern "C" { static __vibeos_v8_flags_start: u8; static __vibeos_v8_flags_end: u8; }
+    let admitted_start = core::ptr::addr_of!(__vibeos_v8_flags_start) as usize;
+    let admitted_end = core::ptr::addr_of!(__vibeos_v8_flags_end) as usize;
+    if size == 0 || start != admitted_start || start.checked_add(size) != Some(admitted_end)
+        || start % sv39::PAGE_SIZE != 0 || size % sv39::PAGE_SIZE != 0 {
+        return Err(NativeDataError::InvalidRange);
+    }
+    if !TABLES_READY.load(Ordering::Acquire)
+        || crate::platform::mmu().ram_granularity != MappingGranularity::Page4K {
+        return Err(NativeDataError::Unavailable);
+    }
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    let mut already_readonly = true;
+    for address in (start..admitted_end).step_by(sv39::PAGE_SIZE) {
+        let old = *ram_leaf_mut(tables, address);
+        let readonly = ram_leaf(address, READ_ONLY_PERMISSIONS).unwrap();
+        if old != readonly {
+            already_readonly = false;
+            if old != ram_leaf(address, WRITABLE_PERMISSIONS).unwrap() {
+                return Err(NativeDataError::PermissionMismatch);
+            }
+        }
+    }
+    if already_readonly { return Ok(()); }
+    for address in (start..admitted_end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = PageTableEntry::EMPTY;
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+    for address in (start..admitted_end).step_by(sv39::PAGE_SIZE) {
+        *ram_leaf_mut(tables, address) = ram_leaf(address, READ_ONLY_PERMISSIONS).unwrap();
+    }
+    publish_pte_writes();
+    synchronize_tlbs(start, size);
+    Ok(())
 }

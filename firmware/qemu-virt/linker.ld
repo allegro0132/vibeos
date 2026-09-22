@@ -16,13 +16,31 @@ SECTIONS {
     __text_start = .;
     KEEP(*(.text.boot))
     *(.text .text.*)
+    /* Abseil places allocator entry points in this executable section. */
+    *(malloc_hook)
     . = ALIGN(4K);
     __text_end = .;
   } > RAM
 
   .rodata : ALIGN(4K) {
     __rodata_start = .;
-    *(.rodata .rodata.*)
+    *(.rodata .rodata.* .srodata .srodata.*)
+    /* Static native runtime callbacks are read-only image data. The native
+       launcher runs initialization only after TLS/heap/stdio admission. */
+    . = ALIGN(8);
+    __preinit_array_start = .;
+    KEEP(*(.preinit_array))
+    __preinit_array_end = .;
+    . = ALIGN(8);
+    __init_array_start = .;
+    KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+    KEEP(*(.init_array))
+    __init_array_end = .;
+    . = ALIGN(8);
+    __fini_array_start = .;
+    KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+    KEEP(*(.fini_array))
+    __fini_array_end = .;
     . = ALIGN(4K);
     __rodata_end = .;
   } > RAM
@@ -32,6 +50,15 @@ SECTIONS {
     *(.sdata .sdata.*)
     *(.data .data.*)
   } > RAM
+
+  /* Sole admission range for V8's page-exclusive mutable flag block. */
+  .vibeos_v8_flags : ALIGN(4K) {
+    __vibeos_v8_flags_start = .;
+    KEEP(*(.vibeos_v8_flags))
+    __vibeos_v8_flags_end = .;
+  } > RAM
+  ASSERT(((__vibeos_v8_flags_end - __vibeos_v8_flags_start) % 4096) == 0,
+         "V8 flags must occupy whole exclusive pages")
 
   .bss (NOLOAD) : ALIGN(4K) {
     __bss_start = .;

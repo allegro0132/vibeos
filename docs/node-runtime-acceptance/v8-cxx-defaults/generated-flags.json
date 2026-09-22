@@ -1,0 +1,44 @@
+{
+  "v8_base_without_compiler": [
+    "-Wno-invalid-offsetof",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-exceptions",
+    "-fno-strict-aliasing"
+  ],
+  "v8_compiler": [
+    "-Wno-invalid-offsetof",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-exceptions",
+    "-fno-strict-aliasing"
+  ],
+  "v8_libbase": [
+    "-Wno-invalid-offsetof",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-exceptions",
+    "-fno-strict-aliasing"
+  ],
+  "v8_libplatform": [
+    "-Wno-invalid-offsetof",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-exceptions",
+    "-fno-strict-aliasing"
+  ],
+  "abseil": [
+    "-Wno-invalid-offsetof",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-exceptions",
+    "-fno-strict-aliasing"
+  ],
+  "torque_base": [
+    "-Wno-invalid-offsetof",
+    "-fexceptions",
+    "-std=gnu++20",
+    "-fno-rtti",
+    "-fno-strict-aliasing"
+  ]
+}

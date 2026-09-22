@@ -1,0 +1,650 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: `vibeos-durable-format` (lib) generated 1 warning (1 duplicate)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+warning: `vibeos-core` (lib) generated 1 warning (1 duplicate)
+   Compiling vibeos-kernel v0.1.0 (/Users/ziangwang/Sources/vibeos/kernel)
+   Compiling vibeos-image-policy v0.1.0 (/Users/ziangwang/Sources/vibeos/policy/image)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+   Compiling vibeos-firmware-qemu-virt v0.1.0 (/Users/ziangwang/Sources/vibeos/firmware/qemu-virt)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (2 duplicates)
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+   Compiling vibeos-vsh v0.1.0 (/Users/ziangwang/Sources/vibeos/components/vsh)
+warning: unused variable: `service_policy`
+    --> kernel/src/world.rs:2127:9
+     |
+2127 |     let service_policy = net_policy.clone();
+     |         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_service_policy`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `InvalidTextRange` is never constructed
+  --> kernel/src/code_pool.rs:34:5
+   |
+28 | pub enum CodePoolError {
+   |          ------------- variant in this enum
+...
+34 |     InvalidTextRange,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `CodePoolError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `freeze_image` and `seal_readable` are never used
+   --> kernel/src/code_pool.rs:314:12
+    |
+269 | impl WritableCode {
+    | ----------------- methods in this implementation
+...
+314 |     pub fn freeze_image(mut self) -> CodeImage {
+    |            ^^^^^^^^^^^^
+...
+327 |     pub fn seal_readable(mut self) -> ReadableExecutableCode {
+    |            ^^^^^^^^^^^^^
+
+warning: struct `CodeImage` is never constructed
+   --> kernel/src/code_pool.rs:384:12
+    |
+384 | pub struct CodeImage { allocation: Allocation }
+    |            ^^^^^^^^^
+
+warning: methods `start`, `bytes`, and `publish_text` are never used
+   --> kernel/src/code_pool.rs:386:12
+    |
+385 | impl CodeImage {
+    | -------------- methods in this implementation
+386 |     pub fn start(&self) -> usize { self.allocation.start() }
+    |            ^^^^^
+387 |     pub fn bytes(&self) -> &[u8] {
+    |            ^^^^^
+...
+390 |     pub fn publish_text(&mut self, offset: usize, len: usize) -> Result<(), CodePoolError> {
+    |            ^^^^^^^^^^^^
+
+warning: struct `ReadableExecutableCode` is never constructed
+   --> kernel/src/code_pool.rs:415:12
+    |
+415 | pub struct ReadableExecutableCode { allocation: Allocation }
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `entry` and `bytes` are never used
+   --> kernel/src/code_pool.rs:417:12
+    |
+416 | impl ReadableExecutableCode {
+    | --------------------------- methods in this implementation
+417 |     pub fn entry(&self) -> usize { self.allocation.start() }
+    |            ^^^^^
+418 |     pub fn bytes(&self) -> &[u8] {
+    |            ^^^^^
+
+warning: constant `COMPONENT_ARTIFACT_OBJECT_KIND_RAW` is never used
+  --> kernel/src/authority_store_platform.rs:53:7
+   |
+53 | const COMPONENT_ARTIFACT_OBJECT_KIND_RAW: u32 = 0x434d_5031;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `COMPONENT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW` is never used
+  --> kernel/src/authority_store_platform.rs:54:7
+   |
+54 | const COMPONENT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW: u32 = 0x434d_4531;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `COMPONENT_GRAPH_VERSION_OBJECT_KIND_RAW` is never used
+  --> kernel/src/authority_store_platform.rs:56:7
+   |
+56 | const COMPONENT_GRAPH_VERSION_OBJECT_KIND_RAW: u32 = 0x4347_5631;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `validate_storage_v2_record_stream_for_policy` is never used
+   --> kernel/src/authority_store_platform.rs:214:15
+    |
+214 | pub(crate) fn validate_storage_v2_record_stream_for_policy(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `storage_v2_migration_import_incremental` is never used
+   --> kernel/src/authority_store_platform.rs:781:15
+    |
+781 | pub(crate) fn storage_v2_migration_import_incremental(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `storage_v2_compact_records` is never used
+   --> kernel/src/authority_store_platform.rs:872:15
+    |
+872 | pub(crate) fn storage_v2_compact_records(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `freeze_code_image` is never used
+   --> kernel/src/mmu.rs:446:8
+    |
+446 | pub fn freeze_code_image(start: usize, pages: usize) {
+    |        ^^^^^^^^^^^^^^^^^
+
+warning: function `publish_code_image_text` is never used
+   --> kernel/src/mmu.rs:450:8
+    |
+450 | pub fn publish_code_image_text(start: usize, pages: usize) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `seal_readable_code` is never used
+   --> kernel/src/mmu.rs:462:8
+    |
+462 | pub fn seal_readable_code(start: usize, pages: usize) {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: function `is_dispatch_hart` is never used
+   --> kernel/src/plic.rs:180:15
+    |
+180 | pub(crate) fn is_dispatch_hart() -> bool {
+    |               ^^^^^^^^^^^^^^^^
+
+warning: variant `Usb` is never constructed
+  --> kernel/src/net_device.rs:40:5
+   |
+36 | pub enum NetworkLocation {
+   |          --------------- variant in this enum
+...
+40 |     Usb {
+   |     ^^^
+   |
+   = note: `NetworkLocation` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: method `describe` is never used
+  --> kernel/src/net_device.rs:87:12
+   |
+79 | impl NetworkLocation {
+   | -------------------- method in this implementation
+...
+87 |     pub fn describe(self) -> String {
+   |            ^^^^^^^^
+
+warning: function `tx_checksum_offload` is never used
+   --> kernel/src/net_device.rs:153:14
+    |
+153 | pub const fn tx_checksum_offload(_info: &NetInfo) -> bool {
+    |              ^^^^^^^^^^^^^^^^^^^
+
+warning: function `rx_checksum_offload` is never used
+   --> kernel/src/net_device.rs:163:14
+    |
+163 | pub const fn rx_checksum_offload(_info: &NetInfo) -> bool {
+    |              ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `ensure_foreground_capacity` and `ensure_foreground_capacity_for_scaled` are never used
+    --> kernel/src/segment_store_platform.rs:2210:14
+     |
+1416 | impl StorageV2Runtime {
+     | --------------------- methods in this implementation
+...
+2210 |     async fn ensure_foreground_capacity(self: &Arc<Self>) -> Result<(), V2RuntimeError> {
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2220 |     async fn ensure_foreground_capacity_for_scaled(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `RawTxOrderPermit` is never constructed
+  --> kernel/src/tty.rs:30:19
+   |
+30 | pub(crate) struct RawTxOrderPermit<'guard> {
+   |                   ^^^^^^^^^^^^^^^^
+
+warning: struct `RawUartRecord` is never constructed
+  --> kernel/src/tty.rs:50:19
+   |
+50 | pub(crate) struct RawUartRecord {
+   |                   ^^^^^^^^^^^^^
+
+warning: methods `release_after_commit`, `write_all`, and `commit_record` are never used
+  --> kernel/src/tty.rs:56:8
+   |
+55 | impl RawUartRecord {
+   | ------------------ methods in this implementation
+56 |     fn release_after_commit(&mut self) {
+   |        ^^^^^^^^^^^^^^^^^^^^
+...
+64 |     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), RawUartRecordError> {
+   |                   ^^^^^^^^^
+...
+71 |     pub(crate) fn commit_record(&mut self) -> Result<(), RawUartRecordError> {
+   |                   ^^^^^^^^^^^^^
+
+warning: function `begin_raw_uart_record` is never used
+   --> kernel/src/tty.rs:109:15
+    |
+109 | pub(crate) fn begin_raw_uart_record() -> Result<RawUartRecord, RawUartRecordError> {
+    |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: static `RAW_RECORD_ACTIVE` is never used
+  --> kernel/src/uart.rs:54:8
+   |
+54 | static RAW_RECORD_ACTIVE: core::sync::atomic::AtomicBool =
+   |        ^^^^^^^^^^^^^^^^^
+
+warning: function `begin_raw_record_activity` is never used
+   --> kernel/src/uart.rs:105:15
+    |
+105 | pub(crate) fn begin_raw_record_activity() {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `raw_record_active` is never used
+   --> kernel/src/uart.rs:111:15
+    |
+111 | pub(crate) fn raw_record_active() -> bool {
+    |               ^^^^^^^^^^^^^^^^^
+
+warning: function `finish_raw_record_activity` is never used
+   --> kernel/src/uart.rs:116:15
+    |
+116 | pub(crate) fn finish_raw_record_activity() {
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `wait_tx_fully_empty` is never used
+   --> kernel/src/uart.rs:133:4
+    |
+133 | fn wait_tx_fully_empty() {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: enum `RawTxRecordError` is never used
+   --> kernel/src/uart.rs:144:17
+    |
+144 | pub(crate) enum RawTxRecordError {
+    |                 ^^^^^^^^^^^^^^^^
+
+warning: struct `RawRecordFraming` is never constructed
+   --> kernel/src/uart.rs:160:8
+    |
+160 | struct RawRecordFraming {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: associated items `NEW`, `append`, and `validate_commit` are never used
+   --> kernel/src/uart.rs:166:11
+    |
+165 | impl RawRecordFraming {
+    | --------------------- associated items in this implementation
+166 |     const NEW: Self = Self {
+    |           ^^^
+...
+171 |     fn append(self, bytes: &[u8]) -> Result<Self, RawTxRecordError> {
+    |        ^^^^^^
+...
+193 |     fn validate_commit(self) -> Result<(), RawTxRecordError> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: struct `RawTxRecord` is never constructed
+   --> kernel/src/uart.rs:276:19
+    |
+276 | pub(crate) struct RawTxRecord {
+    |                   ^^^^^^^^^^^
+
+warning: associated items `begin`, `release_after_commit`, `write_all`, and `commit_record` are never used
+   --> kernel/src/uart.rs:282:19
+    |
+281 | impl RawTxRecord {
+    | ---------------- associated items in this implementation
+282 |     pub(crate) fn begin(
+    |                   ^^^^^
+...
+298 |     fn release_after_commit(&mut self) {
+    |        ^^^^^^^^^^^^^^^^^^^^
+...
+305 |     pub(crate) fn write_all(&mut self, bytes: &[u8]) -> Result<(), RawTxRecordError> {
+    |                   ^^^^^^^^^
+...
+320 |     pub(crate) fn commit_record(&mut self) -> Result<(), RawTxRecordError> {
+    |                   ^^^^^^^^^^^^^
+
+warning: function `raw_read_at` is never used
+   --> kernel/src/virtio_blk.rs:234:21
+    |
+234 | pub(crate) async fn raw_read_at(expected_epoch: u64, sector: u64) -> Result<[u8; 512], BlockError> {
+    |                     ^^^^^^^^^^^
+
+warning: function `raw_write_at` is never used
+   --> kernel/src/virtio_blk.rs:259:21
+    |
+259 | pub(crate) async fn raw_write_at(
+    |                     ^^^^^^^^^^^^
+
+warning: associated items `scan_entropy` and `reset` are never used
+  --> kernel/src/virtio_mmio.rs:12:19
+   |
+ 5 | impl MmioTransport {
+   | ------------------ associated items in this implementation
+...
+12 |     pub unsafe fn scan_entropy() -> Option<Self> {
+   |                   ^^^^^^^^^^^^
+...
+30 |     pub fn reset(self, budget: usize) -> bool {
+   |            ^^^^^
+
+warning: variant `DriverFault` is never constructed
+  --> kernel/src/virtio_net.rs:50:5
+   |
+45 | pub enum NetError {
+   |          -------- variant in this enum
+...
+50 |     DriverFault,
+   |     ^^^^^^^^^^^
+   |
+   = note: `NetError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `location` is never read
+   --> kernel/src/virtio_net.rs:415:9
+    |
+414 | pub struct NetResources {
+    |            ------------ field in this struct
+415 |     pub location: crate::net_device::NetworkLocation,
+    |         ^^^^^^^^
+
+warning: constant `REQUEST_TIMEOUT_MS` is never used
+  --> kernel/src/virtio_rng.rs:35:7
+   |
+35 | const REQUEST_TIMEOUT_MS: u64 = 2_000;
+   |       ^^^^^^^^^^^^^^^^^^
+
+warning: variant `PermissionDenied` is never constructed
+  --> kernel/src/virtio_rng.rs:56:5
+   |
+44 | pub enum RandomError {
+   |          ----------- variant in this enum
+...
+56 |     PermissionDenied,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `RandomError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: methods `len`, `is_empty`, `as_slice`, and `copy_to` are never used
+   --> kernel/src/virtio_rng.rs:124:18
+    |
+116 | impl RandomBytes {
+    | ---------------- methods in this implementation
+...
+124 |     pub const fn len(&self) -> usize {
+    |                  ^^^
+...
+128 |     pub const fn is_empty(&self) -> bool {
+    |                  ^^^^^^^^
+...
+132 |     pub fn as_slice(&self) -> &[u8] {
+    |            ^^^^^^^^
+...
+136 |     pub fn copy_to(&self, output: &mut [u8]) -> Result<(), RandomError> {
+    |            ^^^^^^^
+
+warning: function `info_with` is never used
+   --> kernel/src/virtio_rng.rs:265:8
+    |
+265 | pub fn info_with(lease: &InvocationLease<RandomSource>) -> Result<RandomInfo, RandomError> {
+    |        ^^^^^^^^^
+
+warning: function `bytes_with` is never used
+   --> kernel/src/virtio_rng.rs:273:14
+    |
+273 | pub async fn bytes_with(
+    |              ^^^^^^^^^^
+
+warning: function `fill_with` is never used
+   --> kernel/src/virtio_rng.rs:296:14
+    |
+296 | pub async fn fill_with(
+    |              ^^^^^^^^^
+
+warning: fields `id` and `result` are never read
+   --> kernel/src/virtio_rng.rs:366:9
+    |
+365 |     Completed {
+    |     --------- fields in this variant
+366 |         id: u64,
+    |         ^^
+367 |         result: Result<RandomBytes, RandomError>,
+    |         ^^^^^^
+
+warning: variant `Queued` is never constructed
+   --> kernel/src/virtio_rng.rs:363:5
+    |
+361 | enum RequestSlot {
+    |      ----------- variant in this enum
+362 |     Empty,
+363 |     Queued(PendingRequest),
+    |     ^^^^^^
+
+warning: static `NEXT_REQUEST_ID` is never used
+   --> kernel/src/virtio_rng.rs:395:8
+    |
+395 | static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+    |        ^^^^^^^^^^^^^^^
+
+warning: function `request` is never used
+   --> kernel/src/virtio_rng.rs:405:10
+    |
+405 | async fn request(length: usize) -> Result<RandomBytes, RandomError> {
+    |          ^^^^^^^
+
+warning: function `request_deadline` is never used
+   --> kernel/src/virtio_rng.rs:487:4
+    |
+487 | fn request_deadline() -> u64 {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `queued_session_error` is never used
+   --> kernel/src/virtio_rng.rs:495:4
+    |
+495 | fn queued_session_error(expected_epoch: u64) -> Option<RandomError> {
+    |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `request_completed` is never used
+   --> kernel/src/virtio_rng.rs:508:4
+    |
+508 | fn request_completed(id: u64) -> bool {
+    |    ^^^^^^^^^^^^^^^^^
+
+warning: function `take_completed` is never used
+   --> kernel/src/virtio_rng.rs:512:4
+    |
+512 | fn take_completed(id: u64) -> Option<Result<RandomBytes, RandomError>> {
+    |    ^^^^^^^^^^^^^^
+
+warning: struct `ClientRequestGuard` is never constructed
+   --> kernel/src/virtio_rng.rs:528:8
+    |
+528 | struct ClientRequestGuard {
+    |        ^^^^^^^^^^^^^^^^^^
+
+warning: method `abandon` is never used
+   --> kernel/src/virtio_rng.rs:534:8
+    |
+533 | impl ClientRequestGuard {
+    | ----------------------- method in this implementation
+534 |     fn abandon(&mut self) {
+    |        ^^^^^^^
+
+warning: function `is_online` is never used
+    --> kernel/src/virtio_rng.rs:1153:8
+     |
+1153 | pub fn is_online() -> bool {
+     |        ^^^^^^^^^
+
+warning: associated function `capability_front` is never used
+  --> kernel/src/vsh_platform.rs:26:8
+   |
+25 | impl VshPlatform {
+   | ---------------- associated function in this implementation
+26 |     fn capability_front(space: Arc<Space>, console: Cap) -> Self {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: function `task` is never used
+  --> kernel/src/vsh_platform.rs:88:14
+   |
+88 | pub async fn task(space: Arc<Space>, console: Cap, session: Session) {
+   |              ^^^^
+
+warning: associated function `remote` is never used
+  --> kernel/src/vtop_platform.rs:16:12
+   |
+12 | impl Monitor {
+   | ------------ associated function in this implementation
+...
+16 |     pub fn remote() -> Self {
+   |            ^^^^^^
+
+warning: constant `NETWORK_STACK_MEMORY_BUDGET` is never used
+  --> kernel/src/world.rs:38:7
+   |
+38 | const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `block_bench` is never read
+   --> kernel/src/world.rs:542:9
+    |
+520 | pub struct World {
+    |            ----- field in this struct
+...
+542 |     pub block_bench: Option<Cap>,
+    |         ^^^^^^^^^^^
+
+warning: method `listener_policy` is never used
+   --> kernel/src/world.rs:662:8
+    |
+661 | impl World {
+    | ---------- method in this implementation
+662 |     fn listener_policy(&self) -> Option<&Arc<Space>> {
+    |        ^^^^^^^^^^^^^^^
+
+warning: `vibeos-kernel` (lib) generated 64 warnings (run `cargo fix --lib -p vibeos-kernel` to apply 1 suggestion)
+    Finished `release` profile [optimized + debuginfo] target(s) in 21.73s
+ok   mmu

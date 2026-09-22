@@ -1,0 +1,8 @@
+en/torque-generated/objects-printer.o
+../deps/v8/src/codegen/riscv/macro-assembler-riscv.cc: In member function 'void v8::internal::MacroAssembler::OptimizeCodeOrTailCallOptimizedCodeSlot(v8::internal::Register, v8::internal::Register)':
+../deps/v8/src/codegen/riscv/macro-assembler-riscv.cc:266:57: error: 'temps' was not declared in this scope
+  266 |   TailCallOptimizedCodeSlot(this, optimized_code_entry, temps.Acquire(),
+      |                                                         ^~~~~
+make: *** [/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_base_without_compiler/deps/v8/src/codegen/riscv/macro-assembler-riscv.o] Error 1
+make: *** Waiting for unfinished jobs....
+rm 8a9b8676d1fa7c04ab11ddafef1d4e3eaba00563dffb22ecf11dab6c2c52f575.intermediate 8b873f8e0045dc2991ac1d973253e7cb39dcee117699b45f959f1f0dcab1e240.intermediate 14ea54a8e4588c4f2f3c68933e0e602864bcd661d5f619e09d0f32ef6fdc4abf.intermediate 28641945347e46351a34c23e32b378825

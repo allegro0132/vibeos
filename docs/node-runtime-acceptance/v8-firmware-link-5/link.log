@@ -1,0 +1,239 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-durable-format` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+warning: `vibeos-core` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (2 duplicates)
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_tls.rs:50:26
+   |
+50 |         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                          ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+50 -         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+50 +         let id = NEXT_ID.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+ --> kernel/src/native_semaphore.rs:9:25
+  |
+9 |         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+  |                         ^^^^^^^^^^^^
+  |
+help: replace the use of the deprecated method
+  |
+9 -         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+9 +         if self.permits.try_update(Ordering::Release, Ordering::Relaxed,
+  |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:15:22
+   |
+15 |         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+   |                      ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+15 -         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+15 +         self.permits.try_update(Ordering::Acquire, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:26:34
+   |
+26 |         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                  ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+26 -         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+26 +         let Ok(id) = NEXT_HANDLE.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-kernel` (lib) generated 4 warnings (run `cargo fix --lib -p vibeos-kernel` to apply 4 suggestions)
+   Compiling vibeos-firmware-qemu-virt v0.1.0 (/Users/ziangwang/Sources/vibeos/firmware/qemu-virt)
+error: linking with `ld.lld` failed: exit status: 1
+  |
+  = note:  "ld.lld" "<1 object files omitted>" "--as-needed" "-Bstatic" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/564799cda806740b/out/rustcsWojez/libvibeos_kernel-bb35519e27d8c70c.rlib" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/compiler_builtins/5d9c8ad9a097c700/out/libcompiler_builtins-5d9c8ad9a097c700.rlib" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/564799cda806740b/out/rustcsWojez/raw-dylibs" "-Bdynamic" "-z" "noexecstack" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-kernel/0e685bc38f8cd21d/out" "-o" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/564799cda806740b/out/vibeos_qemu_virt" "--gc-sections" "--undefined=vibeos_v8_smoke" "/Users/ziangwang/Sources/vibeos/target/node-runtime/firmware-link-audit-5/v8-smoke.o" "--start-group" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_snapshot.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_base_without_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libbase.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libplatform.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libabseil.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_zlib.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libsimdutf.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libhighway.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libstdc++.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libm.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/lib/gcc/riscv-none-elf/14.2.0/rv64imafdc_zicsr/lp64d/libgcc.a" "--end-group" "--error-limit=0" "--gc-sections" "-T/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/7f43935f76f1f9d8/out/linker.ld"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: ld.lld: error: undefined symbol: _exit
+          >>> referenced by libc_a-exit.o:(exit) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          >>> referenced by libc_a-abort.o:(abort) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          >>> referenced by platform-vibeos-lifecycle.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_libbase/deps/v8/src/base/platform/platform-vibeos-lifecycle.o:(v8::base::OS::Abort()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libbase.a
+          >>> referenced 2 more times
+          >>> did you mean: exit
+          >>> defined in: /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a(libc_a-exit.o)
+          
+          ld.lld: error: undefined symbol: _write
+          >>> referenced by libc_a-writer.o:(_write_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          >>> did you mean: fwrite
+          >>> defined in: /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a(libc_a-fwrite.o)
+          
+          ld.lld: error: undefined symbol: _unlink
+          >>> referenced by libc_a-unlinkr.o:(_unlink_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _kill
+          >>> referenced by libc_a-signalr.o:(_kill_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _read
+          >>> referenced by libc_a-readr.o:(_read_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _open
+          >>> referenced by libc_a-openr.o:(_open_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _isatty
+          >>> referenced by libc_a-isattyr.o:(_isatty_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _fstat
+          >>> referenced by libc_a-fstatr.o:(_fstat_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _close
+          >>> referenced by libc_a-closer.o:(_close_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+          ld.lld: error: undefined symbol: _lseek
+          >>> referenced by libc_a-lseekr.o:(_lseek_r) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a
+          
+
+error: could not compile `vibeos-firmware-qemu-virt` (bin "vibeos-qemu-virt") due to 1 previous error

@@ -1,0 +1,7 @@
+{
+  "target": "riscv64imac-unknown-none-elf",
+  "features": "wasi-ssh-upload,native-runtime-probe",
+  "heap_end": "0x88000000",
+  "v8_gate_absent": true,
+  "native_libc_initializer_absent": true
+}

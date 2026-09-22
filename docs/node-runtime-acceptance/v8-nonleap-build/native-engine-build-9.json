@@ -1,0 +1,4 @@
+{
+  "exit_code": 130,
+  "reason": "Stopped to correct scratch-scope API call after inspecting its two-register Exclude overload; no runtime acceptance"
+}

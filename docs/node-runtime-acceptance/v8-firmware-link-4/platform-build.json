@@ -1,0 +1,11 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "v8_libbase"
+  ],
+  "exit_code": 0,
+  "seconds": 4.325029958970845,
+  "runtime_acceptance": "NOT_RUN"
+}

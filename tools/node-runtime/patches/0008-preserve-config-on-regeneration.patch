@@ -1,0 +1,39 @@
+--- a/tools/gyp/pylib/gyp/generator/make.py
++++ b/tools/gyp/pylib/gyp/generator/make.py
+@@ -2381,6 +2381,16 @@
+     if not gyp_binary.startswith(os.sep):
+         gyp_binary = os.path.join(".", gyp_binary)
+ 
++    regeneration_command = [gyp_binary, "-fmake"]
++    if gyp.common.GetFlavor(params) == "vibeos":
++        # configure.py calls GYP in-process, so sys.argv[0] is configure,
++        # not GYP. Regenerate only GYP inputs, preserving config.gypi.
++        regeneration_command = [
++            sys.executable,
++            os.path.join(options.toplevel_dir, "tools", "gyp_node.py"),
++            "--regenerate", "-fmake-vibeos",
++        ]
++
+     root_makefile.write(
+         "quiet_cmd_regen_makefile = ACTION Regenerating $@\n"
+         "cmd_regen_makefile = cd $(srcdir); %(cmd)s\n"
+@@ -2393,7 +2403,7 @@
+             ),
+             "cmd": replace_sep(
+                 gyp.common.EncodePOSIXShellList(
+-                    [gyp_binary, "-fmake"]
++                    regeneration_command
+                     + gyp.RegenerateFlags(options)
+                     + build_files_args
+                 )
+--- a/tools/gyp_node.py
++++ b/tools/gyp_node.py
+@@ -52,4 +52,8 @@
+ 
+ 
+ if __name__ == '__main__':
++  if sys.argv[1:2] == ['--regenerate']:
++    # The generated rule already contains the full include/define/file list.
++    # Re-adding run_gyp's defaults would duplicate and grow that list.
++    sys.exit(gyp.main(sys.argv[2:]))
+   run_gyp(sys.argv[1:])

@@ -1,6 +1,7 @@
 //! riscv64 implementation, plus the SBI calls the runtime needs.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mapping::{hart_state_from_sbi, ipi_error_from_sbi};
 use crate::{HartState, IpiError};
@@ -25,6 +26,11 @@ pub const RFENCE_EXTENSION_ID: usize = 0x52464E43;
 const SBI_EXT_RFENCE_REMOTE_FENCE_I: usize = 0;
 const SBI_EXT_RFENCE_REMOTE_SFENCE_VMA: usize = 1;
 const PAGE_SIZE: usize = 4096;
+
+// Scheduler hart masks cannot represent more than one machine word of harts.
+// Keep identity independent of tp once registered: native C++ owns tp for TLS.
+static PHYSICAL_HART_CACHE: [AtomicUsize; usize::BITS as usize] =
+    [const { AtomicUsize::new(usize::MAX) }; usize::BITS as usize];
 
 /// Disable S-mode interrupts; returns whether they were previously enabled.
 #[inline]
@@ -51,13 +57,15 @@ pub fn wait_for_interrupt() {
     unsafe { asm!("wfi") };
 }
 
-/// Hart identity installed in `tp` by the kernel's assembly entry path.
-///
-/// `mhartid` is not accessible from S-mode. Keeping the firmware-provided
-/// `a0` value in `tp` also gives M5.4 a register-local identity without
-/// touching shared memory.
+/// Physical identity, independent of native TLS after scheduler registration.
+/// Before registration only, the assembly entry path supplies this in `tp`.
 #[inline]
 pub fn current_hart_id() -> usize {
+    if let Some(index) = cached_logical_hart_index() {
+        let physical = PHYSICAL_HART_CACHE[index].load(Ordering::Acquire);
+        assert_ne!(physical, usize::MAX, "uninitialized physical hart cache");
+        return physical;
+    }
     let hart: usize;
     unsafe { asm!("mv {}, tp", out(reg) hart, options(nostack, nomem)) };
     hart
@@ -80,13 +88,23 @@ pub fn cached_logical_hart_index() -> Option<usize> {
 /// # Safety
 ///
 /// `index` must be the logical scheduler identity already validated for the
-/// current physical hart, and this must run on that hart.
+/// current physical hart, and this must run on that hart with interrupts
+/// disabled. The logical index must fit in a scheduler hart mask.
 #[inline(always)]
 pub unsafe fn cache_logical_hart_index(index: usize) {
+    let physical = current_hart_id();
+    assert_ne!(physical, usize::MAX, "invalid physical hart identity");
+    let slot = &PHYSICAL_HART_CACHE[index];
+    if let Err(previous) = slot.compare_exchange(
+        usize::MAX, physical, Ordering::AcqRel, Ordering::Acquire,
+    ) {
+        assert_eq!(previous, physical, "physical hart cache remapped");
+    }
     let encoded = index
         .checked_add(1)
         .expect("logical hart cache encoding overflowed");
-    unsafe { asm!("csrw sscratch, {}", in(reg) encoded, options(nostack, nomem)) };
+    // This CSR publication must not move ahead of the mapping store.
+    unsafe { asm!("csrw sscratch, {}", in(reg) encoded, options(nostack)) };
 }
 
 /// Clear the receiving hart's supervisor-software pending bit.

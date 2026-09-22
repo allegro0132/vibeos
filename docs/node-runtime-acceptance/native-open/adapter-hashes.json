@@ -1,0 +1,6 @@
+{
+  "tools/node-runtime/platform/platform-vibeos-libc.cc": "0be9cb39605f5b17ba62728e1bc467bd16aa7eecb8d56270b8604702a68f711c",
+  "tools/node-runtime/platform/vibeos-files.h": "a9be2532ac26f1c4ca42171134884cf7a87e718a7f8465da285e97a3ebc4cc37",
+  "tools/node-runtime/tests/native-libc-test.cc": "419e24285fecd429bb4db8faad598d828f6b37b70b95268c7968092418fe8bdf",
+  "scripts/test-native-libc.py": "9198b77f0752fe1730dab1af24164851e6f6c361c153f689be33a45a42337291"
+}

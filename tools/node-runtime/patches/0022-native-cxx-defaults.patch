@@ -1,0 +1,13 @@
+--- a/common.gypi
++++ b/common.gypi
+@@ -139,6 +139,10 @@
+       }],
+       ['OS=="vibeos" and _toolset=="target"', {
+         'defines': ['__vibeos__=1'],
++        # Match the upstream Unix C++ defaults without importing pthread,
++        # dynamic-loader or host linker assumptions into the bare-metal port.
++        'cflags_cc': ['-fno-rtti', '-fno-exceptions',
++                      '-fno-strict-aliasing'],
+         'cflags': ['-march=rv64gc', '-mabi=lp64d', '-mcmodel=medany'],
+       }],
+     ],

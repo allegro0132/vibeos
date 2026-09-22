@@ -1,0 +1,18 @@
+--- a/deps/v8/src/codegen/riscv/macro-assembler-riscv.cc
++++ b/deps/v8/src/codegen/riscv/macro-assembler-riscv.cc
+@@ -263,8 +263,13 @@
+   LoadTaggedField(optimized_code_entry,
+                   FieldMemOperand(feedback_vector,
+                                   FeedbackVector::kMaybeOptimizedCodeOffset));
+-  TailCallOptimizedCodeSlot(this, optimized_code_entry, temps.Acquire(),
+-                            temps.Acquire());
++  UseScratchRegisterScope temps(this);
++  temps.Include(t0, t1);
++  temps.Exclude(optimized_code_entry, feedback_vector);
++  temps.Exclude(a1, a3);
++  Register scratch1 = temps.Acquire();
++  Register scratch2 = temps.Acquire();
++  TailCallOptimizedCodeSlot(this, optimized_code_entry, scratch1, scratch2);
+ }
+ #endif  // V8_ENABLE_LEAPTIERING
+ 

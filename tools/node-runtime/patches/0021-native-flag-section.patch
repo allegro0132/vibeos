@@ -1,0 +1,14 @@
+--- a/deps/v8/src/flags/flags.cc
++++ b/deps/v8/src/flags/flags.cc
+@@ -35,7 +35,11 @@
+ namespace v8::internal {
+ 
+ // Define {v8_flags}, declared in flags.h.
++#if V8_OS_VIBEOS
++FlagValues v8_flags __attribute__((section(".vibeos_v8_flags")));
++#else
+ FlagValues v8_flags PERMISSION_MUTABLE_SECTION;
++#endif
+ 
+ // {v8_flags} needs to be aligned to a memory page, and the size needs to be a
+ // multiple of a page size. This is required for memory-protection of the memory

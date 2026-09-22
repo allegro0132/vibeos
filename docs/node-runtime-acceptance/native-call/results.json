@@ -1,0 +1,52 @@
+{
+  "scope": "hart identity under foreign tp; not full native TLS or V8 acceptance; protected native call/return and FCSR restoration",
+  "kernel_sha256": "e14b61691c5661c40a2a57d0d1ab18f209912848e5ae702eea4dbc3613697f1f",
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-call-qemu-1/kernel.elf",
+    "-net",
+    "none"
+  ],
+  "passed": true,
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "kernel/src/lib.rs": "34d1574f86974cb8c92bf68bed3b31d30fb1656f983f53fefe8ee63625a5dfec",
+    "kernel/Cargo.toml": "6f647ad5ccb10ead644590235efd97dc82ad5b8517db2714e0cb7e290492a5a2",
+    "firmware/qemu-virt/Cargo.toml": "5286c186b16b2b57c8ee8f77eb9da647f24844a23838b04f42145da612a15906",
+    "kernel/src/mmu.rs": "755c192c44ab930a73cbac397465abc14b969d0abdb4f88dae4354443cbe3472",
+    "kernel/src/trap.rs": "dd212c0e2193c6c0569aa127a7e7e422544de767fcab6f4801fb1d06501ac698",
+    "kernel/src/native_call.rs": "d09c17fa2201f2c80ee8d7859c54e5f31b53ade051a4a88ad3da1beebda86d79",
+    "scripts/test-native-tls-qemu.py": "e8f45a2bcedea7113e6376c59231d144fff966e75558f088799f204c683fc192"
+  },
+  "hart_pairs": [
+    [
+      0,
+      0
+    ],
+    [
+      1,
+      1
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "native_call_passed": true,
+  "elapsed_seconds": 0.31262283300748095
+}

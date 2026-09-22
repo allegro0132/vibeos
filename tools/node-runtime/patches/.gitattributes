@@ -1,0 +1,2 @@
+# Unified patch context lines must preserve their leading/trailing spaces.
+*.patch -whitespace

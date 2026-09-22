@@ -1,0 +1,10 @@
+--- a/tools/v8_gypfiles/v8.gyp
++++ b/tools/v8_gypfiles/v8.gyp
+@@ -1431,6 +1431,7 @@
+             '<(V8_ROOT)/src/base/platform/platform-vibeos-format.cc',
+             '<(V8_ROOT)/src/base/platform/platform-vibeos-stdio.cc',
+             '<(V8_ROOT)/src/base/platform/platform-vibeos-timezone.cc',
++            '<(V8_ROOT)/src/base/platform/platform-vibeos-lifecycle.cc',
+           ],
+         }],
+         ['is_posix or is_fuchsia or (_toolset=="host" and host_os in "mac linux")', {

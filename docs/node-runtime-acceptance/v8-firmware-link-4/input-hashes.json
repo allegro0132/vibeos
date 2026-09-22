@@ -1,0 +1,7 @@
+{
+  "tools/node-runtime/platform/platform-vibeos-libc.cc": "54d7a36004ddbd4ff9fe2eb812fc760ad4e923b9cafb9abdf5fd6997feffb384",
+  "tools/node-runtime/tests/native-libc-test.cc": "c2e6b6b87f7d49434ae5d204e25e334f99a61bcac7a015d767e46113843698bc",
+  "scripts/test-native-libc.py": "4b19297adcbfb5edd2e60d1064201fbdf05c2aeb65a02c9d732627abf0b28893",
+  "tools/node-runtime/patches/0024-native-libc-platform.patch": "1f520fdf5c41035bec14ea45601e44be6909bbd20ce541782933666943daae26",
+  "kernel/src/native_entropy.rs": "2d22b5954b5db11aa6963a81de7015e62b978e7aab45d2bfdc6ddd1c549940c7"
+}

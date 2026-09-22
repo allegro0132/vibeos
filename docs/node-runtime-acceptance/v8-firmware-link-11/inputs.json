@@ -1,0 +1,7 @@
+{
+  "firmware/qemu-virt/linker.ld": "a7804cecaf30979d72c27c8e717ddf04e892d68aa894ae02d2d2c18eaaabcb8a",
+  "tools/node-runtime/platform/platform-vibeos-libc.cc": "a49a11251eb6c925eb2b0e241b162b75953256e606432495bc42404b978d4c9f",
+  "tools/node-runtime/platform/vibeos-process.h": "d54cbdb4e2618dbbe62aabeec3882fe4949614d4097e26c53739cb4eb3d08c28",
+  "tools/node-runtime/tests/v8-smoke.cc": "8ef0a9483a219b6cb460b294c8593cef491fe9a2e18e1cd86ccb942463ed2ea1",
+  "tools/node-runtime/tests/native-libc-test.cc": "fc40e6dcd5313931286d87033c1c7893d3a361cbc3e6eff2d0ebbacd7d9dc0e7"
+}

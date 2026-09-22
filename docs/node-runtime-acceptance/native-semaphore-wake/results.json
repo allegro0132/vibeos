@@ -1,0 +1,99 @@
+{
+  "scope": "hart identity under foreign tp; not full native TLS or V8 acceptance; protected native call/return, suspend/resume, Rust Drop and FCSR restoration; C++ RAII, per-context GCC emutls across suspension, dynamic TLS initialization and LIFO exit destructors (not the full static C++ runtime)",
+  "kernel_sha256": "561da72114ce8844d5345fefd522d436afd997cb72f221fb7882069ab2a9bbdf",
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "128M",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/native-semaphore-wake-qemu-1/kernel.elf",
+    "-net",
+    "none"
+  ],
+  "passed": true,
+  "qemu_version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers",
+  "source_sha256": {
+    "runtime/riscv/src/bare.rs": "598d7d3a4b2fbee8d70fd47893b34622438f7a2c4f1187641289586edfce3a97",
+    "kernel/src/lib.rs": "eba4575e26c11e323393d15ce331ca4dd4a0e3b465fba21f418aa9384de5c3f8",
+    "kernel/Cargo.toml": "9b82ccfb6caf4c660019ef5d97006683290e4789b6401c91f9c295652cd5012c",
+    "firmware/qemu-virt/Cargo.toml": "ce7212ad8ecf45a9dfe5afaed06d15a401f52302e5da6fbb83d824c63b570248",
+    "kernel/src/mmu.rs": "6996e24ceebee2a7dd58e1bd14ee199ab20cacc355c52af4ea2721e083e42f1f",
+    "kernel/src/trap.rs": "dd212c0e2193c6c0569aa127a7e7e422544de767fcab6f4801fb1d06501ac698",
+    "kernel/src/native_call.rs": "ae0aa490c28787d06eb244b5e40eae004f3d72687f443127b48ac34635af7fbf",
+    "kernel/src/native_clock.rs": "59455406375cd6518d5804a6c1dd5aea1713814134abc208cb21d796b2773270",
+    "kernel/src/wasi_clock.rs": "21b51f59482cfb9e7b7f1d6a1a26446d95fdb6eb2ea75cf74c5d1076bd8803d1",
+    "kernel/src/native_semaphore.rs": "9ecc56afca9be3317117c7d21d9ef92a21636cccd8abf712b0cb89e1440e17a2",
+    "kernel/src/native_wait.rs": "afd4f84f37ea22eebbda464ee1a3b55d4c6470c75efb2d9bda253d3e56394f67",
+    "kernel/src/native_notify.rs": "6ba138e21a06efb196322d701a40a14e582fb75017d5f4634bafb6f295bbd1a6",
+    "kernel/src/native_memory.rs": "699747c2ce186b6e219c819418609f9c36532b7109cfc141c6247906c73f2210",
+    "kernel/src/native_page_pool.rs": "053eebfe83c281937293dfdf26ae665ce44f4d7ea2a9a9545b56cb6a6b720710",
+    "kernel/src/native_pages.rs": "c60bee39e6d57b96771fdbbc5916f8bf056e72fe05670fbc40ad26c6c13a0e4e",
+    "kernel/src/native_tcb_pages.rs": "b3eb67f0816c4393a66127160d25684fc54e5b994a3932d712383de0df6f152f",
+    "kernel/src/native_tls.rs": "5901430b430ae50f469dd372f86f20ab799622f107041b65fa677fecf87d476c",
+    "firmware/qemu-virt/linker.ld": "523f6a3954605a0eb7d8e73982a599027be1d90e5598722371acaf4677d3f385",
+    "firmware/qemu-virt/build.rs": "df433d9d69cda67c9636385948edba3c2ed77f4bbe11fe31c829cb39d84d4aed",
+    "kernel/build.rs": "c5be32c7900cd576cdb0a1ad2d290cbcf0a1ab6789e42e206a25bf34512c7ffc",
+    "tools/node-runtime/tests/native-cxx-probe.cc": "501b8158443fa4ef90474bbb5e6091b90b967fbd7d8d061e8863a6cbc15f4b21",
+    "tools/node-runtime/toolchain.lock.json": "970f5c6019938f49297d5a6204d7fef3d20f6b3ecd8751dab9c7e97926203597",
+    "tools/node-runtime/platform/vibeos-memory.h": "798c2805f33fd0b4e30a1eb52ced86e44951745157ad041db4b3f8a71c72ca34",
+    "tools/node-runtime/platform/vibeos-backtrace.h": "bc7f6c072961ac9e8a376bea59ee8aeeaaa3b8c825a6539e9cbbaf820c50a872",
+    "tools/node-runtime/platform/vibeos-sync.h": "1a821c64e331ad4622525991cc0639e127f53e940ce557864b1243a26a3fc845",
+    "tools/node-runtime/platform/vibeos-time.h": "c9c85d9b60b6ab8248c65826ef9d42be51c384d02cc6bed16f96cce64d1a4138",
+    "tools/node-runtime/platform/vibeos-cache.h": "9232e402dc237c8c1392a44c28ab6047152164ef2bbe31ab1a43cffdc554e1c3",
+    "tools/node-runtime/platform/vibeos-stack.h": "b4897aea4c341f79767bbee292635282cc22ca40892deb258ba0672111b8eb23",
+    "tools/node-runtime/platform/vibeos-tcb-pages.h": "0522287fb01e2821c4168304809f9c2f23a739d43a08f64db094cf4675c34e7d",
+    "scripts/test-native-tls-qemu.py": "c048c8a7d35ee5970ff8dfa630dc2549219b1bf40fe76301f5550442e3108f37"
+  },
+  "observed_checks": {
+    "harts": true,
+    "shell": true,
+    "call": true,
+    "suspend": true,
+    "cxx": true,
+    "park": true,
+    "pages": true,
+    "cache": true,
+    "cxx_tls": true,
+    "tls_dtor": true,
+    "tcb_pages": true,
+    "page_pool": true,
+    "memory_abi": true,
+    "static_flags": true,
+    "notify": true,
+    "wait_abi": true,
+    "semaphore": true,
+    "semaphore_owner": true,
+    "semaphore_wake": true
+  },
+  "hart_pairs": [
+    [
+      0,
+      1
+    ],
+    [
+      1,
+      0
+    ],
+    [
+      2,
+      2
+    ],
+    [
+      3,
+      3
+    ]
+  ],
+  "native_call_passed": true,
+  "native_suspend_passed": true,
+  "native_cxx_passed": true,
+  "native_executor_parking_passed": true,
+  "native_page_permissions_passed": true,
+  "elapsed_seconds": 0.2798266669851728
+}

@@ -1,0 +1,146 @@
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/spinlock_wait.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/spinlock_wait.cc
+@@ -21,7 +21,9 @@
+ 
+ #include "absl/base/internal/spinlock_wait.h"
+ 
+-#if defined(_WIN32)
++#if defined(__vibeos__)
++#include "../../../../../src/base/platform/vibeos-spinlock.inc"
++#elif defined(_WIN32)
+ #include "absl/base/internal/spinlock_win32.inc"
+ #elif defined(__linux__)
+ #include "absl/base/internal/spinlock_linux.inc"
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/sysinfo.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/sysinfo.cc
+@@ -13,6 +13,9 @@
+ // limitations under the License.
+ 
+ #include "absl/base/internal/sysinfo.h"
++#if defined(__vibeos__)
++#include "../../../../../src/base/platform/vibeos-sync.h"
++#endif
+ 
+ #include "absl/base/attributes.h"
+ 
+@@ -479,9 +482,13 @@
+ 
+ // Fallback implementation of `GetTID` using `pthread_self`.
+ pid_t GetTID() {
++#if defined(__vibeos__)
++  return vibeos_native_thread_id();
++#else
+   // `pthread_t` need not be arithmetic per POSIX; platforms where it isn't
+   // should be handled above.
+   return static_cast<pid_t>(pthread_self());
++#endif
+ }
+ 
+ #endif
+--- a/deps/v8/third_party/abseil-cpp/absl/base/internal/thread_identity.h
++++ b/deps/v8/third_party/abseil-cpp/absl/base/internal/thread_identity.h
+@@ -219,7 +219,7 @@
+ #define ABSL_THREAD_IDENTITY_MODE ABSL_FORCE_THREAD_IDENTITY_MODE
+ #elif defined(_WIN32) && !defined(__MINGW32__)
+ #define ABSL_THREAD_IDENTITY_MODE ABSL_THREAD_IDENTITY_MODE_USE_CPP11
+-#elif defined(__APPLE__) && defined(ABSL_HAVE_THREAD_LOCAL)
++#elif (defined(__APPLE__) || defined(__vibeos__)) && defined(ABSL_HAVE_THREAD_LOCAL)
+ #define ABSL_THREAD_IDENTITY_MODE ABSL_THREAD_IDENTITY_MODE_USE_CPP11
+ #elif ABSL_PER_THREAD_TLS && defined(__GOOGLE_GRTE_VERSION__) && \
+     (__GOOGLE_GRTE_VERSION__ >= 20140228L)
+--- a/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/waiter.h
++++ b/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/waiter.h
+@@ -17,6 +17,9 @@
+ #define ABSL_SYNCHRONIZATION_INTERNAL_WAITER_H_
+ 
+ #include "absl/base/config.h"
++#if defined(__vibeos__)
++#include "../../../../../src/base/platform/vibeos-waiter.h"
++#else
+ #include "absl/synchronization/internal/futex_waiter.h"
+ #include "absl/synchronization/internal/pthread_waiter.h"
+ #include "absl/synchronization/internal/sem_waiter.h"
+@@ -66,4 +69,5 @@
+ ABSL_NAMESPACE_END
+ }  // namespace absl
+ 
++#endif  // __vibeos__
+ #endif  // ABSL_SYNCHRONIZATION_INTERNAL_WAITER_H_
+--- a/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/pthread_waiter.h
++++ b/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/pthread_waiter.h
+@@ -16,7 +16,7 @@
+ #ifndef ABSL_SYNCHRONIZATION_INTERNAL_PTHREAD_WAITER_H_
+ #define ABSL_SYNCHRONIZATION_INTERNAL_PTHREAD_WAITER_H_
+ 
+-#if !defined(_WIN32) && !defined(__MINGW32__)
++#if !defined(_WIN32) && !defined(__MINGW32__) && !defined(__vibeos__)
+ #include <pthread.h>
+ 
+ #include "absl/base/config.h"
+--- a/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/stdcpp_waiter.h
++++ b/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/stdcpp_waiter.h
+@@ -16,6 +16,7 @@
+ #ifndef ABSL_SYNCHRONIZATION_INTERNAL_STDCPP_WAITER_H_
+ #define ABSL_SYNCHRONIZATION_INTERNAL_STDCPP_WAITER_H_
+ 
++#if !defined(__vibeos__)
+ #include <condition_variable>  // NOLINT(build/c++11)
+ #include <mutex>  // NOLINT(build/c++11)
+ 
+@@ -53,4 +54,5 @@
+ ABSL_NAMESPACE_END
+ }  // namespace absl
+ 
++#endif  // !__vibeos__
+ #endif  // ABSL_SYNCHRONIZATION_INTERNAL_STDCPP_WAITER_H_
+--- a/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/kernel_timeout.h
++++ b/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/kernel_timeout.h
+@@ -15,7 +15,7 @@
+ #ifndef ABSL_SYNCHRONIZATION_INTERNAL_KERNEL_TIMEOUT_H_
+ #define ABSL_SYNCHRONIZATION_INTERNAL_KERNEL_TIMEOUT_H_
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__vibeos__)
+ #include <sys/types.h>
+ #endif
+ 
+--- a/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/kernel_timeout.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/synchronization/internal/kernel_timeout.cc
+@@ -30,18 +30,28 @@
+ #include "absl/base/call_once.h"
+ #include "absl/base/config.h"
+ #include "absl/time/time.h"
++#if defined(__vibeos__)
++#include "../../../../../src/base/platform/vibeos-time.h"
++#endif
+ 
+ namespace absl {
+ ABSL_NAMESPACE_BEGIN
+ namespace synchronization_internal {
+ 
+ int64_t KernelTimeout::SteadyClockNow() {
++#if defined(__vibeos__)
++  const int64_t micros = vibeos_native_monotonic_us();
++  ABSL_RAW_CHECK(micros >= 0 && micros <= INT64_MAX / 1000,
++                 "VibeOS monotonic clock failed or overflowed");
++  return micros * 1000;
++#else
+   if (!SupportsSteadyClock()) {
+     return absl::GetCurrentTimeNanos();
+   }
+   return std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+       .count();
++#endif
+ }
+ 
+ KernelTimeout::KernelTimeout(absl::Time t) {
+@@ -143,7 +153,7 @@
+   return absl::ToTimespec(absl::Nanoseconds(InNanosecondsFromNow()));
+ }
+ 
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__vibeos__)
+ struct timespec KernelTimeout::MakeClockAbsoluteTimespec(clockid_t c) const {
+   if (!has_timeout()) {
+     return absl::ToTimespec(absl::Nanoseconds(kMaxNanos));

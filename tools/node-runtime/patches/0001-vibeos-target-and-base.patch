@@ -1,0 +1,294 @@
+--- a/configure.py
++++ b/configure.py
+@@ -44,7 +44,7 @@
+ # parse our options
+ parser = argparse.ArgumentParser()
+ 
+-valid_os = ('win', 'mac', 'solaris', 'freebsd', 'openbsd', 'linux',
++valid_os = ('vibeos', 'win', 'mac', 'solaris', 'freebsd', 'openbsd', 'linux',
+             'android', 'aix', 'cloudabi', 'os400', 'ios', 'openharmony')
+ valid_arch = ('arm', 'arm64', 'ia32', 'mips', 'mipsel', 'mips64el',
+               'ppc64', 'x64', 'x86', 'x86_64', 's390x', 'riscv64', 'loong64')
+@@ -1541,6 +1541,9 @@
+     SearchFiles('test/cctest', 'h')
+ 
+ def configure_node(o):
++  if options.dest_os == 'vibeos':
++    o['variables']['OS'] = 'vibeos'
++    o['variables']['host_os'] = GetFlavor({})
+   if options.dest_os == 'android':
+     o['variables']['OS'] = 'android'
+   o['variables']['node_prefix'] = options.prefix
+--- a/common.gypi
++++ b/common.gypi
+@@ -134,6 +134,15 @@
+   },
+ 
+   'target_defaults': {
++    'target_conditions': [
++      ['OS=="vibeos"', {
++        'cflags_cc': ['-std=gnu++20'],
++      }],
++      ['OS=="vibeos" and _toolset=="target"', {
++        'defines': ['__vibeos__=1'],
++        'cflags': ['-march=rv64gc', '-mabi=lp64d', '-mcmodel=medany'],
++      }],
++    ],
+     'default_configuration': 'Release',
+     'configurations': {
+       'Debug': {
+--- a/tools/v8_gypfiles/features.gypi
++++ b/tools/v8_gypfiles/features.gypi
+@@ -52,7 +52,7 @@
+         'is_android': 0,
+       }],
+       # flattened (!is_win && !is_fuchsia) because of GYP evaluation order
+-      ['not (OS == "win" or OS == "winuwp") and not (OS == "fuchsia")', {
++      ['OS not in "win winuwp fuchsia vibeos"', {
+         'is_posix': 1,
+       }, {
+         'is_posix': 0,
+--- a/tools/v8_gypfiles/v8.gyp
++++ b/tools/v8_gypfiles/v8.gyp
+@@ -1422,7 +1422,7 @@
+         ['is_component_build', {
+           'defines': ["BUILDING_V8_BASE_SHARED"],
+         }],
+-        ['is_posix or is_fuchsia', {
++        ['is_posix or is_fuchsia or (_toolset=="host" and host_os in "mac linux")', {
+           'sources': [
+             '<(V8_ROOT)/src/base/platform/platform-posix.cc',
+             '<(V8_ROOT)/src/base/platform/platform-posix.h',
+@@ -1436,7 +1436,7 @@
+             }],
+           ],
+         }],
+-        ['OS=="linux" or OS=="openharmony"', {
++        ['OS=="linux" or OS=="openharmony" or (_toolset=="host" and host_os=="linux")', {
+           'sources': [
+             '<(V8_ROOT)/src/base/debug/stack_trace_posix.cc',
+             '<(V8_ROOT)/src/base/platform/platform-linux.cc',
+--- a/tools/v8_gypfiles/toolchain.gypi
++++ b/tools/v8_gypfiles/toolchain.gypi
+@@ -534,6 +534,9 @@
+           },
+         },
+       }],
++      ['OS=="vibeos"', {
++        'defines': ['V8_HAVE_TARGET_OS', 'V8_TARGET_OS_VIBEOS'],
++      }],
+       ['OS=="android"', {
+         'defines': [
+           'V8_HAVE_TARGET_OS',
+--- a/tools/v8_gypfiles/abseil.gyp
++++ b/tools/v8_gypfiles/abseil.gyp
+@@ -5,6 +5,11 @@
+       'target_name': 'abseil',
+       'type': 'static_library',
+       'toolsets': ['host', 'target'],
++      'conditions': [
++        ['OS=="vibeos" and _toolset=="host" and host_os=="mac"', {
++          'link_settings': {'libraries': ['-framework CoreFoundation']},
++        }],
++      ],
+       'variables': {
+         'ABSEIL_ROOT': '../../deps/v8/third_party/abseil-cpp',
+       },
+--- a/tools/gyp/pylib/gyp/generator/make.py
++++ b/tools/gyp/pylib/gyp/generator/make.py
+@@ -2469,6 +2469,15 @@
+ 
+     # wasm-ld doesn't support --start-group/--end-group
+     link_commands = LINK_COMMANDS_LINUX
++    if flavor == "vibeos" and sys.platform == "darwin":
++        # Host generators are Mach-O; target archives are bare-metal ELF.
++        link_commands = (
++            "vibeos_group_start.target := -Wl,--start-group\n"
++            "vibeos_group_end.target := -Wl,--end-group\n"
++            + link_commands.replace("-Wl,--start-group", "$(vibeos_group_start.$(TOOLSET))")
++              .replace("-Wl,--end-group", "$(vibeos_group_end.$(TOOLSET))")
++              .replace(" crsT ", " $(if $(filter host,$(TOOLSET)),crs,crsT) ")
++        )
+     if flavor in ["wasi", "wasm"]:
+         link_commands = link_commands.replace(" -Wl,--start-group", "").replace(
+             " -Wl,--end-group", ""
+--- a/deps/v8/include/v8config.h
++++ b/deps/v8/include/v8config.h
+@@ -95,7 +95,10 @@
+ //  V8_OS_WIN           - Microsoft Windows
+ //  V8_OS_ZOS           - z/OS
+ 
+-#if defined(__ANDROID__)
++#if defined(__vibeos__)
++# define V8_OS_VIBEOS 1
++# define V8_OS_STRING "vibeos"
++#elif defined(__ANDROID__)
+ # define V8_OS_ANDROID 1
+ # define V8_OS_LINUX 1
+ # define V8_OS_POSIX 1
+@@ -203,7 +206,8 @@
+   && !defined(V8_TARGET_OS_LINUX) \
+   && !defined(V8_TARGET_OS_MACOS) \
+   && !defined(V8_TARGET_OS_WIN) \
+-  && !defined(V8_TARGET_OS_CHROMEOS)
++  && !defined(V8_TARGET_OS_CHROMEOS) \
++  && !defined(V8_TARGET_OS_VIBEOS)
+ #  error No known target OS defined.
+ # endif
+ 
+@@ -215,11 +219,15 @@
+   || defined(V8_TARGET_OS_LINUX) \
+   || defined(V8_TARGET_OS_MACOS) \
+   || defined(V8_TARGET_OS_WIN) \
+-  || defined(V8_TARGET_OS_CHROMEOS)
++  || defined(V8_TARGET_OS_CHROMEOS) \
++  || defined(V8_TARGET_OS_VIBEOS)
+ #  error A target OS is defined but V8_HAVE_TARGET_OS is unset.
+ # endif
+ 
+ // Fall back to the detected host OS.
++#ifdef V8_OS_VIBEOS
++# define V8_TARGET_OS_VIBEOS
++#endif
+ #ifdef V8_OS_ANDROID
+ # define V8_TARGET_OS_ANDROID
+ #endif
+@@ -246,7 +254,9 @@
+ 
+ #endif  // V8_HAVE_TARGET_OS
+ 
+-#if defined(V8_TARGET_OS_ANDROID)
++#if defined(V8_TARGET_OS_VIBEOS)
++# define V8_TARGET_OS_STRING "vibeos"
++#elif defined(V8_TARGET_OS_ANDROID)
+ # define V8_TARGET_OS_STRING "android"
+ #elif defined(V8_TARGET_OS_FUCHSIA)
+ # define V8_TARGET_OS_STRING "fuchsia"
+--- a/deps/v8/src/base/once.cc
++++ b/deps/v8/src/base/once.cc
+@@ -4,7 +4,10 @@
+ 
+ #include "src/base/once.h"
+ 
+-#ifdef _WIN32
++#if V8_OS_VIBEOS
++#include "src/base/platform/vibeos-sync.h"
++#include "src/base/logging.h"
++#elif defined(_WIN32)
+ #include <windows.h>
+ #elif defined(V8_OS_STARBOARD)
+ #include "starboard/thread.h"
+@@ -35,12 +38,20 @@
+     // function.
+     init_func();
+     once->store(ONCE_STATE_DONE, std::memory_order_release);
++#if V8_OS_VIBEOS
++    vibeos_native_wake_all(once);
++#endif
+   } else {
+     // Another thread has already started executing the function. We need to
+     // wait until it completes the initialization.
+     while (once->load(std::memory_order_acquire) ==
+            ONCE_STATE_EXECUTING_FUNCTION) {
+-#ifdef _WIN32
++#if V8_OS_VIBEOS
++      CHECK_EQ(0, vibeos_native_wait_until(once, [](void* key) -> int {
++        return static_cast<OnceType*>(key)->load(std::memory_order_acquire) !=
++               ONCE_STATE_EXECUTING_FUNCTION;
++      }));
++#elif defined(_WIN32)
+       ::Sleep(0);
+ #elif defined(V8_OS_STARBOARD)
+       SbThreadYield();
+--- a/deps/v8/src/base/platform/semaphore.h
++++ b/deps/v8/src/base/platform/semaphore.h
+@@ -57,7 +57,9 @@
+   // the semaphore counter is decremented and true is returned.
+   bool WaitFor(const TimeDelta& rel_time) V8_WARN_UNUSED_RESULT;
+ 
+-#if V8_OS_DARWIN
++#if V8_OS_VIBEOS
++  using NativeHandle = void*;
++#elif V8_OS_DARWIN
+   using NativeHandle = dispatch_semaphore_t;
+ #elif V8_OS_POSIX
+   using NativeHandle = sem_t;
+--- a/deps/v8/src/base/platform/semaphore.cc
++++ b/deps/v8/src/base/platform/semaphore.cc
+@@ -15,11 +15,37 @@
+ #include "src/base/logging.h"
+ #include "src/base/platform/elapsed-timer.h"
+ #include "src/base/platform/time.h"
++#if V8_OS_VIBEOS
++#include "src/base/platform/vibeos-sync.h"
++#endif
+ 
+ namespace v8 {
+ namespace base {
+ 
+-#if V8_OS_DARWIN
++#if V8_OS_VIBEOS
++
++Semaphore::Semaphore(int count) {
++  CHECK_GE(count, 0);
++  native_handle_ = vibeos_native_semaphore_create(count);
++  CHECK_NOT_NULL(native_handle_);
++}
++Semaphore::~Semaphore() {
++  vibeos_native_semaphore_destroy(native_handle_);
++}
++void Semaphore::Signal() {
++  CHECK_EQ(0, vibeos_native_semaphore_signal(native_handle_));
++}
++void Semaphore::Wait() {
++  CHECK_EQ(1, vibeos_native_semaphore_wait(native_handle_, -1));
++}
++bool Semaphore::WaitFor(const TimeDelta& rel_time) {
++  const int64_t timeout = rel_time.InMicroseconds();
++  const int result = vibeos_native_semaphore_wait(native_handle_, timeout > 0 ? timeout : 0);
++  CHECK_GE(result, 0);
++  return result == 1;
++}
++
++#elif V8_OS_DARWIN
+ 
+ Semaphore::Semaphore(int count) {
+   native_handle_ = dispatch_semaphore_create(count);
+--- a/deps/v8/src/base/platform/time.cc
++++ b/deps/v8/src/base/platform/time.cc
+@@ -3,6 +3,9 @@
+ // found in the LICENSE file.
+ 
+ #include "src/base/platform/time.h"
++#if V8_OS_VIBEOS
++#include "src/base/platform/vibeos-time.h"
++#endif
+ 
+ #if V8_OS_POSIX
+ #include <fcntl.h>  // for O_RDONLY
+@@ -405,6 +408,15 @@
+   ft.dwHighDateTime = static_cast<DWORD>(us >> 32);
+   return ft;
+ }
++
++#elif V8_OS_VIBEOS
++
++Time Time::Now() {
++  const int64_t micros = vibeos_native_realtime_us();
++  CHECK_GE(micros, 0);
++  return Time(micros);
++}
++Time Time::NowFromSystemTime() { return Now(); }
+ 
+ #elif V8_OS_POSIX || V8_OS_STARBOARD
+ 
+@@ -744,6 +756,9 @@
+   }
+   ticks = (mach_absolute_time() / Time::kNanosecondsPerMicrosecond *
+            info.numer / info.denom);
++#elif V8_OS_VIBEOS
++  ticks = vibeos_native_monotonic_us();
++  CHECK_GE(ticks, 0);
+ #elif V8_OS_SOLARIS
+   ticks = (gethrtime() / Time::kNanosecondsPerMicrosecond);
+ #elif V8_OS_FUCHSIA

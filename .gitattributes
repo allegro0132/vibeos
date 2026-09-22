@@ -6,3 +6,6 @@ vendor/wasmi-softfloat/** whitespace=-blank-at-eof
 
 # Preserve the byte-exact formal QEMU UART transcript, including device CRLF.
 benchmarks/wasm-aot-decision/qemu-v1/uart.log binary
+
+# Preserve native-port evidence transcripts, including UART CRLF and compiler output.
+docs/node-runtime-acceptance/**/*.log whitespace=-blank-at-eol,-blank-at-eof

@@ -5,6 +5,13 @@ edition = "2021"
 autobins = false
 
 [features]
+native-stacks = []
+native-memory = []
+native-call-probe = ["native-stacks", "native-memory"]
+native-cxx-probe = ["native-call-probe", "dep:vibeos-file-store", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
+native-runtime-probe = []
+node-runtime = ["native-cxx-probe"]
+native-exit-probe = ["native-cxx-probe"]
 gro-checked = ["gro-scatter", "vibeos-netstack/gro-checked"]
 gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]
 frontend-rx-batch = ["vibeos-netstack?/frontend-rx-batch"]
@@ -69,7 +76,7 @@ wasmtime-command-fuel-batch = ["wasmtime-command", "vibeos-wasmtime-runtime/fuel
 # wasi-threads on the native command backend: shared memory, atomics, and
 # up to MAX_GUEST_THREADS sibling tasks per command.
 wasmtime-threads = ["wasmtime-command", "vibeos-wasmtime-runtime/threads"]
-wasmtime-async = ["vibeos-wasmtime-runtime/custom-code-registry", "wasmtime-guarded-memory", "vibeos-wasmtime-runtime/async", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
+wasmtime-async = ["native-stacks", "vibeos-wasmtime-runtime/custom-code-registry", "wasmtime-guarded-memory", "vibeos-wasmtime-runtime/async", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
 wasmtime-guarded-memory = ["wasmtime-hardware-traps"]
 wasmtime-hardware-traps = ["wasmtime-native", "vibeos-wasmtime-runtime/native-signals"]
 # Generate code for the firmware-discovered scalar B extensions (zba/zbb/zbc/

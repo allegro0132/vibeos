@@ -1,0 +1,20 @@
+../deps/v8/third_party/abseil-cpp/absl/synchronization/mutex.h:1179:34: note: insert '_Nullable' if the pointer may be null
+ 1179 | void RegisterCondVarTracer(void (*fn)(const char* msg, const void* cv));
+      |                                  ^
+      |                                    _Nullable 
+../deps/v8/third_party/abseil-cpp/absl/synchronization/mutex.h:1179:34: note: insert '_Nonnull' if the pointer should never be null
+ 1179 | void RegisterCondVarTracer(void (*fn)(const char* msg, const void* cv));
+      |                                  ^
+      |                                    _Nonnull 
+64 warnings generated.
+64 warnings generated.
+64 warnings generated.
+64 warnings generated.
+  LINK(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/mksnapshot
+  TOUCH 0df817ab1b6e1a6a624f9519288c6824fdd0fe5e58b6ac5714606b00560e77b9.intermediate
+  ACTION generating: "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_zlib/geni/snapshot.cc" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_zlib/geni/embedded.S" 0df817ab1b6e1a6a624f9519288c6824fdd0fe5e58b6ac5714606b00560e77b9.intermediate
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_snapshot/deps/v8/src/init/setup-isolate-deserialize.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_snapshot/geni/snapshot.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/v8_snapshot/geni/embedded.o
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_snapshot.a
+rm 0df817ab1b6e1a6a624f9519288c6824fdd0fe5e58b6ac5714606b00560e77b9.intermediate 8a9b8676d1fa7c04ab11ddafef1d4e3eaba00563dffb22ecf11dab6c2c52f575.intermediate 8b873f8e0045dc2991ac1d973253e7cb39dcee117699b45f959f1f0dcab1e240.intermediate 14ea54a8e4588c4f2f3c68933e0e602864bcd661d5f619e09d0f32ef6fdc4abf.intermediate 28641945347e46351a34c23e32b37882555d546709edd19b65ffd43ac7fa7bc4.intermediate

@@ -1,0 +1,95 @@
+--- a/deps/v8/third_party/abseil-cpp/absl/debugging/internal/elf_mem_image.h
++++ b/deps/v8/third_party/abseil-cpp/absl/debugging/internal/elf_mem_image.h
+@@ -35,7 +35,8 @@
+ #if defined(__ELF__) && !defined(__OpenBSD__) && !defined(__QNX__) && \
+     !defined(__native_client__) && !defined(__asmjs__) &&             \
+     !defined(__wasm__) && !defined(__HAIKU__) && !defined(__sun) &&   \
+-    !defined(__VXWORKS__) && !defined(__hexagon__) && !defined(__XTENSA__)
++    !defined(__VXWORKS__) && !defined(__hexagon__) && !defined(__XTENSA__) && \
++    !defined(__vibeos__)
+ #define ABSL_HAVE_ELF_MEM_IMAGE 1
+ #endif
+ 
+--- a/deps/v8/third_party/abseil-cpp/absl/debugging/internal/stack_consumption.h
++++ b/deps/v8/third_party/abseil-cpp/absl/debugging/internal/stack_consumption.h
+@@ -25,7 +25,7 @@
+ #ifdef ABSL_INTERNAL_HAVE_DEBUGGING_STACK_CONSUMPTION
+ #error ABSL_INTERNAL_HAVE_DEBUGGING_STACK_CONSUMPTION cannot be set directly
+ #elif !defined(__APPLE__) && !defined(_WIN32) && !defined(__Fuchsia__) && \
+-    (defined(__i386__) || defined(__x86_64__) || defined(__ppc__) || \
++    !defined(__vibeos__) && (defined(__i386__) || defined(__x86_64__) || defined(__ppc__) || \
+      defined(__aarch64__) || defined(__riscv))
+ #define ABSL_INTERNAL_HAVE_DEBUGGING_STACK_CONSUMPTION 1
+ 
+--- a/deps/v8/third_party/abseil-cpp/absl/time/internal/cctz/src/time_zone_impl.cc
++++ b/deps/v8/third_party/abseil-cpp/absl/time/internal/cctz/src/time_zone_impl.cc
+@@ -17,6 +17,9 @@
+ #include <deque>
+ #include <memory>
+ #include <mutex>
++#if defined(__vibeos__)
++#include "../../../../../../../src/base/platform/vibeos-mutex.h"
++#endif
+ #include <string>
+ #include <unordered_map>
+ #include <utility>
+@@ -36,11 +39,17 @@
+     std::unordered_map<std::string, const time_zone::Impl*>;
+ TimeZoneImplByName* time_zone_map = nullptr;
+ 
++#if defined(__vibeos__)
++using TimeZoneMutexType = VibeosMutex;
++#else
++using TimeZoneMutexType = std::mutex;
++#endif
++
+ // Mutual exclusion for time_zone_map.
+-std::mutex& TimeZoneMutex() {
++TimeZoneMutexType& TimeZoneMutex() {
+   // This mutex is intentionally "leaked" to avoid the static deinitialization
+   // order fiasco (std::mutex's destructor is not trivial on many platforms).
+-  static std::mutex* time_zone_mutex = new std::mutex;
++  static TimeZoneMutexType* time_zone_mutex = new TimeZoneMutexType;
+   return *time_zone_mutex;
+ }
+ 
+@@ -60,7 +69,7 @@
+ 
+   // Check whether the time zone has already been loaded.
+   {
+-    std::lock_guard<std::mutex> lock(TimeZoneMutex());
++    std::lock_guard<TimeZoneMutexType> lock(TimeZoneMutex());
+     if (time_zone_map != nullptr) {
+       TimeZoneImplByName::const_iterator itr = time_zone_map->find(name);
+       if (itr != time_zone_map->end()) {
+@@ -74,7 +83,7 @@
+   std::unique_ptr<const Impl> new_impl(new Impl(name));
+ 
+   // Add the new time zone to the map.
+-  std::lock_guard<std::mutex> lock(TimeZoneMutex());
++  std::lock_guard<TimeZoneMutexType> lock(TimeZoneMutex());
+   if (time_zone_map == nullptr) time_zone_map = new TimeZoneImplByName;
+   const Impl*& impl = (*time_zone_map)[name];
+   if (impl == nullptr) {  // this thread won any load race
+@@ -85,7 +94,7 @@
+ }
+ 
+ void time_zone::Impl::ClearTimeZoneMapTestOnly() {
+-  std::lock_guard<std::mutex> lock(TimeZoneMutex());
++  std::lock_guard<TimeZoneMutexType> lock(TimeZoneMutex());
+   if (time_zone_map != nullptr) {
+     // Existing time_zone::Impl* entries are in the wild, so we can't delete
+     // them. Instead, we move them to a private container, where they are
+--- a/tools/v8_gypfiles/abseil.gyp
++++ b/tools/v8_gypfiles/abseil.gyp
+@@ -6,6 +6,10 @@
+       'type': 'static_library',
+       'toolsets': ['host', 'target'],
+       'conditions': [
++        ['OS=="vibeos" and _toolset=="target"', {
++          # VibeOS uses kernel fatal-trap diagnostics, not POSIX signals.
++          'sources!': ['<(ABSEIL_ROOT)/absl/debugging/failure_signal_handler.cc'],
++        }],
+         ['OS=="vibeos" and _toolset=="host" and host_os=="mac"', {
+           'link_settings': {'libraries': ['-framework CoreFoundation']},
+         }],

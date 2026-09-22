@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "scope": "feasibility inputs; not a complete runtime dependency lock",
+  "artifacts": {
+    "node": {
+      "version": "24.14.0",
+      "commit": "f657bb8ed86365ff3fdbe32e27563e778b41486a",
+      "v8_version": "13.6.233.17",
+      "url": "https://nodejs.org/dist/v24.14.0/node-v24.14.0.tar.xz",
+      "archive": "node-v24.14.0.tar.xz",
+      "sha256": "9fe025ef4028aba95d16e7810518bf4a5e8abfb0bdc07d8a3fdbb0afd538d77f",
+      "member": "node-v24.14.0/configure.py"
+    },
+    "esbuild": {
+      "package": "@esbuild/wasi-preview1",
+      "version": "0.25.0",
+      "commit": "e9174d671b1882758cd32ac5e146200f5bee3e45",
+      "url": "https://registry.npmjs.org/@esbuild/wasi-preview1/-/wasi-preview1-0.25.0.tgz",
+      "archive": "esbuild-wasi-0.25.0.tgz",
+      "integrity": "sha512-l+d+iC8MiHHRTMi+askpLDWolEghnxF9P9/u3jQBfrzz/al8Z0CzWsJMC37LqSmi5bSN9Aq/01R7QXWH+rVQ2A==",
+      "member": "package/esbuild.wasm",
+      "sha256": "d2463f070fc5226a69a7e54ee538a34e8b736ab84d9268c2b7977446e35ee410",
+      "module_sha256": "5090d398c1b47b40fc708510d1a9bc11d5381c46de7ea2fac31ed008ef78ff78",
+      "module_bytes": 18166737
+    },
+    "typescript": {
+      "package": "typescript",
+      "version": "5.9.3",
+      "commit": "c63de15a992d37f0d6cec03ac7631872838602cb",
+      "url": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
+      "archive": "typescript-5.9.3.tgz",
+      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+      "member": "package/lib/tsc.js"
+    },
+    "tsx": {
+      "package": "tsx",
+      "version": "4.19.3",
+      "commit": "e04e6c6ccb56f74db5036c358d6c6b24bebe6319",
+      "url": "https://registry.npmjs.org/tsx/-/tsx-4.19.3.tgz",
+      "archive": "tsx-4.19.3.tgz",
+      "integrity": "sha512-4H8vUNGNjQ4V2EOoGw005+c+dGuPSnhpPBPHBtsZdGZBk/iJb4kguGlPWaZTZ3q5nMtFOEsY0nRDlh9PJyd6SQ==",
+      "member": "package/dist/cli.mjs"
+    }
+  }
+}

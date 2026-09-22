@@ -66,6 +66,7 @@ and Duo/Mars packaging.
   restored least authority.
 - **[docs/WASI.md](docs/WASI.md)** — opt-in raw WASI Preview 1 commands, real Rust/C standard-library examples, SSH upload, and QEMU acceptance.
 - **[docs/PYTHON_WASI.md](docs/PYTHON_WASI.md)** — self-contained CPython/WASI commands, frozen standard library, and the opt-in Python QEMU image.
+- **[docs/NODE_RUNTIME.md](docs/NODE_RUNTIME.md)** — pinned JavaScript/TypeScript port inputs and reproducible prerequisite probes; native runtime implementation remains blocked.
 - **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
   admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
   resources, native async, composition, durable installation, and later adapters/AOT.

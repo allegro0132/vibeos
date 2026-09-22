@@ -13,6 +13,11 @@
 
 #![no_std]
 
+#[cfg(any(feature = "gro-scatter", feature = "receive-buffer-exchange"))]
+compile_error!(
+    "the pinned smoltcp fork lacks tcp-gro-receive/tcp-buffer-exchange; restore and pin the matching fork implementation before enabling these experimental features"
+);
+
 extern crate alloc;
 
 pub mod command;

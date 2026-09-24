@@ -5,7 +5,15 @@
 use alloc::vec::Vec;
 use smoltcp::wire::{IpAddress, Ipv4Address, Ipv4Packet, TcpPacket};
 
+#[cfg(feature = "gro-wide")]
+pub const MAX_SEGMENTS: usize = smoltcp::phy::TCP_GRO_MAX_SEGMENTS;
+#[cfg(not(feature = "gro-wide"))]
 pub const MAX_SEGMENTS: usize = 16;
+pub const PROFILE_NONE_OFFSET: usize = 10 + MAX_SEGMENTS;
+pub const PROFILE_LEN: usize = PROFILE_NONE_OFFSET + 5;
+#[cfg(feature = "gro-full-batch")]
+const MAX_BYTES: usize = smoltcp::phy::TCP_GRO_MAX_BYTES;
+#[cfg(not(feature = "gro-full-batch"))]
 const MAX_BYTES: usize = 32 * 1024;
 const TCP: usize = 34;
 
@@ -45,7 +53,7 @@ pub enum NoInput { IngressBudget, EmptyEndpoint, Authority, Rejected, Unsupporte
 
 pub struct Buffer {
     #[cfg(feature = "gro-end-profile")]
-    pub profile: [u64; 31], // 9 end reasons, sizes 0..=16, then 5 receive-none subreasons.
+    pub profile: [u64; PROFILE_LEN], // 9 reasons, sizes 0..=MAX_SEGMENTS, then 5 no-input reasons.
     #[cfg(feature = "gro-end-profile")]
     profile_reason: usize,
     data: Vec<u8>,
@@ -64,7 +72,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self {
             #[cfg(feature = "gro-end-profile")]
-            profile: [0; 31],
+            profile: [0; PROFILE_LEN],
             #[cfg(feature = "gro-end-profile")]
             profile_reason: 0,
             #[cfg(feature = "gro-scatter")]
@@ -166,7 +174,7 @@ impl Buffer {
     #[cfg(feature = "gro-end-profile")]
     pub fn profile_no_input(&mut self, why: NoInput) {
         self.profile_reason = 3;
-        self.profile[26 + why as usize] += 1;
+        self.profile[PROFILE_NONE_OFFSET + why as usize] += 1;
     }
     /// One attempted group, including rejected first frames (size zero).
     /// Recorded before final authority validation; not a delivered-frame count.
@@ -262,11 +270,11 @@ mod tests {
     #[test]
     fn poll_budget_and_allocation_are_bounded() {
         let mut g=Buffer::new(); let capacity=g.data.capacity();
-        let a=frame(0,1448); assert!(g.begin(&a,false));
-        for i in 1..MAX_SEGMENTS { assert!(g.append(&a,&frame((i*1448) as u32,1448),false)); }
-        assert!(!g.append(&a,&frame((MAX_SEGMENTS*1448) as u32,1448),false));
+        let a=frame(0,100); assert!(g.begin(&a,false));
+        for i in 1..MAX_SEGMENTS { assert!(g.append(&a,&frame((i*100) as u32,100),false)); }
+        assert!(!g.append(&a,&frame((MAX_SEGMENTS*100) as u32,100),false));
         g.finish(false); assert_eq!(g.data.capacity(),capacity);
-        assert_eq!(g.merged_segments,15); assert!(g.data.len()<=MAX_BYTES);
+        assert_eq!(g.merged_segments,(MAX_SEGMENTS - 1) as u64); assert!(g.data.len()<=MAX_BYTES);
         let a=frame(0,10); assert!(g.begin(&a,false)); assert!(!g.append(&a,&frame(10,11),false));
         assert!(g.append(&a,&frame(10,5),false)); assert!(g.finished());
     }
@@ -362,10 +370,10 @@ mod tests {
         assert_eq!(g.profile[9], 1); // ineligible first frame
         assert_eq!(g.profile[10], if atomic { 5 } else { 6 }); // singleton attempts
         assert_eq!(g.profile[11], if atomic { 2 } else { 1 }); // short second frame
-        assert_eq!(g.profile[25], 1); // bounded 16-frame group
-        assert_eq!(g.profile[..9].iter().sum::<u64>(), g.profile[9..26].iter().sum::<u64>());
-        assert_eq!(g.profile[27], 1);
-        assert_eq!(g.profile[26..].iter().sum::<u64>(), g.profile[3]);
+        assert_eq!(g.profile[9 + MAX_SEGMENTS], 1); // bounded group at the configured segment ceiling
+        assert_eq!(g.profile[..9].iter().sum::<u64>(), g.profile[9..PROFILE_NONE_OFFSET].iter().sum::<u64>());
+        assert_eq!(g.profile[PROFILE_NONE_OFFSET + 1], 1);
+        assert_eq!(g.profile[PROFILE_NONE_OFFSET..].iter().sum::<u64>(), g.profile[3]);
         // The default path still rejects without materializing the frame.
         assert!(g.begin(&a, false));
         assert_eq!(g.append(&a, &id, false), atomic);

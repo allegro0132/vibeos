@@ -5,6 +5,16 @@ edition = "2021"
 autobins = false
 
 [features]
+hang-watchdog = ["vibeos-core/hang-watchdog"]
+hang-failure-report = ["vibeos-core/hang-failure-report"]
+hang-watchdog-selftest = ["hang-watchdog", "vibeos-core/hang-watchdog-selftest"]
+gro-prefix-views = ["gro-checked", "vibeos-netstack?/gro-prefix-views"]
+gro-full-batch = ["gro-wide", "vibeos-netstack?/gro-full-batch"]
+gro-wide = ["gro-checked", "vibeos-netstack?/gro-wide"]
+rx-align-empty = ["vibeos-netstack?/rx-align-empty"]
+application-rx-batch = ["vibeos-iperf3-server?/receive-batch", "vibeos-tcp-probe?/receive-batch"]
+tcp-read-profile = ["vibeos-net-api?/tcp-read-profile"]
+receive-exchange-profile = ["receive-buffer-exchange", "vibeos-netstack?/receive-exchange-profile"]
 rx-boundary-profile = ["network-inline-rx", "rx-publish-batch", "vibeos-core/rx-boundary-profile"]
 gro-checked = ["gro-scatter", "vibeos-netstack/gro-checked"]
 gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]

@@ -218,7 +218,7 @@ impl<const N: usize> Ownership<N> {
         if offset >= self.buffer_bytes || length == 0 || length > self.buffer_bytes {
             return Err(Error::Range);
         }
-        if length > super::MAX_TCP_IO_BYTES_PER_CALL
+        if length > super::MAX_TCP_RECEIVE_TRANSFER_BYTES
             || length > self.byte_budget.saturating_sub(self.queued_bytes())
         {
             return Err(Error::Budget);
@@ -555,17 +555,17 @@ mod tests {
     }
 
     #[test]
-    fn ranges_per_call_limit_and_exhaustion_fail_closed() {
+    fn ranges_transfer_limit_and_exhaustion_fail_closed() {
         let a = owner(1, 1);
-        let mut pool = Ownership::<2>::new(65536, 65536).unwrap();
+        let mut pool = Ownership::<2>::new(131072, 65536).unwrap();
         pool.slots[0].generation = u64::MAX;
         let ticket = pool.reserve(a).unwrap();
         assert_eq!(ticket.index(), 1);
         for (offset, length, error) in [
-            (65536, 1, Error::Range),
+            (131072, 1, Error::Range),
             (0, 0, Error::Range),
-            (0, 65537, Error::Range),
-            (0, 32769, Error::Budget),
+            (0, 131073, Error::Range),
+            (0, 65537, Error::Budget),
         ] {
             assert_eq!(
                 pool.prepare(ticket, a, connection(1), offset, length),

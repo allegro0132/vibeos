@@ -256,6 +256,11 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
         asm!("csrr {}, sepc", out(reg) sepc);
     }
 
+    #[cfg(feature = "hang-watchdog")]
+    if let Some(hart) = current_hart_index() {
+        vibeos_core::hang_watch::enter(hart, irq_entry, scause, sepc);
+    }
+
     #[cfg(feature = "wasmtime-async")]
     if unsafe { recover_bad_stack_probe(scause, sepc, _frame) } { return; }
 
@@ -266,11 +271,17 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
     let code = scause & !(1usize << 63);
 
     if !is_interrupt {
+        #[cfg(feature = "hang-watchdog")]
+        if let Some(hart) = current_hart_index() { vibeos_core::hang_watch::stage(hart, 6, 0); }
         #[cfg(feature = "wasmtime-hardware-traps")]
         unsafe { crate::wasmtime_platform::native_traps::dispatch(code, sepc, _interrupted_fp, stval); }
         // A returning Wasmtime handler did not recognize the exception. Keep
         // the existing fatal behavior for host faults and unknown trap sites.
-        crate::println!(
+        // A synchronous exception can interrupt code holding TTY/TX.
+        // Reuse the panic writer so reporting never re-enters those locks.
+        use core::fmt::Write;
+        let mut fatal = crate::SbiWriter;
+        let _ = writeln!(fatal,
             "\n[!] fatal trap: cause={} stval={:#x} sepc={:#x} ({})",
             code,
             stval,
@@ -278,20 +289,20 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
             exception_name(code)
         );
         if let Some(hart) = crate::mmu::stack_guard_hart(stval) {
-            crate::println!(
+            let _ = writeln!(fatal,
                 "[!] stack guard: hart{} blocked {}",
                 hart,
                 exception_name(code)
             );
         }
         if crate::mmu::code_pool_contains(stval) {
-            crate::println!("[!] W^X code pool blocked {}", exception_name(code));
+            let _ = writeln!(fatal,"[!] W^X code pool blocked {}", exception_name(code));
         }
         if crate::mmu::rodata_contains(stval) {
-            crate::println!("[!] read-only .rodata blocked {}", exception_name(code));
+            let _ = writeln!(fatal,"[!] read-only .rodata blocked {}", exception_name(code));
         }
         if crate::cap_table_pool::contains(stval) {
-            crate::println!(
+            let _ = writeln!(fatal,
                 "[!] read-only capability table blocked {}",
                 exception_name(code)
             );
@@ -304,6 +315,12 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
         // has been bound to one logical scheduler hart.
         sbi::shutdown(true);
     };
+
+    #[cfg(feature = "hang-watchdog")]
+    if code == 5 {
+        vibeos_core::hang_watch::stage(hart, 2, 0);
+        vibeos_core::hang_watch::timer(hart, irq_entry);
+    }
 
     // IRQ work belongs to the kernel, never to the component it interrupted.
     // This also protects future handler changes from accidentally consuming a
@@ -345,6 +362,8 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
             ))
         ))]
         let _ = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());
+        #[cfg(feature = "hang-watchdog")]
+        vibeos_core::hang_watch::stage(hart, 5, 0);
         IN_INTERRUPT[hart].store(false, Ordering::Release);
         return;
     }
@@ -354,7 +373,17 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
     match code {
         5 => exec::timer_tick_at(irq_entry),
         9 => {
+            #[cfg(feature = "hang-watchdog")]
+            vibeos_core::hang_watch::stage(hart, 3, 0);
+            #[cfg(feature = "lock-stall-probe")]
+            let mut stall = vibeos_core::LoopStallProbe::new(
+                vibeos_core::LoopStallKind::ExternalInterrupt,
+            );
             while let Some(irq) = plic::claim() {
+                #[cfg(feature = "lock-stall-probe")]
+                stall.observe(u64::from(irq));
+                #[cfg(feature = "hang-watchdog")]
+                vibeos_core::hang_watch::stage(hart, 4, irq as usize);
                 if !plic::dispatch(irq, irq_entry) {
                     // A level-triggered source without a handler would
                     // otherwise immediately retrigger forever. Mask it before
@@ -362,6 +391,8 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
                     let _ = plic::disable(irq);
                 }
                 plic::complete(irq);
+                #[cfg(feature = "hang-watchdog")]
+                vibeos_core::hang_watch::stage(hart, 3, 0);
             }
         }
         _ => {}
@@ -370,6 +401,8 @@ extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usi
     system_owner.restore();
     #[cfg(feature = "wasm-c84-profile-irq-overlay")]
     let _ = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());
+    #[cfg(feature = "hang-watchdog")]
+    vibeos_core::hang_watch::stage(hart, 5, 0);
     IN_INTERRUPT[hart].store(false, Ordering::Release);
 }
 

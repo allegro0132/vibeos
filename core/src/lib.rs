@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "hang-failure-report")]
+pub mod hang_watch;
 pub mod arch;
 pub mod bench;
 pub mod boot_log;
@@ -34,6 +36,8 @@ pub mod poll_budget;
 pub mod runqueue;
 #[cfg(feature = "lock-stall-probe")]
 mod lock_stall;
+#[cfg(feature = "lock-stall-probe")]
+pub use lock_stall::{LoopStallKind, LoopStallProbe};
 pub mod sync;
 
 pub mod net_segmentation;

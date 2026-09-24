@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+hang-failure-report = []
+hang-watchdog = ["hang-failure-report"]
+hang-watchdog-selftest = ["hang-watchdog"]
 rx-boundary-profile = ["rx-admission-batch"]
 rx-admission-batch = ["vibeos-hal/rx-admission-batch"]
 rx-queue-profile = []

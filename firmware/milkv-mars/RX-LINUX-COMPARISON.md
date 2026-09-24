@@ -6232,3 +6232,1094 @@ After all measurements, stable FIT `918fdf3b…600b6` was RAM-restored; kernel/D
 hashes, network initialization and gigabit link passed in
 `20260917-device-checked-baseline-restore/`. SD/SPI were not modified. Normal
 firmware feature selection is restored.
+
+### 2026-09-21: RX boundary diagnostics, changed host adapter and observer effect
+
+Resumed after the interrupted Sep 17 build: the old process handle was gone,
+but the completed ELF matched its build manifest SHA-256 before packaging.
+Root `16023de` had captured the temporary diagnostic `ethernet` feature line;
+packaging restores the ordinary compatibility profile. Diagnostic features
+remain available explicitly and are not intended as production defaults.
+
+The host adapter changed from en13 (`00:e0:4f:83:87:aa`) to en7
+(`c4:d6:d3:a9:32:a6`). The latter has 192.168.77.1/24, MTU 1500 and a gigabit
+full-duplex link. bootpd still targeted the absent en13. Backed up its plist to
+`20260921-bootpd-before-en7.plist`, changed only `dhcp_enabled` to en7, and
+reloaded the existing daemon. Board 192.168.77.10 then passed independent
+64 MiB verification. The initial `20260917-rx-boundary-sampled-checked-measure/`
+run never established a TCP connection and is explicitly excluded. Its prefix
+reflects the prepared script's date, not a successful Sep 17 measurement.
+
+The opt-in `rx-boundary-profile` associates endpoint admission/empty reads with
+the preceding driver RX turn on the same logical hart. It records publication
+count (0..32), exit reason (budget, zero-ticket poll, queue pressure), and a
+post-protocol descriptor-ready check made under existing device authority.
+The latter is later than an empty-read observation and cannot prove descriptor
+state at that earlier instant. Zero tickets alone also do not distinguish
+physical lack of frames from other receive-source conditions. Counts carry no
+permission to consume data; cleanup and scheduling policy are unchanged.
+
+Full instrumentation on Sep 17 lowered the checked image's throughput to
+931.093 Mbps; its nonempty full-rate driver turns almost always published 32.
+That probe changed the timing phenomenon being investigated. Retained the
+full probe source in `20260917-rx-boundary-full-original/`; the full control FIT
+was built and packaged but was not run. Changed diagnostics to select one in
+127 driver turns, skipping admission accounting and extra descriptor reads on
+other turns. The existing core suite and RISC-V image build passed; these are
+diagnostic counters, not a network optimization.
+
+On Sep 21's en7, sampled FIT
+`ea23c8d8778eccdd78a320d087132fac4479160f5bf9e806991b1b2473fe09e4`
+reported 933.440 Mbps. In the ten-second full-rate capture, 199 of 200 sampled
+RX turns published the full 32, one published 29 and ended on zero tickets,
+none hit queue pressure, and post-protocol descriptors were ready in all
+samples. At 600 Mbps, 160 of 343 sampled turns published zero, 64 used the full
+budget, and 119 published partial batches. Post-protocol descriptors were ready
+in 93/119 partial samples (78.15%). There were 401 sampled endpoint-empty calls,
+all associated with zero-ticket driver exits. These are systematic sample
+counts, not exhaustive turn totals or unbiased CPU shares. Receive-pool full
+and dropped counters stayed zero. The analysis rejects windows with fewer than
+1,000 weighted sampled publications, preventing idle captures being treated as
+loaded measurements.
+
+Unprofiled checked FIT `cb7f27ec…44cbd`, reloaded and tested on the same en7,
+received 947.717 and 948.823 Mbps (mean 948.270) at 1.29028 and 1.29216 summed
+resident cores. Paced 600 Mbps samples used 0.99591, 1.07321 and 1.01196 cores.
+The 64 MiB pattern check passed. Thus even the sampled boundary probe differs
+by -1.564% throughput and must not establish the cause of the original
+unprofiled empty-endpoint pattern. There is no basis here for changing GRO
+limits, delaying packets, or claiming a CPU reduction. Move hotspot analysis
+to the existing timer-PC sampler, with an unarmed/armed check in the same image;
+retain its known IRQ-mask and saved-RA limitations.
+
+Evidence: `20260921-rx-boundary-sampled-checked-measure/`,
+`20260921-device-checked-measure/`, `20260921-boundary-observer-effect.json`,
+DHCP backup/reload script and integrity result, and the explicitly excluded
+initial directory. Measurement directories contain raw serial logs, iperf JSON,
+image identities and the recorded host interface. Historical en13
+performance is not used as this session's control.
+
+### 2026-09-21: current checked-path timer-PC capture
+
+Used the existing `pc-sample` feature on the checked/scatter/inline/peer/event
+configuration, with `rx-boundary-profile` absent. FIT SHA-256:
+`b781106e55ff343b9e47a07db965c11dd7822427338b6a9c6f525fd5091d1510`.
+Exact ELF: `target/mars-reference/20260921-bootlog-checked-pc.elf`. Both source
+revisions, all dirty/untracked source files and the selected feature map are
+archived in `20260921-checked-pc-source-manifest.json` and the matching ZIP.
+
+On the same en7, a 15-second run with the collector unarmed received 948.367
+Mbps at 1.28767 summed non-WFI cores. A second 15-second run, containing a
+three-second capture after three seconds of traffic, received 947.905 Mbps
+at 1.30933 cores. The throughput difference is -0.049%; the timer collector
+adds interrupt work, including on otherwise idle harts. This small same-image
+comparison is not a production CPU result, but retains line-rate traffic far
+better than the RX-boundary instrumentation. Dumping happened after traffic
+finished. Independent 64 MiB verification then passed; all 2,481,792 loans were
+released with free=128 and ready=borrowed=full=dropped=0.
+
+The parser validated a complete, non-overflowing capture against that exact
+ELF: h0/h1/h2/h3 had 1486/1498/1499/1499 samples. h0 lateness p50/p90/p99/max
+was 1/63/72/4232.25 microseconds. h1 was 0.75/3/29.25/33 microseconds. Do not
+turn sample percentages into cycle shares: IRQ-masked regions defer samples,
+periodic collection can alias work, and saved RA is not a stack trace.
+
+On h0, 434/1486 samples (29.21%) landed in `compiler_builtins::mem::memcpy`.
+Exact disassembly puts the leading PCs (`0x4058030c`, `0x40580316`,
+`0x40580304`, etc.) in the nonaligned-source shift/merge loop. For 344 of these
+samples, RA is `0x40580296`, the return point from memcpy's internal cold-path
+marker call. That overwrites the original caller in x1: it does NOT identify
+which network copy consumed this time. Only ten memcpy samples retained the
+scatter ring-writer return point; other retained addresses include loan-slot
+push/retire and protocol poll. Avoid assigning the full 29.21% to TCP payload
+copying. The existing wrapped copy profiler is the next tool for recovering
+original call sites, byte counts and alignment on this current path. Do not
+repeat the earlier compiler_builtins opt-level experiment as if it were new;
+its prior controlled result did not reduce CPU.
+
+Other leading h0 PC locations were SpinGuard Drop bodies for InlineService
+(19.0%), TcpListener Inner (11.9%) and the stamped receive queue (10.4%). These
+are critical-section boundaries at interrupt restoration, not evidence that
+those fractions were spent contending on locks. h1's 78.3% in `exec::run`, and
+h2/h3's 100%, include WFI and must not be called busy-executor overhead. The
+next investigation should distinguish actual copies from time spent inside
+these protected batches; the current data does not justify tuning GRO limits.
+
+Evidence: `20260921-checked-pc-measure/{summary.json,analysis.json,dump.log,
+memcpy-joint.json,memcpy.asm,integrity.json,pool.log}`, load/build/package logs,
+source archive, and exact ELF. The focused joint histogram uses the same
+`llvm-nm --defined-only` symbol set as the main parser and selects the exact
+memcpy symbol, excluding functions whose names merely contain memcpy. The
+Mars goal remains open: unprofiled checked RX is about 948 Mbps at 1.29 cores,
+not below one core, and these diagnostic runs add no new long-duration or
+forced-fault qualification.
+
+Stable FIT `918fdf3b…600b6` was restored after capture; load hashes, network
+initialization and gigabit link passed in `20260921-checked-pc-baseline-restore/`.
+SD/SPI were unchanged. The DHCP correction remains on en7, and the ordinary
+firmware feature profile is restored. Generic symbol folding may share Drop
+bodies, so their printed type names also need caller/disassembly context.
+
+
+### 2026-09-21 — checked RX copy callers and exchange/batch integration gap
+
+The existing copy wrapper was rebuilt on the current checked/scatter/inline RX
+path (FIT `2ec0517bc3752a4de0f76852d2c0a8a14edbbb91cecb64722cd3deef501f91f7`).
+A three-second capture samples one in 127 external memcpy calls of at least
+256 bytes. It excludes inlined copies, memmove and smaller calls; the 4 MHz
+ticks are elapsed time, including interrupt effects, not CPU cycles. There
+were no table overflows. The parser regression suite passed all three tests.
+
+| Original copy caller | Hart | Sampled calls | Sampled bytes | Elapsed ticks |
+| --- | ---: | ---: | ---: | ---: |
+| `Scattered::write_into`, RA `0x40212b2c` | 0 | 1641 | 2388650 | 17363 |
+| `VecDeque<u8>::spec_extend`, RA `0x403b315a` | 0 | 124 | 2650283 | 15644 |
+| `TcpListener::try_recv`, RA `0x403b3e00` | 1 | 108 | 2501440 | 10027 |
+
+The scatter writer is the DMA-fragment-to-TCP-ring copy. The deque extension
+is consistent with the copied frontend queue path; its generic symbol alone
+is not a unique call-chain attribution. Application receive performs another
+copy. Most scatter samples have source alignment 6 modulo 8 and destination
+alignment 1 or 5 modulo 8. The smaller fixed-size copies in inline dispatch,
+checked-window retirement and RX admission remain visible but should not be
+confused with payload bytes or automatically replaced with new shared pools.
+Prior pool and memcpy optimization experiments did not demonstrate CPU wins.
+
+Instrumentation substantially perturbs this path: a 15-second unarmed flow
+measured 940.317 Mbps / 1.28593 resident cores; the armed flow measured
+874.699 Mbps / 1.26691 cores. These are caller/alignment diagnostics, NOT a
+performance improvement or a way to assign exact CPU percentages to copies.
+The independent 64 MiB pattern test passed. Evidence is under
+`target/mars-reference/20260921-checked-copy-measure/`, including `dump.log`,
+`analysis.json`, `callers.json`, `summary.json`, and `integrity.json`; the exact
+ELF, feature map, source snapshot/manifest and build/load logs are retained.
+
+Code inspection identified two concrete constraints for a future exchange
+experiment on this path:
+
+* `frontend-rx-batch` is excluded when `receive-buffer-exchange` is enabled,
+  so simply enabling exchange loses the single-guard frontend transaction.
+* `Binding::exchange` exchanges the entire readable ring but caps admission
+  at 32 KiB. A 32-frame receive turn can exceed that bound and fall back to
+  copying. This is a possible fallback cause, not a measured current rate.
+
+The pool supports larger buffers and queued exchanged ranges, while its
+application read independently enforces the 32 KiB per-call contract. Any
+combined implementation must retain a bounded producer turn, capacity and
+connection checks, exact-owner cleanup, copied fallback ordering, and unlock
+before notification. It must also be compared against the current batched
+path: the earlier exchange experiment's high exchanged-byte ratio did not
+produce a CPU improvement. No exchange feature was enabled or ownership
+contract changed as a result of this diagnostic run.
+
+After the user's power-cycle confirmation, UART responded and the unprofiled
+checked FIT `cb7f27ec…44cbd` was RAM-loaded with verified FIT hashes and gigabit
+link. This post-recovery smoke check passed the independent 64 MiB pattern:
+948.491 Mbps / 1.29094 resident cores at full rate, and 599.995 Mbps / 1.00409
+cores at 600 Mbps pacing (20 seconds each). It confirms recovery and agrees
+with the earlier runs; it is not a new optimization or long-duration result.
+Evidence: `20260921-ready-checked-load/` and `20260921-ready-checked-measure/`.
+
+At the end of the smoke check all 2,700,394 acquired RX loans were released;
+128 buffers were free with no ready/borrowed buffers, pool-full events or pool
+drops. Stable FIT `918fdf3b…600b6` was then restored in RAM, with FIT hashes,
+network initialization and 1000 Mbps link verified in
+`20260921-ready-baseline-restore/`. SD/SPI were unchanged.
+
+
+### 2026-09-21 — preserve frontend batching during receive exchange
+
+Implemented the combination of `frontend-rx-batch` and
+`receive-buffer-exchange`, still default-off. `TcpReceiveBatch` now offers
+connection-checked publication of exchanged ranges under its existing guard;
+the protocol adapter attempts exchange before copied fallback in that same
+transaction. Pool publication preserves stream order and capacity checks.
+Normal notification happens after unlocking. An exchange/publication failure
+cleans up an unpublished transfer and invokes stream recovery only after
+releasing the frontend guard, avoiding recursive listener locking. The legacy
+non-batched path remains available. The 32 KiB exchange limit was unchanged to
+isolate this integration step.
+
+Tests cover copied/exchanged ordering, wrapped storage, stale-generation
+rejection without consumption, capacity, and a synchronous reentrant wake.
+The latter now sees four committed exchange bytes before appending 252 copied
+bytes to the 256-byte queue; legacy mode still exercises rejection/reset when
+the wake fills the queue before publication. Both modes release their pool
+ownership. Commands used offline/locked Cargo tests with these combinations:
+net-protocol exchange+batch+checked+pooled+native-segmentation+events (5 unit,
+51 integration), batch without exchange (5+43), legacy exchange+events (32
+integration), and net-api exchange+events (16+12+10+1 tests). Logs are
+`20260921-{batch-exchange-events,batch-no-exchange,exchange-legacy,
+batch-exchange-api}-tests.log` under `target/mars-reference/`.
+
+Mars build and image checks passed. FIT
+`c733aa15c1b5c27397adf8326d22378fb8c59d3b9c639a5ebf7e38753792c414`
+was verified by U-Boot and RAM-booted with gigabit link. Measurement on en7:
+
+| Load | TCP receive Mbps | Non-WFI cores | Exchanged frontend bytes |
+| --- | ---: | ---: | ---: |
+| Full, run 1 | 947.935 | 1.30306 | 0.0387% |
+| Full, run 2 | 946.140 | 1.29900 | 0.1249% |
+| 600 Mbps, run 1 | 599.965 | 1.06212 | 36.2413% |
+| 600 Mbps, run 2 | 599.995 | 1.07459 | 38.5102% |
+
+The current non-exchange checked path was approximately 948 Mbps / 1.29 cores.
+This experiment does NOT establish a CPU saving. Its important new evidence
+is that almost no payload reaches exchange under the current full-rate batch
+shape, unlike the old independently scheduled exchange experiment. The 32 KiB
+limit is a concrete next suspect, not a measured refusal reason: current
+counters do not distinguish over-limit, out-of-order data and exhausted spare
+slots. `receive_ownership::Ownership::prepare` enforces the same 32 KiB limit;
+changing only `Binding::exchange` would fail after swapping buffers. Any larger
+transfer experiment must explicitly bound producer work and pool admission
+while retaining the separate 32 KiB application read contract.
+
+The independent 64 MiB pattern test passed, but its ordinary probe listeners
+remain copied: this does NOT establish hardware byte-for-byte correctness of
+the exchanged path. That requires a probe assembled with receive storage and
+verified consumer-owner handling. Host real-TCP tests exercise exchanged data;
+hardware exchange integrity, long-duration and hard-fault recovery remain
+unqualified. All 5,350,018 RX DMA loans were released, with 128 free buffers,
+no outstanding loans, no pool-full events and no pool drops. This is not a
+claim about all MAC/network loss counters.
+
+Evidence: `20260921-checked-exchange-batch-{load,measure}/`, exact ELF, feature
+map, source ZIP/manifest, focused patch, build and packaging logs under
+`target/mars-reference/`. `measure/exchange-ratios.json` uses per-test counter
+deltas. The temporary feature profile was restored by packaging; the combined
+implementation remains an opt-in experiment, not the production default.
+
+Stable FIT `918fdf3b…600b6` was restored after this experiment; verified
+load hashes, network initialization and gigabit link are recorded in
+`20260921-exchange-batch-baseline-restore/`. SD/SPI were unchanged.
+
+
+### 2026-09-21 — exchange refusal evidence and separate transfer/read bounds
+
+Added default-off `receive-exchange-profile` through firmware, kernel, netstack
+and protocol. `nrxexwhy` reports exclusive first-refusal counts and pending-byte
+sums: empty, drive budget, transfer limit, pool byte budget, no spare,
+transport refusal, success and reserve error. Later untested conditions may
+also reject an attempt; pending bytes are attempt observations, not unique
+network bytes. Transport refusal is intentionally not labelled TCP reordering.
+No per-packet output or allocation is added; the diagnostic counters compile
+out when this feature is absent.
+
+The 32 KiB diagnostic FIT was
+`5ea5a71be5261f5a947cbb49c5137e7c820a9561347ebac76f814b8fec3fcd3a`.
+During the full-rate test, 49,884 of 49,913 attempts (99.9419%) stopped first at
+the transfer limit, accounting for 99.9794% of observed pending bytes. One
+attempt hit the drive budget, and 28 succeeded. No attempts reached a spare
+or transport refusal. This does not prove those later conditions cannot bind
+once the size limit is removed. At 600 Mbps, 53.190% hit the transfer limit,
+46.799% succeeded, three hit drive budget and two were transport refusals.
+Instrumentation reduced full throughput to 932.198 Mbps; these diagnostic
+results are not a CPU performance comparison.
+
+Evidence: `20260921-exchange-reasons-{load,measure}/`, feature map, source
+snapshot/manifest, ELF and build logs under `target/mars-reference/`.
+`measure/reasons.json` is computed from per-run counter deltas by
+`20260921-exchange-reasons-analyze.py` in that directory's parent.
+
+Based on that evidence, introduced `MAX_TCP_RECEIVE_TRANSFER_BYTES` equal to
+the already-supported 64 KiB frontend capacity. Both Binding admission and
+the pool ownership state machine use this bound. Frontend capacity, pool byte
+budget, connection generation, no-out-of-order exchange and spare ownership
+checks remain in force. Application reads retain `MAX_TCP_IO_BYTES_PER_CALL`
+of 32 KiB. This is still within the existing four-chunk producer-turn budget;
+no unbounded receive loop or larger frontend capacity was introduced.
+
+The opt-in exchange image now also assembles independent TCP probe listeners
+with permanent receive storage. Their normal `try_recv` path resolves the
+current tracked consumer identity, just like the existing exchanged iperf
+listener. This permits an actual pattern test through exchanged buffers,
+rather than treating a copied probe's success as exchange qualification.
+
+Host tests passed for the API (16 unit + 12 frontend + 11 receive frontend + 1
+allocation tests), combined protocol (5 unit + 52 integration), and legacy
+exchange protocol (32 integration). New tests deliver a real TCP 48 KiB range
+through one exchange, then read it with the unchanged 32 KiB application
+limit; another checks a full 64 KiB wrapped range, exact bytes, queue capacity
+and release. The boundary test initially requested an invalid 128 KiB pool
+byte budget; it was corrected to the actual 64 KiB maximum before passing.
+No production capacity was increased to accommodate the test.
+
+
+The unprofiled 64 KiB exchange FIT is
+`e864c7b331998ded3857dfe3800d3ddd502f1badbaa2a01d656ff1af9bd47239`.
+Build/image checks, U-Boot hashes and gigabit link passed. The independent
+64 MiB changing-pattern transfer passed; its counter window observed
+31,904,973 exchanged bytes and 35,203,916 copied bytes (47.5421% exchanged,
+including small service control traffic). This establishes exercised hardware
+exchange correctness for that finite mixed-path test, not an all-exchanged
+64 MiB transfer or long-duration/fault qualification.
+
+| Load | TCP receive Mbps | Non-WFI cores | Exchanged frontend bytes |
+| --- | ---: | ---: | ---: |
+| Full, run 1 | 948.282 | 1.35858 | 99.9750% |
+| Full, run 2 | 948.556 | 1.36323 | 99.9990% |
+| 600 Mbps, run 1 | 599.982 | 1.03906 | 100% |
+| 600 Mbps, run 2 | 599.995 | 0.96519 | 100% |
+
+Removing the size rejection successfully removes almost all frontend payload
+copies in the full-rate iperf path. It does NOT reduce full-rate CPU: the
+application hart rises from about 29.6% in the current copied checked path to
+36.3–36.4%, while the dispatch hart remains nearly saturated. The paced results
+vary and do not establish a repeatable improvement. Thus the under-one-core
+objective remains unmet and exchange stays default-off. The next investigation
+should quantify read-call/short-read frequency and pool/lease management work,
+not assume another copy removal is sufficient. Current `Queue::read` completes
+one queue chunk at a time, even when application output has room; this is a
+code-inspection hypothesis for additional per-call overhead, not a measured
+attribution. Metadata ownership transitions also remain necessary for safe
+recovery and must not be removed merely to improve a benchmark.
+
+The final performance snapshot had all 5,354,652 DMA loans released, 128 free
+buffers, no outstanding loans and no RX-pool drops/full events. Evidence is in
+`20260921-exchange64-{load,measure}/`, including `integrity-exchange-{before,
+after}.log`, `summary.json`, `exchange-ratios.json`, full UART logs, exact ELF,
+source snapshot/manifest and feature map under `target/mars-reference/`.
+
+Normal protocol-task recovery also passed on this image: a running-task restart
+was rejected, active flow cancellation completed, restart advanced generation
+1 to 2 and retired nine old capabilities, the interrupted client exited without
+forced termination, and a fresh TCP flow plus another 64 MiB pattern test
+passed. Final DMA pool counts were 6,541,737 acquired/released, 128 free, zero
+ready/borrowed/full/dropped. Evidence:
+`20260921-exchange64-stack-recovery/`. This is normal cancellation/destruction,
+not forced-fault or abandoned-lock recovery qualification. Post-restart pattern
+counters were not separately sampled, so its exchanged fraction is unknown.
+
+Stable FIT `918fdf3b…600b6` was restored to RAM after testing, with hash,
+network initialization and gigabit-link checks in
+`20260921-exchange64-baseline-restore/`. SD/SPI were unchanged; ordinary
+firmware defaults are restored and the Mars goal remains open.
+
+
+### 2026-09-21 — read-call comparison: more empty reads, not more successful reads
+
+Added default-off `tcp-read-profile` at the public `TcpListener::try_recv`
+entry. `ntcpread` separates copied/exchanged frontend calls and reports calls,
+positive progress, actual bytes, short reads, zero progress, WouldBlock, closed,
+errors, sampled count/ticks and maximum sampled ticks since boot. A short read
+is below min(requested length, the unchanged 32 KiB per-call limit). Direct
+calls to the explicit-owner integration API alone are not counted; production
+component adapters use the instrumented entry. Timing samples every 127 calls
+include owner lookup, locks, payload copy and notification, plus any interrupts;
+these are elapsed 4 MHz ticks, NOT CPU cycles. Result accounting is outside
+the sampled interval. Ordinary images compile out the recorder and shell
+command. Unit coverage distinguishes returned bytes from requested bytes,
+short reads from a full 32 KiB read into a 64 KiB output, and nonprogress/error
+results. API tests passed both with and without receive exchange.
+
+Both images were built from the same worktree with the same checked RX flags;
+only receive exchange and its associated listener assembly differ. No host
+build ran during throughput measurement. Both passed image/load checks,
+gigabit link and their independent 64 MiB pattern smoke check. FIT hashes:
+
+* Copied checked: `320d01dc3571b89e6f9af0967f6e284180d2b95c924124290fe8575f970d8dee`.
+* Exchanged 64 KiB: `6a1733cc61aec3d5c3485e21ee52ce9cafa5ede8c0287d794c1da50f9ef1f739`.
+
+| Path, 20-second test | Mbps | Non-WFI cores | Read calls | Positive reads | WouldBlock | Mean positive bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Copy 1 | 948.811 | 1.29535 | 410435 | 102585 | 307850 | 23124.9 |
+| Copy 2 | 947.642 | 1.29117 | 410399 | 102547 | 307852 | 23104.9 |
+| Exchange 1 | 948.159 | 1.34153 | 490783 | 100872 | 389911 | 23501.4 |
+| Exchange 2 | 948.494 | 1.34072 | 488601 | 99444 | 389157 | 23847.3 |
+
+All four windows had zero error/closed/zero-progress results. The counter
+windows include small control traffic and command/setup boundaries, so their
+byte totals are not exactly iperf payload totals. Both runs together transferred
+about 4.742 GB through the frontend. Normalized by those bytes, exchange has
+19.30% more total receive calls and 26.52% more WouldBlock calls, but FEWER
+positive reads and slightly MORE bytes per positive read. Short-read fraction
+is higher (about 72% versus 50%), yet it is NOT evidence of more successful
+application reads. This corrects the prior unverified hypothesis that splitting
+exchange ranges necessarily increased positive-read count.
+
+Application-hart residency is about 34.6–34.7% for exchange and 29.7–29.8% for
+copy; dispatch remains about 99.4–99.7%. Sampled mean elapsed time over ALL
+read outcomes is 6.65/6.21 us for exchange and 6.42/6.41 us for copy. The
+outcome mixture differs and samples are periodic: these means cannot isolate
+pool/lease CPU time or prove which path has cheaper successful reads. The
+exchange diagnostic itself differs from its unprofiled image (about 1.34 vs
+1.36 cores), so neither mode should be treated as an instrumentation-free
+performance improvement. The unprofiled copied path remains the better CPU
+reference, about 948 Mbps / 1.29 cores.
+
+Next: separate data/control and empty-read timing plus wake/poll counts before
+changing queue coalescing or lifetime rules. Code inspection shows iperf checks
+control then performs one payload read per drive and yields after progress;
+its idle path performs two checks before waiting. Exchange also resolves
+consumer provenance before learning the queue is empty. These identify places
+to measure, not yet proven causes or permission to skip capability/generation
+checks. We should not claim that merging queue chunks alone will remove the
+observed extra WouldBlock traffic.
+
+Evidence under `target/mars-reference/`: paired
+`20260921-{checked,exchange64}-read-profile-{load,measure}/`, exact FIT/ELF,
+feature maps, source ZIP/manifests, build/package and test logs;
+`20260921-tcp-read-comparison.json`; and `20260921-tcp-read-analyze.py` with
+per-run `read-analysis.json`. The analyzer rejects inconsistent outcome sums,
+negative counter deltas and incompatible schemas. All data is from en7.
+
+Stable FIT `918fdf3b…600b6` was restored in RAM after the comparison;
+load hashes, network initialization and gigabit link passed in
+`20260921-tcp-read-baseline-restore/`. SD/SPI and the default receive path
+were not changed by these diagnostic runs. The Mars goal remains open.
+
+
+### 2026-09-21 — bounded application RX batches on the copied checked path
+
+Added opt-in `receive-batch` in both iperf3-server and independent tcp-probe,
+forwarded by kernel/Mars `application-rx-batch`. Payload receive processes at
+most four existing API calls per task drive, stopping immediately on no
+progress. Each call retains its 32 KiB limit and live capability/connection
+validation. No service spins waiting for a new packet. Iperf checks control
+once per bounded drive, then drains ready data; probe preserves per-flow bounds
+and the existing order of visiting flows. Source/TX mode keeps one call per
+drive. Header/result state transitions, pattern verification and close behavior
+remain in the existing state machines.
+
+The experiment starts from copied checked RX, the better CPU reference. It does
+not enable buffer exchange or read instrumentation. Host suites passed in both
+modes: eight iperf tests and seven probe tests with batching, and eight/six in
+control mode. Tests verify a fifth ready read remains for a later drive, short
+reads cannot evade the four-call bound, WouldBlock stops the batch, mid-batch
+revocation prevents further reads, and fragmented sink/source/result data
+remain exact. Builds and image checks passed for paired same-worktree images:
+
+* Batch FIT: `ec9d1a69158cb601c8c9e898956262660cdef88c38903ced4372bbc14c8b71ea`.
+* Control FIT: `939efdaba1a1215f7df1d8dbc6e9d20e210501af487bf22e1352fcf6dc74b4ac`.
+
+Both were hash-verified in U-Boot and RAM-booted on the current en7 link. No host
+build ran during traffic measurement. Both independent 64 MiB pattern tests
+passed. Iperf results (20 seconds per row):
+
+| Path | Receiver Mbps | Non-WFI cores |
+| --- | ---: | ---: |
+| Batch full 1 | 948.139 | 1.26845 |
+| Batch full 2 | 948.969 | 1.26716 |
+| Control full 1 | 949.122 | 1.29677 |
+| Control full 2 | 948.448 | 1.29574 |
+| Batch 600M 1 | 599.965 | 0.98077 |
+| Batch 600M 2 | 599.747 | 0.99870 |
+| Control 600M 1 | 599.995 | 1.07151 |
+| Control 600M 2 | 599.965 | 1.00119 |
+
+The small full-rate sample shows about 2.20% lower total residency, with the
+application hart near 27.0% instead of 29.9%; dispatch stays nearly saturated.
+Paced totals have enough run-to-run variation that their mean difference is not
+proof of a repeatable improvement. This is neither the requested below-one-core
+full-rate result nor long-duration qualification. Do not extrapolate success at
+600 Mbps to success at gigabit.
+
+Independent READY/GO-gated TCP tests exclude connection setup from CPU windows.
+Each row transfers 2 GiB total and confirms board byte counts; pattern integrity
+is covered by the separate 64 MiB test, not these throughput rows.
+
+| Path | Flows | Receiver Mbps | Non-WFI cores |
+| --- | ---: | ---: | ---: |
+| Batch | 1 | 948.466 | 1.31295 |
+| Control | 1 | 949.120 | 1.34127 |
+| Batch, first | 4 | 788.409 | 1.30338 |
+| Control, first | 4 | 801.550 | 1.30623 |
+| Control, repeat | 4 | 797.742 | 1.30776 |
+
+Single-flow independent service shows a similar small residency reduction.
+Four-flow throughput was lower in the first candidate run, so it requires a
+repeat before any adoption decision. This is not a blanket win across loads.
+Host interface capture `20260921-app-rx-interface.log` confirms en7 MTU 1500,
+192.168.77.1/24 and active 1000baseT full duplex during this comparison.
+
+The candidate four-flow repeat reached 790.232 Mbps / 1.29968 cores, again
+below control's 797.742–801.550 Mbps. Mean throughput across two four-flow runs
+is about 1.29% lower, while CPU per delivered bit is slightly worse. The modest
+single-flow CPU benefit therefore does not justify enabling this policy by
+default for all services. Keep it opt-in; do not describe it as an across-load
+network optimization. Dispatch/driver/protocol residency remains the dominant
+full-rate cost and the next target. Avoid increasing the batch number without
+new fairness/queue evidence.
+
+Normal recovery on the candidate passed: running-task restart was rejected,
+active flow cancellation completed, generation advanced 1 to 2 with nine old
+capabilities retired, the interrupted client exited without a forced kill, and
+fresh iperf plus another 64 MiB pattern test passed. All 2,658,729 acquired DMA
+loans were released, with 128 free and zero ready/borrowed/full/dropped. This
+checks normal cancellation, not hard-fault recovery or one-hour stability.
+
+Evidence under `target/mars-reference/`: paired `20260921-app-rx-{batch,control}`
+feature maps, source ZIP/manifests, FIT/ELFs, build/package/load logs,
+`-measure/`, `-gated-measure/`, `-four-repeat/`; batch `-stack-recovery/`;
+`20260921-app-rx-comparison.json` and `20260921-app-rx-independent-comparison.json`.
+The latter preserves individual runs rather than hiding the four-flow regression
+in a combined average. Firmware default feature selection is restored.
+
+Stable FIT `918fdf3b…600b6` was restored to RAM after the experiment;
+verified load hashes, network initialization and gigabit link are saved in
+`20260921-app-rx-baseline-restore/`. SD/SPI were unchanged.
+
+
+## 2026-09-21: source-aligned empty TCP receive rings (opt-in)
+
+The copied checked-GRO path still spends substantial dispatch work copying
+scattered payloads into TCP receive rings. Unlike the earlier unsuccessful
+empty-ring reset-to-zero experiment, `tcp-align-empty-rx` matches the first
+logical source fragment's machine-word alignment. It changes the origin only
+when both the receive ring and assembler are empty and payload offset is zero.
+Unread bytes and out-of-order holes retain their origin. Empty/small storage is
+bounded, and scatter clipping/empty fragments are handled explicitly. The
+integration feature is `rx-align-empty`, default off; no ownership or capability
+check is removed. Application batching and receive-buffer exchange are off in
+this comparison.
+
+Tests: smoltcp scatter/GRO configuration passed 389 unit tests, five doctests
+and one compile-fail test; contiguous TCP configuration passed 194 tests.
+Protocol tests passed 5 + 43, and exchange compatibility passed 5 + 52.
+New tests cover ring backing offsets/capacities, all source low bits, clipped
+fragment ranges and out-of-order holes while the readable prefix is drained.
+Logs are `target/mars-reference/20260921-rx-align-*-tests.log`.
+
+Copy-profile FIT SHA-256:
+`72d274e1a217e8802b422370f9d0fa6446a9550b2237f56e47877bff3b86e74e`.
+The profile samples one in 127 external memcpy calls of at least 256 bytes.
+It measures elapsed 4 MHz ticks including interruption, not exclusive CPU cycles.
+The dominant h0 Scattered::write_into site sampled 1,770 calls / 2,583,952 bytes:
+897 calls had source/destination low bits 6/6 and 873 had 6/2. About 50.68% of
+sampled bytes now use equal word alignment, versus almost none in the previous
+checked-copy capture. Sampled elapsed cost was 1.625 ns/byte versus 1.817 in
+that previous capture. This verifies the intended mechanism, not an equivalent
+whole-system CPU saving. The second VecDeque copy remained misaligned (6/0).
+
+The diagnostic image passed the independent 64 MiB pattern test and dropped no
+copy samples. Unarmed throughput was 946.589 Mbps / 1.29104 non-WFI cores;
+armed throughput was 887.187 Mbps / 1.27385 cores. Profiling perturbs throughput,
+so adoption depends on unprofiled A/B rather than these timings. Evidence:
+`20260921-rx-align-copy-measure/{analysis,copy-alignment,summary}.json`, raw logs,
+ELF and source archive.
+
+Unprofiled candidate FIT:
+`3542e9e41663e7e2524d81a03b948efd0ecae715e7e870b9021df744210f111c`.
+Same-source control FIT:
+`d8c1297ed2ea680a15050ce5f0a042fa498e310f715f500f66550e7901ab4a6b`.
+Both feature maps, source ZIP/manifests and build/package logs are archived under
+`target/mars-reference/` with `20260921-rx-align` and `-control` names. Neither
+image includes copy profiling or application RX batching.
+
+Unprofiled hardware results (20 seconds per row; en7, MTU 1500):
+
+| Path | Offered rate | Receiver Mbps | Non-WFI cores |
+| --- | --- | ---: | ---: |
+| rx-align | Full | 947.433 | 1.30100 |
+| rx-align | Full | 947.965 | 1.30225 |
+| rx-align | 600M | 599.995 | 1.05457 |
+| rx-align | 600M | 599.965 | 1.06955 |
+| rx-align-control | Full | 948.320 | 1.29420 |
+| rx-align-control | Full | 948.518 | 1.29657 |
+| rx-align-control | 600M | 599.935 | 1.05454 |
+| rx-align-control | 600M | 599.995 | 1.05465 |
+
+Both images passed independent 64 MiB pattern integrity. This small sequential
+A/B provides no evidence of an overall CPU reduction. The source-alignment
+mechanism works, but its sampled copy timing does not establish a system-level
+benefit. Keep the option disabled; no adoption or one-hour qualification is
+claimed. Dispatch residency remains near saturation at full rate, which also
+limits attribution from aggregate non-WFI measurements alone. Evidence is in
+`20260921-rx-align{,-control}-measure/` and `20260921-rx-align-comparison.json`.
+
+The candidate/control returned all 5,352,097 / 5,354,500 acquired DMA loans,
+respectively: each ended with 128 free, zero ready/borrowed/full/dropped.
+Full-rate mean residency was 1.30162 candidate versus 1.29539 control (+0.48%);
+600 Mbps means were 1.06206 versus 1.05459 (+0.71%). These small differences
+are not claimed as statistically established regressions, but do not justify
+enabling the feature.
+
+Stable FIT `918fdf3b…600b6` was restored to RAM successfully; component hashes,
+network initialization and gigabit link were verified in
+`20260921-rx-align-baseline-restore/`. SD and SPI contents were not changed.
+
+
+## 2026-09-21: bounded wider GRO experiment
+
+The current copied checked-GRO baseline differs from the old low-aggregation
+pipeline: `20260921-rx-align-control-measure/01-gro-after.log` has 88,457 budget
+ends versus 16,056 receive-none ends. The attempted-size histogram is dominated
+by 16 (88,459) and 15 (14,337) segments. These are cumulative counters including
+the preceding integrity test, not isolated throughput deltas. This justifies a
+bounded larger-group experiment, rather than repeating the earlier pipeline's
+unsupported assumption that increasing GRO limits would help.
+
+Default-off `gro-wide` enables smoltcp `tcp-gro-wide`: up to 32 borrowed frame
+views, with the existing independent 32 KiB aggregate byte ceiling unchanged.
+For 1460-byte TCP payloads the byte ceiling permits 22 segments; a 23rd frame
+must remain available to the next group. Sequence, flow, flags, headers,
+checksums, capability revalidation and 32-wire-frame poll budgets remain in
+force. No waiting for future arrivals is introduced. The larger loan window
+and generic release batches use bounded arrays; no narrow bit mask is widened
+implicitly. The legacy copied fallback obeys the same byte ceiling.
+
+GRO profile lengths and the no-input offset follow the segment ceiling, and
+`ngrodetail` version 3 prints the actual histogram range. This prevents silently
+folding larger groups into the old 16-segment bin. PacketDeviceStats has an
+explicit zero default because arrays longer than 32 do not implement Default
+in this toolchain. No unsafe zeroing is introduced.
+
+Host verification: wide smoltcp passed 387 tests, five doctests and one compile
+failure borrow test. Wide and control protocol configurations each passed
+6 + 44 tests, including actual TCP payload delivery, wire-frame poll budgeting,
+loan-window wrap/rejection and revocation cleanup. A new 1460-byte segment test
+checks the exact 22-segment byte-boundary rejection, materialized bytes and the
+unchanged rejected successor. These tests prove bounds/correctness, not CPU
+benefit. Logs: `20260921-gro-wide-{smoltcp,protocol,control}-tests.log`.
+
+
+The first wide image (`43f69b7c…0b9da6`) is rejected: full-rate tests reached
+only 37.94 and 46.33 Mbps, despite successful 64 MiB pattern verification and
+complete DMA loan reclamation. The matching 16-segment control restored roughly
+948 Mbps. A 15-second header capture (`20260921-gro-wide-capture/rx.pcap`)
+contained 6,413 retransmission-marked sender packets and 754 duplicate ACKs,
+with no zero-window indications and no kernel capture drops. These are host
+capture observations, not a count of physical link loss. Parse `packets.tsv`,
+not the initial CSV export whose repeated fields contain escaped commas.
+
+Code inspection found an implementation error in this experiment: GRO's new
+32-frame constructor limit was not propagated to `Scattered::new`, which still
+rejected more than 16 fragments. The interface discards that failed receive,
+explaining why the otherwise valid larger groups triggered TCP retransmission.
+The constructor-only byte-limit tests did not cover this downstream contract.
+The fix shares `TCP_RX_MAX_FRAGMENTS` between GRO and scattered TCP admission.
+A new full interface/established socket test delivers a patterned 22 x 1460-byte
+group and verifies every byte and the cumulative ACK, alongside the overflow
+rejection test. Fixed images use distinct `gro-wide-fixed` artifact names;
+the original failed image and capture are retained as diagnostic evidence.
+The initial control's later traffic overlapped a short host test compilation;
+use the fresh fixed-source control for CPU comparison rather than treating
+these initial diagnostic runs as final performance evidence.
+
+Fixed wide smoltcp tests pass 388 + 5 doctests + 1 compile-fail; fixed normal
+GRO passes 386 + 5 + 1, and protocol tests pass 6 + 44. Fixed candidate FIT is
+`91f43469a12baf1d152cdbc5ed2a314cb0fe6436eacbed95026df8a17fee64ad`.
+A further limitation to check in the actual histogram is the interaction of
+32-wire-frame polling with the preserved 32 KiB byte limit: a full 32-frame
+batch may split into 22 + 10, still two TCP invocations like 16 + 16. Merely
+observing some groups larger than 16 is therefore not enough to claim reduced
+protocol work; compare mean segments per aggregate and whole-path CPU.
+
+Fixed-source 16-segment control FIT:
+`b28215b14c82621949178ab42d92e6bc3e31ea32ba28d8fb587654f44fb9f8ac`.
+The fixed candidate's first full-rate histogram confirms the predicted split:
+48,712 groups of 22 and 47,512 groups of 10 (cumulative after integrity + first
+run). The no-input reasons include 47,623 wire-budget boundaries versus 1,151
+empty-endpoint boundaries. Therefore the larger segment ceiling has not removed
+the two-invocation structure of a 32-frame poll. Full-rate throughput is about
+917 Mbps; smaller absolute residency at lower throughput would not establish
+better CPU efficiency. Do not adopt this configuration as an optimization.
+A future full-batch experiment must address the aggregate byte bound together
+with poll size and validate all downstream length/fragment contracts; increasing
+only the descriptor/fragment count is insufficient.
+
+Final unprofiled fixed-source comparison (20 seconds per row):
+
+| Path | Offered rate | Receiver Mbps | Non-WFI cores | Mean frames per GRO attempt |
+| --- | --- | ---: | ---: | ---: |
+| gro-wide-fixed | Full | 917.095 | 1.28873 | 15.952 |
+| gro-wide-fixed | Full | 917.661 | 1.28878 | 15.970 |
+| gro-wide-fixed | 600M | 599.965 | 1.10222 | 14.043 |
+| gro-wide-fixed | 600M | 599.995 | 1.03343 | 14.371 |
+| gro-wide-fixed-control | Full | 948.661 | 1.29117 | 15.973 |
+| gro-wide-fixed-control | Full | 948.805 | 1.29650 | 15.967 |
+| gro-wide-fixed-control | 600M | 599.965 | 1.00670 | 13.160 |
+| gro-wide-fixed-control | 600M | 599.965 | 1.02797 | 12.780 |
+
+Both fixed images passed independent 64 MiB pattern integrity. The wide option
+remains disabled; passing integrity does not offset the full-rate throughput
+regression, and no one-hour or multi-flow qualification is claimed. Evidence
+is in paired `20260921-gro-wide-fixed{,-control}-measure/`, source archives,
+feature maps, FIT/ELFs, and `20260921-gro-wide-fixed-comparison.json`. Interface
+capture confirms en7 at MTU 1500 and active gigabit full duplex.
+
+Full-rate means: fixed candidate 917.378 Mbps / 1.28875 non-WFI cores;
+control 948.733 Mbps / 1.29384 cores. Mean segments per actual aggregate are
+15.97235 and 15.97553 respectively: the experiment does not reduce protocol
+invocations per wire frame. Candidate CPU per delivered bit is worse. All
+5,248,186 candidate and 5,355,603 control DMA loans were returned, with 128 free
+and zero ready/borrowed/full/dropped at the end of both captures.
+
+Stable FIT `918fdf3b…600b6` was restored to RAM with component hashes and
+gigabit link verified in `20260921-gro-wide-baseline-restore/`. No SD/SPI writes
+were performed. The next useful experiment must make a full 32-frame batch fit
+one GRO object across all receive contracts; this turn does not claim that
+implementation or the less-than-one-core objective has been achieved.
+
+
+## 2026-09-21: one complete RX poll batch per GRO object
+
+The preceding experiment measured essentially identical 15.97-segment mean
+aggregates with 16-frame and 32-frame/32-KiB limits. It is evidence against
+increasing only fragment count. Default-off `gro-full-batch` now enables the
+32-fragment contract and a 48 KiB aggregate byte ceiling, enough for a complete
+32 x MTU-1500 data batch (46,720 payload bytes without TCP options), below the
+IPv4 length limit even when the Ethernet header is included. All other grouping
+conditions, original checksum policy, generation/capability validation, wire
+poll budget and application read limits are unchanged.
+
+The byte ceiling is exported by smoltcp as `TCP_GRO_MAX_BYTES` and shared with
+the adapter's copied fallback. The checked loan path remains borrowed; its
+ordinary payload processing still copies directly into the TCP receive ring.
+The existing fallback buffer reserves the configured capacity once, not once
+per incoming packet. This is not an end-to-end zero-copy change.
+
+Host tests use the active byte/fragment ceilings for exact-boundary rejection
+and the real established socket test. With this option the latter delivers
+32 x 1460 patterned bytes and verifies the cumulative ACK, exceeding both the
+old 16-fragment entry limit and old 32 KiB aggregate limit. Full configuration:
+388 smoltcp tests + 5 doctests + 1 compile-fail; protocol 6 + 44 tests passed.
+The separate 32-fragment/32-KiB and original protocol configurations are also
+regressed. Evidence: `20260921-gro-full-{smoltcp,protocol}-tests.log`,
+`20260921-gro-full-wide-regression.log`, `20260921-gro-full-control-tests.log`.
+Hardware acceptance still requires measured grouping, integrity and CPU results.
+
+Full-batch candidate FIT SHA-256:
+`122392c03c327aff7a9babfbf1e3b5cd46b60b7f15d20e10f952be2f4e348463`.
+Same-source original-GRO control FIT SHA-256:
+`a298f83b985c3358e05f38037e00fe375c81308a350d49df6fda43a9098c4090`.
+Both source ZIP/manifests, feature maps, ELF/FIT and build/package logs are
+archived under `20260921-gro-full{,-control}`. Application read batching,
+empty-ring alignment, receive-buffer exchange and copy profiling are disabled
+in both. Host build and test processes ended before performance measurement.
+
+Candidate hardware evidence confirms mechanism, not benefit: full-rate means
+are about 31.6 frames per GRO attempt, with the histogram concentrated at 31
+and 32. Two 20-second iperf receives reached 946.75/946.58 Mbps with
+1.29128/1.29233 non-WFI cores; 600 Mbps runs used 1.06777/1.06991 cores.
+Independent READY/GO-gated TCP service: one flow 948.052 Mbps / 1.34315 cores,
+four flows 734.495 Mbps / 1.28740 cores. These transfers confirm byte counts;
+the separate 64 MiB pattern test checks content integrity. More segments per
+GRO object has not by itself produced a measured total CPU improvement.
+A paired control is required before attributing the observed four-flow result.
+
+Paired unprofiled iperf results (20 seconds per row):
+
+| Path | Offered rate | Receiver Mbps | Non-WFI cores | Mean segments per aggregate |
+| --- | --- | ---: | ---: | ---: |
+| gro-full | Full | 946.750 | 1.29128 | 31.657 |
+| gro-full | Full | 946.580 | 1.29233 | 31.627 |
+| gro-full | 600M | 599.954 | 1.06777 | 22.158 |
+| gro-full | 600M | 599.995 | 1.06991 | 21.932 |
+| gro-full-control | Full | 947.776 | 1.28971 | 15.978 |
+| gro-full-control | Full | 947.650 | 1.29003 | 15.956 |
+| gro-full-control | 600M | 599.927 | 1.07272 | 12.912 |
+| gro-full-control | 600M | 599.965 | 1.08723 | 12.738 |
+
+Independent READY/GO-gated service, 2 GiB total per row:
+
+| Path | Flows | Receiver Mbps | Non-WFI cores |
+| --- | ---: | ---: | ---: |
+| gro-full | 1 | 948.052 | 1.34315 |
+| gro-full | 4 | 734.495 | 1.28740 |
+| gro-full-control | 1 | 947.556 | 1.34054 |
+| gro-full-control | 4 | 784.973 | 1.30196 |
+
+Full-rate iperf means: candidate 946.665 Mbps / 1.29180 cores, control
+947.713 Mbps / 1.28987 cores. Mean segments per actual aggregate nearly doubled
+(31.642 vs 15.967), but measured total residency did not fall. Independent
+single-flow service also showed no improvement. The one paired four-flow run
+was slower with the candidate (734.5 vs 785.0 Mbps); do not claim an exact
+statistically established regression from one pair, but this gives no basis
+for enabling the configuration. Keep it default off. Both 64 MiB integrity
+tests passed, and all 5,348,787 / 5,352,306 candidate/control DMA loans were
+released, with 128 free and zero ready/borrowed/full/dropped after iperf.
+
+A concrete next inspection point is `checked_gro::Token::consume`: it currently
+materializes references for every prefetched slot before learning how short the
+compatible prefix is. Interleaved flows can repeatedly rebuild views of the
+same pending suffix. A 32-slot window increases this work relative to 16 even
+when the resulting GRO prefix is short. This is a code-based explanation to
+test, not a proven attribution of the observed multi-flow cost. Constructing
+views only as the compatible prefix is inspected could preserve ownership and
+lookahead ordering while eliminating repeated suffix work. No such change is
+included in these measured images.
+
+Stable FIT `918fdf3b…600b6` was restored to RAM; component hashes, network
+initialization and gigabit link were verified in
+`20260921-gro-full-baseline-restore/`. SD/SPI contents were unchanged. The
+full-batch option remains experimental and does not meet the CPU objective.
+
+
+## 2026-09-22: construct views only for the inspected GRO prefix
+
+This experiment began before midnight; artifact names retain the
+`20260921-gro-prefix` prefix. The preceding full-batch experiment showed that
+mean aggregation near 32 is not itself evidence of CPU savings. Code inspection
+also found that each attempt built views of the entire prefetched suffix before
+checking compatibility. A short prefix could therefore cause repeated slot
+traversal across successive attempts, especially with interleaved flows.
+
+Default-off `gro-prefix-views` reads the first frame and then only the next
+candidate needed by the builder. Accepted views are retained for consumers of
+original frames; rejected lookahead remains in its owned slot. PSH/short/capacity
+termination does not inspect a further frame. Stable immutable borrows, checksum
+policy, callback lifetime, consumed count, release batching and capability
+validation remain unchanged. No unsafe code or cached validation is added.
+
+A new interleaved four-flow fixture combines 1/2/3-frame prefixes and terminal
+PSH, checks original-frame callbacks and materialized payload callbacks, crosses
+window wraps and checks that the unconsumed suffix stays live until its turn.
+Existing drop/revocation/checksum-policy tests also run. Both 16- and 32-frame
+candidate configurations and the original control pass 6 + 45 protocol tests.
+The hardware comparison keeps the normal 16-frame/32-KiB configuration and
+changes only prefix-view construction. It does not enable full-batch GRO,
+application batching, exchange, alignment or copy sampling.
+
+Candidate FIT:
+`462db9a1196081d58cc58467a4ecbbe406de5037ea86894e984c2fbfef9d06d9`.
+Same-source control FIT:
+`059670e818ad8dc38aabcba093f1ad4ce7123c130c114e1ba8de28325c426807`.
+Paired source archives, feature maps, build/package logs and FIT/ELFs use
+`20260921-gro-prefix{,-control}` artifact names. The candidate booted successfully;
+all host builds and unit tests completed before benchmark launch.
+
+Hardware measurement did not start: after successful candidate RAM boot/link,
+the first `quiet` timed out with zero captured bytes. A separate newline probe
+also captured zero bytes. Three pings and a five-second TCP connection to 5300
+failed; en7 retained 192.168.77.1/24, MTU 1500, active 1000baseT full duplex,
+and the board route still used en7. No other UART holder was reported by lsof.
+This establishes loss of both observed control paths, not a proven cause or a
+performance result. The candidate had been idle while the control build and
+benchmark launch completed; no benchmark traffic preceded the failure.
+
+Failure evidence: `20260921-gro-prefix-measure/summary.json`, its empty serial
+log, `20260921-gro-prefix-serial-recheck.log` and
+`20260921-gro-prefix-connection-status.json`. Physical power recovery has been
+requested. No stable-RAM restoration is claimed while the board is unreachable.
+Retry scripts preserve the original failure output and use fresh
+`20260922-gro-prefix-*` measurement/load paths with the same archived FIT.
+
+The subsequent bounded 60-second recovery capture also collected zero bytes
+(`20260922-gro-prefix-recovery-capture.log`). Its reader has exited; no serial
+reader or benchmark remains running. Await hardware recovery before dependent
+measurements. The goal remains incomplete.
+
+Follow-up recovery audit (2026-09-22): TCP 5300 still times out in
+`20260922-gro-prefix-recheck-2.json`. Offline comparison of the exact candidate
+and control ELF prologues shows `SharedIpv4TcpStack::poll_network` reserves
+8 KiB in both (496-byte initial decrement plus 7,696 bytes). Thus this function
+has no direct frame-size increase in the candidate. This is not a complete
+call-graph stack bound and does not rule out other hangs, stack failures or
+connection problems. Raw prologues are archived in
+`20260922-gro-prefix-stack-prologues.json`; no speculative fix or performance
+claim is made from them.
+
+Third consecutive hardware-blocker audit: the bounded checks in
+`20260922-gro-prefix-recheck-3.json` again show TCP timeout and a ten-second
+serial probe with zero bytes. The probe exited; no benchmark or serial reader
+remains live. Candidate/control images and host regressions are ready, but
+hardware recovery is required for performance comparison and stable-image
+restoration. Further unmeasured tuning would not resolve this evidence gap.
+The thread goal is marked blocked pending physical recovery; it is not complete.
+
+After the user reported power recovery on 2026-09-22, `bootlog` still timed out
+with zero captured UART bytes and TCP 5300 timed out. The host retained active
+gigabit link and its correct address. USB registry inspection confirms
+54340134951 is USB Single Serial; the additional 607NTSULG0063 port is LG Monitor
+Controls and was not opened. No assumption that Mars moved to this other port
+was made. Serial-USB reconnection alone was requested, preserving board power,
+to recover observability before deciding another board action. Evidence:
+`20260922-gro-prefix-after-ready.json` and
+`20260922-gro-prefix-ready-bootlog.log`. No benchmark or image reload ran.
+
+The bounded serial reconnect probe ended without a prompt; all 11 attempts
+timed out (`20260922-mars-usb-reconnect/events.json`). No USB-reconnect completion
+has yet been reported, so this is not evidence that physical reconnection
+failed. DHCP leases still map the known kernel MAC to 192.168.77.10 and the
+board U-Boot MAC to 192.168.77.15, with no fresh lease file update after this
+reported power cycle. There is no positive evidence of a new kernel address.
+No reader remains running; await the requested USB reconnection before retrying.
+
+Resumed-run blocker audit: after the user's `ready`, three consecutive turns
+still found no serial response and no TCP connectivity. The final bounded probe
+exited with zero serial bytes and TCP timeout; evidence is
+`20260922-mars-reconnect-audit-3/result.json`. No reader remains active.
+Candidate/control builds and host tests are ready, but software image loading,
+performance comparison and stable-RAM restoration require hardware access.
+The goal is marked blocked again pending the requested serial USB reconnection;
+it is not complete and no new CPU result is claimed.
+
+Recovery and immediate retry (2026-09-22): the serial prompt returned and TCP
+5300 changed from timeout to connection refused. The recovered firmware did
+not recognize `bootlog`, so it was not the archived prefix candidate. The same
+candidate FIT was then RAM-loaded successfully; both FIT hashes, kernel device
+initialization, 1000 Mbps link, `bootlog`, `quiet` and `nrxbat` passed in
+`20260922-gro-prefix-retry-load/`. The final admission histogram contained only
+one empty poll. After that loader closed its serial session, the separate
+measurement process timed out on its first `quiet`, collecting zero bytes.
+Both TCP 5300 and 5201 independently timed out; lsof found no other UART holder.
+No integrity transfer or throughput run started. The result in
+`20260922-gro-prefix-measure/summary.json` is a control-path failure, not a
+performance result or proof that GRO prefix views caused a hang.
+
+For the next physical recovery, two syntax-checked combined RAM-load/measurement
+scripts (`ramboot-measure-20260922-gro-prefix{,-control}-continuous.py`) keep one
+serial descriptor open from U-Boot through integrity and CPU measurements.
+They retain the exact archived FITs and use new output directories. Run the
+control first to distinguish a candidate-specific failure from the shared
+firmware/host path. This change removes a serial close/reopen boundary; it does
+not assume that this boundary caused the fault. Power recovery has been
+requested. Stable RAM restoration and the paired comparison remain pending.
+
+Next goal-turn audit: `20260922-083149-prefix-recovery-audit/result.json`
+again records an eight-second serial timeout (zero bytes) and TCP 5300 timeout.
+The reader exited normally after recording the failure. This is the second
+consecutive turn with the same post-load hardware-access blocker; no new
+physical recovery confirmation has arrived. Earlier host line-setting evidence
+already shows reopen defaults can change, but also documents failures during
+continuous capture, so the planned continuous-session control is a discriminating
+check, not a claimed fix. Paired hardware measurement remains pending.
+
+Third consecutive post-retry blocker audit:
+`20260922-083242-prefix-recovery-audit-3/result.json` again reports zero serial
+bytes and TCP timeout. The bounded probe exited; no test or serial reader is
+left running. Hardware access is still required to run the prepared continuous
+control/candidate comparison and restore stable RAM firmware. The goal is
+blocked pending physical recovery, not complete; no new performance claim is
+supported by these failed control-path checks.
+
+### 2026-09-23: GRO prefix-view hardware comparison and four-flow failure
+
+Physical recovery restored the shell. Host en7 remained MTU 1500 and active
+1000baseT/full duplex. The continuous-session control and candidate loaders both
+verified their archived FIT component hashes, boot admission, and gigabit link.
+In BOTH images the immediate first 64 MiB verifier connected, then failed
+admission after approximately 5.006 seconds without submitting payload. Subsequent
+same-image attempts passed all 67,108,864 patterned bytes. This common startup
+failure is unresolved; retaining one serial FD did not eliminate it. It was
+not a data mismatch. Do not silently count these first attempts as passing.
+
+The completed, unprofiled-copy paired measurements are in
+`20260923-gro-prefix{,-control}-measure/`; raw startup attempts retain the earlier
+`20260922-gro-prefix{,-control}-continuous-{load,measure}/` names. Both use normal
+16-frame/32 KiB GRO limits. Each rate has two 20-second runs:
+
+| Image | Full-rate mean Mbps | Full-rate resident cores | 600 Mbps resident cores | Full-rate segments/aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| Control | 931.294 | 1.28775 | 1.02740 | 15.985 |
+| Prefix views | 948.864 | 1.29584 | 0.99728 | 15.870 |
+
+Resident cores means summed non-WFI time, not instruction attribution. Candidate
+full-rate CPU is not lower; paced CPU is about 2.9% lower in this small sequential
+sample. The throughput difference alone does not establish a reproducible
+improvement, especially with no repeated boot-order reversal yet. The target
+of over 900 Mbps below one core is NOT met. Exact per-round data, histograms,
+and nonnegative counter deltas are in `20260923-gro-prefix-comparison.json`.
+Prefix views remains default-off.
+
+Independent candidate single-flow 2 GiB reception passed at 948.996 Mbps and
+1.34104 resident cores (`20260921-gro-prefix-gated-measure/`, filenames preserved).
+The subsequent four-flow phase timed out awaiting application admission; no
+four-flow throughput or CPU result exists. The last successful pool snapshot
+showed 6,827,134 acquired/released, free=128, ready=borrowed=full=dropped=0.
+This proves pool recovery at that snapshot, not the absence of a later fault.
+The next control loader timed out at its initial `quiet`, before any reboot
+or image replacement. Both TCP 5300 and 5201 then timed out independently
+(`20260923-prefix-after-fourflow-status.json`). All readers/clients have exited.
+The candidate therefore cannot be accepted as a stable optimization; cause is
+not yet established. Physical recovery was requested to repeat the exact
+single/four-flow sequence on control. Stable RAM restoration remains pending.
+
+Follow-up on 2026-09-23: the bounded recovery audit unexpectedly found a shell
+prompt and TCP connection refused (`20260923-081713-fourflow-recovery-audit/`).
+Control was successfully RAM-loaded in `20260923-gro-prefix-control-retry-load/`.
+Its independent 2 GiB tests passed: single flow 934.155 Mbps/1.33364 resident
+cores; four flows 762.149 Mbps/1.29405 cores. Results retain the path
+`20260921-gro-prefix-control-gated-measure/`.
+
+The same archived candidate was reloaded successfully in
+`20260923-gro-prefix-fourflow-retry-load/`. A diagnostic-only client logs each
+port's connection start, application-ready barrier entry, completion or failure
+to stderr, while retaining the original transfer implementation and GO barrier.
+The candidate passed single flow 948.964 Mbps/1.34143 cores and four flows
+787.031 Mbps/1.30310 cores. Ports 5301..5303 became ready in about 5 ms; port
+5300, just used by the preceding single-flow test, took 9.795 seconds. This
+setup delay is excluded from the measured CPU/throughput interval. It identifies
+a connection-reuse delay in this run, not the cause of the previous total loss.
+Evidence: `20260923-gro-prefix-gated-diagnostic-measure/`, with per-port events
+in `02-stderr.log`. One successful repeat does not clear the previous failure
+or qualify stability; prefix views stays default-off.
+
+After the successful four-flow measurement process exited, stable-image
+restoration failed at its first `bootlog` command, before reboot or any image
+load (`20260921-gro-prefix-baseline-restore/`). Thus no successful stable-image
+restoration is claimed. Both TCP ports subsequently timed out as recorded in
+`20260923-prefix-after-passed-fourflow-status.json`. All probes/loaders are
+terminal. Loss also following a completed four-flow run means the earlier
+admission timeout alone cannot be treated as the exclusive trigger. Recovery
+must preserve observability before further causal claims.
+
+### 2026-09-23: user-requested hang investigation, paired diagnostics
+
+The initial eight-second bootlog probe again timed out. After preparing a fresh
+lock-stall diagnostic, a later prompt probe succeeded and RAM loading resumed.
+No assertion is made about what physically restored access. The diagnostic uses
+the exact prefix candidate feature set plus `lock-stall-probe`. Source manifest
+comparison against the archived candidate shows identical root/vendor HEADs
+and all archived code hashes; only this document differs. Ordinary firmware
+features were restored after building. FIT:
+`target/mars-boot-20260921-bootlog-hang-20260923/out/artifacts/vibeos.itb`,
+SHA-256 `9a2fef80722e94886f48161e84181600be10996a414321696cce22cf747ffe8c`.
+Build/image checks passed. Packaging initially failed because OrbStack was not
+running; starting it and rerunning mkimage succeeded. Exact ELF, feature map,
+and source archive/manifest are retained under mars-reference with the
+`bootlog-hang-20260923`/`hang-20260923` names.
+
+Diagnostic RAM load verified both FIT component hashes and gigabit link.
+Single/four-flow independent transfers both exited zero, followed by eighteen
+successful 10-second idle/NIDLE windows. A subsequent three-minute passive
+capture (no serial commands between bootlogs) also passed. No LOCK_STALL,
+panic or assertion marker was captured. Boot entry_ticks stayed 39862328,
+including after serial reopen. Evidence: `20260923-hang-diagnostic-run/`,
+`20260923-hang-passive-{serial.log,results.jsonl}`.
+
+The exact archived uninstrumented prefix candidate was then RAM-loaded and
+passed the same single/four-flow plus eighteen idle-window sequence. With the
+serial FD closed under caffeinate, all six TCP connection probes over one
+minute succeeded. Reopened bootlog retained entry_ticks=42433783. Evidence:
+`20260923-hang-uninstrumented-run/`, `20260923-hang-closed-control/`, and
+`20260923-hang-boot-continuity.json`. The TCP probes are brief connection checks,
+not a sustained traffic test. Neither closing serial nor the transfer sequence
+is a deterministic reproducer in these runs. These passes do not erase the
+previous failures, establish hardware stability, or prove a software fix.
+
+Code review found unbounded UART transmit/drain/RX loops and the external-IRQ
+claim loop, plus IRQ-masked network critical sections. These are investigation
+candidates, not identified causes; no speculative forced unlock or interrupt
+masking change was applied. The hang remains unresolved. Current board at the
+end of these bounded runs is the uninstrumented prefix candidate, with verified
+serial/network response; all test processes exited. No SD/SPI changes.
+
+### Extended loop-stall diagnostic (2026-09-23, not yet hardware-tested)
+
+The existing default-off `lock-stall-probe` now also instruments two IRQ-masked
+loops: PLIC external-interrupt claim/dispatch and UART receive draining. A
+per-invocation sparse timer probe reports `LOOP_STALL` once after roughly two
+seconds, including physical hart, elapsed ticks, iteration count and IRQ
+number. It writes via the existing best-effort SBI diagnostic path without
+scheduler/TTY locks or allocation. UART input contents are not logged. It does
+not break the loop, mask IRQs, release locks or reset hardware. A callback/MMIO
+read that never returns remains invisible to this probe, and SBI output may
+itself stall. Ordinary builds have no added code unless the feature is enabled.
+This is additional observability, NOT a hang fix.
+
+The two existing threshold/wrap/one-report detector tests passed; the Mars
+release build and image checks passed. Packaged FIT:
+`target/mars-boot-20260921-bootlog-hangloops-20260923/out/artifacts/vibeos.itb`,
+SHA-256 `790d48224b9697c58ea007d46239f8192ea4b62212d281bf1aff376a3c465fb3`.
+Feature selection was restored; source, exact ELF and manifest are archived.
+`ramboot-20260923-loop-stall.py` is syntax-checked and ready for recovery.
+
+Before this image could be loaded, the previously responsive uninstrumented
+candidate again lost serial and both TCP ports during the later idle interval.
+The diagnostic changes therefore were not executing during that loss. Evidence:
+`20260923-loop-stall-preload-serial.log` (zero captured bytes) and
+`20260923-loop-stall-preload-network.json` (5300/5201 timeout). All probes exited.
+Power recovery was requested to load the new image; root cause and fix remain
+unverified. The previous successful short tests did not qualify idle stability.

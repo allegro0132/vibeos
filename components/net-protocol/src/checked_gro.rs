@@ -55,10 +55,13 @@ impl Token<'_> {
         f: impl FnOnce(TcpGroRx<'_>, &[&[u8]]) -> R) -> R
     {
         let mut frames = [&[][..]; MAX_SEGMENTS];
+        #[cfg(not(feature = "gro-prefix-views"))]
         for (i, frame) in frames[..self.window.len].iter_mut().enumerate() {
             *frame = self.window.slots[(self.window.head + i) % MAX_SEGMENTS]
                 .as_ref().expect("admitted loan").as_bytes();
         }
+        #[cfg(feature = "gro-prefix-views")]
+        { frames[0] = self.window.slots[self.window.head].as_ref().expect("admitted loan").as_bytes(); }
         let first = frames[0];
         let Some(mut builder) = TcpGroBuilder::new(first, caps) else {
             self.window.consumed = 1;
@@ -66,10 +69,19 @@ impl Token<'_> {
             return f(TcpGroRx::Frame(first), &frames[..1]);
         };
         let mut reason = if first[47] & 8 != 0 { 1 } else { 7 };
-        for frame in &frames[1..self.window.len] {
+        for i in 1..self.window.len {
             if builder.is_finished() { break; }
+            // Borrow only the next candidate. The rejected lookahead stays in
+            // its slot; no view of the uninspected suffix is constructed.
+            #[cfg(feature = "gro-prefix-views")]
+            let frame = self.window.slots[(self.window.head + i) % MAX_SEGMENTS]
+                .as_ref().expect("admitted loan").as_bytes();
+            #[cfg(not(feature = "gro-prefix-views"))]
+            let frame = frames[i];
             match builder.push(frame) {
                 Ok(()) => {
+                    #[cfg(feature = "gro-prefix-views")]
+                    { frames[i] = frame; }
                     reason = if frame[47] & 8 != 0 { 1 }
                         else if frame[16..18] != first[16..18] { 2 } else { 7 };
                 }

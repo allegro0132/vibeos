@@ -10,6 +10,9 @@
 
 extern crate alloc;
 
+#[cfg(feature = "tcp-read-profile")]
+pub mod receive_profile;
+
 #[cfg(feature = "receive-buffer-exchange")]
 pub mod receive_ownership;
 #[cfg(feature = "receive-buffer-exchange")]
@@ -35,6 +38,11 @@ use vibeos_core::sync::SpinLock;
 pub const DEFAULT_TCP_FRONTEND_BUFFER_BYTES: usize = 4 * 1024;
 pub const MAX_TCP_FRONTEND_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 32 * 1024;
+/// Producer-owned range publication is bounded by one frontend queue, while
+/// each application read retains the smaller per-call execution budget.
+#[cfg(feature = "receive-buffer-exchange")]
+pub const MAX_TCP_RECEIVE_TRANSFER_BYTES: usize = MAX_TCP_FRONTEND_BUFFER_BYTES;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpStreamState {
@@ -165,6 +173,31 @@ pub struct TcpReceiveBatch<'a> {
 }
 
 impl TcpReceiveBatch<'_> {
+    /// Generation checked while the producer transaction holds the listener guard.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn exchange_generation(&self) -> Option<NonZeroU64> {
+        if self.inner.receive_exchange.is_none() || !matches!(self.inner.state,
+            TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return None;
+        }
+        NonZeroU64::new(self.inner.generation)
+    }
+
+    /// Publish an exchanged range in stream order with copied fallback bytes.
+    /// The enclosing transaction performs notification only after unlocking.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn publish_exchange(&mut self, ticket: receive_ownership::Ticket,
+        owner: receive_ownership::Owner, generation: NonZeroU64) -> Result<usize, TcpFrontendError> {
+        if self.exchange_generation() != Some(generation) {
+            return Err(TcpFrontendError::StaleConnection);
+        }
+        let was_empty = self.inner.received_len() == 0;
+        let length = self.inner.receive_exchange.as_mut().ok_or(TcpFrontendError::InvalidIdentity)?
+            .publish(ticket, owner, generation).map_err(|_| TcpFrontendError::InvalidIdentity)?;
+        self.became_readable |= was_empty && length != 0;
+        Ok(length)
+    }
+
     pub fn receive(&mut self, input: &[u8]) -> usize {
         if !matches!(self.inner.state,
             TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
@@ -502,6 +535,23 @@ impl TcpListener {
         connection: TcpConnectionToken,
         output: &mut [u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        #[cfg(feature = "tcp-read-profile")]
+        let sample = {
+            #[cfg(feature = "receive-buffer-exchange")]
+            let exchanged = self.has_receive_exchange;
+            #[cfg(not(feature = "receive-buffer-exchange"))]
+            let exchanged = false;
+            receive_profile::RECORDER.begin(exchanged)
+        };
+        let result = self.try_recv_inner(connection, output);
+        #[cfg(feature = "tcp-read-profile")]
+        sample.finish(&result, output.len());
+        result
+    }
+
+    #[inline]
+    fn try_recv_inner(&self, connection: TcpConnectionToken, output: &mut [u8])
+        -> Result<TcpIoResult, TcpFrontendError> {
         #[cfg(feature = "receive-buffer-exchange")]
         if self.has_receive_exchange {
             let consumer = receive_ownership::Owner::current_reader()

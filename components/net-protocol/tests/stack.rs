@@ -1506,7 +1506,7 @@ fn gro_keeps_wire_frame_budget_and_requests_another_poll() {
     stack.poll_network(0).unwrap();
     assert_eq!(stack.device_stats().rx_frames,32);
     assert_eq!(inbound.stats().2,32);
-    assert_eq!(stack.device_stats().gro_aggregates,2);
+    assert_eq!(stack.device_stats().gro_aggregates, if cfg!(feature = "gro-wide") { 1 } else { 2 });
     stack.poll_network(1).unwrap();
     assert_eq!(stack.device_stats().rx_frames,64);
     assert_eq!(inbound.stats().2,0);
@@ -2010,7 +2010,7 @@ mod pooled_receive {
         let tickets: Vec<_> = (0..64).map(|i| inject(&q, &gro_test_data(i * 100))).collect();
         stack.poll_network(0).unwrap();
         assert_eq!(stack.device_stats().rx_frames, 32);
-        assert_eq!(stack.device_stats().gro_aggregates, 2);
+        assert_eq!(stack.device_stats().gro_aggregates, if cfg!(feature = "gro-wide") { 1 } else { 2 });
         assert!(q.has_message());
         stack.poll_network(1).unwrap();
         assert_eq!(stack.device_stats().rx_frames, 64);
@@ -2040,16 +2040,16 @@ mod pooled_receive {
         let before = stack.device_stats();
         assert_eq!(before.rx_frames, 32);
         assert!(q.has_message());
-        assert_eq!(&before.gro_end_profile[26..], &[1, 0, 0, 0, 0]);
+        assert_eq!(&before.gro_end_profile[vibeos_net_protocol::GRO_PROFILE_NONE_OFFSET..], &[1, 0, 0, 0, 0]);
         assert_eq!(before.gro_end_profile[3], 1);
         stack.poll_network(1).unwrap();
         let after = stack.device_stats();
         assert_eq!(after.rx_frames, 33);
         assert!(!q.has_message());
-        assert_eq!(&after.gro_end_profile[26..], &[1, 1, 0, 0, 0]);
+        assert_eq!(&after.gro_end_profile[vibeos_net_protocol::GRO_PROFILE_NONE_OFFSET..], &[1, 1, 0, 0, 0]);
         assert_eq!(after.gro_end_profile[3], 2);
         assert_eq!(after.gro_end_profile[..9].iter().sum::<u64>(),
-                   after.gro_end_profile[9..26].iter().sum::<u64>());
+                   after.gro_end_profile[9..vibeos_net_protocol::GRO_PROFILE_NONE_OFFSET].iter().sum::<u64>());
         drop(stack);
         for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
     }
@@ -2106,6 +2106,48 @@ mod pooled_receive {
             assert_eq!(d.has_immediate_work().unwrap(), delivered < tickets.len());
         }
         assert_eq!(delivered, tickets.len());
+        assert!(d.receive(Instant::ZERO).is_none());
+        drop(d);
+        for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
+    }
+
+    #[cfg(feature = "gro-checked")]
+    #[test]
+    fn checked_interleaved_flows_preserve_raw_prefix_views_and_suffix_loans() {
+        let q = unsafe { ReceiveEndpoint::new("checked-interleaved", 128, &OPS).unwrap() };
+        let out = Endpoint::new("checked-interleaved-out", 64);
+        let mut cs = CSpace::new("checked-interleaved");
+        let (_, rx) = receive(&mut cs, q.clone());
+        let (_, tx) = authority(&mut cs, &out, Rights::SEND);
+        let mut d = PacketDevice::new(session_stamp(), rx, tx);
+        d.set_rx_checksum_offload(true);
+        let groups: Vec<Vec<Vec<u8>>> = (0..24).map(|group| {
+            (0..1 + group % 3).map(|i| {
+                let mut frame = gro_test_data(group * 1000 + i * 100);
+                frame[34..36].copy_from_slice(&(40000u16 + (group % 4) as u16).to_be_bytes());
+                if group % 2 == 0 && i == group % 3 { frame[47] |= 8; }
+                frame
+            }).collect()
+        }).collect();
+        let tickets: Vec<_> = groups.iter().flatten().map(|f| inject(&q, f)).collect();
+        let mut consumed = 0;
+        for (index, group) in groups.iter().enumerate() {
+            let (rx, tx) = d.receive(Instant::ZERO).unwrap(); drop(tx);
+            if index % 2 == 0 {
+                rx.consume_gro(|frames| {
+                    assert_eq!(frames.len(), group.len());
+                    for (frame, expected) in frames.iter().zip(group) { assert_eq!(*frame, expected.as_slice()); }
+                });
+            } else {
+                rx.consume(|bytes| {
+                    let expected: Vec<u8> = group.iter().flat_map(|f| f[54..].iter().copied()).collect();
+                    assert_eq!(&bytes[54..], expected.as_slice());
+                });
+            }
+            consumed += group.len();
+            // The unconsumed suffix remains live even across slot-array wraps.
+            for ticket in &tickets[consumed..] { assert!(!records().lock().unwrap()[&ticket.pool()].released); }
+        }
         assert!(d.receive(Instant::ZERO).is_none());
         drop(d);
         for ticket in tickets { assert!(records().lock().unwrap()[&ticket.pool()].released); }
@@ -2605,7 +2647,7 @@ fn normal_stack_rebuild_reuses_writers_and_preserves_unrelated_leases() {
 
 #[test]
 #[cfg(all(feature = "receive-buffer-exchange", feature = "activity-events"))]
-fn rejected_exchange_aborts_stream_and_cannot_be_retried() {
+fn exchange_publication_handles_reentrant_wake_without_losing_bytes() {
     use std::{future::Future, pin::pin, sync::atomic::{AtomicBool, Ordering}, task::{Context, Wake, Waker}};
     use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
     use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
@@ -2641,9 +2683,15 @@ fn rejected_exchange_aborts_stream_and_cannot_be_retried() {
     impl Wake for Fill {
         fn wake(self: Arc<Self>) {
             if !self.fired.swap(true, Ordering::Relaxed) {
-                // Consume the capacity after network_begin_drive snapshots it,
-                // but before the exchange publication rechecks admission.
+                // Legacy driving notifies between the capacity snapshot and
+                // publication. Batched driving notifies after publication.
+                #[cfg(not(feature = "frontend-rx-batch"))]
                 assert_eq!(self.frontend.network_receive(&[7; 256]), 256);
+                // A batched producer commits the four exchanged bytes before
+                // unlocking and waking us. Re-entry must neither deadlock nor
+                // overfill the queue, and the original bytes remain first.
+                #[cfg(feature = "frontend-rx-batch")]
+                assert_eq!(self.frontend.network_receive(&[7; 256]), 252);
             }
         }
     }
@@ -2653,20 +2701,39 @@ fn rejected_exchange_aborts_stream_and_cannot_be_retried() {
     let mut cx = Context::from_waker(&waker);
     let mut waiting = pin!(event.wait());
     assert!(waiting.as_mut().poll(&mut cx).is_pending());
-    assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
-    assert!(fill.fired.load(Ordering::Relaxed));
-    assert_eq!(frontend.snapshot().state, TcpStreamState::Reset);
-    assert_eq!(frontend.snapshot().readable_bytes, 0);
-    assert_eq!(pool.queued_bytes(), 0);
-    assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
-    // Even after ordinary network polling, neither socket may auto-relisten.
-    for _ in 0..10 {
-        client.poll(now); server.poll_network(now).unwrap(); now += 1;
-        assert!(!server.tcp_is_listening(handle).unwrap());
-        assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+    #[cfg(feature = "frontend-rx-batch")]
+    {
+        let report = server.drive_tcp_frontend(handle, &frontend).unwrap();
+        assert_eq!(report.exchanged_bytes, 4);
+        assert!(fill.fired.load(Ordering::Relaxed));
+        assert_eq!(frontend.snapshot().readable_bytes, 256);
+        let peer = frontend.try_accept().unwrap();
+        let mut bytes = [0; 256];
+        assert_eq!(frontend.try_recv_for(peer, owner, &mut bytes).unwrap(), TcpIoResult::Progress(4));
+        assert_eq!(&bytes[..4], b"data");
+        assert_eq!(frontend.try_recv_for(peer, owner, &mut bytes).unwrap(), TcpIoResult::Progress(252));
+        assert_eq!(&bytes[..252], &[7; 252]);
+        assert_eq!(pool.queued_bytes(), 0);
+        drop(server);
+        assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
     }
-    drop(server);
-    assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
+    #[cfg(not(feature = "frontend-rx-batch"))]
+    {
+        assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+        assert!(fill.fired.load(Ordering::Relaxed));
+        assert_eq!(frontend.snapshot().state, TcpStreamState::Reset);
+        assert_eq!(frontend.snapshot().readable_bytes, 0);
+        assert_eq!(pool.queued_bytes(), 0);
+        assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+        // Even after ordinary network polling, neither socket may auto-relisten.
+        for _ in 0..10 {
+            client.poll(now); server.poll_network(now).unwrap(); now += 1;
+            assert!(!server.tcp_is_listening(handle).unwrap());
+            assert!(server.drive_tcp_frontend(handle, &frontend).is_err());
+        }
+        drop(server);
+        assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
+    }
 }
 
 #[test]
@@ -2743,4 +2810,52 @@ fn shared_port_exchange_keeps_simultaneous_streams_in_separate_pools() {
         assert_eq!(pool.queued_bytes(), 0);
         assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
     }
+}
+
+#[test]
+#[cfg(all(feature = "receive-buffer-exchange", feature = "frontend-rx-batch"))]
+fn frontend_exchanges_more_than_one_application_read_without_copying() {
+    use vibeos_core::{heap::{AllocationDomain, ArenaId, OwnerId}, sync::TaskRecoveryKey};
+    use vibeos_net_api::{receive_ownership::Owner, receive_storage::Storage};
+    let owner = Owner { domain: AllocationDomain::new(OwnerId::new(192), ArenaId::new(192)), task: TaskRecoveryKey::new(192).unwrap() };
+    let pool = Storage::<3>::new_static(65536, 65536).unwrap();
+    let frontend = TcpListener::new_with_receive_storage("large-exchange", TcpListenerId::new(192).unwrap(), SERVER_PORT, 65536, 4096, pool).unwrap();
+    let mut caps = CSpace::new("large-exchange");
+    let to_server = Endpoint::new("large-in", 128);
+    let to_client = Endpoint::new("large-out", 128);
+    let (_, si) = authority(&mut caps, &to_server, Rights::RECV);
+    let (_, so) = authority(&mut caps, &to_client, Rights::SEND);
+    let (_, ci) = authority(&mut caps, &to_client, Rights::RECV);
+    let (_, co) = authority(&mut caps, &to_server, Rights::SEND);
+    let mut server = SharedIpv4TcpStack::new(Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 192), session_stamp(), si, so).unwrap();
+    let handle = server.add_tcp_listener(SERVER_PORT).unwrap();
+    unsafe { server.enable_receive_exchange(handle, frontend.clone(), owner).unwrap(); }
+    let mut client = TestClient::with_transmit_capacity(ci, co, 65536);
+    let expected: Vec<u8> = (0..49152).map(|i| ((i * 37 + i / 251) & 255) as u8).collect();
+    let mut sent = 0;
+    for now in 0..10000 {
+        client.poll(now);
+        if sent < expected.len() && client.socket().can_send() {
+            sent += client.socket().send_slice(&expected[sent..]).unwrap();
+            client.poll(now);
+        }
+        server.poll_network(now).unwrap();
+        if server.tcp_stream_status(handle).unwrap().readable_bytes == expected.len() { break; }
+    }
+    assert_eq!(server.tcp_stream_status(handle).unwrap().readable_bytes, expected.len());
+    let report = server.drive_tcp_frontend(handle, &frontend).unwrap();
+    assert_eq!(report.exchanged_bytes, expected.len());
+    assert_eq!(report.received_bytes, expected.len());
+    let peer = frontend.try_accept().unwrap();
+    let mut output = vec![0; 65536];
+    let mut observed = Vec::new();
+    while observed.len() < expected.len() {
+        let TcpIoResult::Progress(n) = frontend.try_recv_for(peer, owner, &mut output).unwrap() else { panic!("missing exchange") };
+        assert!(n > 0 && n <= 32768);
+        observed.extend_from_slice(&output[..n]);
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(pool.queued_bytes(), 0);
+    drop(server);
+    assert_eq!(unsafe { pool.retire_stopped_owner(owner) }, 0);
 }

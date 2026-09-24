@@ -24,6 +24,8 @@ pub use receive::PacketReceive;
 pub use transmit::PacketTransmit;
 #[cfg(feature = "bounded-gro")]
 mod gro;
+#[cfg(feature = "bounded-gro")]
+pub use gro::{PROFILE_LEN as GRO_PROFILE_LEN, PROFILE_NONE_OFFSET as GRO_PROFILE_NONE_OFFSET};
 #[cfg(feature = "gro-checked")]
 mod checked_gro;
 
@@ -248,7 +250,7 @@ impl fmt::Display for StackError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketDeviceStats {
     #[cfg(feature = "rx-admission-batch")]
     pub rx_admission_sizes: [u64; 9],
@@ -263,7 +265,22 @@ pub struct PacketDeviceStats {
     pub gro_merged_segments: u64,
     pub gro_aggregates: u64,
     #[cfg(feature = "gro-end-profile")]
-    pub gro_end_profile: [u64; 31],
+    pub gro_end_profile: [u64; gro::PROFILE_LEN],
+}
+
+impl Default for PacketDeviceStats {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "rx-admission-batch")]
+            rx_admission_sizes: [0; 9],
+            rx_frames: 0, tx_frames: 0, tx_segmented_requests: 0,
+            rejected_ingress_frames: 0, rejected_device_epoch_frames: 0,
+            rejected_stack_generation_frames: 0, tx_backpressure_events: 0,
+            pending_egress: false, gro_merged_segments: 0, gro_aggregates: 0,
+            #[cfg(feature = "gro-end-profile")]
+            gro_end_profile: [0; gro::PROFILE_LEN],
+        }
+    }
 }
 
 /// A lossless-at-the-endpoint-boundary smoltcp device adapter.
@@ -1623,14 +1640,51 @@ impl SharedIpv4TcpStack {
             }
         }
         let transport = self.tcp_stream_status(listener)?;
-        #[cfg(all(feature = "frontend-rx-batch", not(feature = "receive-buffer-exchange")))]
+        #[cfg(feature = "frontend-rx-batch")]
         let drive = {
             let entry = self.listener(listener)?;
             let socket = entry.socket;
             let reset_requested = entry.reset_requested;
+            #[cfg(feature = "receive-buffer-exchange")]
+            let index = self.listener_index(listener)?;
+            #[cfg(feature = "receive-buffer-exchange")]
+            let mut exchange_failed = false;
             let (drive, result) = frontend.network_receive_drive(transport.state, |drive, batch| {
                 let _phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
                 let mut budget = drive.receive_capacity.min(transport.readable_bytes);
+                #[cfg(feature = "receive-buffer-exchange")]
+                if budget != 0 && !reset_requested {
+                    self.device.revalidate_authority()?;
+                    if let Some(exchange) = &mut self.listeners[index].exchange {
+                        let generation = batch.exchange_generation()
+                            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                        let (_, binding) = exchange.bindings.iter_mut().find(|(handle, _)| *handle == socket)
+                            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                        // The installed binding owns this socket's storage. The
+                        // listener guard serializes publication with copied RX.
+                        let transfer = match unsafe { binding.exchange(self.sockets.get_mut::<tcp::Socket>(socket), generation, budget) } {
+                            Ok(transfer) => transfer,
+                            Err(_) => {
+                                exchange_failed = true;
+                                return Err(TcpFrontendDriveError::QueueInvariant);
+                            }
+                        };
+                        if let Some(transfer) = transfer {
+                            let length = match batch.publish_exchange(transfer.ticket, exchange.owner, generation) {
+                                Ok(length) => length,
+                                Err(error) => {
+                                    exchange_failed = true;
+                                    binding.discard_unpublished(transfer)
+                                        .map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                                    return Err(error.into());
+                                }
+                            };
+                            report.exchanged_bytes += length;
+                            report.received_bytes += length;
+                            budget -= length;
+                        }
+                    }
+                }
                 for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
                     let capacity = budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
                     if capacity == 0 || reset_requested { break; }
@@ -1648,17 +1702,20 @@ impl SharedIpv4TcpStack {
                 }
                 Ok::<(), TcpFrontendDriveError>(())
             })?;
+            // Recovery re-enters the listener: never run it under the batch guard.
+            #[cfg(feature = "receive-buffer-exchange")]
+            if exchange_failed { self.fail_receive_exchange(index, frontend); }
             result?;
             drive
         };
-        #[cfg(any(not(feature = "frontend-rx-batch"), feature = "receive-buffer-exchange"))]
+        #[cfg(not(feature = "frontend-rx-batch"))]
         let drive = frontend.network_begin_drive(transport.state)?;
         drop(phase);
         // Conservative turn-local budgets. Concurrent application progress may
         // add work, but cannot cause over-consumption; next drive rechecks it.
-        #[cfg(all(feature = "frontend-rx-batch", not(feature = "receive-buffer-exchange")))]
+        #[cfg(feature = "frontend-rx-batch")]
         let mut receive_budget: usize = 0;
-        #[cfg(any(not(feature = "frontend-rx-batch"), feature = "receive-buffer-exchange"))]
+        #[cfg(not(feature = "frontend-rx-batch"))]
         let mut receive_budget = drive.receive_capacity.min(transport.readable_bytes);
         let mut transmit_budget = drive.queued_send_bytes;
         // Borrow transport storage only for the synchronous copy. No socket
@@ -1666,7 +1723,7 @@ impl SharedIpv4TcpStack {
         // chunk limits even when either ring wraps. This avoids clearing and
         // copying through a 32 KiB scratch buffer on every frontend poll.
         let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
-        #[cfg(feature = "receive-buffer-exchange")]
+        #[cfg(all(feature = "receive-buffer-exchange", not(feature = "frontend-rx-batch")))]
         if receive_budget != 0 {
             let index = self.listener_index(listener)?;
             let entry = &mut self.listeners[index];

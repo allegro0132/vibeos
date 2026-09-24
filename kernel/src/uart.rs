@@ -351,7 +351,11 @@ pub fn handle_irq() {
         ConsoleInterrupt::Receive => {}
     }
     let mut received = false;
+    #[cfg(feature = "lock-stall-probe")]
+    let mut stall = vibeos_core::LoopStallProbe::new(vibeos_core::LoopStallKind::UartReceive);
     while let Some(byte) = (hardware().read_byte)() {
+        #[cfg(feature = "lock-stall-probe")]
+        stall.observe(u64::from(irq()));
         // SAFETY: the boot-hart top half remains the sole producer.
         unsafe { let _ = RX.push_from_producer(byte); }
         received = true;

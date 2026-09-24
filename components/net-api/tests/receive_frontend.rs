@@ -372,3 +372,58 @@ fn stale_frontend_chunk_does_not_leak_following_ranges_or_free_reused_slot() {
         pool.release_writer(c, owner(2)).unwrap();
     }
 }
+
+#[test]
+fn receive_batch_orders_exchange_and_copy_and_rejects_stale_generation() {
+    let (pool, listener) = fixture(16);
+    let peer = listener.try_accept().unwrap();
+    let generation = listener.network_exchange_generation().unwrap();
+    let transfer = pending(pool, generation, b"defgh");
+    listener.network_receive_drive(TcpStreamState::Established, |drive, batch| {
+        assert_eq!(drive.receive_capacity, 16);
+        assert_eq!(batch.exchange_generation(), Some(generation));
+        assert_eq!(batch.receive(b"abc"), 3);
+        let stale = NonZeroU64::new(generation.get() + 1).unwrap();
+        assert_eq!(batch.publish_exchange(transfer, owner(1), stale), Err(TcpFrontendError::StaleConnection));
+        assert_eq!(batch.publish_exchange(transfer, owner(1), generation), Ok(5));
+        assert_eq!(batch.receive(b"ijklmnopoverflow"), 8);
+        assert_eq!(batch.receive(b"overflow"), 0);
+    }).unwrap();
+    let mut observed = Vec::new();
+    let mut bytes = [0; 16];
+    while observed.len() < 16 {
+        let TcpIoResult::Progress(n) = listener.try_recv_for(peer, owner(2), &mut bytes).unwrap() else { panic!("lost batch bytes") };
+        assert!(n != 0);
+        observed.extend_from_slice(&bytes[..n]);
+    }
+    assert_eq!(observed, b"abcdefghijklmnop");
+    assert_eq!(pool.queued_bytes(), 0);
+}
+
+#[test]
+fn full_frontend_range_wraps_and_drains_in_bounded_application_reads() {
+    use vibeos_net_api::{MAX_TCP_FRONTEND_BUFFER_BYTES, MAX_TCP_IO_BYTES_PER_CALL};
+    let capacity = MAX_TCP_FRONTEND_BUFFER_BYTES;
+    let pool = Storage::<3>::new_static(capacity, capacity).unwrap();
+    let listener = TcpListener::new_with_receive_storage("large-range",
+        TcpListenerId::new(191).unwrap(), 9001, capacity, 16, pool).unwrap();
+    listener.network_update_state(TcpStreamState::Established).unwrap();
+    let peer = listener.try_accept().unwrap();
+    let generation = listener.network_exchange_generation().unwrap();
+    let expected: Vec<u8> = (0..capacity).map(|i| ((i * 31 + i / 251) & 255) as u8).collect();
+    let ticket = pending(pool, generation, &expected);
+    listener.network_receive_drive(TcpStreamState::Established, |_, batch| {
+        assert_eq!(batch.publish_exchange(ticket, owner(1), generation), Ok(capacity));
+        assert_eq!(batch.receive(b"overflow"), 0);
+    }).unwrap();
+    let mut observed = Vec::new();
+    let mut output = vec![0; capacity];
+    while observed.len() < capacity {
+        let TcpIoResult::Progress(n) = listener.try_recv_for(peer, owner(2), &mut output).unwrap() else { panic!("lost range") };
+        assert!(n > 0 && n <= MAX_TCP_IO_BYTES_PER_CALL);
+        observed.extend_from_slice(&output[..n]);
+    }
+    assert_eq!(observed, expected);
+    assert_eq!(pool.queued_bytes(), 0);
+    assert_eq!(listener.network_receive_capacity(), capacity);
+}

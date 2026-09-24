@@ -29,6 +29,8 @@ use vibeos_net_protocol::{
 
 pub use vibeos_net_protocol::command::NetworkInterfaceId;
 pub use vibeos_net_protocol::{PacketTransmit, PacketReceive};
+#[cfg(feature = "gro-end-profile")]
+pub use vibeos_net_protocol::{GRO_PROFILE_LEN, GRO_PROFILE_NONE_OFFSET};
 
 pub mod command;
 pub mod config;
@@ -43,10 +45,10 @@ pub fn rx_admission_sizes() -> [u64; 9] {
 /// Approximate once-per-second totals for live stack instances; no hot-path
 /// atomic increments. Diagnostic only, not a lifetime delivery guarantee.
 #[cfg(feature = "gro-end-profile")]
-static GRO_END_STATS: [core::sync::atomic::AtomicU64; 31] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; 31];
+static GRO_END_STATS: [core::sync::atomic::AtomicU64; GRO_PROFILE_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; GRO_PROFILE_LEN];
 #[cfg(feature = "gro-end-profile")]
-pub fn gro_end_stats() -> [u64; 31] {
+pub fn gro_end_stats() -> [u64; GRO_PROFILE_LEN] {
     core::array::from_fn(|i| GRO_END_STATS[i].load(core::sync::atomic::Ordering::Relaxed))
 }
 #[cfg(feature = "bounded-gro")]
@@ -111,6 +113,11 @@ static EXCHANGE_BYTES: [core::sync::atomic::AtomicU64; 2] = [const { core::sync:
 #[cfg(feature = "receive-buffer-exchange")]
 pub fn receive_exchange_bytes() -> [u64; 2] {
     core::array::from_fn(|i| EXCHANGE_BYTES[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "receive-exchange-profile")]
+pub fn receive_exchange_attempts() -> [u64; 16] {
+    vibeos_net_protocol::receive_exchange::attempt_stats()
 }
 
 pub const COMPONENT_NAME: &str = "net-stack";
@@ -362,7 +369,7 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
             #[cfg(feature = "rx-admission-batch")]
             let mut admission_sizes = [0u64; 9];
             #[cfg(feature = "gro-end-profile")]
-            let mut end_totals = [0u64; 31];
+            let mut end_totals = [0u64; GRO_PROFILE_LEN];
             for interface in &interfaces {
                 if let Some(active) = interface.stack.as_ref() {
                     let stats = active.core.device_stats();

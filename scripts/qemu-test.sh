@@ -636,7 +636,8 @@ for case_file in tests/cases/*.in; do
     boot=$((boot + 1))
   done
 
-  if [ "$name" = "guard_page" ]; then
+  if [ "$name" = "guard_page" ] || [ "$name" = "guard_page_tty" ]; then
+    cp "$qemu_log" "target/qemu-$name.log"
     guard_probe=$(sed -n 's/.*guard probe: hart0 store into \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
     guard_stval=$(sed -n 's/.*fatal trap: cause=15 stval=\(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
     if [ -z "$guard_probe" ] || [ "$guard_probe" != "$guard_stval" ] \

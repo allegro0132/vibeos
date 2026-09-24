@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-prefix-views = ["gro-checked"]
+gro-full-batch = ["gro-wide", "smoltcp/tcp-gro-full-batch"]
+gro-wide = ["gro-checked", "smoltcp/tcp-gro-wide"]
+rx-align-empty = ["smoltcp/tcp-align-empty-rx"]
+receive-exchange-profile = ["receive-buffer-exchange"]
 gro-checked = ["gro-scatter", "gro-atomic-id"]
 gro-scatter = ["gro-batch-release", "smoltcp/tcp-gro-receive"]
 frontend-rx-batch = []

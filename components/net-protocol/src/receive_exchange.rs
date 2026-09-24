@@ -8,6 +8,29 @@ use vibeos_net_api::{
     receive_storage::Storage,
 };
 
+// Diagnostic-only first-refusal counters. The selected reason is exclusive;
+// later conditions may also have refused the same attempt. Counts and pending
+// bytes are separate so short/control traffic does not dominate interpretation.
+#[cfg(feature = "receive-exchange-profile")]
+static ATTEMPTS: [core::sync::atomic::AtomicU64; 16] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 16];
+
+#[cfg(feature = "receive-exchange-profile")]
+pub fn attempt_stats() -> [u64; 16] {
+    core::array::from_fn(|i| ATTEMPTS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+#[inline]
+fn record(reason: usize, bytes: usize) {
+    #[cfg(feature = "receive-exchange-profile")]
+    {
+        ATTEMPTS[reason * 2].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ATTEMPTS[reason * 2 + 1].fetch_add(bytes as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "receive-exchange-profile"))]
+    let _ = (reason, bytes);
+}
+
 #[derive(Debug)]
 pub struct Transfer {
     pub ticket: Ticket,
@@ -81,17 +104,20 @@ impl<const N: usize> Binding<N> {
         max_bytes: usize,
     ) -> Result<Option<Transfer>, Error> {
         let length = socket.recv_queue();
-        let limit = max_bytes
-            .min(vibeos_net_api::MAX_TCP_IO_BYTES_PER_CALL)
-            .min(self.pool.available_bytes());
-        if length == 0 || length > limit {
-            return Ok(None);
+        if length == 0 { record(0, length); return Ok(None); }
+        if length > max_bytes { record(1, length); return Ok(None); }
+        if length > vibeos_net_api::MAX_TCP_RECEIVE_TRANSFER_BYTES {
+            record(2, length); return Ok(None);
         }
+        let limit = max_bytes
+            .min(vibeos_net_api::MAX_TCP_RECEIVE_TRANSFER_BYTES)
+            .min(self.pool.available_bytes());
+        if length > limit { record(3, length); return Ok(None); }
         let (old_pointer, capacity) = self.pool.writer_address(self.current, self.owner)?;
         let (next, replacement) = match Self::reserve_buffer(self.pool, self.owner) {
             Ok(value) => value,
-            Err(Error::Full) => return Ok(None),
-            Err(error) => return Err(error),
+            Err(Error::Full) => { record(4, length); return Ok(None); }
+            Err(error) => { record(7, length); return Err(error); }
         };
         let received = match socket.exchange_receive_buffer(replacement, limit) {
             Ok(buffer) => buffer,
@@ -101,6 +127,7 @@ impl<const N: usize> Binding<N> {
                 unsafe {
                     self.pool.release_writer(next, self.owner)?;
                 }
+                record(5, length);
                 return Ok(None);
             }
         };
@@ -120,6 +147,7 @@ impl<const N: usize> Binding<N> {
             self.pool
                 .prepare(old, self.owner, connection, offset, length)?;
         }
+        record(6, length);
         Ok(Some(Transfer {
             ticket: old,
             length,

@@ -504,13 +504,21 @@ impl Server {
         let Some(connection) = self.data else {
             return Err(SocketError::Failed);
         };
-        match space.tcp_recv(listener, connection, &mut self.scratch)? {
-            TcpIoResult::Progress(length) => {
-                self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
-                Ok(length != 0)
+        // Drain a bounded amount of ready data in this task poll. Every chunk
+        // still crosses the adapter's live capability/connection checks. Stop
+        // on no progress; never spin waiting for another packet to arrive.
+        let budget = if cfg!(feature = "receive-batch") { 4 } else { 1 };
+        let mut worked = false;
+        for _ in 0..budget {
+            match space.tcp_recv(listener, connection, &mut self.scratch)? {
+                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock | TcpIoResult::Closed => break,
+                TcpIoResult::Progress(length) => {
+                    self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
+                    worked = true;
+                }
             }
-            TcpIoResult::WouldBlock | TcpIoResult::Closed => Ok(false),
         }
+        Ok(worked)
     }
 
     fn send_payload(&mut self, space: &Space, listener: Cap) -> Result<bool, SocketError> {
@@ -708,10 +716,15 @@ mod tests {
         struct Mock {
             input: Mutex<VecDeque<Vec<u8>>>,
             output: Mutex<Vec<Vec<u8>>>,
+            fail_after: Mutex<Option<usize>>,
         }
         impl Platform for Mock {
             fn tcp_accept(&self, _: Cap) -> Result<Option<TcpConnectionToken>, SocketError> { Ok(None) }
             fn tcp_recv(&self, _: Cap, _: TcpConnectionToken, out: &mut [u8]) -> Result<TcpIoResult, SocketError> {
+                if let Some(left) = self.fail_after.lock().unwrap().as_mut() {
+                    if *left == 0 { return Err(SocketError::AuthorityRevoked); }
+                    *left -= 1;
+                }
                 let Some(bytes) = self.input.lock().unwrap().pop_front() else { return Ok(TcpIoResult::WouldBlock); };
                 out[..bytes.len()].copy_from_slice(&bytes);
                 Ok(TcpIoResult::Progress(bytes.len()))
@@ -729,7 +742,7 @@ mod tests {
         listener.network_update_state(TcpStreamState::Established).unwrap();
         let token = listener.try_accept().unwrap();
         let mut space = CSpace::new("scratch"); let cap = space.mint(listener, Rights::ALL);
-        let mock = Mock { input: Mutex::new([b"abc".to_vec()].into()), output: Mutex::new(Vec::new()) };
+        let mock = Mock { input: Mutex::new([b"abc".to_vec()].into()), output: Mutex::new(Vec::new()), fail_after: Mutex::new(None) };
         let mut server = Server::new(); server.control = Some(token);
         server.scratch.fill(0xa5);
         assert!(server.read_control(&mock, cap).unwrap());
@@ -742,6 +755,22 @@ mod tests {
         assert!(server.flush_control(&mock, cap, cap).unwrap());
         assert!(server.control_tx.is_empty());
         assert_eq!(*mock.output.lock().unwrap(), [b"xyz".to_vec(), b"z".to_vec()]);
+        #[cfg(feature = "receive-batch")]
+        {
+            server.data = Some(token);
+            mock.input.lock().unwrap().extend((0..5).map(|_| b"abc".to_vec()));
+            assert!(server.receive_payload(&mock, cap).unwrap());
+            assert_eq!(server.bytes_transferred, 12);
+            assert_eq!(mock.input.lock().unwrap().len(), 1, "one drive must not drain an unbounded producer");
+            assert!(server.receive_payload(&mock, cap).unwrap());
+            assert_eq!(server.bytes_transferred, 15);
+            assert!(!server.receive_payload(&mock, cap).unwrap());
+            mock.input.lock().unwrap().extend((0..3).map(|_| b"abc".to_vec()));
+            *mock.fail_after.lock().unwrap() = Some(1);
+            assert_eq!(server.receive_payload(&mock, cap), Err(SocketError::AuthorityRevoked));
+            assert_eq!(server.bytes_transferred, 18);
+            assert_eq!(mock.input.lock().unwrap().len(), 2, "revocation must stop the batch immediately");
+        }
     }
 
     mod setup_recovery {

@@ -44,6 +44,46 @@ fn hex(value: u64) {
         byte(b"0123456789abcdef"[nibble]);
     }
 }
+
+/// Diagnostic sites whose loops run with supervisor interrupts masked.
+#[derive(Clone, Copy)]
+pub enum LoopStallKind {
+    ExternalInterrupt,
+    UartReceive,
+}
+
+/// Best-effort evidence only: does not mask a source, release a lock or reset
+/// hardware. Like the lock probe, SBI output can itself block. It cannot see
+/// a single MMIO access or callback that never returns.
+pub struct LoopStallProbe {
+    probe: Probe,
+    kind: LoopStallKind,
+    iterations: u64,
+}
+
+impl LoopStallProbe {
+    pub const fn new(kind: LoopStallKind) -> Self {
+        Self { probe: Probe::new(), kind, iterations: 0 }
+    }
+
+    /// Call once per iteration. `detail` is the interrupt source number;
+    /// counts include successful iterations, not just failed operations.
+    pub fn observe(&mut self, detail: u64) {
+        self.iterations = self.iterations.saturating_add(1);
+        if let Some(elapsed) = self.probe.check() {
+            text(b"\r\nLOOP_STALL kind=");
+            text(match self.kind {
+                LoopStallKind::ExternalInterrupt => b"external_irq",
+                LoopStallKind::UartReceive => b"uart_rx",
+            });
+            text(b" hart="); hex(crate::arch::current_hart_id() as u64);
+            text(b" elapsed_ticks="); hex(elapsed);
+            text(b" iterations="); hex(self.iterations);
+            text(b" detail="); hex(detail);
+            text(b"\r\n");
+        }
+    }
+}
 /// Best-effort independent atomic snapshots, not a transactional owner record.
 /// Owner/key/state apply only to recoverable locks. Concurrent hart records may
 /// interleave because acquiring an output lock would hide the deadlock.

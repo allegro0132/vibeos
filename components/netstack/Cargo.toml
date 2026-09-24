@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-prefix-views = ["gro-checked", "vibeos-net-protocol/gro-prefix-views"]
+gro-full-batch = ["gro-wide", "vibeos-net-protocol/gro-full-batch"]
+gro-wide = ["gro-checked", "vibeos-net-protocol/gro-wide"]
+rx-align-empty = ["vibeos-net-protocol/rx-align-empty"]
+receive-exchange-profile = ["receive-buffer-exchange", "vibeos-net-protocol/receive-exchange-profile"]
 gro-checked = ["vibeos-net-protocol/gro-checked"]
 gro-scatter = ["vibeos-net-protocol/gro-scatter"]
 frontend-rx-batch = ["vibeos-net-protocol/frontend-rx-batch"]

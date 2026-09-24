@@ -2767,11 +2767,30 @@ pub fn build() {
     let tcp_probe_roots = service_policy.as_ref().map(|policy_space| {
         let mut policy = policy_space.0.lock();
         core::array::from_fn(|index| {
+            #[cfg(not(feature = "receive-buffer-exchange"))]
             let listener = vibeos_net_api::TcpListener::new("tcp-probe",
                 vibeos_net_api::TcpListenerId::new(3 + index as u64).unwrap(),
                 vibeos_tcp_probe::FIRST_PORT + index as u16,
                 vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
                 vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES).unwrap();
+            // The independent pattern verifier must exercise the same storage
+            // handoff as iperf when this experiment is selected. Pools outlive
+            // both the protocol and probe task arenas; try_recv derives the
+            // current tracked consumer identity before granting a read lease.
+            #[cfg(feature = "receive-buffer-exchange")]
+            let listener = {
+                #[cfg(feature = "tcp-large-window")]
+                let socket_bytes = 256 * 1024;
+                #[cfg(not(feature = "tcp-large-window"))]
+                let socket_bytes = 32 * 1024;
+                let capacity = vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES;
+                let pool = vibeos_net_api::receive_storage::Storage::new_static(socket_bytes, capacity).unwrap();
+                crate::println!("RXEX_POOL listener={} port={} bytes={} slots=3", 3 + index,
+                    vibeos_tcp_probe::FIRST_PORT + index as u16, socket_bytes);
+                vibeos_net_api::TcpListener::new_with_receive_storage("tcp-probe",
+                    vibeos_net_api::TcpListenerId::new(3 + index as u64).unwrap(),
+                    vibeos_tcp_probe::FIRST_PORT + index as u16, capacity, capacity, pool).unwrap()
+            };
             #[cfg(feature = "network-profile")]
             crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
             policy.mint(listener, Rights::ALL_VOLATILE)

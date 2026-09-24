@@ -150,44 +150,51 @@ impl Flow {
             }
         }
         if self.done < self.size {
-            let len = (self.size - self.done).min(CHUNK as u64) as usize;
-            let now = p.now_ms();
-            let io = if self.source {
-                p.tcp_send(listener, connection, &PAYLOAD[..len])?
-            } else {
-                p.tcp_recv(listener, connection, &mut self.buffer[..len])?
-            };
-            match io {
-                TcpIoResult::Progress(n) => {
-                    // Diagnostic mode verifies application-visible bytes, after
-                    // DMA, GRO, TCP reassembly and frontend queue delivery. It
-                    // is deliberately separate from throughput-only mode 0.
-                    if self.header[8] == 2 {
-                        let mut expected = (self.done % 251) as u8;
-                        for byte in &self.buffer[..n] {
-                            if *byte != expected {
-                                return Err(SocketError::Failed);
+            let budget = if cfg!(feature = "receive-batch") && !self.source { 4 } else { 1 };
+            let mut worked = false;
+            for _ in 0..budget {
+                if self.done == self.size { break; }
+                let len = (self.size - self.done).min(CHUNK as u64) as usize;
+                let now = p.now_ms();
+                let io = if self.source {
+                    p.tcp_send(listener, connection, &PAYLOAD[..len])?
+                } else {
+                    p.tcp_recv(listener, connection, &mut self.buffer[..len])?
+                };
+                match io {
+                    TcpIoResult::Progress(n) => {
+                        // Diagnostic mode verifies application-visible bytes, after
+                        // DMA, GRO, TCP reassembly and frontend queue delivery. It
+                        // is deliberately separate from throughput-only mode 0.
+                        if self.header[8] == 2 {
+                            let mut expected = (self.done % 251) as u8;
+                            for byte in &self.buffer[..n] {
+                                if *byte != expected {
+                                    return Err(SocketError::Failed);
+                                }
+                                expected = if expected == 250 { 0 } else { expected + 1 };
                             }
-                            expected = if expected == 250 { 0 } else { expected + 1 };
                         }
+                        if n != 0 {
+                            self.started_ms.get_or_insert(now);
+                        }
+                        self.done += n as u64;
+                        if self.done == self.size {
+                            self.result[..8].copy_from_slice(&self.done.to_be_bytes());
+                            self.result[8..].copy_from_slice(
+                                &p.now_ms()
+                                    .saturating_sub(self.started_ms.unwrap_or(now))
+                                    .to_be_bytes(),
+                            );
+                        }
+                        if n == 0 { break; }
+                        worked = true;
                     }
-                    if n != 0 {
-                        self.started_ms.get_or_insert(now);
-                    }
-                    self.done += n as u64;
-                    if self.done == self.size {
-                        self.result[..8].copy_from_slice(&self.done.to_be_bytes());
-                        self.result[8..].copy_from_slice(
-                            &p.now_ms()
-                                .saturating_sub(self.started_ms.unwrap_or(now))
-                                .to_be_bytes(),
-                        );
-                    }
-                    return Ok(n != 0);
+                    TcpIoResult::WouldBlock => break,
+                    TcpIoResult::Closed => return Err(SocketError::Failed),
                 }
-                TcpIoResult::WouldBlock => return Ok(false),
-                TcpIoResult::Closed => return Err(SocketError::Failed),
             }
+            return Ok(worked);
         }
         match p.tcp_send(listener, connection, &self.result[self.result_used..])? {
             TcpIoResult::Progress(n) => {
@@ -320,6 +327,7 @@ mod tests {
     struct Model {
         listener: alloc::sync::Arc<TcpListener>,
         now: AtomicU64,
+        read_limit: usize,
     }
     impl Model {
         fn new() -> (Self, Cap) {
@@ -336,6 +344,7 @@ mod tests {
                 Self {
                     listener,
                     now: AtomicU64::new(1),
+                    read_limit: usize::MAX,
                 },
                 cap,
             )
@@ -351,8 +360,9 @@ mod tests {
             c: TcpConnectionToken,
             b: &mut [u8],
         ) -> Result<TcpIoResult, SocketError> {
+            let length = b.len().min(self.read_limit);
             self.listener
-                .try_recv(c, b)
+                .try_recv(c, &mut b[..length])
                 .map_err(|_| SocketError::StaleConnection)
         }
         fn tcp_send(
@@ -397,6 +407,24 @@ mod tests {
             assert!(request(&h).is_err());
         }
     }
+    #[test]
+    #[cfg(feature = "receive-batch")]
+    fn ready_sink_is_bounded_even_when_short_reads_keep_succeeding() {
+        let (mut p, cap) = Model::new();
+        p.read_limit = 1;
+        let mut flow = Flow::new();
+        flow.connection = p.listener.try_accept();
+        flow.header = header(false, 32);
+        flow.header_used = 24;
+        flow.size = 32;
+        assert_eq!(p.listener.network_receive(&[0xa5; 32]), 32);
+        assert!(flow.drive(&p, cap).unwrap());
+        assert_eq!(flow.done, 4);
+        assert_eq!(p.listener.snapshot().readable_bytes, 28);
+        assert!(flow.drive(&p, cap).unwrap());
+        assert_eq!(flow.done, 8);
+    }
+
     #[test]
     fn fragmented_sink_and_source_preserve_exact_count_and_drain_result() {
         for source in [false, true] {

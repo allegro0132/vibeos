@@ -110,6 +110,16 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
             crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),
         #[cfg(all(feature = "receive-buffer-exchange", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         "nrxexchange" => println!("RXEX_BYTES fields=[exchanged,copied] values={:?}", vibeos_netstack::receive_exchange_bytes()),
+        #[cfg(all(feature = "receive-exchange-profile", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "nrxexwhy" => println!("RXEX_ATTEMPTS version=1 pairs=[calls,pending_bytes] reasons=[empty,drive_budget,transfer_limit,pool_budget,no_spare,transport_refused,success,reserve_error] values={:?}", vibeos_netstack::receive_exchange_attempts()),
+        #[cfg(all(feature = "tcp-read-profile", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "ntcpread" => {
+            for exchanged in [false, true] {
+                println!("TCP_READ version=1 exchange={} hz={} sample_every=127 fields=[calls,progress,bytes,short,zero,blocked,closed,error,sampled,ticks,max_ticks] values={:?}",
+                    exchanged, crate::exec::timebase_hz(), vibeos_net_api::receive_profile::RECORDER.snapshot(exchanged));
+            }
+            println!("TCP_READ_END");
+        },
         #[cfg(feature = "tx-wait-profile")]
         "ntxwait" => println!("TX_WAIT hz={} fields=[other_turns,other_ticks,tx_only_turns,tx_only_ticks,idle_turns,idle_ticks] values={:?}",
             crate::exec::timebase_hz(), crate::dwmac_net::tx_wait_stats()),
@@ -188,10 +198,11 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
         #[cfg(all(feature = "gro-end-profile", feature = "dhcp-iperf3-server"))]
         "ngrodetail" => {
             let counts = vibeos_netstack::gro_end_stats();
-            println!("GRO_DETAIL version=2");
+            let none = vibeos_netstack::GRO_PROFILE_NONE_OFFSET;
+            println!("GRO_DETAIL version=3");
             println!("GRO_END fields=[first_rejected,psh,short,receive_none,next_ineligible,headers,ipid,budget,original_invalid] values={:?} approximate=true", &counts[..9]);
-            println!("GRO_SIZE sizes=0..16 values={:?} attempted=true", &counts[9..26]);
-            println!("GRO_NONE fields=[ingress_budget,empty_endpoint,authority,rejected,unsupported] values={:?}", &counts[26..]);
+            println!("GRO_SIZE sizes=0..{} values={:?} attempted=true", none - 10, &counts[9..none]);
+            println!("GRO_NONE fields=[ingress_budget,empty_endpoint,authority,rejected,unsupported] values={:?}", &counts[none..]);
         }
         #[cfg(feature = "tx-lease-profile")]
         "ntxlease" => {
@@ -845,7 +856,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "mmu" => match rest.as_slice() {
             [] => mmu_status(),
-            ["guard", "fault"] => mmu_guard_fault(),
+            ["guard", "fault"] => mmu_guard_fault(false),
+            ["guard", "fault-tty"] => mmu_guard_fault(true),
             ["wx"] => mmu_wx_demo().await,
             ["wx", "fault", "execute"] => crate::code_pool::execute_writable_probe(),
             ["wx", "fault", "read"] => crate::rustc::sealed_access_probe(false),
@@ -1332,7 +1344,7 @@ fn mmu_capability_table_write_probe() -> ! {
     panic!("read-only capability table accepted a store")
 }
 
-fn mmu_guard_fault() {
+fn mmu_guard_fault(hold_tty: bool) {
     let hart = ipi::current_logical_hart().expect("guard probe requires a registered hart");
     let guard = mmu::stack_guard_page(hart.index()).expect("current hart guard must exist");
     println!(
@@ -1340,6 +1352,18 @@ fn mmu_guard_fault() {
         hart.index(),
         guard
     );
+    if hold_tty {
+        struct FaultWhileFormatting(usize);
+        impl core::fmt::Display for FaultWhileFormatting {
+            fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                // Formatting executes inside tty::emit's lock. The same known
+                // guard page as the ordinary fatal probe must reject this store.
+                unsafe { (self.0 as *mut u8).write_volatile(0x5a) };
+                panic!("stack guard accepted a store while formatting")
+            }
+        }
+        println!("{}", FaultWhileFormatting(guard));
+    }
     // Safety: this command is an explicit fatal acceptance probe. The address
     // is the current hart's statically reserved guard page, never heap or
     // device memory. A successful return is itself an integrity failure.

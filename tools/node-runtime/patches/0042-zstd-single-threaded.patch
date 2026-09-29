@@ -1,0 +1,26 @@
+--- a/deps/zstd/zstd.gyp
++++ b/deps/zstd/zstd.gyp
+@@ -73,19 +73,21 @@
+         # cxx_library(name='xxhash')
+         'XXH_NAMESPACE=ZSTD_',
+         # cxx_library(name='threading')
+-        'ZSTD_MULTITHREAD',
+         # TODO: Use deps/zstd/lib/decompress/huf_decompress_amd64.S.
+         'ZSTD_DISABLE_ASM',
+       ],
+       'all_dependent_settings': {
+         'defines': [
+           'XXH_NAMESPACE=ZSTD_',
+-          'ZSTD_MULTITHREAD',
+           # TODO: Use deps/zstd/lib/decompress/huf_decompress_amd64.S.
+           'ZSTD_DISABLE_ASM',
+         ],
+       },
+       'conditions': [
++        [ 'OS!="vibeos"', {
++          'defines': [ 'ZSTD_MULTITHREAD' ],
++          'all_dependent_settings': { 'defines': [ 'ZSTD_MULTITHREAD' ] },
++        }],
+         [ 'OS=="solaris"', {
+           'cflags': [ '-pthreads' ],
+           'ldflags': [ '-pthreads' ],

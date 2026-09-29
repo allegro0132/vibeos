@@ -1,0 +1,22 @@
+--- a/src/node_os.cc
++++ b/src/node_os.cc
+@@ -113,6 +113,9 @@
+   int count;
+ 
+   int err = uv_cpu_info(&cpu_infos, &count);
++#if defined(__vibeos__)
++  if (err) return Environment::GetCurrent(args)->ThrowUVException(err, "uv_cpu_info");
++#endif
+   if (err)
+     return;
+ 
+@@ -183,6 +186,9 @@
+ 
+ 
+ static void GetLoadAvg(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  return Environment::GetCurrent(args)->ThrowUVException(UV_ENOTSUP, "uv_loadavg");
++#endif
+   CHECK(args[0]->IsFloat64Array());
+   Local<Float64Array> array = args[0].As<Float64Array>();
+   CHECK_EQ(array->Length(), 3);

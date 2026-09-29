@@ -1,3 +1,6 @@
+#include "../platform/vibeos-files.h"
+#include "../platform/vibeos-sync.h"
+#include <fcntl.h>
 // Host contract test with injected bridges, not target runtime acceptance.
 #include <cassert>
 #include <cstdlib>
@@ -13,11 +16,40 @@ extern "C" pid_t _getpid();
 extern "C" int _kill(pid_t, int);
 extern "C" int vibeos_native_runtime_initialize();
 static int initializations;
+static int environment_error, environment_overwrite;
+extern "C" const char* vibeos_native_env_get(const void* name, size_t length) {
+  assert(length == 4 && !std::memcmp(name, "NAME", 4));
+  return "fixture";
+}
+extern "C" int vibeos_native_env_set(const void* name, size_t length,
+    const void* value, size_t value_length, int overwrite) {
+  assert(length == 4 && !std::memcmp(name, "NAME", 4));
+  assert(value_length == 3 && !std::memcmp(value, "new", 3));
+  environment_overwrite = overwrite;
+  return environment_error;
+}
+extern "C" int vibeos_native_env_unset(const void* name, size_t length) {
+  assert(length == 4 && !std::memcmp(name, "NAME", 4));
+  return environment_error;
+}
+extern "C" char* vibeos_test_getenv(const char*);
+extern "C" int vibeos_test_setenv(const char*, const char*, int);
+extern "C" int vibeos_test_unsetenv(const char*);
+extern "C" char* _getenv_r(struct _reent*, const char*);
+extern "C" int _setenv_r(struct _reent*, const char*, const char*, int);
+extern "C" int _unsetenv_r(struct _reent*, const char*);
 extern "C" void __libc_init_array() { ++initializations; }
 extern "C" void __libc_fini_array() {}
 extern "C" int _unlink(const char*);
 extern "C" int _open(const char*, int, int);
-extern "C" int vibeos_native_open(const void*, size_t, uint32_t mode) { return mode == 0 ? 3 : -13; }
+extern "C" int vibeos_native_path_stat(const void*, size_t, int, vibeos_native_file_stat_t*) { return -13; }
+extern "C" int vibeos_native_wait_until_context(void*, int (*)(void*), void*, int64_t) { return 0; }
+static int open_error;
+static uint32_t open_mode;
+extern "C" int vibeos_native_open(const void*, size_t, uint32_t mode) {
+  open_mode = mode;
+  return open_error ? open_error : mode == 0 ? 3 : -13;
+}
 extern "C" int64_t vibeos_native_file_size(int) { return 42; }
 extern "C" int64_t vibeos_native_file_seek(int, int64_t offset, int) { return offset; }
 static int unlink_result;
@@ -60,10 +92,29 @@ extern "C" void* vibeos_native_sbrk(ptrdiff_t increment) {
   return increment > 0 ? allocation : reinterpret_cast<void*>(uintptr_t(-1));
 }
 int main() {
+  assert(!std::strcmp(vibeos_test_getenv("NAME"), "fixture"));
+  assert(vibeos_test_setenv("NAME", "new", 0) == 0 && environment_overwrite == 0);
+  struct _reent reent = {};
+  assert(!std::strcmp(_getenv_r(&reent, "NAME"), "fixture"));
+  environment_error = -20;
+  assert(_setenv_r(&reent, "NAME", "new", 1) == -1 && reent._errno == E2BIG && environment_overwrite == 1);
+  environment_error = -9;
+  assert(_unsetenv_r(&reent, "NAME") == -1 && reent._errno == EINVAL);
+  environment_error = -16;
+  assert(vibeos_test_setenv("NAME", "new", 1) == -1 && errno == ENOMEM);
+  environment_error = 0;
+  assert(vibeos_test_unsetenv("NAME") == 0);
   assert(vibeos_native_runtime_initialize() == 0);
   assert(vibeos_native_runtime_initialize() == 0 && initializations == 1);
   assert(_open("file", 0, 0) == 3);
   assert(_open("file", 1, 0) == -1 && errno == ENOTSUP);
+  open_error = -17;
+  assert(_open("file", O_WRONLY | O_CREAT | O_EXCL, 0644) == -1 && errno == EEXIST);
+  assert(open_mode == (1 | 4 | 8));
+  open_error = -18;
+  assert(_open("file", O_RDWR | O_TRUNC, 0) == -1 && errno == ENOTEMPTY);
+  assert(open_mode == (2 | 16));
+  open_error = 0;
   assert(_unlink(nullptr) == -1 && errno == EFAULT);
   assert(_unlink("file") == 0);
   const int file_errors[] = {ENOENT, EISDIR, EBUSY, EINVAL, ENAMETOOLONG, ENOTDIR, ELOOP};

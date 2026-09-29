@@ -1,0 +1,20 @@
+--- a/src/node_worker.cc
++++ b/src/node_worker.cc
+@@ -506,6 +506,17 @@
+ }
+ 
+ void Worker::New(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  // Reject before allocating message ports, an isolate, or native thread state.
++  auto* unsupported_isolate = args.GetIsolate();
++  auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++      unsupported_isolate, "VibeOS Node has no worker thread capability")).As<v8::Object>();
++  error->Set(unsupported_isolate->GetCurrentContext(),
++      v8::String::NewFromUtf8Literal(unsupported_isolate, "code"),
++      v8::String::NewFromUtf8Literal(unsupported_isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  unsupported_isolate->ThrowException(error);
++  return;
++#endif
+   Environment* env = Environment::GetCurrent(args);
+   THROW_IF_INSUFFICIENT_PERMISSIONS(
+       env, permission::PermissionScope::kWorkerThreads, "");

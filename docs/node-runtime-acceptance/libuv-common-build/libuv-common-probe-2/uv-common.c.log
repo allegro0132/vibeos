@@ -1,0 +1,21 @@
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv_recv_buffer_size':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:658:37: error: 'SO_RCVBUF' undeclared (first use in this function)
+  658 |   return uv__socket_sockopt(handle, SO_RCVBUF, value);
+      |                                     ^~~~~~~~~
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:658:37: note: each undeclared identifier is reported only once for each function it appears in
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv_send_buffer_size':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:662:37: error: 'SO_SNDBUF' undeclared (first use in this function)
+  662 |   return uv__socket_sockopt(handle, SO_SNDBUF, value);
+      |                                     ^~~~~~~~~
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv__fs_get_dirent_type':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:772:55: warning: unused parameter 'dent' [-Wunused-parameter]
+  772 | uv_dirent_type_t uv__fs_get_dirent_type(uv__dirent_t* dent) {
+      |                                         ~~~~~~~~~~~~~~^~~~
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv_recv_buffer_size':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:659:1: warning: control reaches end of non-void function [-Wreturn-type]
+  659 | }
+      | ^
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv_send_buffer_size':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:663:1: warning: control reaches end of non-void function [-Wreturn-type]
+  663 | }
+      | ^

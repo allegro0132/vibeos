@@ -5,6 +5,10 @@ use crate::sync::SpinLock;
 struct State { generation: u64, next: u64, waiter: Option<(u64, Option<Waker>)> }
 pub(super) struct NativeNotify { state: SpinLock<State> }
 pub(super) struct Wait { notify: Arc<NativeNotify>, id: u64, observed: u64 }
+impl alloc::task::Wake for NativeNotify {
+    fn wake(self: Arc<Self>) { self.signal(); }
+    fn wake_by_ref(self: &Arc<Self>) { self.signal(); }
+}
 impl NativeNotify {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self { state: SpinLock::new(State { generation: 0, next: 1, waiter: None }) })

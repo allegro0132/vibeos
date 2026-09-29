@@ -1,0 +1,1290 @@
+[
+  {
+    "command": [
+      "wasm-upload",
+      "rust.wasm",
+      "60303",
+      "26aaaa101ebc195d9ebf090fd65388b42a9f0847e0f5101aedd74c28bf6321f6"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 22,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm",
+      "args",
+      "a b",
+      "\u4e2d\u6587"
+    ],
+    "status": 0,
+    "stdout_bytes": 11,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm",
+      "filter"
+    ],
+    "status": 0,
+    "stdout_bytes": 13300,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm",
+      "filter"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm",
+      "stderr"
+    ],
+    "status": 0,
+    "stdout_bytes": 4,
+    "stderr_bytes": 4
+  },
+  {
+    "command": [
+      "wasm-run",
+      "rust.wasm",
+      "exit"
+    ],
+    "status": 7,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "c.wasm",
+      "13356",
+      "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm",
+      "args",
+      "a b",
+      "\u4e2d\u6587"
+    ],
+    "status": 0,
+    "stdout_bytes": 11,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm",
+      "filter"
+    ],
+    "status": 0,
+    "stdout_bytes": 13300,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm",
+      "filter"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm",
+      "stderr"
+    ],
+    "status": 0,
+    "stdout_bytes": 4,
+    "stderr_bytes": 4
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm",
+      "exit"
+    ],
+    "status": 7,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "case": "unauthorized key",
+    "status": 255
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "c.wasm",
+      "13356",
+      "0000000000000000000000000000000000000000000000000000000000000000"
+    ],
+    "status": 2,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "c.wasm",
+      "13356",
+      "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303"
+    ],
+    "status": 2,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "c.wasm",
+      "13356",
+      "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303"
+    ],
+    "status": 2,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "../c.wasm"
+    ],
+    "status": 255,
+    "stdout_bytes": 0,
+    "stderr_bytes": 34
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "malformed.wasm",
+      "8",
+      "dc0cbbe931352caad7a936203e1d540bb96efc8aaafbf760fb94774364aeac06"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "malformed.wasm"
+    ],
+    "status": 126,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "copy.wasm",
+      "25951",
+      "6825ba060a95298d36d65a51d23309ab43c7fbe9bd5ca098577b7f31135fa3ee"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "copy.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "bounds.wasm",
+      "141",
+      "457bf168466a31e226a552bfd71f81c81b89bc5adf3e9723d754cf8be3f8a184"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "bounds.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "memory.wasm",
+      "56",
+      "4294339ebab5c70bf19ddfb1561f3955748994bb44948a56df69ae19c31ff625"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "memory.wasm"
+    ],
+    "status": 124,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "trap.wasm",
+      "51",
+      "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "trap.wasm"
+    ],
+    "status": 125,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "unknown.wasm",
+      "67",
+      "bbcfa62cd44efc4ceb49a124dd68d44ff8c290b4cc1a5d89a78ae178a8f7f66f"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "unknown.wasm"
+    ],
+    "status": 126,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "loop.wasm",
+      "70",
+      "1c85e54252758b6ae95ad5b47320a74294f651660043dbe10f2ae655ac8f53a4"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "loop.wasm"
+    ],
+    "status": 124,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "output.wasm",
+      "148",
+      "860eb78c794210a3a07ea8946b9c80010ad1d63ef8926a48a29ef79084cdbc21"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "output.wasm"
+    ],
+    "status": 124,
+    "stdout_bytes": 65536,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-upload",
+      "changed.wasm",
+      "3084",
+      "a887224183ff40d069c16ed43604f5658bffa69c36fb750ec57746ac8717afe9"
+    ],
+    "status": 0,
+    "stdout_bytes": 0,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "changed.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 20,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  },
+  {
+    "command": [
+      "wasm-run",
+      "c.wasm"
+    ],
+    "status": 0,
+    "stdout_bytes": 19,
+    "stderr_bytes": 0
+  }
+]

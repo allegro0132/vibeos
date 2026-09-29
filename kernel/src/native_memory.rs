@@ -3,6 +3,30 @@
 use crate::{native_page_pool::NativePagePool, mmu::NativeDataPermission as Permission};
 use vibeos_core::heap::{enter_owner, OwnerId};
 const PAGE: usize = 4096;
+// V8 process initialization reserves global cppgc metadata. Its page allocator
+// must outlive every invocation; these bounded TCB pages never belong to a job.
+static PROCESS_MEMORY: crate::sync::SpinLock<Option<NativeMemory>> = crate::sync::SpinLock::new(None);
+static PROCESS_ALLOCATIONS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[no_mangle]
+extern "C" fn vibeos_native_process_pages_scope(enter: i32) -> i32 {
+    use core::sync::atomic::Ordering;
+    crate::native_tls::require_current();
+    if enter != 0 && enter != 1 { return -1; }
+    if PROCESS_ALLOCATIONS.compare_exchange(enter == 0, enter != 0,
+            Ordering::AcqRel, Ordering::Acquire).is_err() { return -1; }
+    0
+}
+fn with_page_owner<R>(address: usize, size: usize, f: impl FnOnce(&mut NativeMemory) -> R) -> R {
+    crate::native_tls::require_current();
+    let mut process = PROCESS_MEMORY.lock();
+    if let Some(memory) = process.as_mut() {
+        if memory.pool.as_ref().is_some_and(|p| p.owns(address, size)) {
+            return f(memory);
+        }
+    }
+    drop(process);
+    crate::native_tls::with_memory(f)
+}
 pub(super) struct NativeMemory {
     pool: Option<NativePagePool>,
     owner: Option<OwnerId>,
@@ -69,24 +93,43 @@ fn permission_from_abi(permission: i32) -> Option<Permission> {
         _ => None,
     }
 }
+
+#[no_mangle]
+extern "C" fn vibeos_native_system_memory(total: *mut u64, free: *mut u64) -> i32 {
+    crate::native_tls::require_current();
+    if total.is_null() || free.is_null() { return -1; }
+    let ram = crate::platform::mmu().ram.len();
+    let heap = crate::HEAP.snapshot();
+    // Includes reusable size-class space, unlike bump_remaining alone. This
+    // is allocator accounting, not a promise of one contiguous allocation.
+    let available = heap.bump_used_bytes.saturating_add(heap.bump_remaining_bytes)
+        .saturating_sub(heap.live_bytes).min(ram);
+    unsafe { total.write(ram as u64); free.write(available as u64); }
+    0
+}
 #[no_mangle]
 extern "C" fn vibeos_native_pages_allocate(_hint: *mut u8, size: usize,
                                           alignment: usize, permission: i32) -> *mut u8 {
+    crate::native_tls::require_current();
+    if PROCESS_ALLOCATIONS.load(core::sync::atomic::Ordering::Acquire) {
+        return PROCESS_MEMORY.lock().get_or_insert_with(|| NativeMemory::new(4 * 1024 * 1024))
+            .allocate(size, alignment, permission);
+    }
     crate::native_tls::with_memory(|memory| memory.allocate(size, alignment, permission))
 }
 #[no_mangle]
 extern "C" fn vibeos_native_pages_release(address: *mut u8, size: usize) -> i32 {
-    crate::native_tls::with_memory(|m| m.operation(address as usize, size,
+    with_page_owner(address as usize, size, |m| m.operation(address as usize, size,
         |pool, address, size| unsafe { pool.release(address, size) }))
 }
 #[no_mangle]
 extern "C" fn vibeos_native_pages_protect(address: *mut u8, size: usize, permission: i32) -> i32 {
     let Some(permission) = permission_from_abi(permission) else { return -1; };
-    crate::native_tls::with_memory(|m| m.operation(address as usize, size,
+    with_page_owner(address as usize, size, |m| m.operation(address as usize, size,
         |pool, address, size| unsafe { pool.protect(address, size, permission) }))
 }
 fn clear(address: *mut u8, size: usize, decommit: bool) -> i32 {
-    crate::native_tls::with_memory(|m| m.operation(address as usize, size,
+    with_page_owner(address as usize, size, |m| m.operation(address as usize, size,
         |pool, address, size| unsafe { pool.clear(address, size, decommit) }))
 }
 #[no_mangle]

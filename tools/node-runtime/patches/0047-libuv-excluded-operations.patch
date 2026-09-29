@@ -1,0 +1,10 @@
+--- a/deps/uv/uv.gyp
++++ b/deps/uv/uv.gyp
+@@ -176,6 +176,7 @@
+             'src/vibeos/vibeos-fs.c',
+             'src/vibeos/vibeos-sync.c',
+             'src/vibeos/vibeos-time.c',
++            'src/vibeos/vibeos-unavailable.c',
+           ],
+           'include_dirs': ['src/vibeos'],
+           'cflags': ['-ffunction-sections', '-fdata-sections'],

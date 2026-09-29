@@ -1,0 +1,13 @@
+[
+  "uv_fs_event_init",
+  "uv_fs_event_start",
+  "uv_fs_poll_getpath",
+  "uv_fs_poll_init",
+  "uv_fs_poll_start",
+  "uv_kill",
+  "uv_process_kill",
+  "uv_signal_init",
+  "uv_signal_start",
+  "uv_signal_stop",
+  "uv_spawn"
+]

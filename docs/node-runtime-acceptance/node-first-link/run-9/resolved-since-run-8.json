@@ -1,0 +1,11 @@
+[
+  "uv_fileno",
+  "uv_guess_handle",
+  "uv_is_readable",
+  "uv_is_writable",
+  "uv_pipe_init",
+  "uv_pipe_open",
+  "uv_pipe_pending_count",
+  "uv_pipe_pending_type",
+  "uv_try_write"
+]

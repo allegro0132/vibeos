@@ -1,0 +1,51 @@
+{
+  "passed": true,
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-cpu",
+    "rv64",
+    "-smp",
+    "4",
+    "-m",
+    "1G",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/fresh-57-node-ssh-qemu/kernel.elf",
+    "-object",
+    "rng-random,id=rng,filename=/dev/urandom",
+    "-device",
+    "virtio-rng-device,rng=rng,bus=virtio-mmio-bus.1",
+    "-netdev",
+    "user,id=net,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:51335-10.0.2.15:2222",
+    "-device",
+    "virtio-net-device,netdev=net,bus=virtio-mmio-bus.0,mac=02:00:00:00:00:01",
+    "-drive",
+    "if=none,id=project,format=raw,file=/Users/ziangwang/Sources/vibeos/target/fresh-57-node-ssh-qemu/project.raw,cache=writeback",
+    "-device",
+    "virtio-blk-device,drive=project,bus=virtio-mmio-bus.2,queue-size=8",
+    "-global",
+    "virtio-mmio.force-legacy=false"
+  ],
+  "kernel_sha256": "b0e9cbef5328871e00871c4f4611832be1a94afa542e701b495e80c082092c9e",
+  "checks": {
+    "SSH_NODE_SETUP=ok": true,
+    "SSH_NODE_EVAL=42": true,
+    "SSH_NODE_STDIN=wire-input": true,
+    "Returned(7)": true,
+    "SSH_NODE_AFTER_CANCEL=ok": true,
+    "remote_ctrl_c": true,
+    "no_fatal": true
+  },
+  "seconds": 10.86882187507581,
+  "source_sha256": {
+    "scripts/test-node-ssh-qemu.py": "91cedd71fbe8455b71bd655ff8fa2564c867f8c6647a43c138d90a81a800c6aa",
+    "kernel/src/native_node.rs": "890c047cd4dea4f379cfbc5a00bbedd4d11be8c9e7ae65c460c7e174b3655598",
+    "kernel/src/ssh_platform.rs": "313eff123f072426cdeb23c500447419763079cc64ecba59f19d3eb62f549e65",
+    "kernel/src/segment_store_platform.rs": "1f371cab9e98b6dd78e01042a7dd702bf07d6ee3881bc85e01aa87dcf791f628",
+    "components/sshd/src/lib.rs": "b66cca0d739a183b2a18bf070371baebbece30a85d0807732d50667186b4c27f"
+  }
+}

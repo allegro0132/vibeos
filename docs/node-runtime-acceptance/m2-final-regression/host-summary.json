@@ -1,0 +1,6 @@
+{
+  "passed": 169,
+  "failed": 0,
+  "ignored": 5,
+  "scope": "vibeos-vsh, vibeos-file-store, vibeos-wasi-command, vibeos-sshd; all emitted unit/integration/doctest results"
+}

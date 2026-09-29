@@ -1,0 +1,12 @@
+{
+  "command": [
+    "patch",
+    "--dry-run",
+    "-p1",
+    "--fuzz=0",
+    "--batch",
+    "-i",
+    "/Users/ziangwang/Sources/vibeos/tools/node-runtime/patches/0049-node-excluded-network-constructors.patch"
+  ],
+  "exit_code": 0
+}

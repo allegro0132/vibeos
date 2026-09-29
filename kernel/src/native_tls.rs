@@ -22,14 +22,31 @@ pub(super) struct ParkHook {
     pub context: usize,
     pub call: unsafe fn(usize, usize, PendingPoll) -> bool,
 }
+// Explicit process-owned synchronization domain. Sharing is only for serial
+// invocations of one trusted runtime; unrelated native tasks get fresh domains.
+pub(super) struct NativeSyncDomain {
+    semaphores: crate::sync::SpinLock<crate::native_semaphore::Semaphores>,
+    notify: alloc::sync::Arc<crate::native_notify::NativeNotify>,
+}
+impl NativeSyncDomain {
+    pub(super) fn new() -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            semaphores: crate::sync::SpinLock::new(crate::native_semaphore::Semaphores::new()),
+            notify: crate::native_notify::NativeNotify::new(),
+        })
+    }
+}
+
 struct State {
+    process: RefCell<crate::native_process::ProcessMetadata>,
+    environment: RefCell<crate::native_env::Environment>,
     file_table: RefCell<crate::native_files::FileTable>,
     files: RefCell<Option<crate::native_files::FileGrant>>,
     stdio: RefCell<Option<crate::native_stdio::StdioGrant>>,
     #[cfg(feature = "queued-entropy")]
     entropy: RefCell<Option<crate::native_entropy::EntropyGrant>>,
     park: Cell<Option<ParkHook>>,
-    semaphores: RefCell<crate::native_semaphore::Semaphores>,
+    sync_domain: alloc::sync::Arc<NativeSyncDomain>,
     notify: alloc::sync::Arc<crate::native_notify::NativeNotify>,
     wait_key: Cell<Option<usize>>,
     id: i32,
@@ -48,18 +65,24 @@ pub(super) struct NativeTls { state: Box<State> }
 pub(super) struct ActiveTls<'a>(&'a NativeTls);
 impl NativeTls {
     pub(super) fn new(stack_low: usize, stack_high: usize, page_capacity: usize) -> Self {
+        Self::with_sync_domain(stack_low, stack_high, page_capacity, NativeSyncDomain::new())
+    }
+    pub(super) fn with_sync_domain(stack_low: usize, stack_high: usize, page_capacity: usize,
+                                   sync_domain: alloc::sync::Arc<NativeSyncDomain>) -> Self {
         assert!(stack_low != 0 && stack_low < stack_high);
         assert_eq!((stack_low | stack_high) % 16, 0);
         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
             |next| (next <= i32::MAX as usize).then_some(next + 1))
             .expect("native execution identity space exhausted") as i32;
         Self { state: Box::new(State {
+            process: RefCell::new(crate::native_process::ProcessMetadata::new()),
+            environment: RefCell::new(crate::native_env::Environment::new()),
             file_table: RefCell::new(crate::native_files::FileTable::new()),
             files: RefCell::new(None),
             stdio: RefCell::new(None),
             #[cfg(feature = "queued-entropy")]
             entropy: RefCell::new(None),
-            semaphores: RefCell::new(crate::native_semaphore::Semaphores::new()), park: Cell::new(None), notify: crate::native_notify::NativeNotify::new(), wait_key: Cell::new(None), id, memory: RefCell::new(crate::native_memory::NativeMemory::new(page_capacity)), stack: StackBounds { low: stack_low, high: stack_high }, slots: RefCell::new(Vec::new()),
+            notify: sync_domain.notify.clone(), sync_domain, park: Cell::new(None), wait_key: Cell::new(None), id, memory: RefCell::new(crate::native_memory::NativeMemory::new(page_capacity)), stack: StackBounds { low: stack_low, high: stack_high }, slots: RefCell::new(Vec::new()),
             destructors: RefCell::new(Vec::new()), phase: Cell::new(0) }) }
     }
     /// The pinned runner must outlive all native frames using this hook.
@@ -73,8 +96,20 @@ impl NativeTls {
         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
         *self.state.files.borrow_mut() = Some(grant);
     }
+    pub(super) fn set_title(&self, title: &str) -> Result<(), i32> {
+        assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+        self.state.process.borrow_mut().set_title(title.as_bytes())
+    }
+    pub(super) fn set_environment(&self, entries: &[(&str, &str)]) -> Result<(), i32> {
+        assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+        let mut environment = crate::native_env::Environment::new();
+        for (key, value) in entries { environment.set(key.as_bytes(), value.as_bytes(), true)?; }
+        *self.state.environment.borrow_mut() = environment;
+        Ok(())
+    }
     pub(super) fn set_stdio(&self, grant: crate::native_stdio::StdioGrant) {
         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+        grant.watch_cancellation(core::task::Waker::from(self.state.notify.clone()));
         *self.state.stdio.borrow_mut() = Some(grant);
     }
     pub(super) fn revoke_memory(&self) { self.state.memory.borrow_mut().revoke(); }
@@ -228,7 +263,7 @@ pub(super) fn notification() -> alloc::sync::Arc<crate::native_notify::NativeNot
 }
 pub(super) fn with_semaphores<R>(f: impl FnOnce(&mut crate::native_semaphore::Semaphores) -> R) -> R {
     let state = unsafe { current_state() };
-    f(&mut state.semaphores.borrow_mut())
+    f(&mut state.sync_domain.semaphores.lock())
 }
 
 #[cfg(feature = "queued-entropy")]
@@ -240,10 +275,42 @@ pub(super) fn stdio_grant() -> Option<crate::native_stdio::StdioGrant> {
     unsafe { current_state() }.stdio.borrow().clone()
 }
 
+// Transport wakers retain only the independent notification object, never a
+// native stack pointer, TLS state reference, or C callback.
+pub(super) fn io_notification() -> alloc::sync::Arc<crate::native_notify::NativeNotify> {
+    unsafe { current_state() }.notify.clone()
+}
+
 pub(super) fn file_grant() -> Option<crate::native_files::FileGrant> {
     unsafe { current_state() }.files.borrow().clone()
 }
 
 pub(super) fn with_file_table<R>(f: impl FnOnce(&mut crate::native_files::FileTable) -> R) -> R {
     f(&mut unsafe { current_state() }.file_table.borrow_mut())
+}
+pub(super) fn with_environment<R>(f: impl FnOnce(&mut crate::native_env::Environment) -> R) -> R {
+    f(&mut unsafe { current_state() }.environment.borrow_mut())
+}
+
+pub(super) fn with_process<R>(f: impl FnOnce(&mut crate::native_process::ProcessMetadata) -> R) -> R {
+    let state = unsafe { current_state() };
+    f(&mut state.process.borrow_mut())
+}
+
+// Fatal diagnostics only: bounded psABI frame walk within the admitted native
+// stack. Never dereference a frame outside that mapping or attempt recovery.
+pub(super) fn print_native_backtrace() {
+    let bounds = unsafe { current_state() }.stack;
+    let mut frame: usize;
+    unsafe { asm!("mv {}, s0", out(reg) frame, options(nomem, nostack)); }
+    for index in 0..24 {
+        if frame & 15 != 0 || frame > bounds.high || frame < bounds.low ||
+            frame - bounds.low < 2 * core::mem::size_of::<usize>() { break; }
+        let record = frame as *const usize;
+        let (previous, pc) = unsafe { (*record.sub(2), *record.sub(1)) };
+        if pc == 0 { break; }
+        crate::println!("NATIVE FATAL FRAME index={} pc={:#x}", index, pc);
+        if previous <= frame { break; }
+        frame = previous;
+    }
 }

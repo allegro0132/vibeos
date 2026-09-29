@@ -12,6 +12,10 @@ impl StdioGrant {
     pub(super) fn new(io: Arc<CommandIo>) -> Self {
         Self { io, closed: Arc::new(AtomicU8::new(0)) }
     }
+    pub(super) fn cancelled(&self) -> bool { self.io.cancelled() }
+    pub(super) fn watch_cancellation(&self, waker: core::task::Waker) {
+        self.io.watch_cancellation(waker);
+    }
     fn open(&self, fd: i32) -> bool {
         (0..=2).contains(&fd) && self.closed.load(Ordering::Acquire) & (1 << fd) == 0
     }
@@ -19,14 +23,65 @@ impl StdioGrant {
 fn error(error: WasiIoError) -> isize {
     match error { WasiIoError::Denied => -3, WasiIoError::Closed => -4, WasiIoError::Failed => -5 }
 }
+
+// Poll exactly once on the native stack. A pending read owns no caller buffer:
+// GuestIo retains only the notification waker, which wakes the Rust runner.
+// The libuv loop re-polls on its native stack and delivers callbacks there.
+#[no_mangle]
+pub(super) unsafe extern "C" fn vibeos_native_try_read(
+    fd: i32, output: *mut u8, length: usize,
+) -> isize {
+    use core::task::{Context, Poll, Waker};
+    if fd >= 3 { return -13; } // Async regular-file reader is not admitted yet.
+    let Some(grant) = crate::native_tls::stdio_grant() else { return -3; };
+    if fd != 0 || !grant.open(fd) { return -1; }
+    if output.is_null() && length != 0 { return -2; }
+    if grant.io.cancelled() { return -3; }
+    if length == 0 { return 0; }
+    let mut bytes = [0u8; IO_CHUNK];
+    let count = length.min(IO_CHUNK);
+    let waker = Waker::from(crate::native_tls::io_notification());
+    let mut cx = Context::from_waker(&waker);
+    match GuestIo(&grant.io).read(&mut cx, &mut bytes[..count]) {
+        Poll::Pending => -15,
+        Poll::Ready(Err(failure)) => error(failure),
+        Poll::Ready(Ok(count)) => {
+            if grant.io.cancelled() { return -3; }
+            if count != 0 { unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), output, count); } }
+            count as isize
+        }
+    }
+}
+
+// Async writes use the same bounded transport as synchronous writes, but a
+// full pipe registers a notification and immediately returns pending.
+#[no_mangle]
+pub(super) unsafe extern "C" fn vibeos_native_try_write(
+    fd: i32, input: *const u8, length: usize,
+) -> isize {
+    use core::task::{Context, Poll, Waker};
+    if fd >= 3 { return -13; }
+    let Some(grant) = crate::native_tls::stdio_grant() else { return -3; };
+    if (fd != 1 && fd != 2) || !grant.open(fd) { return -1; }
+    if input.is_null() && length != 0 { return -2; }
+    if grant.io.cancelled() { return -3; }
+    if length == 0 { return 0; }
+    let count = length.min(IO_CHUNK);
+    let mut bytes = [0u8; IO_CHUNK];
+    unsafe { core::ptr::copy_nonoverlapping(input, bytes.as_mut_ptr(), count); }
+    let waker = Waker::from(crate::native_tls::io_notification());
+    let mut cx = Context::from_waker(&waker);
+    match GuestIo(&grant.io).write(&mut cx, fd as u32, &bytes[..count]) {
+        Poll::Pending => -15,
+        Poll::Ready(Err(failure)) => error(failure),
+        Poll::Ready(Ok(count)) => count as isize,
+    }
+}
 // Negative ABI results: bad descriptor=-1, invalid pointer=-2, denied=-3,
 // closed pipe=-4, transport/runner failure=-5. Positive results allow short IO.
 #[no_mangle]
 pub(super) unsafe extern "C" fn vibeos_native_write(fd: i32, input: *const u8, length: usize) -> isize {
-    if fd >= 3 {
-        let kind = crate::native_files::kind(fd);
-        return if kind < 0 { kind as isize } else { -1 };
-    }
+    if fd >= 3 { return unsafe { crate::native_files::write(fd, input, length) }; }
     let Some(grant) = crate::native_tls::stdio_grant() else { return -3; };
     if (fd != 1 && fd != 2) || !grant.open(fd) { return -1; }
     if input.is_null() && length != 0 { return -2; }
@@ -60,6 +115,18 @@ pub(super) unsafe extern "C" fn vibeos_native_read(fd: i32, output: *mut u8, len
         }
         Err(failure) => error(failure),
     }
+}
+
+// Drainable output shutdown keeps the descriptor live until explicit close.
+#[no_mangle]
+pub(super) extern "C" fn vibeos_native_shutdown_write(fd: i32) -> i32 {
+    let Some(grant) = crate::native_tls::stdio_grant() else { return -3; };
+    if (fd != 1 && fd != 2) || !grant.open(fd) { return -1; }
+    if grant.io.cancelled() { return -3; }
+    // Standard streams are unidirectional. Signal EOF after buffered bytes,
+    // retaining descriptor ownership until the handle's eventual close.
+    if fd == 1 { grant.io.stdout.close(); } else { grant.io.stderr.close(); }
+    0
 }
 
 // Descriptor kind 1 is a pipe. No tty or regular-file authority is inferred.

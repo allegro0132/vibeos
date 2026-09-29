@@ -1,0 +1,22 @@
+Undefined symbols for architecture arm64:
+  "_vibeos_native_path_stat", referenced from:
+      __stat in libc.o
+  "_vibeos_native_wait_until_context", referenced from:
+      _sleep in libc.o
+ld: symbol(s) not found for architecture arm64
+clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+Traceback (most recent call last):
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-libc.py", line 29, in <module>
+    main()
+    ~~~~^^
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-libc.py", line 22, in main
+    subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror',
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        str(ROOT / 'tools/node-runtime/tests/native-libc-test.cc'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        str(work / 'libc.o'), '-o', str(work / 'test')], check=True)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 578, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '/Users/ziangwang/Sources/vibeos/tools/node-runtime/tests/native-libc-test.cc', '/var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/vibeos-native-libc-ge4od30f/libc.o', '-o', '/var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/vibeos-native-libc-ge4od30f/test']' returned non-zero exit status 1.

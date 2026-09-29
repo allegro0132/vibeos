@@ -1,0 +1,41 @@
+--- a/deps/uv/uv.gyp
++++ b/deps/uv/uv.gyp
+@@ -156,6 +156,29 @@
+       'target_name': 'libuv',
+       'toolsets': ['host', 'target'],
+       'type': '<(uv_library)',
++      'target_conditions': [
++        ['OS=="vibeos" and _toolset=="host" and "<(host_os)"=="mac"', {
++          'sources': ['<@(uv_sources_apple)', '<@(uv_sources_bsd_common)', 'src/unix/proctitle.c'],
++          'defines': ['_DARWIN_USE_64_BIT_INODE=1', '_DARWIN_UNLIMITED_SELECT=1'],
++        }],
++        ['OS=="vibeos" and _toolset=="host" and "<(host_os)"=="linux"', {
++          'sources': ['<@(uv_sources_linux)', 'src/unix/proctitle.c'],
++          'defines': ['_GNU_SOURCE'],
++        }],
++        ['OS=="vibeos" and _toolset=="target"', {
++          'sources!': [
++            'src/fs-poll.c', 'src/random.c', 'src/threadpool.c',
++          ],
++          'sources/': [['exclude', '^src/unix/(?!loop-watcher[.]c$)']],
++          'sources': [
++            'include/uv/vibeos.h',
++            'src/vibeos/vibeos-loop.c',
++            'src/vibeos/vibeos-fs.c',
++          ],
++          'include_dirs': ['src/vibeos'],
++          'cflags': ['-ffunction-sections', '-fdata-sections'],
++        }],
++      ],
+       'include_dirs': [
+         'include',
+         'src/',
+@@ -227,7 +250,7 @@
+               [ 'OS=="zos" and uv_library=="shared_library"', {
+                 'ldflags': [ '-Wl,DLL' ],
+               }],
+-              ['OS != "solaris" and OS != "android" and OS != "zos"', {
++              ['OS != "solaris" and OS != "android" and OS != "zos" and OS != "vibeos"', {
+                 'ldflags': [ '-pthread' ],
+               }],
+               ['OS!="mac"', {

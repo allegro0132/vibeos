@@ -1,0 +1,14 @@
+--- a/deps/uv/src/unix/loop-watcher.c
++++ b/deps/uv/src/unix/loop-watcher.c
+@@ -20,7 +20,11 @@
+  */
+ 
+ #include "uv.h"
++#if defined(__vibeos__)
++#include "uv-common.h"
++#else
+ #include "internal.h"
++#endif
+ 
+ #define UV_LOOP_WATCHER_DEFINE(name, type)                                    \
+   int uv_##name##_init(uv_loop_t* loop, uv_##name##_t* handle) {              \

@@ -7,8 +7,10 @@
 extern "C" {
 #endif
 
-// A handle is private to its active runtime invocation. Destruction is called
-// only after all users have returned from their C++ frames.
+// A handle is private to the admitted synchronization domain. Ordinary tasks
+// have an invocation-local domain; serial Node invocations explicitly share a
+// process-owned domain for upstream global locks. Destruction requires all
+// users to have returned from their C++ frames.
 void* vibeos_native_semaphore_create(int count);
 void vibeos_native_semaphore_destroy(void* semaphore);
 int vibeos_native_semaphore_signal(void* semaphore);

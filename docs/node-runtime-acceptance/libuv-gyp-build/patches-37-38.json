@@ -1,0 +1,17 @@
+{
+  "scope": "Affected files from prepared tree 10; zero-fuzz application only, not execution acceptance",
+  "results": [
+    {
+      "patch": "0037-node-process-operations.patch",
+      "sha256": "5dc13573140faf5b1f35e6d83859bd5fdc2cfa0051dcec6c86dd5ca876635df5",
+      "exit_code": 0,
+      "stdout": "patching file 'src/node_process_methods.cc'\n"
+    },
+    {
+      "patch": "0038-node-static-report.patch",
+      "sha256": "3647178eb70168c47a80243087bd13f6966cbd78337d9918a33b161dcfcbaaec",
+      "exit_code": 0,
+      "stdout": "patching file 'src/node_report.cc'\npatching file 'src/node_report_utils.cc'\n"
+    }
+  ]
+}

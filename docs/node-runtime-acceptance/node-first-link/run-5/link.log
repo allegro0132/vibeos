@@ -1,0 +1,1381 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-durable-format` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+warning: `vibeos-core` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (2 duplicates)
+   Compiling vibeos-kernel v0.1.0 (/Users/ziangwang/Sources/vibeos/kernel)
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_tls.rs:53:26
+   |
+53 |         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                          ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+53 -         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+53 +         let id = NEXT_ID.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+ --> kernel/src/native_semaphore.rs:9:25
+  |
+9 |         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+  |                         ^^^^^^^^^^^^
+  |
+help: replace the use of the deprecated method
+  |
+9 -         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+9 +         if self.permits.try_update(Ordering::Release, Ordering::Relaxed,
+  |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:15:22
+   |
+15 |         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+   |                      ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+15 -         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+15 +         self.permits.try_update(Ordering::Acquire, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:26:34
+   |
+26 |         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                  ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+26 -         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+26 +         let Ok(id) = NEXT_HANDLE.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_files.rs:80:36
+   |
+80 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                    ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+80 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+80 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> kernel/src/native_files.rs:144:36
+    |
+144 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    |                                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+144 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+144 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+    |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> kernel/src/native_files.rs:497:36
+    |
+497 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    |                                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+497 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+497 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+    |
+
+warning: `vibeos-kernel` (lib) generated 7 warnings (run `cargo fix --lib -p vibeos-kernel` to apply 7 suggestions)
+   Compiling vibeos-firmware-qemu-virt v0.1.0 (/Users/ziangwang/Sources/vibeos/firmware/qemu-virt)
+error: linking with `ld.lld` failed: exit status: 1
+  |
+  = note:  "ld.lld" "<1 object files omitted>" "--as-needed" "-Bstatic" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/66f0c416eb409fca/out/rustc37BgbC/libvibeos_kernel-50a5fdf863362907.rlib" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/compiler_builtins/5d9c8ad9a097c700/out/libcompiler_builtins-5d9c8ad9a097c700.rlib" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/66f0c416eb409fca/out/rustc37BgbC/raw-dylibs" "-Bdynamic" "-z" "noexecstack" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-kernel/5f5a6f9da12c48f5/out" "-o" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/66f0c416eb409fca/out/vibeos_qemu_virt" "--gc-sections" "--undefined=vibeos_v8_smoke" "/Users/ziangwang/Sources/vibeos/target/node-runtime/node-link-5/v8-smoke.o" "/Users/ziangwang/Sources/vibeos/target/node-runtime/node-link-5/node-snapshot-stub.o" "--start-group" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_snapshot.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_base_without_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libbase.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libplatform.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libabseil.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_zlib.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libsimdutf.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libhighway.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libstdc++.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libm.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/lib/gcc/riscv-none-elf/14.2.0/rv64imafdc_zicsr/lp64d/libgcc.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/ada/libada.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/brotli/libbrotli.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/histogram/libhistogram.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/llhttp/libllhttp.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/merve/libmerve.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nbytes/libnbytes.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nghttp2/libnghttp2.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/simdjson/libsimdjson.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/zlib/libzlib.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/zstd/libzstd.a" "--end-group" "--error-limit=0" "--gc-sections" "-T/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/037b93ae5f0cc787/out/linker.ld"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: ld.lld: error: undefined symbol: uv_fs_opendir
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::OpenDirSync(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::OpenDir(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::OpenDir(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_closedir
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::DirHandle::Close(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::DirHandle::Close(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::DirHandle::GCClose()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_readdir
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::DirHandle::Read(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_dir.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_dir.o:(node::fs_dir::DirHandle::Read(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_close
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::~Storage()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::~Storage()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::~Storage()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 3 more times
+          
+          ld.lld: error: undefined symbol: uv_fileno
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(node::UDPWrap::GetFD(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::GetFD()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(non-virtual thunk to node::LibuvStreamWrap::GetFD()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_udp_set_ttl
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::(anonymous namespace)::SetLibuvInt32<&uv_udp_set_ttl>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_broadcast
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::(anonymous namespace)::SetLibuvInt32<&uv_udp_set_broadcast>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_multicast_loop
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::(anonymous namespace)::SetLibuvInt32<&uv_udp_set_multicast_loop>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_multicast_ttl
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::(anonymous namespace)::SetLibuvInt32<&uv_udp_set_multicast_ttl>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_open
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(node::UDPWrap::Open(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_multicast_interface
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(node::UDPWrap::SetMulticastInterface(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_membership
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(node::UDPWrap::SetMembership(v8::FunctionCallbackInfo<v8::Value> const&, uv_membership)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_set_source_membership
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(node::UDPWrap::SetSourceMembership(v8::FunctionCallbackInfo<v8::Value> const&, uv_membership)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_get_process_title
+          >>> referenced by util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/util.o:(node::GetProcessTitle[abi:cxx11](char const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/util.o:(node::GetProcessTitle[abi:cxx11](char const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_getpid
+          >>> referenced by util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/util.o:(node::DiagnosticFilename::MakeFilename[abi:cxx11](unsigned long, char const*, char const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/util.o:(node::GetHumanReadableProcessName[abi:cxx11]()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_trace_writer.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/node_trace_writer.o:(node::tracing::NodeTraceWriter::OpenNewFileForStreaming()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 6 more times
+          
+          ld.lld: error: undefined symbol: uv_udp_getsockname
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::GetSockOrPeerName<node::UDPWrap, &uv_udp_getsockname>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sockaddr.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sockaddr.o:(node::SocketAddress::FromSockName(uv_udp_s const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_udp_getpeername
+          >>> referenced by udp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/udp_wrap.o:(void node::GetSockOrPeerName<node::UDPWrap, &uv_udp_getpeername>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sockaddr.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sockaddr.o:(node::SocketAddress::FromPeerName(uv_udp_s const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tty_get_winsize
+          >>> referenced by tty_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tty_wrap.o:(node::TTYWrap::GetWindowSize(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tty_set_mode
+          >>> referenced by tty_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tty_wrap.o:(node::TTYWrap::SetRawMode(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_guess_handle
+          >>> referenced by tty_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tty_wrap.o:(node::TTYWrap::IsTTY(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_util.o:(node::util::GuessHandleType(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_util.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_util.o:(node::util::FastGuessHandleType(v8::Local<v8::Value>, unsigned int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 2 more times
+          
+          ld.lld: error: undefined symbol: uv_tty_init
+          >>> referenced by tty_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tty_wrap.o:(node::TTYWrap::New(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by tty_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tty_wrap.o:(node::TTYWrap::TTYWrap(node::Environment*, v8::Local<v8::Object>, int, int*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_prepare_v2
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Clear()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 9 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_step
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 13 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_type
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Length()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 4 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_bytes
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::LoadKey(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Load(v8::Local<v8::Name>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_blob
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::LoadKey(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Load(v8::Local<v8::Name>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_errstr
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 28 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_finalize
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Enumerate() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 16 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_open
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_exec
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_int
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Length()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::StorageLengthGetter(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_int
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::LoadKey(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_thread_setname
+          >>> referenced by agent.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/agent.o:(node::tracing::Agent::Start()::'lambda'(void*)::_FUN(void*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_watchdog.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_watchdog.o:(node::Watchdog::Run(void*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_worker.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_worker.o:(node::worker::Worker::StartThread(v8::FunctionCallbackInfo<v8::Value> const&)::'lambda'(void*)::_FUN(void*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 3 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_blob
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Load(v8::Local<v8::Name>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Remove(v8::Local<v8::Name>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_webstorage.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_webstorage.o:(node::webstorage::Storage::Store(v8::Local<v8::Name>, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_thread_join
+          >>> referenced by agent.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/agent.o:(node::tracing::Agent::~Agent()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by agent.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/agent.o:(node::tracing::Agent::StopTracing()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_watchdog.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_watchdog.o:(node::Watchdog::~Watchdog()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 2 more times
+          
+          ld.lld: error: undefined symbol: uv_thread_create
+          >>> referenced by agent.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/agent.o:(node::tracing::Agent::Start()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by agent.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tracing/agent.o:(node::tracing::Agent::AddClient(std::set<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::less<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>> const&, std::unique_ptr<node::tracing::AsyncTraceWriter, std::default_delete<node::tracing::AsyncTraceWriter>>, node::tracing::Agent::UseDefaultCategoryMode)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_watchdog.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_watchdog.o:(node::Watchdog::Watchdog(v8::Isolate*, unsigned long, bool*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 2 more times
+          
+          ld.lld: error: undefined symbol: uv_tcp_init
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::New(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::TCPWrap(node::Environment*, v8::Local<v8::Object>, node::AsyncWrap::ProviderType)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_nodelay
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::SetNoDelay(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_open
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::Open(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_listen
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::Listen(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::Listen(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_keepalive
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::SetKeepAlive(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_close_reset
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::Reset(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::TCPWrap::Reset(v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_if_indextoiid
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::AddressToJS(node::Environment*, sockaddr const*, v8::Local<v8::Object>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_extended_errcode
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::THROW_ERR_SQLITE_ERROR(v8::Isolate*, node::sqlite::DatabaseSync*) (.part.0.isra.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_errmsg
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::THROW_ERR_SQLITE_ERROR(v8::Isolate*, node::sqlite::DatabaseSync*) (.part.0.isra.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_result_blob
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_result_text
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_getpeername
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(void node::GetSockOrPeerName<node::TCPWrap, &uv_tcp_getpeername>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sockaddr.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sockaddr.o:(node::SocketAddress::FromPeerName(uv_tcp_s const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_tcp_getsockname
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(void node::GetSockOrPeerName<node::TCPWrap, &uv_tcp_getsockname>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sockaddr.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sockaddr.o:(node::SocketAddress::FromSockName(uv_tcp_s const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_result_error
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 8 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_result_null
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_result_double
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_result_int64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::JSValueToSQLiteResult(v8::Isolate*, sqlite3_context*, v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3session_delete
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::DeleteSessions()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::~DatabaseSync()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::Session::Delete()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_read_stop
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::ReadStop()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(non-virtual thunk to node::LibuvStreamWrap::ReadStop()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessStdioPipe::ReadCallback(uv_stream_s*, long, uv_buf_t const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_try_write
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::DoTryWrite(uv_buf_t**, unsigned long*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(non-virtual thunk to node::LibuvStreamWrap::DoTryWrite(uv_buf_t**, unsigned long*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_write2
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::DoWrite(node::WriteWrap*, uv_buf_t*, unsigned long, uv_stream_s*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(non-virtual thunk to node::LibuvStreamWrap::DoWrite(node::WriteWrap*, uv_buf_t*, unsigned long, uv_stream_s*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_shutdown
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::DoShutdown(node::ShutdownWrap*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(non-virtual thunk to node::LibuvStreamWrap::DoShutdown(node::ShutdownWrap*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessStdioPipe::Start()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_stream_set_blocking
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::SetBlocking(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_pending_count
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::OnUvRead(long, uv_buf_t const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_pending_type
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::OnUvRead(long, uv_buf_t const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_accept
+          >>> referenced by stream_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/stream_wrap.o:(node::LibuvStreamWrap::OnUvRead(long, uv_buf_t const*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::PipeWrap, uv_pipe_s>::OnConnection(uv_stream_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::TCPWrap, uv_tcp_s>::OnConnection(uv_stream_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_backup_finish
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::FinalizeBackups()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 4 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_errcode
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::FinalizeBackups()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::HandleBackupError(v8::Local<v8::Promise::Resolver>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 4 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_close_v2
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::FinalizeBackups()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::~DatabaseSync()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Close(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 6 more times
+          
+          ld.lld: error: undefined symbol: uv_signal_init
+          >>> referenced by signal_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/signal_wrap.o:(node::(anonymous namespace)::SignalWrap::New(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_init
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessStdioPipe::Initialize(uv_loop_s*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::New(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::PipeWrap(node::Environment*, v8::Local<v8::Object>, node::AsyncWrap::ProviderType, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_write
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessStdioPipe::Start()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_signal_start
+          >>> referenced by signal_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/signal_wrap.o:(node::(anonymous namespace)::SignalWrap::Start(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_process_kill
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessRunner::Kill() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by process_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/process_wrap.o:(node::(anonymous namespace)::ProcessWrap::Kill(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessRunner::Kill() (.part.0)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 6 more times
+          
+          ld.lld: error: undefined symbol: uv_signal_stop
+          >>> referenced by signal_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/signal_wrap.o:(node::(anonymous namespace)::SignalWrap::Stop(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_reset
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::Run(node::Environment*, node::sqlite::DatabaseSync*, sqlite3_stmt*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSyncIterator::Return(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::SQLTagStore::Run(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 11 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_last_insert_rowid
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::Run(node::Environment*, node::sqlite::DatabaseSync*, sqlite3_stmt*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_changes64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::Run(node::Environment*, node::sqlite::DatabaseSync*, sqlite3_stmt*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_is_readable
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::PipeWrap, uv_pipe_s>::AfterConnect(uv_connect_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::TCPWrap, uv_tcp_s>::AfterConnect(uv_connect_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_is_writable
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::PipeWrap, uv_pipe_s>::AfterConnect(uv_connect_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by connection_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/connection_wrap.o:(node::ConnectionWrap<node::TCPWrap, uv_tcp_s>::AfterConnect(uv_connect_s*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::WalkHandle(uv_handle_s*, void*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_connect2
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::Connect(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_set_authorizer
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::SetAuthorizer(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::SetAuthorizer(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_open_v2
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::Backup(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_db_config
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 4 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_busy_timeout
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Open()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_get_autocommit
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::IsTransactionGetter(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_bind2
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::Bind(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_create_function_v2
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::CustomFunction(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_chmod
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::Fchmod(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_open
+          >>> referenced by pipe_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/pipe_wrap.o:(node::PipeWrap::Open(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_db_filename
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::Location(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_spawn
+          >>> referenced by process_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/process_wrap.o:(node::(anonymous namespace)::ProcessWrap::Spawn(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by spawn_sync.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/spawn_sync.o:(node::SyncProcessRunner::TryInitializeAndRunLoop(v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_task_runner.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_task_runner.o:(node::task_runner::ProcessRunner::Run()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_create_window_function
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::AggregateFunction(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_sql
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::SourceSQLGetter(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_expanded_sql
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::ExpandedSQLGetter(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_free
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::ExpandedSQLGetter(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(void node::sqlite::Session::Changeset<&sqlite3session_patchset>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(void node::sqlite::Session::Changeset<&sqlite3session_changeset>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3changeset_apply
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::ApplyChangeset(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_load_extension
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::LoadExtension(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3session_create
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::CreateSession(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3session_attach
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::DatabaseSync::CreateSession(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_int64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_blob64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_double
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_null
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_text64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindValue(v8::Local<v8::Value> const&, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_parameter_count
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::SQLTagStore::Run(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::SQLTagStore::Iterate(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::SQLTagStore::All(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 2 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_name
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::ColumnNameToName(node::Environment*, sqlite3_stmt*, int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::ColumnNameToName(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 3 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_column_count
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::All(node::Environment*, node::sqlite::DatabaseSync*, sqlite3_stmt*, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::Get(node::Environment*, node::sqlite::DatabaseSync*, sqlite3_stmt*, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_getrusage_thread
+          >>> referenced by node_worker.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_worker.o:(node::CallbackQueue<void, node::Environment*>::CallbackImpl<node::worker::Worker::CpuUsage(v8::FunctionCallbackInfo<v8::Value> const&)::'lambda'(node::Environment*)>::Call(node::Environment*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::ThreadCPUUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_thread_create_ex
+          >>> referenced by node_worker.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_worker.o:(node::worker::Worker::StartThread(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_environ
+          >>> referenced by node_task_runner.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_task_runner.o:(node::task_runner::ProcessRunner::SetEnvironmentVariables()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Enumerate(v8::Isolate*) const) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_poll_start
+          >>> referenced by node_stat_watcher.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_stat_watcher.o:(node::StatWatcher::Start(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_origin_name
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_database_name
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_table_name
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_decltype
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::Columns(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_user_data
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xFinal(sqlite3_context*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xValue(sqlite3_context*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_value_type
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_value_bytes
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_value_blob
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_value_text
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_value_double
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_value_int64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::UserDefinedFunction::xFunc(sqlite3_context*, int, sqlite3_value**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xStepBase(sqlite3_context*, int, sqlite3_value**, v8::Global<v8::Function> node::sqlite::CustomAggregate::*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_int64
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::ColumnToValue(node::Environment*, sqlite3_stmt*, int, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_double
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::ColumnToValue(node::Environment*, sqlite3_stmt*, int, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_column_text
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementExecutionHelper::ColumnToValue(node::Environment*, sqlite3_stmt*, int, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_queue_work
+          >>> referenced by node_zlib.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_zlib.o:(node::ThreadPoolWork::ScheduleWork()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::AfterThreadPoolWork(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_api.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_api.o:(napi_queue_async_work) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_backup_init
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::Backup(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_clear_bindings
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindParams(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_parameter_index
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindParams(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindParams(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_bind_parameter_name
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindParams(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::StatementSync::BindParams(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_backup_step
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::DoThreadPoolWork()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_aggregate_context
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xFinal(sqlite3_context*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xFinal(sqlite3_context*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::CustomAggregate::xValue(sqlite3_context*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: sqlite3_backup_pagecount
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::AfterThreadPoolWork(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3_backup_remaining
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(node::sqlite::BackupJob::AfterThreadPoolWork(int)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3session_patchset
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(void node::sqlite::Session::Changeset<&sqlite3session_patchset>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: sqlite3session_changeset
+          >>> referenced by node_sqlite.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_sqlite.o:(void node::sqlite::Session::Changeset<&sqlite3session_changeset>(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_getppid
+          >>> referenced by node_process_object.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_object.o:(node::GetParentProcessId(v8::Local<v8::Name>, v8::PropertyCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_poll_init
+          >>> referenced by node_stat_watcher.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_stat_watcher.o:(node::StatWatcher::StatWatcher(node::fs::BindingData*, v8::Local<v8::Object>, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_uname
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetOSInformation(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_cpu_info
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetCPUInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_gethostname
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetHostname(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_interface_addresses
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_get_available_memory
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::GetAvailableMemory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_get_constrained_memory
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::GetConstrainedMemory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_options.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_options.o:(node::PerIsolateOptions::HandleMaxOldSpaceSizePercentage(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 2 more times
+          
+          ld.lld: error: undefined symbol: uv_free_interface_addresses
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_resident_set_memory
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::Rss(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::MemoryUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_getrusage
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::CPUUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::ResourceUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_kill
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::Kill(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_cwd
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::Cwd(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::Chdir(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_chdir
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::Chdir(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_get_free_memory
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::FastGetFreeMemory(v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetFreeMemory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_get_total_memory
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::FastGetTotalMemory(v8::Local<v8::Value>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetTotalMemory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 5 more times
+          
+          ld.lld: error: undefined symbol: uv_loadavg
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetLoadAvg(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_homedir
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetHomeDirectory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_getpriority
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_setpriority
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::SetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_get_passwd
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetUserInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetUserInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_poll_getpath
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPath(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPath(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_getsockname
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPipeEndpoints(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPipeEndpoints(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_pipe_getpeername
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPipeEndpoints(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report_utils.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report_utils.o:(node::report::ReportPipeEndpoints(uv_handle_s*, node::JSONWriter*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_utime
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CopyUtimes(std::filesystem::__cxx11::path const&, std::filesystem::__cxx11::path const&, node::Environment*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::UTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::UTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_copyfile
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CpSyncOverrideFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CopyFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CopyFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_getenv
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Query(char const*) const) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Query(v8::Isolate*, v8::Local<v8::String>) const) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Get[abi:cxx11](char const*) const) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced 1 more times
+          
+          ld.lld: error: undefined symbol: uv_os_setenv
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Set(v8::Isolate*, v8::Local<v8::String>, v8::Local<v8::String>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_unsetenv
+          >>> referenced by node_env_var.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_env_var.o:(node::RealEnvStore::Delete(v8::Isolate*, v8::Local<v8::String>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_futime
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FUTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FUTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_fchown
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FChown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FChown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_fchmod
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FChmod(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::FChmod(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_fsync
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Fsync(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Fsync(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_fdatasync
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Fdatasync(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Fdatasync(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_mkdtemp
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Mkdtemp(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Mkdtemp(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_lutime
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::LUTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::LUTimes(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_lchown
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::LChown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::LChown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_chown
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Chown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Chown(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_chmod
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Chmod(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Chmod(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_symlink
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Symlink(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Symlink(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_link
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Link(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Link(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_statfs
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::StatFs(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::StatFs(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_set_process_title
+          >>> referenced by node_process_object.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_object.o:(node::ProcessTitleSetter(v8::Local<v8::Name>, v8::Local<v8::Value>, v8::PropertyCallbackInfo<void> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node.o:(node::InitializeNodeWithArgsInternal(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, node::ProcessInitializationFlags::Flags)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_event_init
+          >>> referenced by fs_event_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/fs_event_wrap.o:(node::(anonymous namespace)::FSEventWrap::Start(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_event_start
+          >>> referenced by fs_event_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/fs_event_wrap.o:(node::(anonymous namespace)::FSEventWrap::Start(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_disable_stdio_inheritance
+          >>> referenced by node.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node.o:(node::InitializeNodeWithArgsInternal(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>>*, node::ProcessInitializationFlags::Flags)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_setup_args
+          >>> referenced by node.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node.o:(node::Start(int, char**)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_mkstemp
+          >>> referenced by compile_cache.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/compile_cache.o:(node::CompileCacheHandler::Persist()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv__tcp_bind
+          >>> referenced by uv-common.c:333 (../deps/uv/src/uv-common.c:333)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_tcp_bind) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:333 (../deps/uv/src/uv-common.c:333)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_tcp_bind) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_init_ex
+          >>> referenced by uv-common.c:374 (../deps/uv/src/uv-common.c:374)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_init) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_bind
+          >>> referenced by uv-common.c:385 (../deps/uv/src/uv-common.c:385)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_bind) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:385 (../deps/uv/src/uv-common.c:385)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_bind) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__tcp_connect
+          >>> referenced by uv-common.c:405 (../deps/uv/src/uv-common.c:405)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_tcp_connect) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:405 (../deps/uv/src/uv-common.c:405)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_tcp_connect) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_connect
+          >>> referenced by uv-common.c:423 (../deps/uv/src/uv-common.c:423)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_connect) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_disconnect
+          >>> referenced by uv-common.c:430 (../deps/uv/src/uv-common.c:430)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_connect) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_send
+          >>> referenced by uv-common.c:461 (../deps/uv/src/uv-common.c:461)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:464 (../deps/uv/src/uv-common.c:464)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:464 (../deps/uv/src/uv-common.c:464)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_try_send
+          >>> referenced by uv-common.c:461 (../deps/uv/src/uv-common.c:461)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_try_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:464 (../deps/uv/src/uv-common.c:464)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_try_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          >>> referenced by uv-common.c:464 (../deps/uv/src/uv-common.c:464)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_try_send) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_recv_start
+          >>> referenced by uv-common.c:541 (../deps/uv/src/uv-common.c:541)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_recv_start) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__udp_recv_stop
+          >>> referenced by uv-common.c:549 (../deps/uv/src/uv-common.c:549)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_udp_recv_stop) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv__read_start
+          >>> referenced by uv-common.c:937 (../deps/uv/src/uv-common.c:937)
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libuv/deps/uv/src/uv-common.o:(uv_read_start) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a
+          
+          ld.lld: error: undefined symbol: uv_exepath
+          >>> referenced by env.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/env.o:(node::Environment::GetExecPath(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>>>> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+
+error: could not compile `vibeos-firmware-qemu-virt` (bin "vibeos-qemu-virt") due to 1 previous error

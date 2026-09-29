@@ -1,0 +1,9 @@
+vsh> node --root @home -e "require('fs').mkdirSync('ssh-project'); console.log('SSH_NODE_' + 'SETUP=ok')"
+SSH_NODE_SETUP=ok
+vsh> node --root @home/ssh-project -e "console.log('SSH_NODE_' + 'EVAL=42')"
+SSH_NODE_EVAL=42
+vsh> echo wire-input | node --root @home/ssh-project -e "let s=''; process.stdin.on('data',x=>s+=x); process.stdin.on('end',()=>console.log('SSH_NODE_'+'STDIN='+s.trim()))"
+SSH_NODE_STDIN=wire-input
+vsh> node --root @home/ssh-project -e "process.exit(7)"
+  vsh job %4: Returned(7)
+vsh> node --root @home/ssh-project -e "console.log('SSH_NODE_'+'CPU_READY'); for(;;){}"

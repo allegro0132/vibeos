@@ -1,0 +1,65 @@
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+make: Nothing to be done for `histogram'.
+make: Nothing to be done for `zlib'.
+make: Nothing to be done for `llhttp'.
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nghttp2/libnghttp2.a
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/ada/libada.a
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/merve/libmerve.a
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/simdjson/libsimdjson.a
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/brotli/libbrotli.a
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/debug.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/entropy_common.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/fse_decompress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/fse_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/huf_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/decompress/huf_decompress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/pool.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/threading.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/xxhash.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/zstd_common.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/error_private.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/hist.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_compress_literals.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_compress_sequences.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_compress_superblock.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_double_fast.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_fast.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_lazy.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_ldm.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_opt.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstd_preSplit.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/zstdmt_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/decompress/zstd_ddict.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/decompress/zstd_decompress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/decompress/zstd_decompress_block.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/nbytes/deps/nbytes/src/nbytes.o
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nbytes/libnbytes.a
+  AR(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/zstd/libzstd.a

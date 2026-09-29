@@ -1,0 +1,5 @@
+{
+  "components/vsh/src/engine.rs": "e13cdd5aecd53c9e56c2d64179d502a11fc1777b7e29a3bb2fc499cddd3a7b74",
+  "components/vsh/tests/vsh.rs": "36e64a3a0a7dbbb94230e233745cddfb1e4630aa32a991d0d1c1e817442dbcc2",
+  "kernel/src/native_files.rs": "50c169e3bb9f5eea57e65e11d68f18ce18633f162d87e4097b335364043a633d"
+}

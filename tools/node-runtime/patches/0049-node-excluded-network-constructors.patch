@@ -1,0 +1,38 @@
+--- a/src/tcp_wrap.cc
++++ b/src/tcp_wrap.cc
+@@ -151,6 +151,16 @@
+ }
+ 
+ void TCPWrap::New(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  auto* isolate = args.GetIsolate();
++  auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++      isolate, "VibeOS Node has no network capability")).As<v8::Object>();
++  error->Set(isolate->GetCurrentContext(),
++      v8::String::NewFromUtf8Literal(isolate, "code"),
++      v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  isolate->ThrowException(error);
++  return;
++#endif
+   // This constructor should not be exposed to public javascript.
+   // Therefore we assert that we are not trying to call this as a
+   // normal function.
+--- a/src/udp_wrap.cc
++++ b/src/udp_wrap.cc
+@@ -268,6 +268,16 @@
+ }
+ 
+ void UDPWrap::New(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  auto* isolate = args.GetIsolate();
++  auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++      isolate, "VibeOS Node has no network capability")).As<v8::Object>();
++  error->Set(isolate->GetCurrentContext(),
++      v8::String::NewFromUtf8Literal(isolate, "code"),
++      v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  isolate->ThrowException(error);
++  return;
++#endif
+   CHECK(args.IsConstructCall());
+   Environment* env = Environment::GetCurrent(args);
+   new UDPWrap(env, args.This());

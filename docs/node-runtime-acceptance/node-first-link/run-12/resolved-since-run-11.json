@@ -1,0 +1,12 @@
+[
+  "uv_fs_chmod",
+  "uv_fs_chown",
+  "uv_fs_fchmod",
+  "uv_fs_fchown",
+  "uv_fs_futime",
+  "uv_fs_lchown",
+  "uv_fs_link",
+  "uv_fs_lutime",
+  "uv_fs_symlink",
+  "uv_fs_utime"
+]

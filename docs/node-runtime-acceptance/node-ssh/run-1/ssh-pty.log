@@ -1,0 +1,3 @@
+vsh> node --root @home -e "require('fs').mkdirSync('ssh-project'); console.log('SSH_NODE_' + 'SETUP=ok')"
+  vsh: path-root capability cannot be delegated at bytes 12..17
+vsh> 

@@ -1,0 +1,12 @@
+--- a/deps/uv/include/uv/vibeos.h
++++ b/deps/uv/include/uv/vibeos.h
+@@ -53,6 +53,9 @@
+   struct in6_addr sin6_addr;
+   uint32_t sin6_scope_id;
+ };
++static inline int IN6_IS_ADDR_LINKLOCAL(const struct in6_addr* address) {
++  return address->s6_addr[0] == 0xfe && (address->s6_addr[1] & 0xc0) == 0x80;
++}
+ static inline uint16_t htons(uint16_t value) {
+ #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+   return __builtin_bswap16(value);

@@ -1,0 +1,11 @@
+[
+  "uv_free_interface_addresses",
+  "uv_getrusage",
+  "uv_getrusage_thread",
+  "uv_if_indextoiid",
+  "uv_interface_addresses",
+  "uv_os_get_passwd",
+  "uv_os_getpriority",
+  "uv_os_homedir",
+  "uv_os_setpriority"
+]

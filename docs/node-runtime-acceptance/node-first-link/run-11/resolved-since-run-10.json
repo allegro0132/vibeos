@@ -1,0 +1,8 @@
+[
+  "uv_chdir",
+  "uv_cwd",
+  "uv_os_environ",
+  "uv_os_getenv",
+  "uv_os_setenv",
+  "uv_os_unsetenv"
+]

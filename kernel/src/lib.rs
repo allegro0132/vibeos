@@ -1179,6 +1179,10 @@ mod native_process;
 #[cfg(feature = "native-cxx-probe")]
 mod native_files;
 #[cfg(feature = "native-cxx-probe")]
+mod native_env;
+#[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
+mod native_node;
+#[cfg(feature = "native-cxx-probe")]
 mod native_clock;
 #[cfg(all(feature = "native-call-probe", not(target_feature = "d")))]
 compile_error!("native-call-probe requires the riscv64gc LP64D target");
@@ -2101,7 +2105,7 @@ fn start_services(boot_time: u64) -> ! {
 
     #[cfg(all(feature = "native-cxx-probe", not(feature = "node-runtime")))]
     exec::spawn_pinned_on(exec::HartId::BOOT, "native-cxx-park", native_call::parking_probe());
-    #[cfg(feature = "node-runtime")]
+    #[cfg(feature = "node-runtime-gate")]
     exec::spawn_pinned_on(exec::HartId::BOOT, "v8-gate", native_call::v8_gate());
 
     trap::enable_interrupts();

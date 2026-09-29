@@ -1,0 +1,6 @@
+[
+  "uv_cpu_info",
+  "uv_loadavg",
+  "uv_os_gethostname",
+  "uv_os_uname"
+]

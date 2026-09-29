@@ -1,0 +1,100 @@
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/fs-poll.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/idna.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/inet.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/random.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/strscpy.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/thread-common.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/threadpool.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/timer.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/uv-data-getter-setters.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/uv-common.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/version.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/async.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/core.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/dl.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/fs.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/getaddrinfo.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/getnameinfo.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/loop.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/loop-watcher.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/pipe.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/poll.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/process.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/random-devurandom.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/signal.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/stream.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/tcp.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/thread.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/tty.o
+  CC(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/libuv/deps/uv/src/unix/udp.o
+  TOUCH /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/googletest/gtest_prod.stamp
+../deps/uv/src/unix/udp.c:1367:26: warning: variable length array folded to constant array as an extension [-Wgnu-folding-constant]
+ 1367 |   struct sockaddr* addrs[N];
+      |                          ^
+../deps/uv/src/unix/udp.c:1368:22: warning: variable length array folded to constant array as an extension [-Wgnu-folding-constant]
+ 1368 |   unsigned int nbufs[N];
+      |                      ^
+../deps/uv/src/unix/udp.c:1369:18: warning: variable length array folded to constant array as an extension [-Wgnu-folding-constant]
+ 1369 |   uv_buf_t* bufs[N];
+      |                  ^
+3 warnings generated.
+  AR(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/deps/uv/libuv.a
+  CXX(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/node_js2c/tools/js2c.o
+  CXX(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.host/node_js2c/src/embedded_data.o
+warning: unknown warning option '-Wno-restrict' [-Wunknown-warning-option]
+warning: unknown warning option '-Wno-restrict' [-Wunknown-warning-option]
+1 warning generated.
+1 warning generated.
+  LINK(host) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/node_js2c
+Undefined symbols for architecture x86_64:
+  "_uv__fs_event_close", referenced from:
+      _uv_close in libuv.a[15](core.o)
+  "_uv__hrtime", referenced from:
+      _uv_hrtime in libuv.a[15](core.o)
+      _uv_run in libuv.a[15](core.o)
+      _uv_run in libuv.a[15](core.o)
+      _uv_run in libuv.a[15](core.o)
+      _uv_update_time in libuv.a[15](core.o)
+      _uv_loop_init in libuv.a[20](loop.o)
+  "_uv__io_check_fd", referenced from:
+      _uv_poll_init in libuv.a[23](poll.o)
+  "_uv__io_fork", referenced from:
+      _uv_loop_fork in libuv.a[20](loop.o)
+  "_uv__io_poll", referenced from:
+      _uv_run in libuv.a[15](core.o)
+  "_uv__platform_invalidate_fd", referenced from:
+      _uv__io_close in libuv.a[15](core.o)
+      _uv_poll_stop in libuv.a[23](poll.o)
+      _uv_poll_start in libuv.a[23](poll.o)
+      _uv__poll_close in libuv.a[23](poll.o)
+  "_uv__platform_loop_delete", referenced from:
+      _uv_loop_init in libuv.a[20](loop.o)
+      _uv__loop_close in libuv.a[20](loop.o)
+  "_uv__platform_loop_init", referenced from:
+      _uv_loop_init in libuv.a[20](loop.o)
+  "_uv__process_title_cleanup", referenced from:
+      _uv_library_shutdown in libuv.a[12](uv-common.o)
+  "_uv_setup_args", referenced from:
+      node::FixupMain(int, char**, char***) in js2c.o
+      _main in js2c.o
+ld: symbol(s) not found for architecture x86_64
+clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+make: *** [/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/node_js2c] Error 1

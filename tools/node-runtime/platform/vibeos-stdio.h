@@ -9,7 +9,12 @@ extern "C" {
 // Kind 1 is a pipe; negative results use the same error convention.
 int vibeos_native_fd_kind(int fd);
 int vibeos_native_close(int fd);
+int vibeos_native_shutdown_write(int fd);
 ptrdiff_t vibeos_native_read(int fd, void* output, size_t length);
+// Nonblocking poll: -15 means pending (notification registered), -13 unsupported.
+// Pending retains neither the buffer nor a native callback.
+ptrdiff_t vibeos_native_try_read(int fd, void* output, size_t length);
+ptrdiff_t vibeos_native_try_write(int fd, const void* input, size_t length);
 ptrdiff_t vibeos_native_write(int fd, const void* input, size_t length);
 #ifdef __cplusplus
 }

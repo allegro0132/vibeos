@@ -1,0 +1,3 @@
+patching file 'src/process_wrap.cc'
+patching file 'src/signal_wrap.cc'
+patching file 'src/node_stat_watcher.cc'

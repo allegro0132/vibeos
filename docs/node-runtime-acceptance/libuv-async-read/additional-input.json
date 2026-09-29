@@ -1,0 +1,5 @@
+{
+  "note": "This declaration-only local header was not included by the original evidence collector. Future link/run collectors include local headers. The original run report is preserved.",
+  "path": "tools/node-runtime/libuv/vibeos-requests.h",
+  "sha256": "1a9256dc9576d40280548476db5d1bc5b323324cb96d6a08162b0a43c49be7a1"
+}

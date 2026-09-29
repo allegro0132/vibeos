@@ -111,6 +111,8 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 }
 
 pub fn install_standard_commands(session: &mut Session) {
+    #[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
+    crate::native_node::install(session);
     #[cfg(feature = "wasi-preview1")]
     if crate::platform::component_enabled("wasi") { crate::wasi::install(session); }
     install_shared_commands(session);
@@ -202,6 +204,8 @@ fn install_shared_commands(session: &mut Session) {
     feature = "dhcp-iperf3-server"
 ))]
 pub fn install_remote_commands(session: &mut Session) {
+    #[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
+    crate::native_node::install(session);
     install_shared_commands(session);
     session.install_vtop(Arc::new(crate::vtop_platform::Monitor::remote()));
     #[cfg(feature = "provisioned-ssh")]

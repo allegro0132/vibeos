@@ -658,6 +658,7 @@ impl FileTreeRoot {
             return Err(FileError::InvalidType.into());
         }
         Ok(Some(Self {
+            boundary: crate::ROOT_FILE_ID,
             inner: alloc::sync::Arc::new(crate::FileTreeInner {
                 state: vibeos_core::sync::SpinLock::new(alloc::sync::Arc::new(state)),
                 persistent_root: vibeos_core::sync::SpinLock::new(Some(root)),

@@ -610,15 +610,15 @@ pub(super) async fn parking_probe() {
     }
 }
 
-// Initial async runner: normal completion only. Cancellation must be integrated
-// with cooperative V8 termination before exposing this runner to VSH jobs.
+// The supervisor owns this runner until cooperative termination returns through
+// the native frames. Dropping a suspended runner remains a trusted fatal error.
 #[cfg(feature = "native-cxx-probe")]
 #[repr(C)]
 struct NativeAsyncState {
     caller: core::cell::UnsafeCell<Context>,
     native: core::cell::UnsafeCell<Context>,
     tls: crate::native_tls::NativeTls,
-    entry: extern "C" fn(usize) -> usize,
+    entry: core::cell::RefCell<Option<alloc::boxed::Box<dyn FnOnce() -> usize + Send>>>,
     result: core::cell::Cell<usize>,
     finished: core::cell::Cell<bool>,
     pending: core::cell::Cell<Option<(usize, crate::native_tls::PendingPoll)>>,
@@ -639,7 +639,10 @@ __vibe_native_async_start:
 #[cfg(feature = "native-cxx-probe")]
 extern "C" fn native_async_entry(pointer: *const NativeAsyncState) {
     let state = unsafe { &*pointer };
-    state.result.set((state.entry)(0));
+    // Take ownership before calling: neither a RefCell borrow nor a borrowed
+    // launcher buffer may remain in the supervisor while this stack parks.
+    let entry = state.entry.borrow_mut().take().expect("native entry runs once");
+    state.result.set(entry());
     crate::native_tls::finish_current();
     state.finished.set(true);
 }
@@ -653,7 +656,7 @@ unsafe fn native_async_park(pointer: usize, data: usize, poll: crate::native_tls
     true
 }
 #[cfg(feature = "native-cxx-probe")]
-struct NativeAsync {
+pub(super) struct NativeAsync {
     state: core::pin::Pin<alloc::boxed::Box<NativeAsyncState>>,
     _stack: Stack,
     started: bool,
@@ -664,12 +667,24 @@ impl NativeAsync {
         Self::with_capacity(entry, 1024 * 1024)
     }
     fn with_capacity(entry: extern "C" fn(usize) -> usize, capacity: usize) -> Self {
+        Self::with_sync_domain(entry, capacity, crate::native_tls::NativeSyncDomain::new())
+    }
+    fn with_sync_domain(entry: extern "C" fn(usize) -> usize, capacity: usize,
+                        sync_domain: alloc::sync::Arc<crate::native_tls::NativeSyncDomain>) -> Self {
+        Self::try_owned_entry(alloc::boxed::Box::new(move || entry(0)), capacity, sync_domain)
+            .expect("native async stack")
+    }
+    /// The entry owns every argument it needs across native-stack suspension.
+    /// Admission fails if the protected stack is occupied or cannot allocate.
+    /// Call only from the persistent, pinned supervisor that will await run().
+    pub(super) fn try_owned_entry(entry: alloc::boxed::Box<dyn FnOnce() -> usize + Send>, capacity: usize,
+                        sync_domain: alloc::sync::Arc<crate::native_tls::NativeSyncDomain>) -> Option<Self> {
         use core::cell::{Cell, UnsafeCell};
-        let stack = Stack::allocate().expect("native async stack");
+        let stack = Stack::allocate()?;
         let state = alloc::boxed::Box::pin(NativeAsyncState {
             caller: UnsafeCell::new(Context::zero()), native: UnsafeCell::new(Context::zero()),
-            tls: crate::native_tls::NativeTls::new(BASE, BASE + SIZE, capacity),
-            entry, result: Cell::new(0), finished: Cell::new(false), pending: Cell::new(None),
+            tls: crate::native_tls::NativeTls::with_sync_domain(BASE, BASE + SIZE, capacity, sync_domain),
+            entry: core::cell::RefCell::new(Some(entry)), result: Cell::new(0), finished: Cell::new(false), pending: Cell::new(None),
             parks: Cell::new(0), hart: crate::sbi::current_hart_id(),
         });
         unsafe extern "C" { fn __vibe_native_async_start(); }
@@ -683,9 +698,10 @@ impl NativeAsync {
                 context: (&*state as *const NativeAsyncState) as usize, call: native_async_park,
             });
         }
-        Self { state, _stack: stack, started: false }
+        Some(Self { state, _stack: stack, started: false })
     }
-    async fn run(mut self) -> (usize, usize) {
+    pub(super) fn tls(&self) -> &crate::native_tls::NativeTls { &self.state.tls }
+    pub(super) async fn run(mut self) -> (usize, usize) {
         loop {
             assert_eq!(crate::sbi::current_hart_id(), self.state.hart);
             self.started = true;
@@ -890,7 +906,13 @@ async fn native_open_probe() {
     let cap = space.0.lock().mint(root, Rights::ALL);
     extern "C" fn entry(_: usize) -> usize {
         assert_eq!(unsafe { vibeos_native_open(b"../source".as_ptr(), 9, 0) }, -3);
-        assert_eq!(unsafe { vibeos_native_open(b"source".as_ptr(), 6, 1) }, -13);
+        assert_eq!(unsafe { vibeos_native_open(b"source".as_ptr(), 6, 3) }, -13);
+        let write_only = unsafe { vibeos_native_open(b"source".as_ptr(), 6, 1) };
+        assert!(write_only >= 3);
+        let mut untouched = [0xa5; 1];
+        assert_eq!(unsafe { vibeos_native_read(write_only, untouched.as_mut_ptr(), 1) }, -1);
+        assert_eq!(untouched, [0xa5; 1]);
+        assert_eq!(vibeos_native_close(write_only), 0);
         let fd = unsafe { vibeos_native_open(b"/source".as_ptr(), 7, 0) };
         assert!(fd >= 3);
         assert_eq!(vibeos_native_fd_kind(fd), 2);
@@ -927,19 +949,164 @@ async fn native_open_probe() {
     crate::println!("NATIVE OPEN PASS read=1 seek=1 chunks=1 eof=1 close=1 revoked=1 readonly=1");
 }
 
+// Test-only handshake: the peer must execute on the same hart as Node.
+#[cfg(feature = "node-runtime")]
+static NODE_CANCEL_PROBE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "node-runtime")]
+static NODE_IDLE_CANCEL_START: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_idle_cancel_probe_arm() {
+    crate::native_tls::require_current();
+    NODE_CANCEL_PROBE.store(2, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_cpu_cancel_probe_arm() {
+    crate::native_tls::require_current();
+    NODE_CANCEL_PROBE.store(4, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "node-runtime")]
+pub(super) fn node_idle_cancel_probe(timeout_us: i64) {
+    use core::sync::atomic::Ordering;
+    if timeout_us > 1_000_000 && NODE_CANCEL_PROBE.load(Ordering::Acquire) == 2 {
+        NODE_IDLE_CANCEL_START.store(crate::wasi_clock::time(1, 0).unwrap(), Ordering::Release);
+        crate::println!("NODE IDLE CANCEL entered_wait_us={}", timeout_us);
+        NODE_CANCEL_PROBE.store(1, Ordering::Release);
+    }
+}
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_cancel_probe_arm() {
+    crate::native_tls::require_current();
+    NODE_CANCEL_PROBE.store(1, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_probe_revoke_files() {
+    crate::native_tls::require_current();
+    crate::native_files::revoke_probe_grant();
+}
+
+#[cfg(feature = "node-runtime")]
+static NODE_REPEAT_REMAINING: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_probe_repeat(remaining: u32) {
+    crate::native_tls::require_current();
+    assert!(remaining < 100);
+    NODE_REPEAT_REMAINING.store(remaining as usize, core::sync::atomic::Ordering::Release);
+}
+
+// Test-only completion evidence survives Node closing its owned stdio handles.
+#[cfg(feature = "node-runtime")]
+#[no_mangle]
+extern "C" fn vibeos_node_probe_finished(status: i32, exit_code: i32, explicit_exit: i32, cancelled: i32) {
+    crate::native_tls::require_current();
+    if status == 0 {
+        if cancelled != 0 { crate::println!("NODE CANCEL infinite_loop=1 terminated=1 PASS"); }
+        else { crate::println!("NODE EXIT observed={} PASS", exit_code); }
+        if explicit_exit != 0 { crate::println!("NODE EXIT explicit=1 PASS"); }
+        crate::println!("NODE SMOKE teardown PASS");
+    }
+    else { crate::println!("NODE SMOKE FAILED"); }
+}
+
 #[cfg(feature = "node-runtime")]
 pub(super) async fn v8_gate() {
+    let mut invocation = 0;
+    let sync_domain = crate::native_tls::NativeSyncDomain::new();
+    loop {
+        let result = v8_gate_invocation(sync_domain.clone()).await;
+        invocation += 1;
+        crate::println!("NATIVE INVOCATION index={} returned={} released=1", invocation, result);
+        if result != 0 || NODE_REPEAT_REMAINING.load(core::sync::atomic::Ordering::Acquire) == 0 {
+            crate::sbi::shutdown(result != 0);
+        }
+    }
+}
+
+#[cfg(feature = "node-runtime")]
+async fn v8_gate_invocation(sync_domain: alloc::sync::Arc<crate::native_tls::NativeSyncDomain>) -> usize {
     use alloc::sync::Arc;
     use core::future::poll_fn;
     use vibeos_wasi_command::CommandIo;
     let io = Arc::new(CommandIo::new());
-    io.stdin.close();
+    NODE_CANCEL_PROBE.store(0, core::sync::atomic::Ordering::Release);
+    NODE_IDLE_CANCEL_START.store(0, core::sync::atomic::Ordering::Release);
+    let cancel_peer = {
+        let io = io.clone();
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "node-cancel-peer", async move {
+            loop {
+                match NODE_CANCEL_PROBE.load(core::sync::atomic::Ordering::Acquire) {
+                    1 => {
+                        crate::exec::sleep_ms(10).await;
+                        io.cancel();
+                        crate::println!("NODE CANCEL same_hart_peer=1 requested=1");
+                        break;
+                    }
+                    3 => break,
+                    _ => crate::exec::sleep_ms(1).await,
+                }
+            }
+        })
+    };
+    #[cfg(not(feature = "native-uv-probe"))]
+    let input = {
+        let io = io.clone();
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "node-input", async move {
+            crate::exec::sleep_ms(50).await;
+            if io.cancelled() { return; }
+            assert_eq!(poll_fn(|cx| io.stdin.write(cx, b"node-\xe4\xb8")).await.unwrap(), 7);
+            crate::exec::sleep_ms(50).await;
+            if io.cancelled() { return; }
+            assert_eq!(poll_fn(|cx| io.stdin.write(cx, b"\xad-stdin\n")).await.unwrap(), 8);
+            io.stdin.close();
+        })
+    };
+    #[cfg(feature = "native-uv-probe")]
+    let input = {
+        let io = io.clone();
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "uv-input", async move {
+            crate::exec::sleep_ms(50).await;
+            assert_eq!(poll_fn(|cx| io.stdin.write(cx, b"uv-ready")).await.unwrap(), 8);
+            crate::exec::sleep_ms(100).await;
+            assert_eq!(poll_fn(|cx| io.stdin.write(cx, b"stream-ready")).await.unwrap(), 12);
+            io.stdin.close();
+        })
+    };
     let stdout = io.clone();
     let out = crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "v8-stdout", async move {
         let mut bytes = [0u8; 1024];
+        let marker = b"NODE CPU CANCEL entered_loop=1\n";
+        let mut matched = 0;
+        #[cfg(feature = "native-uv-probe")]
+        {
+            crate::exec::sleep_ms(100).await;
+            let mut total = 0;
+            while total < 9 * 1024 {
+                let count = poll_fn(|cx| stdout.stdout.read(cx, &mut bytes)).await.unwrap();
+                assert!(count != 0 && count <= 9 * 1024 - total);
+                assert!(bytes[..count].iter().all(|byte| *byte == b'X'));
+                total += count;
+            }
+            crate::println!("UV OUTPUT bytes={} PASS", total);
+        }
         loop {
             let count = poll_fn(|cx| stdout.stdout.read(cx, &mut bytes)).await.unwrap();
             if count == 0 { break; }
+            if NODE_CANCEL_PROBE.load(core::sync::atomic::Ordering::Acquire) == 4 {
+                for &byte in &bytes[..count] {
+                    matched = if byte == marker[matched] { matched + 1 }
+                              else { usize::from(byte == marker[0]) };
+                    if matched == marker.len() {
+                        NODE_CANCEL_PROBE.store(1, core::sync::atomic::Ordering::Release);
+                        matched = 0;
+                        break;
+                    }
+                }
+            }
             crate::print!("{}", core::str::from_utf8(&bytes[..count]).unwrap_or("[invalid utf8]"));
         }
     });
@@ -957,17 +1124,158 @@ pub(super) async fn v8_gate() {
         crate::println!("V8 GATE native_entry ram=1GiB stack=256KiB");
         unsafe { vibeos_v8_smoke() as usize }
     }
-    let run = NativeAsync::with_capacity(entry, 128 * 1024 * 1024);
+    #[cfg(feature = "native-uv-probe")]
+    let file_grant = {
+        use crate::{cap::Rights, native_files::FileGrant};
+        use vibeos_file_store::{FileTreeRoot, RelPath};
+        let root = Arc::new(FileTreeRoot::new_empty(0x757666696c6573).unwrap());
+        // Prove inode-addressed range writes before admitting native descriptors.
+        let temporary = RelPath::parse("range-original").unwrap();
+        let renamed = RelPath::parse("range-renamed").unwrap();
+        let mut range_tx = root.begin().unwrap();
+        range_tx.write_chunks(&temporary, [b"abcdef".as_slice()], false).unwrap();
+        range_tx.commit_authoritative().await.unwrap();
+        let original = root.snapshot();
+        let id = original.stat(&temporary, true).unwrap().file_id;
+        let mut range_tx = root.begin().unwrap();
+        range_tx.rename(&temporary, &renamed, false).unwrap();
+        range_tx.write_chunks(&temporary, [b"untouched".as_slice()], false).unwrap();
+        range_tx.write_file_range(id, 4095, b"XYZ").await.unwrap();
+        range_tx.commit_authoritative().await.unwrap();
+        let content = root.snapshot().read_chunks(&renamed).unwrap().flatten().copied().collect::<alloc::vec::Vec<_>>();
+        assert_eq!(&content[..6], b"abcdef");
+        assert!(content[6..4095].iter().all(|byte| *byte == 0));
+        assert_eq!(&content[4095..], b"XYZ");
+        assert_eq!(root.snapshot().read_chunks(&temporary).unwrap().flatten().copied().collect::<alloc::vec::Vec<_>>(), b"untouched");
+        let mut range_tx = root.begin().unwrap();
+        range_tx.truncate_file(id, 2).await.unwrap();
+        range_tx.truncate_file(id, 5).await.unwrap();
+        range_tx.commit_authoritative().await.unwrap();
+        assert_eq!(root.snapshot().read_chunks(&renamed).unwrap().flatten().copied().collect::<alloc::vec::Vec<_>>(), b"ab\0\0\0");
+        assert_eq!(original.read_chunks(&temporary).unwrap().flatten().copied().collect::<alloc::vec::Vec<_>>(), b"abcdef");
+        let mut range_tx = root.begin().unwrap();
+        range_tx.remove(&temporary, false, false).unwrap();
+        range_tx.remove(&renamed, false, false).unwrap();
+        range_tx.commit_authoritative().await.unwrap();
+        crate::println!("NATIVE FILE RANGE identity=1 sparse=1 truncate=1 snapshot=1 PASS");
+
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&RelPath::parse("main.js").unwrap(),
+                        [b"export const answer = 42;\n".as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("write-test").unwrap(), [b"abcdef".as_slice()], false).unwrap();
+        tx.mkdir(&RelPath::parse("src").unwrap(), false).unwrap();
+        tx.symlink("../main.js", &RelPath::parse("src/link.js").unwrap()).unwrap();
+        tx.symlink("loop", &RelPath::parse("loop").unwrap()).unwrap();
+        tx.write_chunks(&RelPath::parse("delete-sync").unwrap(), [b"sync".as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("delete-async").unwrap(), [b"async".as_slice()], false).unwrap();
+        tx.commit().unwrap();
+        let space = crate::world::Space::new("uv-file-probe");
+        // Check async admission without granting WRITE; this separate native
+        // task has no C++ frames or process-lifetime runtime initialization.
+        extern "C" fn deny_async_unlink(_: usize) -> usize {
+            let mut title = [1u8; 32];
+            assert_eq!(unsafe { crate::native_process::vibeos_native_get_title(title.as_mut_ptr(), title.len()) }, 0);
+            assert_eq!(title[0], 0);
+            assert_eq!(unsafe { crate::native_process::vibeos_native_set_title(b"previous title".as_ptr(), 14) }, 0);
+            assert_eq!(crate::native_env::vibeos_native_env_count(), 0);
+            assert_eq!(unsafe { crate::native_env::vibeos_native_env_set(
+                b"PREVIOUS_INVOCATION".as_ptr(), 19, b"private".as_ptr(), 7, 1) }, 0);
+            assert_eq!(unsafe { crate::native_files::vibeos_native_unlink_begin(
+                b"delete-async".as_ptr(), 12) }, -3);
+            assert_eq!(unsafe { crate::native_files::vibeos_native_access(b"main.js".as_ptr(), 7, 4) }, 0);
+            assert_eq!(unsafe { crate::native_files::vibeos_native_access(b"main.js".as_ptr(), 7, 2) }, -3);
+            for operation in 1..=5 {
+                assert_eq!(unsafe { crate::native_files::vibeos_native_tree_change(
+                    operation, b"src".as_ptr(), 3, b"other".as_ptr(), 5, 1) }, -3);
+            }
+            assert_eq!(unsafe { crate::native_files::vibeos_native_open(b"main.js".as_ptr(), 7, 1) }, -3);
+            assert_eq!(unsafe { crate::native_files::vibeos_native_open(b"denied-create".as_ptr(), 13, 5) }, -3);
+            crate::println!("UV CREATE readonly_denied=1 PASS");
+            crate::println!("UV WRITE readonly_open_denied=1 PASS");
+            crate::println!("UV TREE readonly_mutations_denied=3 PASS");
+            crate::println!("UV LINKS readonly_denied=2 PASS");
+            crate::println!("UV ACCESS readonly_read=1 readonly_write_denied=1 PASS");
+            42
+        }
+        let readonly = space.0.lock().mint(root.clone(), Rights::READ);
+        let denied = NativeAsync::new(deny_async_unlink);
+        denied.state.tls.set_files(FileGrant::new(space.clone(), readonly).unwrap());
+        assert_eq!(denied.run().await, (42, 0));
+        assert!(root.snapshot().stat(&RelPath::parse("delete-async").unwrap(), false).is_ok());
+        crate::println!("UV UNLINK readonly_admission=denied PASS");
+        // Project fixture explicitly grants deletion as well as read/revocation.
+        let cap = space.0.lock().mint(root, Rights::READ.union(Rights::WRITE).union(Rights::REVOKE));
+        FileGrant::new(space, cap).unwrap()
+    };
+    #[cfg(not(feature = "native-uv-probe"))]
+    let node_project_parent;
+    #[cfg(not(feature = "native-uv-probe"))]
+    let file_grant = {
+        use crate::{cap::Rights, native_files::FileGrant};
+        use vibeos_file_store::{FileTreeRoot, RelPath};
+        let root = Arc::new(FileTreeRoot::new_empty(0x6e6f646567617465).unwrap());
+        node_project_parent = root.clone();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&RelPath::parse("project").unwrap(), false).unwrap();
+        tx.write_chunks(&RelPath::parse("outside-secret").unwrap(), [b"protected".as_slice()], false).unwrap();
+        tx.symlink("../outside-secret", &RelPath::parse("project/escape").unwrap()).unwrap();
+        tx.commit_authoritative().await.unwrap();
+        let mut tx = root.begin().unwrap().into_directory(&RelPath::parse("project").unwrap()).unwrap();
+        tx.write_chunks(&RelPath::parse("main.cjs").unwrap(),
+            [include_bytes!("../../tools/node-runtime/tests/node-project-smoke.js").as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("dep.cjs").unwrap(),
+            [b"exports.answer = require('./leaf.cjs').answer; exports.load = () => import('./dep.mjs');\n".as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("leaf.cjs").unwrap(),
+            [b"exports.answer = 40 + 2;\n".as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("leaf.mjs").unwrap(),
+            [b"export const value = 98;\n".as_slice()], false).unwrap();
+        tx.write_chunks(&RelPath::parse("dep.mjs").unwrap(),
+            [b"import { value } from './leaf.mjs'; export const answer = value + 1;\n".as_slice()], false).unwrap();
+        tx.commit_authoritative().await.unwrap();
+        let space = crate::world::Space::new("node-gate-project");
+        crate::native_files::directory_grant_probe().await;
+        let cap = space.0.lock().mint(root, Rights::READ.union(Rights::WRITE).union(Rights::REVOKE));
+        FileGrant::new(space, cap).unwrap().directory(RelPath::parse("project").unwrap()).unwrap()
+    };
+    let run = NativeAsync::with_sync_domain(entry, 128 * 1024 * 1024, sync_domain);
+    run.state.tls.set_files(file_grant);
+    #[cfg(feature = "native-uv-probe")]
+    run.state.tls.set_environment(&[("VIBEOS_TEST_SEED", "from-launcher")]).unwrap();
+    #[cfg(feature = "native-uv-probe")]
+    run.state.tls.set_title("gate-v8").unwrap();
     run.state.tls.set_stdio(crate::native_stdio::StdioGrant::new(io.clone()));
     let grant = crate::world::world().native_entropy_probe_grant().expect("V8 gate entropy grant");
     run.state.tls.set_entropy(grant);
     let (live_before, _, _) = crate::HEAP.stats();
     let (result, parks) = run.run().await;
+    let idle_start = NODE_IDLE_CANCEL_START.load(core::sync::atomic::Ordering::Acquire);
+    if idle_start != 0 {
+        let elapsed_ms = (crate::wasi_clock::time(1, 0).unwrap() - idle_start) / 1_000_000;
+        assert!(elapsed_ms < 10_000, "idle cancellation must wake before the long timer");
+        assert_eq!(result, 130);
+        crate::println!("NODE IDLE CANCEL elapsed_ms={} returned=130 PASS", elapsed_ms);
+    }
+    #[cfg(not(feature = "native-uv-probe"))]
+    {
+        let bytes = node_project_parent.snapshot().read_chunks(&vibeos_file_store::RelPath::parse("outside-secret").unwrap())
+            .unwrap().flatten().copied().collect::<alloc::vec::Vec<_>>();
+        assert_eq!(bytes, b"protected");
+        crate::println!("NODE ROOT outside_unchanged=1 PASS");
+    }
+    NODE_CANCEL_PROBE.store(3, core::sync::atomic::Ordering::Release);
+    let _ = cancel_peer.join().await;
+    let _ = input.join().await;
     io.stdout.close(); io.stderr.close();
     let _ = out.join().await; let _ = err.join().await;
     let (live_after, global_peak, bump_remaining) = crate::HEAP.stats();
     crate::println!("V8 GATE memory global_live_before={} global_live_after={} global_peak={} bump_remaining={}",
                     live_before, live_after, global_peak, bump_remaining);
     crate::println!("V8 GATE returned={} parks={} waiters={}", result, parks, io.pending_waiters());
-    crate::sbi::shutdown(result != 0);
+    result
+}
+
+#[cfg(feature = "native-uv-probe")]
+#[no_mangle]
+extern "C" fn vibeos_uv_probe_revoke_files() {
+    crate::native_files::revoke_probe_grant();
 }

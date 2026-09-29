@@ -8,6 +8,12 @@
 extern "C" {
 #endif
 #define VIBEOS_NATIVE_PAGE_SIZE 4096u
+// Trusted serial process initialization only. Begin/end a non-nested scope
+// allocating bounded process-lifetime TCB pages instead of invocation pages.
+int vibeos_native_process_pages_scope(int enter);
+// Mapped RAM extent and managed heap bytes not charged to live allocations.
+// Free bytes include fragmentation and are not a contiguous allocation promise.
+int vibeos_native_system_memory(uint64_t* total, uint64_t* free_bytes);
 enum VibeosPagePermission {
   VIBEOS_PAGE_NONE = 0,
   VIBEOS_PAGE_READ = 1,

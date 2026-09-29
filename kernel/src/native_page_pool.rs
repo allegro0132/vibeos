@@ -9,6 +9,9 @@ pub(super) struct NativePagePool {
     next_id: u64,
 }
 impl NativePagePool {
+    pub(super) fn owns(&self, address: usize, bytes: usize) -> bool {
+        self.range(address, bytes).is_some()
+    }
     pub(super) fn new(pages: usize, alignment: usize) -> Option<Self> {
         let mut allocations = Vec::new();
         allocations.try_reserve_exact(pages).ok()?;

@@ -1,0 +1,5 @@
+{
+  "reason": "Known fatal fixture assertion: UV SYNC marker preceded the stdout backpressure pattern. Sent SIGINT to the test process group after preserving serial evidence.",
+  "session_exit_code": 130,
+  "runtime_acceptance": "FAIL"
+}

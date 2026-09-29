@@ -1,0 +1,11 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "libnode"
+  ],
+  "exit_code": 2,
+  "seconds": 4.077668832964264,
+  "runtime_acceptance": "NOT_RUN"
+}

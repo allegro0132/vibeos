@@ -1,0 +1,90 @@
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/entropy_encode.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/fast_log.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/histogram.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/literal_cost.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/memory.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/metablock.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/static_dict.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/static_dict_lut.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/static_init.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/brotli/deps/brotli/c/enc/utf8_util.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/debug.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/entropy_common.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/fse_decompress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/fse_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/compress/huf_compress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/decompress/huf_decompress.o
+  CC(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/pool.o
+In file included from ../deps/zstd/lib/common/pool.c:26:
+../deps/zstd/lib/common/pool.c: In function 'POOL_thread':
+../deps/zstd/lib/common/threading.h:80:41: error: implicit declaration of function 'pthread_mutex_lock'; did you mean 'ZSTD_pthread_mutex_lock'? [-Wimplicit-function-declaration]
+   80 | #define ZSTD_pthread_mutex_lock(a)      pthread_mutex_lock((a))
+      |                                         ^~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:72:9: note: in expansion of macro 'ZSTD_pthread_mutex_lock'
+   72 |         ZSTD_pthread_mutex_lock(&ctx->queueMutex);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:81:41: error: implicit declaration of function 'pthread_mutex_unlock'; did you mean 'ZSTD_pthread_mutex_unlock'? [-Wimplicit-function-declaration]
+   81 | #define ZSTD_pthread_mutex_unlock(a)    pthread_mutex_unlock((a))
+      |                                         ^~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:80:17: note: in expansion of macro 'ZSTD_pthread_mutex_unlock'
+   80 |                 ZSTD_pthread_mutex_unlock(&ctx->queueMutex);
+      |                 ^~~~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:86:41: error: implicit declaration of function 'pthread_cond_wait'; did you mean 'ZSTD_pthread_cond_wait'? [-Wimplicit-function-declaration]
+   86 | #define ZSTD_pthread_cond_wait(a, b)    pthread_cond_wait((a), (b))
+      |                                         ^~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:83:13: note: in expansion of macro 'ZSTD_pthread_cond_wait'
+   83 |             ZSTD_pthread_cond_wait(&ctx->queuePopCond, &ctx->queueMutex);
+      |             ^~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:87:41: error: implicit declaration of function 'pthread_cond_signal'; did you mean 'ZSTD_pthread_cond_signal'? [-Wimplicit-function-declaration]
+   87 | #define ZSTD_pthread_cond_signal(a)     pthread_cond_signal((a))
+      |                                         ^~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:91:13: note: in expansion of macro 'ZSTD_pthread_cond_signal'
+   91 |             ZSTD_pthread_cond_signal(&ctx->queuePushCond);
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c: In function 'POOL_create_advanced':
+../deps/zstd/lib/common/threading.h:78:41: error: implicit declaration of function 'pthread_mutex_init'; did you mean 'ZSTD_pthread_mutex_init'? [-Wimplicit-function-declaration]
+   78 | #define ZSTD_pthread_mutex_init(a, b)   pthread_mutex_init((a), (b))
+      |                                         ^~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:136:18: note: in expansion of macro 'ZSTD_pthread_mutex_init'
+  136 |         error |= ZSTD_pthread_mutex_init(&ctx->queueMutex, NULL);
+      |                  ^~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:84:41: error: implicit declaration of function 'pthread_cond_init'; did you mean 'ZSTD_pthread_cond_init'? [-Wimplicit-function-declaration]
+   84 | #define ZSTD_pthread_cond_init(a, b)    pthread_cond_init((a), (b))
+      |                                         ^~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:137:18: note: in expansion of macro 'ZSTD_pthread_cond_init'
+  137 |         error |= ZSTD_pthread_cond_init(&ctx->queuePushCond, NULL);
+      |                  ^~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:91:41: error: implicit declaration of function 'pthread_create'; did you mean 'ZSTD_pthread_create'? [-Wimplicit-function-declaration]
+   91 | #define ZSTD_pthread_create(a, b, c, d) pthread_create((a), (b), (c), (d))
+      |                                         ^~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:151:17: note: in expansion of macro 'ZSTD_pthread_create'
+  151 |             if (ZSTD_pthread_create(&ctx->threads[i], NULL, &POOL_thread, ctx)) {
+      |                 ^~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c: In function 'POOL_join':
+../deps/zstd/lib/common/threading.h:88:41: error: implicit declaration of function 'pthread_cond_broadcast'; did you mean 'ZSTD_pthread_cond_broadcast'? [-Wimplicit-function-declaration]
+   88 | #define ZSTD_pthread_cond_broadcast(a)  pthread_cond_broadcast((a))
+      |                                         ^~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:171:5: note: in expansion of macro 'ZSTD_pthread_cond_broadcast'
+  171 |     ZSTD_pthread_cond_broadcast(&ctx->queuePushCond);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:92:38: error: implicit declaration of function 'pthread_join'; did you mean 'pthread_atfork'? [-Wimplicit-function-declaration]
+   92 | #define ZSTD_pthread_join(a)         pthread_join((a),NULL)
+      |                                      ^~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:176:13: note: in expansion of macro 'ZSTD_pthread_join'
+  176 |             ZSTD_pthread_join(ctx->threads[i]);  /* note : could fail */
+      |             ^~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c: In function 'POOL_free':
+../deps/zstd/lib/common/threading.h:79:41: error: implicit declaration of function 'pthread_mutex_destroy'; did you mean 'ZSTD_pthread_mutex_destroy'? [-Wimplicit-function-declaration]
+   79 | #define ZSTD_pthread_mutex_destroy(a)   pthread_mutex_destroy((a))
+      |                                         ^~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:183:5: note: in expansion of macro 'ZSTD_pthread_mutex_destroy'
+  183 |     ZSTD_pthread_mutex_destroy(&ctx->queueMutex);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/threading.h:85:41: error: implicit declaration of function 'pthread_cond_destroy'; did you mean 'ZSTD_pthread_cond_destroy'? [-Wimplicit-function-declaration]
+   85 | #define ZSTD_pthread_cond_destroy(a)    pthread_cond_destroy((a))
+      |                                         ^~~~~~~~~~~~~~~~~~~~
+../deps/zstd/lib/common/pool.c:184:5: note: in expansion of macro 'ZSTD_pthread_cond_destroy'
+  184 |     ZSTD_pthread_cond_destroy(&ctx->queuePushCond);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~
+make: *** [/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/zstd/deps/zstd/lib/common/pool.o] Error 1
+make: *** Waiting for unfinished jobs....

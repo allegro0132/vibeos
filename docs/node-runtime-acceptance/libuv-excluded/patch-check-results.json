@@ -1,0 +1,28 @@
+[
+  {
+    "patch": "0047-libuv-excluded-operations.patch",
+    "command": [
+      "patch",
+      "--dry-run",
+      "-p1",
+      "--fuzz=0",
+      "--batch",
+      "-i",
+      "/Users/ziangwang/Sources/vibeos/tools/node-runtime/patches/0047-libuv-excluded-operations.patch"
+    ],
+    "exit_code": 0
+  },
+  {
+    "patch": "0048-node-excluded-handle-constructors.patch",
+    "command": [
+      "patch",
+      "--dry-run",
+      "-p1",
+      "--fuzz=0",
+      "--batch",
+      "-i",
+      "/Users/ziangwang/Sources/vibeos/tools/node-runtime/patches/0048-node-excluded-handle-constructors.patch"
+    ],
+    "exit_code": 0
+  }
+]

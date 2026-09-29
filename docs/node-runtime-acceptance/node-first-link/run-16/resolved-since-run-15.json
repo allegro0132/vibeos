@@ -1,0 +1,9 @@
+[
+  "uv_disable_stdio_inheritance",
+  "uv_exepath",
+  "uv_get_process_title",
+  "uv_os_getpid",
+  "uv_os_getppid",
+  "uv_set_process_title",
+  "uv_setup_args"
+]

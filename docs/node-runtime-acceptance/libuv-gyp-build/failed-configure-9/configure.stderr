@@ -1,0 +1,1 @@
+gyp: name 'host_os' is not defined while evaluating condition 'OS=="vibeos" and _toolset=="host" and host_os=="mac"' in /Users/ziangwang/Sources/vibeos/target/node-runtime/native-qualified-9/source/node-v24.14.0/deps/uv/uv.gyp

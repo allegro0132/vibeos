@@ -1,0 +1,10 @@
+[
+  "uv_available_parallelism",
+  "uv_cancel",
+  "uv_fs_access",
+  "uv_fs_readlink",
+  "uv_fs_unlink",
+  "uv_gettimeofday",
+  "uv_sleep",
+  "uv_uptime"
+]

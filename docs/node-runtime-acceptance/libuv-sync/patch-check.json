@@ -1,0 +1,5 @@
+{
+  "patch_sha256": "55223ce90365b2ecd7cef82d14043975dd7e854092f7ae9626ccb5a4e617c36b",
+  "exit_code": 0,
+  "stdout": "patching file 'deps/uv/uv.gyp'\n"
+}

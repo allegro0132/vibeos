@@ -82,9 +82,31 @@ bool RunChecks(v8::Isolate* isolate) {
 // FP state, TLS, allocator, clocks, entropy, stdio and suspendable wait bridges.
 // This one-shot gate disposes process-global V8 and cannot be used as a Node
 // invocation implementation or for the later 100-invocation lifecycle test.
+#ifdef VIBEOS_UV_LOOP_GATE
+extern "C" int vibeos_uv_loop_smoke();
+extern "C" int vibeos_uv_sync_smoke();
+extern "C" int vibeos_uv_file_smoke();
+extern "C" int vibeos_uv_stream_output_smoke();
+#endif
 extern "C" int vibeos_v8_smoke() {
   if (started.exchange(true)) return 2;
   if (vibeos_native_runtime_initialize() != 0) return 4;
+#ifdef VIBEOS_UV_LOOP_GATE
+  if (int status = vibeos_uv_loop_smoke()) {
+    std::printf("UV LOOP FAILED status=%d\n", status);
+    std::fflush(stdout);
+    return 5;
+  }
+  if (int status = vibeos_uv_sync_smoke()) {
+    std::printf("UV SYNC FAILED status=%d\n", status);
+    return 7;
+  }
+  if (int status = vibeos_uv_file_smoke()) {
+    std::printf("UV FILE FAILED status=%d\n", status);
+    std::fflush(stdout);
+    return 6;
+  }
+#endif
   v8::V8::SetFlagsFromString(
       "--jitless --single-threaded --expose-gc --max-old-space-size=128");
   v8::V8::SetEntropySource(Entropy);
@@ -110,5 +132,8 @@ extern "C" int vibeos_v8_smoke() {
   std::puts(passed ? "V8 SMOKE teardown PASS" : "V8 SMOKE FAILED");
   std::fflush(stdout);
   std::fflush(stderr);
+#ifdef VIBEOS_UV_LOOP_GATE
+  if (vibeos_uv_stream_output_smoke()) return 8;
+#endif
   return passed ? 0 : 1;
 }

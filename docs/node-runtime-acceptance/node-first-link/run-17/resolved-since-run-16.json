@@ -1,0 +1,6 @@
+[
+  "uv_thread_create",
+  "uv_thread_create_ex",
+  "uv_thread_join",
+  "uv_thread_setname"
+]

@@ -1,0 +1,11 @@
+--- a/src/node_constants.cc
++++ b/src/node_constants.cc
+@@ -44,7 +44,7 @@
+ #endif  // !OPENSSL_NO_ENGINE
+ #endif  // HAVE_OPENSSL
+ 
+-#if defined(__POSIX__)
++#if defined(__POSIX__) && !defined(__vibeos__)
+ #include <dlfcn.h>
+ #endif
+ 

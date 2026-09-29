@@ -1,0 +1,23 @@
+--- a/deps/nghttp2/lib/nghttp2_net.h
++++ b/deps/nghttp2/lib/nghttp2_net.h
+@@ -29,17 +29,17 @@
+ #  include <config.h>
+ #endif /* defined(HAVE_CONFIG_H) */
+ 
+-#ifdef HAVE_ARPA_INET_H
++#if defined(HAVE_ARPA_INET_H) && !defined(__vibeos__)
+ #  include <arpa/inet.h>
+ #endif /* defined(HAVE_ARPA_INET_H) */
+ 
+-#ifdef HAVE_NETINET_IN_H
++#if defined(HAVE_NETINET_IN_H) && !defined(__vibeos__)
+ #  include <netinet/in.h>
+ #endif /* defined(HAVE_NETINET_IN_H) */
+ 
+ #include <nghttp2/nghttp2.h>
+ 
+-#ifdef WIN32
++#if defined(WIN32) || defined(__vibeos__)
+ /* Windows requires ws2_32 library for ntonl family functions.  We
+    define inline functions for those function so that we don't have
+    dependency on that lib. */

@@ -10,6 +10,8 @@ pub(super) unsafe extern "C" fn vibeos_native_wait_until_context(
     let Some(ready) = ready else { return -1; };
     if timeout_us < -1 { return -1; }
     let Some(admission) = crate::native_tls::admit_wait(key as usize) else { return -1; };
+    #[cfg(feature = "node-runtime")]
+    crate::native_call::node_idle_cancel_probe(timeout_us);
     let deadline = if timeout_us >= 0 {
         let Some(deadline) = now().and_then(|n| n.checked_add(timeout_us as u64)) else { return -1; };
         Some(deadline)

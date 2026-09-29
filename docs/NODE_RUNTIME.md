@@ -1,37 +1,50 @@
 # Native JavaScript / TypeScript port: feasibility gate
 
-**Status: M1 V8 feasibility passes on QEMU: real expressions, JS exceptions,
-full GC and normal teardown. Official esbuild WASI execution also passes.
-Node.js, tsc and tsx commands remain unavailable; the full port is incomplete.**
+**Status: real V8 and official esbuild WASI execute on QEMU. Native Node now
+runs through capability-rooted local VSH and authorized OpenSSH PTY sessions.
+CJS/ESM, files, stdio/pipes, timers, exact exit status and cooperative cancellation
+pass target tests. Official tsc/tsx execution and final safety/regression
+qualification remain incomplete.**
+
+[Current compatibility and limits](NODE_RUNTIME_COMPATIBILITY.md).
 
 ## Milestones
 
-- **M0 — build baseline and pinned inputs:** complete. Source checksums, offline
-  probes, and explicit Rust toolchain selection are implemented. The ordinary
-  QEMU WASI image builds and boots; VSH executes an echo command. Network tests
-  pass (24), as do WASI tests (22; one external-fixture test intentionally ignored)
-  and the Python probe tests (8). This is not V8/Node acceptance.
-- **M1 — native platform / V8:** complete for the one-shot feasibility gate.
-  Real expressions, exceptions, full GC and normal teardown pass on QEMU with
-  the protected native ABI and suspendable bridges. See
-  [run 3 evidence](node-runtime-acceptance/v8-first-execution/README.md).
-  Production cancellation and repeated Node lifecycle qualification remain M3/M5.
-- **M2 — esbuild WASI:** complete. Seven real QEMU transform/denial/lifecycle
-  cases pass with memory/fuel evidence; the tsx service adapter remains M4.
-- **M3 — Node:** execute CJS/ESM, file/stream/timer operations and cancellation.
-- **M4 — TypeScript tools:** run tsc and the adapted upstream tsx entirely on
-  VibeOS, including cross-file TSX/source maps and negative type checks.
-- **M5 — qualification:** authority denial/revocation, cancellation, backpressure,
-  100-cycle reclamation and the affected regression suites.
+Current numbering follows the agreed implementation order. Older evidence below
+retains its original internal milestone labels.
 
-Each completed milestone is committed and pushed to the `implement_nodejs`
-branch. The full goal stays open until M1–M5 pass their target acceptance.
+- **M0 — build baseline and pinned inputs:** complete; the earlier baseline
+  and ordinary QEMU/WASI/VSH verification evidence is retained below.
+- **M1 — feasibility:** complete for one-shot real V8 expression/exception/GC
+  and official esbuild WASI TS/TSX transformation on QEMU. See
+  [V8 evidence](node-runtime-acceptance/v8-first-execution/README.md).
+- **M2 — Node loop:** complete; the [fresh 57-patch build and execution](node-runtime-acceptance/node-fresh-57/README.md)
+  passes VSH, authorized SSH and 100 successful launcher invocations. [Local VSH evidence](node-runtime-acceptance/node-vsh/README.md)
+  covers eval, CJS/ESM, files, pipes, stream-capability redirection, exit 7,
+  uncaught diagnostics and CPU/idle Ctrl-C followed by successful relaunch.
+  [OpenSSH PTY evidence](node-runtime-acceptance/node-ssh/README.md) covers the
+  admitted project-root capability, pipe input, exit 7 and remote Ctrl-C/relaunch.
+  The SSH/VSH transport retains its existing buffered command-output semantics.
+  [Launcher lifecycle evidence](node-runtime-acceptance/node-launcher-entry/README.md)
+  records earlier 100-cycle execution and the subsequent ownership fixes.
+- **M3 — TypeScript tools:** pending official tsc and adapted upstream tsx
+  project execution, diagnostics, declarations, TSX and source locations.
+- **M4 — safety and lifecycle:** pending complete authority/revocation,
+  infinite-loop cancellation, output backpressure and 100-cycle reclamation.
+- **M5 — regression and evidence:** pending final affected host/QEMU suites,
+  reproducible complete build, timing/memory records and compatibility matrix.
 
-The intended implementation is real Node.js with its bundled V8/libuv, statically
-linked into an opt-in QEMU image. V8 starts in JIT-less mode. Resource access must
-remain capability-backed. The first release targets offline projects, not npm
-installation, networking, child processes, user workers or native addons. A port
-of the upstream tsx loader/transform code may adapt its launch and esbuild backend.
+Completed milestones are committed and pushed to `implement_nodejs`. The full
+goal stays open until all agreed target execution and qualification requirements
+pass; M3, the full M4 audit and final M5 qualification remain outstanding.
+
+The implementation uses real Node.js with its bundled V8/libuv, statically linked
+into an opt-in QEMU image. V8 starts JIT-less. Resource access remains rooted in
+explicit capabilities. The first release targets offline projects; npm online
+installation, network services, child processes, user workers, native addons and
+watch are excluded. The upstream tsx loading/transform adaptation remains pending.
+Optional node:sqlite and SQLite-backed Web Storage are excluded with upstream
+`--without-sqlite`; their exact runtime rejection remains unqualified.
 
 ## Added tooling
 
@@ -115,6 +128,48 @@ runtime. This profile boots the one-shot smoke entry with 1 GiB RAM; it is not
 yet an interactive Node command image. The default image retains 128 MiB RAM
 and does not link V8. The execution harness requires every runtime marker,
 normal QEMU shutdown and no fatal trap; build success alone cannot pass it.
+
+## Node/libuv work in progress
+
+Patch 0027 supplies VibeOS libuv platform types and explicit unsupported network
+operations. Nine upstream common sources cross-compile, including timers and
+address conversion. The initial failed full libuv build and common-object
+results are retained in
+[libuv-common-build](node-runtime-acceptance/libuv-common-build/README.md).
+Reproduce the object check with `scripts/check-libuv-platform.py --source
+<prepared-node-source> --work target/<fresh-directory>`.
+
+The dedicated timer/async loop backend now passes a
+[QEMU prerequisite](node-runtime-acceptance/libuv-loop/README.md): upstream timer
+and phase callbacks, coalesced async notification, `UV_RUN_ONCE`/`NOWAIT`, busy
+loop rejection and normal close. Add `--uv-loop` to both the V8 link helper and
+QEMU harness to require this check before V8. The helper now selects the
+`native-uv-probe` fixture and also requires an
+[async stdin request](node-runtime-acceptance/libuv-async-read/README.md) to
+complete after timer progress. Its request queue polls the real transport
+without parking the whole event loop. The
+[async stdout backpressure check](node-runtime-acceptance/libuv-async-write/README.md)
+also passes: nine requests deliver 9216 validated bytes, with timer progress
+while the bounded pipe is full. Regular-file async IO, the uv_stream layer,
+full libuv GYP integration and actual Node execution remain pending.
+The [descriptor-file prerequisite](node-runtime-acceptance/libuv-files/README.md)
+passes capability-rooted open, synchronous read, snapshot fstat, deferred
+open/close callbacks and revocation denial. Positioned IO and writable files
+remain incomplete; the test uses a volatile
+file tree, not durable storage. A subsequent
+[path prerequisite](node-runtime-acceptance/libuv-paths/README.md) now passes
+stat/lstat/realpath, contained symlink open/read, traversal denial and circular
+link rejection. Resolved readers pin metadata and content together; the
+file-store host suite passes 29 tests (5 existing ignored cases).
+
+Patch 0029 now builds the backend through upstream libuv GYP, separating native
+target sources from the host platform used by `node_js2c`. The
+[GYP archive QEMU check](node-runtime-acceptance/libuv-gyp-build/README.md)
+passes all current libuv/V8 prerequisites using the actual target `libuv.a`.
+`build-v8.py uv` and `build-v8.py node` expose the next build phases. Node target
+compilation has started: patch 0030 removes native-addon dynamic loading;
+c-ares' Unix socket dependency is the next observed failure. Node has not yet
+linked or executed.
 
 ## Historical implementation notes
 
@@ -917,3 +972,192 @@ including cancellation, 100 reclaimed invocations and cold restart. The separate
 also passes persistence and powered-off image verification. These checks cover
 existing functionality affected by shared kernel/linker changes; they do not
 establish native Node filesystem support or V8 execution acceptance.
+
+Node incremental build update: patches 31–33 preserve pure IP conversion while rejecting DNS operations, select static-image debugging, and adapt address conversion. Target compilation now reaches `node.cc`, failing on unavailable `sys/termios.h`. See `node-build-6` through `node-build-9` in `docs/node-runtime-acceptance/libuv-gyp-build`. Node execution acceptance remains pending.
+
+Node build update (10–15): embedded startup, credential selection, process-operation rejection and static reporting now compile. The next observed failure is the POSIX thread-based SIGINT watchdog in `node_watchdog.cc`. Cancellation and Node runtime acceptance remain pending; evidence is in `docs/node-runtime-acceptance/libuv-gyp-build`.
+
+Node build 17 now produces the first target `libnode.a`; all 40 patches apply to a fresh locked extraction and its libuv configuration/build pass. This is compile/archive evidence only: Node firmware linking, execution and cancellation remain pending. See `node-build-17.json`, archive member hashes and `fresh-40-*` evidence in `docs/node-runtime-acceptance/libuv-gyp-build`.
+
+First Node embedding link: the new one-shot `node-smoke.cc` compiles for RV64GC, but firmware linking reports 500 unresolved symbols (150 libuv APIs plus bundled libraries and native helpers). Evidence is in `docs/node-runtime-acceptance/node-first-link`. Dependency build now reaches zstd pthread support after patch 41 adapts nghttp2 byte order. No Node QEMU execution has occurred.
+
+Node link attempt 2: ten real bundled dependency archives build; upstream no-snapshot source is included. Missing symbols decrease from 500 to 291 (150 libuv, 75 SQLite, 63 uvwasi, three newlib). Evidence: `docs/node-runtime-acceptance/node-first-link/run-2`. No Node firmware or execution acceptance yet.
+
+Libuv sync prerequisite now passes QEMU: regular/recursive mutexes, semaphore permits and parked condition timeout/relock, alongside prior V8 and libuv gates (17 parks, zero waiters). Evidence: `docs/node-runtime-acceptance/libuv-sync/run-2`; the failed fixture ordering run is preserved. Full Node, concurrency and invocation lifecycle acceptance remain pending.
+
+Libuv metrics and read/write lock gates now pass QEMU: metrics mutex lifecycle, eight timer-loop init/close cycles, shared readers and exclusive write/try-lock behavior. Evidence: `docs/node-runtime-acceptance/libuv-metrics` and `libuv-rwlock`. Full Node execution, concurrent contention and repeated invocation lifecycle remain pending.
+
+Newlib prerequisite QEMU pass: capability-rooted `stat`, explicit unsupported hard-link creation, and monotonic parked `sleep`; includes escape, missing path, symlink loop and revocation checks (29 parks, zero waiters). Evidence: `docs/node-runtime-acceptance/node-libc`. Full Node firmware linking/execution remains pending.
+
+Node firmware link 3 still fails with 206 unresolved names, down from 291: 131 libuv and 75 SQLite/session APIs. Sync/newlib references are resolved; Node WASI explicitly rejects because V8 WebAssembly is disabled. The esbuild WASI service is unchanged. Evidence: `docs/node-runtime-acceptance/node-first-link/run-3` and `node-wasi-boundary`. No Node execution acceptance yet.
+
+Libuv clocks/identity prerequisite passes QEMU: realtime, monotonic clock, uptime, 3 ms parked sleep, stable native task identity and single-task parallelism. Existing gates still pass (31 parks, zero waiters). Evidence: `docs/node-runtime-acceptance/libuv-clock`. Full Node startup and toolchain execution remain pending.
+
+Libuv unlink now passes QEMU with real rooted transactions: synchronous deletion, deferred async completion via Rust-owned futures, read-only admission refusal, escape/directory/revocation denial. Evidence: `docs/node-runtime-acceptance/libuv-unlink/run-3` (33 parks, zero waiters), with build/fixture failures retained. Slow durable publication, cancellation and full Node execution remain pending.
+
+Queued filesystem `uv_cancel` now passes QEMU: deferred ECANCELED completion preserves a queued deletion target; already-polled stdin returns EBUSY and completes normally. Repeated/late cancellation and request reuse are checked. Evidence: `docs/node-runtime-acceptance/libuv-cancel` (35 parks, zero waiters). This does not satisfy JavaScript infinite-loop cancellation or full Node acceptance.
+
+Rooted `uv_fs_readlink` now passes QEMU in sync/async forms: literal self-link, short-buffer preservation, ordinary-file error, escape and revocation denial. Evidence: `docs/node-runtime-acceptance/libuv-readlink` (36 parks, zero waiters). Full Node module resolution remains pending.
+
+Capability-backed `uv_fs_access` passes QEMU: read/write rights, read-only denial, missing and escaped paths, invalid modes, async completion and revocation. X_OK is explicitly unsupported; W_OK checks authority, not implemented write-open support. Evidence: `docs/node-runtime-acceptance/libuv-access` (37 parks, zero waiters). Full Node execution remains pending.
+
+Node link attempt 4 still fails with 198 unresolved symbols (123 libuv, 75 SQLite/session), resolving 8 names since run 3. Evidence: `docs/node-runtime-acceptance/node-first-link/run-4`. Node QEMU execution remains pending.
+
+Capability-rooted `uv_fs_scandir` passes QEMU: sorted names and file/directory/symlink types, full/partial cleanup, deferred callback, path errors and revocation denial. Evidence: `docs/node-runtime-acceptance/libuv-scandir` (38 parks, zero waiters). Node startup and TypeScript directory consumption remain pending.
+
+Rooted `uv_fs_mkdir`, `uv_fs_rename` and `uv_fs_rmdir` pass QEMU with real sync/async transactions, descendant preservation, type/nonempty errors, read-only/escape/revocation denial. Evidence: `docs/node-runtime-acceptance/libuv-tree` (45 parks, zero waiters). Unix mode bits do not replace capability authority. Full Node and compiler-output acceptance remain pending.
+
+File-tree inode-addressed range-write/truncate primitives pass host tests (31 passed, 5 ignored) and a QEMU identity/path-reuse/sparse/truncation/snapshot fixture. Evidence: `docs/node-runtime-acceptance/file-ranges`. Native writable descriptors and libuv file-write integration remain pending; this does not establish Node compiler-output support.
+
+Existing-file writable native descriptors and synchronous libuv writes/ftruncate pass QEMU: identity after rename, content readback, live metadata, mode restrictions and revocation denial (53 parks, zero waiters). Host file-store tests pass (31 passed, 5 ignored). Evidence: `docs/node-runtime-acceptance/libuv-write-file`. Creation, async file IO, unlinked-open lifetime and full Node output remain pending.
+
+Synchronous native/libuv create, exclusive-open, truncate-open and append pass QEMU, including newlib EEXIST, content readback, symlink collision, escape/read-only/revocation denial (60 parks, zero waiters). Evidence: `docs/node-runtime-acceptance/libuv-create/run-2`. Async create/write and full Node/TypeScript execution remain pending.
+
+Async regular-file writes and ftruncate pass QEMU with owned Rust transaction futures, deferred completion, content/size checks and queued cancellation preserving data. Evidence: `docs/node-runtime-acceptance/libuv-async-file` (62 parks, zero waiters). Delayed durable publication, async reads/open and full Node remain pending.
+
+Node firmware link 5 still fails with 193 missing names (118 libuv, 75 SQLite/session), resolving 5 names since run 4. Evidence: `docs/node-runtime-acceptance/node-first-link/run-5`. Real Node execution remains pending.
+
+Node link 6 removes all 75 SQLite/session references via upstream `--without-sqlite`; 118 libuv symbols remain unresolved. Target libnode build 20 and fresh 46-patch preparation/configuration/libuv build pass. Evidence: `docs/node-runtime-acceptance/node-first-link/run-6` and `node-without-sqlite`. No Node execution milestone yet.
+
+Excluded child-process/watch/host-signal APIs pass QEMU ENOTSUP/no-side-effect checks (14 APIs, 63 parks, zero waiters). Node constructor guards compile but JS rejection tests remain unexecuted. Link 7 still has 107 unresolved names, resolving 11 since run 6. Evidence: `docs/node-runtime-acceptance/libuv-excluded` and `node-first-link/run-7`.
+
+Owned async regular-file reads pass QEMU: deferred bytes/EOF, cancellation preserving cursor/buffer, delivery-buffer retry, consumed IDs and denied delivery after capability revocation. Evidence: `docs/node-runtime-acceptance/libuv-async-file-read` (64 parks, zero waiters). Persistent-latency/concurrent cursor qualification, async create-open and full Node remain pending.
+
+Sync/async positioned regular-file IO passes QEMU: content and unchanged cursor, invalid/overflow offset refusal, and ESPIPE for stdio positioning. Evidence: `docs/node-runtime-acceptance/libuv-positioned-io` (67 parks, zero waiters). Full Node/TypeScript and remaining lifecycle/storage qualification are still pending.
+
+The first-port Node network boundary passes 32 QEMU ENOTSUP/no-mutation checks (68 parks, zero waiters); TCP/UDP constructor rejection guards compile. Node firmware link 8 still has 78 unresolved names, resolving 29 since run 7. Evidence: `docs/node-runtime-acceptance/libuv-network-excluded` and `node-first-link/run-8`. Native Node/TypeScript acceptance remains pending.
+
+Invocation-local stdio pipe handle lifecycle passes QEMU: descriptor classification, stdin attachment/direction, data preservation, duplicate/IPC refusal, deferred close and endpoint closure. Evidence: `docs/node-runtime-acceptance/libuv-stream-handles` (69 parks, zero waiters). Stream data transfer and complete Node stdio remain pending.
+
+Nonblocking `uv_try_write` now passes actual multi-vector stdout output, invalid-buffer/direction and closed-handle checks in QEMU (69 parks, zero waiters). Evidence: `docs/node-runtime-acceptance/libuv-stream-write/run-3`; prior assertion failures are retained. Stream short-transfer/backpressure qualification, queued writes/reads and Node execution remain pending.
+
+Node link 9 still fails with 69 unresolved libuv symbols, resolving 9 since run 8. Evidence: `docs/node-runtime-acceptance/node-first-link/run-9`. No Node runtime milestone yet.
+
+Queued `uv_write`/non-IPC `uv_write2` now pass QEMU with exactly 16 KiB of ordered multi-vector data, copied descriptors, partial progress, deferred callbacks, close cancellation and zero remaining queue/active state. Evidence: `docs/node-runtime-acceptance/libuv-async-stream-write/run-2` (71 parks, zero waiters). Stream reads/shutdown and full Node execution remain pending.
+
+`uv_shutdown` now passes QEMU queued-write drain, deferred callback ordering, descriptor preservation, repeated-shutdown/write rejection and close cancellation checks. Evidence: `docs/node-runtime-acceptance/libuv-stream-shutdown/run-2` (72 parks, zero waiters). The verifier treats stdout/stderr as separately ordered streams; run 1's assertion failure is retained. Stream reads and complete Node execution remain pending.
+
+Stream reads now pass QEMU delayed input, small-buffer delivery, ENOBUFS retry, stop/restart preservation and EOF/close checks. Evidence: `docs/node-runtime-acceptance/libuv-stream-read` (74 parks, zero waiters). Cached delivery rechecks authority; revocation/reentrant-callback races and duplicate-descriptor ownership remain unqualified. Full Node execution remains pending.
+
+Node link 10 still fails with 64 unresolved libuv symbols, resolving 5 since run 9. Evidence: `docs/node-runtime-acceptance/node-first-link/run-10`. No Node runtime milestone yet.
+
+Invocation-local `uv_cwd`/`uv_chdir` now pass QEMU relative IO/unlink, root escape denial, short-buffer behavior, directory replacement detection and revocation checks. Evidence: `docs/node-runtime-acceptance/libuv-cwd` (82 parks, zero waiters). Renamed cwd recovery, queued-path/chdir races and complete Node module execution remain limited or pending as documented.
+
+Invocation-owned environment now passes QEMU explicit seed/isolation, shared libuv/newlib access, enumeration snapshots, unset/empty values and size/count limits. Evidence: `docs/node-runtime-acceptance/libuv-environment` (83 parks, zero waiters). Full Node process.env and lifecycle/cache qualification remain pending.
+
+Fresh 51-patch preparation/configuration/libuv build and host libc contract checks pass (see `libuv-environment/fresh-build`). Node link 11 still has 58 unresolved symbols, resolving 6 since run 10; see `node-first-link/run-11`. No Node execution milestone yet.
+
+Relative symlink and hard-link operations pass QEMU literal-target/inode checks, async copied arguments, queued cancellation, escape/read-only/revocation denial and cleanup. Evidence: `docs/node-runtime-acceptance/libuv-links` (93 parks, zero waiters). Absolute symlink targets remain explicitly unsupported; full Node execution remains pending.
+
+Eight Unix owner/mode/timestamp mutation APIs now return explicit ENOTSUP through synchronous/deferred filesystem request paths. QEMU checks callbacks, cancellation, cleanup and unchanged file metadata/content; evidence: `docs/node-runtime-acceptance/libuv-metadata-unavailable` (95 parks, zero waiters). These metadata features remain unsupported, and Node execution remains pending.
+
+Node link 12 still has 48 unresolved libuv symbols, resolving 10 since run 11; evidence: `node-first-link/run-12`. No Node runtime milestone yet.
+
+File sync APIs now check authoritative publication with fresh descriptor authority; in-progress publication returns explicit EBUSY. QEMU covers commit/busy, deferred completion, cancellation, unchanged generation and denial checks; evidence: `docs/node-runtime-acceptance/libuv-file-sync` (100 parks, zero waiters). File-store host tests: 32 passed, 5 ignored. Volatile-root testing does not establish disk-flush or power-loss guarantees.
+
+IPC/TTY exclusion APIs and nonblocking standard-stream mode pass QEMU unchanged-output/no-callback checks; evidence: `docs/node-runtime-acceptance/libuv-ipc-tty-unavailable` (101 parks, zero waiters). Node IPC constructor protection compiles and has a prospective JS test, but Node execution remains pending.
+
+Node link 13 still has 37 unresolved libuv symbols, resolving 11 since run 12; evidence: `node-first-link/run-13`. No Node execution milestone yet.
+
+Memory queries now pass QEMU actual-allocation visibility and RSS refusal checks; evidence: `libuv-memory` (102 parks, zero waiters). System/free readings use board RAM and heap accounting; unified process quota/RSS attribution remains unavailable. Node link 14 still has 32 unresolved libuv symbols, resolving 5 since run 13; evidence: `node-first-link/run-14`. No Node execution milestone yet.
+
+Directory handles now pass QEMU batched enumeration/types/EOF, async completion/cancellation, replacement refusal and revocation/cleanup tests; evidence: `libuv-directory` (114 parks, zero waiters). Enumeration is a snapshot; renamed/deleted directory handles fail closed. Full Node execution and teardown qualification remain pending.
+
+Node link 15 still has 29 unresolved libuv symbols, resolving the three directory APIs since run 14; evidence: `node-first-link/run-15`. Node execution remains unaccepted.
+
+Invocation-owned process titles and logical pid/ppid now pass QEMU copy/bounds/identity and stdio preservation checks; evidence: `libuv-process` (116 parks, zero waiters). Executable-path lookup remains explicitly unsupported until the launcher/tool mount provides a virtual path; Node's upstream argv[0] fallback is retained. Full Node JS process behavior remains unaccepted.
+
+Node link 16 still has 22 unresolved libuv symbols, resolving 7 process metadata/initialization names since run 15; evidence: `node-first-link/run-16`. Node execution remains pending.
+
+Native thread creation/join/naming exclusion APIs pass QEMU unchanged-output/no-entry/identity checks; evidence: `libuv-thread-excluded` (118 parks, zero waiters). Node Worker constructor rejection compiles and patch 53 applies with zero fuzz; JavaScript behavior remains unexecuted. Thread-based internal custom loaders also remain unsupported pending the planned in-instance tsx adaptation.
+
+Node link 17 still has 18 unresolved libuv symbols, resolving 4 thread exclusion APIs since run 16; evidence: `node-first-link/run-17`. Node execution remains pending.
+
+The serialized native `uv_queue_work` path passes QEMU deferred execution, cancellation, requeue/free and mixed file/timer progress checks; evidence: `libuv-work` (122 parks, zero waiters). Callbacks run on the protected native stack, one per loop iteration; running C/C++ work is not forcibly interrupted. A Node asynchronous zlib roundtrip test is prepared but unexecuted.
+
+Node link 18 still has 17 unresolved libuv symbols, resolving `uv_queue_work` since run 17; evidence: `node-first-link/run-18`. Full Node execution remains pending.
+
+OS accounting/account/priority/interface rejection and explicit HOME queries pass QEMU; evidence: `libuv-os-boundary` (123 parks, zero waiters). Unsupported queries preserve outputs; home lookup uses invocation environment only. Full Node API and toolchain execution remain pending.
+
+Node link 19 still has 8 unresolved libuv symbols, resolving 9 OS query/home boundary names since run 18; evidence: `node-first-link/run-19`. Full Node execution remains pending.
+
+Temporary file/directory creation now passes QEMU sync/async entropy-backed exclusive creation, byte-exact content preservation, queued cancellation and revocation checks; evidence: `libuv-temp` (142 parks, zero waiters). Parking work runs only on the native stack. Forced entropy/collision/storage failures and full Node execution remain pending.
+
+Node link 20 still has 6 unresolved libuv symbols, resolving temporary file/directory creation since run 19; evidence: `node-first-link/run-20`. Full Node execution remains pending.
+
+System image labels, explicit HOSTNAME and CPU/load unavailability pass QEMU; evidence: `libuv-system` (143 parks, zero waiters). Node CPU/load bindings compile with explicit ENOTSUP and patch 54 applies with zero fuzz. The void libuv load-average ABI uses NaN samples; Node JS behavior remains unexecuted.
+
+Node link 21 still has two unresolved libuv symbols (`uv_fs_copyfile`, `uv_fs_statfs`), resolving four system-query names since run 20; evidence: `node-first-link/run-21`. Full Node execution remains pending.
+
+Atomic regular-file copy and permission-checked statfs refusal pass QEMU; evidence: `libuv-copy` (162 parks, zero waiters). Copy preserves immutable content and target hard-link identity, supports deferred cancellation and rejects unsupported forced storage reflink. Durable-fault qualification and full Node execution remain pending.
+
+Node link 22 resolves all undefined symbols but still fails with 21 medany relocations to absent weak zstd trace hooks; evidence: `node-first-link/run-22`. No Node ELF or execution yet.
+
+Node link 23 produces the first complete Node ELF after disabling absent weak zstd trace hooks; evidence: `node-first-link/run-23`. First real QEMU execution fails at duplicate cppgc initialization in the embedding test (`node-first-execution/run-1`); Node JavaScript/teardown acceptance remains pending.
+
+After removing duplicate cppgc initialization, Node's second QEMU run reaches JavaScript loading but rejects `process.cwd` because the gate omitted a project capability. It tears down normally with return 1 and zero waiters; evidence: `node-first-execution/run-2`. A private project fixture is being attached explicitly.
+
+Node's third target execution runs Buffer/Promise/timer and asynchronous zlib checks and returns zero with no waiters. Its verifier still fails because normal environment cleanup closes stdout before the teardown marker; evidence: `node-first-execution/run-3`. A kernel test-probe completion channel is being added; no complete M2 milestone yet.
+
+Real Node's preliminary embedding gate now passes QEMU with inline JS/Buffer/Promise/timer, asynchronous zlib and normal teardown, return 0 and zero waiters; evidence: `node-first-execution/run-4`. The earlier failures are retained. Project module/filesystem/cancellation and full M2 acceptance remain pending.
+
+Asynchronous create/truncate opens now pass libuv cancellation/preservation tests (`libuv-open-async`, 167 parks). Real Node project execution passes cross-file CJS, ESM dynamic import and sync/Promise file creation/read/write/truncation with return 0 and zero waiters (`node-project-execution/run-2`, 11 parks). Full M2 and TypeScript acceptance remain pending.
+
+Real Node stdin/UTF-8/EOF execution now passes alongside prior project and runtime tests; evidence: `node-stdin-execution` (13 parks, return 0, zero waiters). Nonzero exit, cancellation, production commands and full M2 acceptance remain pending.
+
+Real Node nonzero exits now pass QEMU: passive `process.exitCode=7` and active `process.exit(7)` both complete native teardown, propagate 7 and leave zero waiters. Evidence: `node-exit-execution/run-1` and `node-explicit-exit-execution/run-3`; failed outer-TryCatch assertions and the diagnostic run are retained in runs 1–2. This does not qualify infinite-loop cancellation or complete M2.
+
+The same gate source also passes default exit-0 regression after explicit-exit support (`node-exit-execution/default-regression`), including prior CJS/ESM, filesystem, stdin and async runtime checks.
+
+VibeOS-only V8 bytecode-budget checkpoints now yield through the retained native stack and observe CommandIo cancellation after resumption. The actual Node-context infinite-loop gate passes same-hart cancellation, normal termination/teardown, return 130 and zero waiters (`node-cancel-execution/run-1`, 194 parks). This is not yet a production VSH cancellation or full M2/M4 qualification.
+
+The patched V8/native checkpoint also passes the non-cancelled Node regression with native return 0 and zero waiters (`node-cancel-execution/default-regression`), covering all prior project/stream/runtime checks.
+
+The upstream Node main-module bootstrap now passes QEMU with `/main.cjs` read through the project grant (`node-main-execution/run-1`). Main identity, argv, cwd, all prior project/runtime checks, exit 0 and teardown pass (193 parks, zero waiters). VSH registration and reusable runtime lifecycle remain pending.
+
+The shared project fixture also passes the original embedding-entry QEMU regression (`node-main-execution/inline-regression`); the build records and rechecks JS fixture/generated include hashes.
+
+Native FileGrant now takes a fresh-lease provider suitable for a VSH invocation. The bounded VSH provider observes resource revocation and job cancellation in host tests (33 VSH tests pass); the generic provider passes the Node main-module QEMU regression with return 0 and zero waiters. Evidence and precise remaining integration limits: `native-authority-provider/README.md`. Production command wiring and subtree project-root admission remain pending.
+
+Directory-bounded immutable snapshots now constrain link resolution, listing, content reads and recursive-copy source traversal. Host tests pass (34 passed, 5 ignored), and the ordinary Node main-file QEMU regression remains green with return 0 and zero waiters (`directory-snapshot-boundary`). Live writable subtree admission and Node use of that boundary remain pending.
+
+Live FileTreeRoot directory views now share parent storage while bounding snapshots, readers, inode admission and transactions. Bounded transactions reject pre-existing edits and outside inode mutations. Host tests pass (37 passed, 5 ignored), and actual Node QEMU execution from a granted project subdirectory denies sibling visibility and outward-link read/write/realpath while preserving the parent's protected file (`directory-live-boundary/run-1`, return 0, 196 parks, zero waiters). VSH source-capability projection/revocation and production command registration still require integration.
+
+Final live-directory boundary regression also passes QEMU (`directory-live-boundary/run-2`) after stale content-stager admission and cross-view ancestor-copy checks; host file-store suite remains 37 passed, 5 ignored.
+
+Native project projection now retains its original capability lease and revalidates directory identity at every operation; the QEMU probe rejects revoked parents, replacement directories, retargeted entry links and readonly writes (`project-authority-projection/run-1`). Real Node additionally observes EACCES for both new path reads and a previously opened descriptor after parent revocation, then completes normal exit/teardown with return 0 and zero waiters (`project-authority-projection/node-revocation`, 208 parks). Production VSH provider wiring remains pending.
+
+Node/V8 process initialization is now separated into `tools/node-runtime/runtime/node-process.*`. Fresh native invocation contexts share only an explicitly owned synchronization domain for process-global locks. The first repeated-run failure identified an invocation-local semaphore backing Node's global `cli_options_mutex`; bounded fatal frame logs and symbolization are retained. Two executions then pass, followed by 100 consecutive main-file executions in QEMU (`node-repeat-execution/run-4`, 64.5674 s host wall time, peak kernel heap 305765120 bytes, cleanup live-byte variation 256 bytes, zero standard-stream waiters per run). Bump remaining stabilizes after iteration 2. Production command wiring, repeated failure/cancellation inventory and complete M4 remain pending.
+
+A launcher-facing `vibeos_node_run` ABI now separates runtime execution from smoke assertions. File startup and upstream `-e` evaluation both pass QEMU through this ABI, including require/argv and the full shared project checks (`node-launcher-entry`). The ABI uses invocation-owned Node options and normal per-call cleanup; VSH registration, idle cancellation wakeup and dedicated error/exit/cancel qualification for this new entry remain pending.
+
+The reusable launcher ABI now passes explicit `process.exit(7)` and idle-loop cancellation in QEMU (`node-launcher-entry/explicit-exit` and `idle-cancel`). The latter enters a 60-second native timer wait, is cancelled by a same-hart peer, and returns 130 with normal cleanup after 114 ms and zero waiters. CommandIo cancellation now wakes an owned native-domain observer; libuv readiness and loop return observe the cancelled grant. Eight host CommandIo tests pass. VSH registration, new-ABI CPU/exception/repeat acceptance and full M2 remain pending.
+
+The idle-cancellation change passes the full ordinary launcher main-file QEMU regression with exit 0 and zero waiters (`node-launcher-entry/idle-cancel-regression`).
+
+CPU-loop cancellation through the reusable launcher initially exposed a Node callback teardown failure (fatal exit 1). Patch 0057 now stops cancelled callbacks before async-hooks cleanup and disables JS callback retry. The timer-callback infinite-loop QEMU retest returns 130 with normal teardown and zero waiters; both failed and passing evidence are retained in `node-launcher-entry/cpu-cancel`. Production VSH cancellation remains pending.
+
+The reusable launcher ABI now passes 100 serial ordinary Node main-file invocations after patch 0057 (`node-launcher-entry/repeat-100`): all return 0 with zero waiters and complete all project/stream/runtime checks. QEMU host wall time is 66.726 seconds; cleanup live heap stays within 36186624–36186880 bytes. This does not qualify repeated error/cancellation cycles or production VSH admission.
+
+Production `node --root @home/project main.js` and `-e` now run through VSH
+capability command registration and a persistent SYSTEM-owned pinned supervisor.
+Automatic gate startup is separately gated by `node-runtime-gate`; `--node-shell`
+builds the command image. The first mixed VSH test uncovered cppgc global metadata
+allocated in an invocation page pool; initialization now uses a separate bounded
+4 MiB process-lifetime TCB page pool. Failed and passing evidence is retained in
+`node-vsh/`. Run 4 passes eval, CJS, dynamic ESM, pipe input, filesystem IO, timer,
+stream-capability redirection, nonzero conditional exit, uncaught diagnostics,
+and CPU/idle Ctrl-C followed by successful fresh invocations. SSH execution,
+exact VSH numeric exit status, final-source lifecycle/regression qualification,
+and complete M2 evidence remain pending.
+
+`node-vsh/run-5` additionally verifies the exact VSH Returned(7) result and
+uncaught eval source position [eval]:1:7 while repeating the complete mixed
+command and Ctrl-C sequence. All checks pass.
+
+Authorized OpenSSH PTY execution now passes against the native Node image
+(`node-ssh/run-3`): bounded project-root admission, eval, stdin pipeline, exact
+exit 7, Ctrl-C and fresh invocation after cancellation. The platform grants the
+already recovered home tree only to the existing admitted command profile and
+never to onboarding sessions. Existing SSH/VSH output capture semantics remain
+in effect; 20 SSHD host tests pass. Full final-source regression is still pending.

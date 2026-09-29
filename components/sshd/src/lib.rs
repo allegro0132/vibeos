@@ -512,6 +512,11 @@ pub trait Platform: Sync {
         false
     }
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool);
+    /// Install explicitly authorized project roots for an authenticated shell.
+    /// Implementations must revalidate the captured command profile. Never
+    /// called for password onboarding; default grants no filesystem access.
+    fn install_vsh_project_roots(&self, _session: &mut vibeos_vsh::Session,
+                                 _profile: AuthorizedProfile) {}
     /// Explicit per-connection hook for image-policy-pinned Component commands
     /// admitted to the restricted SSH exec profile. The default installs
     /// nothing; it is never called for onboarding credentials or interactive
@@ -4336,6 +4341,11 @@ async fn serve_interactive_shell(
         Some(AuthCredential::OnboardingPassword)
     );
     space.install_vsh_commands(&mut session, onboarding);
+    if !onboarding {
+        if let Some(candidate) = protocol.committed {
+            space.install_vsh_project_roots(&mut session, candidate.profile);
+        }
+    }
     let mut frontend = TerminalFrontend::new();
 
     let repl = run_shell_repl(

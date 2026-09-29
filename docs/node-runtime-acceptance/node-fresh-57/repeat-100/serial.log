@@ -1,0 +1,1811 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x82d13000..0xc0000000  (1002420 KiB)
+  traps     stvec armed, PLIC ctx S/hart0, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x82613000..0x82813000, MXR clear, RFENCE ready
+  read-only 9128 KiB .rodata 0x819b4000..0x8229e000; 4096 KiB COW capability-table pool
+  world     9 capability spaces, 1 typed channel, 5 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:1) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=793472 global_live_after=44593920 global_peak=314172288 bump_remaining=712276096
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=1 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:2) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=2 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:3) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=3 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:4) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=4 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #1 = 21.537 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:5) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=5 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:6) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=6 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:7) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=7 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:8) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=8 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[logger] reading #2 = 21.574 C
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:9) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=9 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:10) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=10 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:11) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=11 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:12) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=12 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:13) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=13 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[guest]  heartbeat 1
+vsh> [2K[logger] reading #3 = 21.611 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:14) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=14 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:15) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=15 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:16) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=16 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:17) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=17 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:18) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593664 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=18 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #4 = 21.648 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:19) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126144 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=19 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:20) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=20 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:21) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=21 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:22) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=22 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #5 = 21.685 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:23) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=23 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:24) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=24 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:25) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=25 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:26) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=26 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:27) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2K[guest]  heartbeat 2
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=27 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #6 = 21.722 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:28) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=28 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:29) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=29 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:30) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=30 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:31) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=31 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[logger] reading #7 = 21.759 C
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:32) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=32 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:33) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=33 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:34) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=34 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:35) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=35 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:36) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=36 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #8 = 21.796 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:37) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=37 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:38) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=38 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:39) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=39 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:40) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=40 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[guest]  heartbeat 3
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:41) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593664 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=41 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #9 = 21.833 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:42) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126144 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=42 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:43) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=43 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:44) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=44 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:45) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=45 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #10 = 21.870 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:46) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=46 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:47) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=47 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:48) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=48 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:49) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=49 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:50) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=50 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #11 = 21.907 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:51) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=51 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:52) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=52 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:53) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=53 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:54) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=54 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[guest]  heartbeat 4
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[logger] reading #12 = 21.944 C
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:55) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=55 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:56) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=56 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:57) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=57 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:58) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=58 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:59) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=59 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #13 = 21.981 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:60) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=60 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:61) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=61 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:62) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=62 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:63) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=63 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:64) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593664 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=64 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #14 = 22.018 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:65) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126144 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=65 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:66) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=66 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:67) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=67 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:68) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=68 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[guest]  heartbeat 5
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2K[logger] reading #15 = 22.055 C
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:69) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=69 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:70) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=70 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:71) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=71 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:72) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=72 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:73) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=73 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #16 = 22.092 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:74) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=74 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:75) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=75 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:76) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=76 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:77) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=77 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[logger] reading #17 = 22.129 C
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:78) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=78 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:79) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=79 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:80) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=80 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:81) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=81 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:82) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2K[guest]  heartbeat 6
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=82 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #18 = 22.166 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:83) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=83 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:84) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=84 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:85) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=85 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:86) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=86 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:87) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=87 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #19 = 22.203 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:88) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=88 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:89) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=89 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:90) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=90 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:91) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=91 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[logger] reading #20 = 22.240 C
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:92) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=92 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:93) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=93 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:94) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=94 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:95) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=95 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2K[guest]  heartbeat 7
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:96) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=96 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2K[logger] reading #21 = 22.277 C
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:97) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=97 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:98) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=98 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:99) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=99 returned=0 released=1
+vsh> [2KNATIVE PROJECT AUTH revoked=1 replaced=1 retargeted=1 readonly=1 PASS
+vsh> [2KV8 GATE native_entry ram=1GiB stack=256KiB
+vsh> [2KNODE MAIN file=1 argv=1 cwd=1 PASS
+vsh> [2KNODE PROJECT cjs=42 sync_file=1 PASS
+vsh> [2KNODE ROOT sibling_hidden=1 symlink_denied=3 PASS
+vsh> [2K(node:100) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+vsh> [2KNODE SMOKE buffer promise timer=42 PASS
+vsh> [2KNODE SMOKE queued zlib roundtrip PASS
+vsh> [2KNODE PROJECT esm=99 dynamic_import=1 async_file=1 PASS
+vsh> [2KNODE EXIT observed=0 PASS
+vsh> [2KNODE SMOKE teardown PASS
+vsh> [2KNODE ROOT outside_unchanged=1 PASS
+vsh> [2KNODE STDIN utf8=1 eof=1 bytes=15 PASS
+vsh> [2KV8 GATE memory global_live_before=45126400 global_live_after=44593920 global_peak=314172288 bump_remaining=443840640
+vsh> [2KV8 GATE returned=0 parks=196 waiters=0
+vsh> [2KNATIVE INVOCATION index=100 returned=0 released=1
+vsh> 

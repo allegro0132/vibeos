@@ -1,0 +1,20 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "libhistogram",
+    "libzlib",
+    "libllhttp",
+    "libnghttp2",
+    "libada",
+    "libmerve",
+    "libsimdjson",
+    "libbrotli",
+    "libzstd",
+    "libnbytes"
+  ],
+  "exit_code": 2,
+  "seconds": 2.5559863329981454,
+  "runtime_acceptance": "NOT_RUN"
+}

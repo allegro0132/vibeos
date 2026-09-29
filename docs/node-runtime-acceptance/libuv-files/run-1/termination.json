@@ -1,0 +1,4 @@
+{
+  "termination": "SIGINT after confirmed fatal panic; runner exit 130",
+  "reason": "Fixture minted READ only but called revoke, which correctly requires REVOKE. Corrected fixture grants READ|REVOKE, not WRITE."
+}

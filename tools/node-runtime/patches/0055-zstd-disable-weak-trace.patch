@@ -1,0 +1,17 @@
+--- a/deps/zstd/lib/common/zstd_trace.h
++++ b/deps/zstd/lib/common/zstd_trace.h
+@@ -39,7 +39,13 @@
+ 
+ /* Only enable tracing when weak symbols are available. */
+ #ifndef ZSTD_TRACE
+-#  define ZSTD_TRACE ZSTD_HAVE_WEAK_SYMBOLS
++#  if defined(__vibeos__)
++/* No trace provider exists in the static image. Undefined weak hooks resolve
++ * to zero, outside medany PC-relative reach from the RV64 kernel mapping. */
++#    define ZSTD_TRACE 0
++#  else
++#    define ZSTD_TRACE ZSTD_HAVE_WEAK_SYMBOLS
++#  endif
+ #endif
+ 
+ #if ZSTD_TRACE

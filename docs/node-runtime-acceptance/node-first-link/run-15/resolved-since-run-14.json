@@ -1,0 +1,5 @@
+[
+  "uv_fs_closedir",
+  "uv_fs_opendir",
+  "uv_fs_readdir"
+]

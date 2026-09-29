@@ -1,0 +1,46 @@
+{
+  "passed": false,
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-cpu",
+    "rv64",
+    "-smp",
+    "4",
+    "-m",
+    "1G",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/node-ssh-qemu-2/kernel.elf",
+    "-object",
+    "rng-random,id=rng,filename=/dev/urandom",
+    "-device",
+    "virtio-rng-device,rng=rng,bus=virtio-mmio-bus.1",
+    "-netdev",
+    "user,id=net,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:63027-10.0.2.15:2222",
+    "-device",
+    "virtio-net-device,netdev=net,bus=virtio-mmio-bus.0,mac=02:00:00:00:00:01",
+    "-drive",
+    "if=none,id=project,format=raw,file=/Users/ziangwang/Sources/vibeos/target/node-ssh-qemu-2/project.raw,cache=writeback",
+    "-device",
+    "virtio-blk-device,drive=project,bus=virtio-mmio-bus.2,queue-size=8",
+    "-global",
+    "virtio-mmio.force-legacy=false"
+  ],
+  "kernel_sha256": "c16df2610e538a41fd6b87eb11b56cf01069658a20fb46a2aa757794fe127b30",
+  "checks": {
+    "no_fatal": true
+  },
+  "error": "missing b'SSH_NODE_SETUP=ok'\nb'vsh> node --root @home -e \"require(\\'fs\\').mkdirSync(\\'ssh-project\\'); console.log(\\'SSH_NODE_\\' + \\'SETUP=ok\\')\"\\r\\n  vsh: path-root capability cannot be delegated at bytes 12..17\\r\\nvsh> '",
+  "seconds": 36.34294958401006,
+  "source_sha256": {
+    "scripts/test-node-ssh-qemu.py": "7c9a9cc237b7e486734c5ac86ad27d47c0d64ef089e5d7a33ec1601a25a3134d",
+    "kernel/src/native_node.rs": "890c047cd4dea4f379cfbc5a00bbedd4d11be8c9e7ae65c460c7e174b3655598",
+    "kernel/src/ssh_platform.rs": "5742e0ee4171f94f5a45197af4c24e881ae233b634dd32a8f645d77ced16ca7b",
+    "kernel/src/segment_store_platform.rs": "1f371cab9e98b6dd78e01042a7dd702bf07d6ee3881bc85e01aa87dcf791f628",
+    "components/sshd/src/lib.rs": "b66cca0d739a183b2a18bf070371baebbece30a85d0807732d50667186b4c27f"
+  }
+}

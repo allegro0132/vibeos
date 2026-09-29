@@ -1,0 +1,22 @@
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/tests/native-libc-test.cc:24:16: error: conflicting types for 'vibeos_native_wait_until_context'
+   24 | extern "C" int vibeos_native_wait_until_context(const void*, int (*)(void*), void*, int64_t) { return 0; }
+      |                ^
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/tests/../platform/vibeos-sync.h:30:5: note: previous declaration is here
+   30 | int vibeos_native_wait_until_context(void* key, int (*ready)(void*),
+      |     ^
+1 error generated.
+Traceback (most recent call last):
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-libc.py", line 29, in <module>
+    main()
+    ~~~~^^
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-libc.py", line 22, in main
+    subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror',
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        str(ROOT / 'tools/node-runtime/tests/native-libc-test.cc'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        str(work / 'libc.o'), '-o', str(work / 'test')], check=True)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 578, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror', '/Users/ziangwang/Sources/vibeos/tools/node-runtime/tests/native-libc-test.cc', '/var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/vibeos-native-libc-kbvc3cun/libc.o', '-o', '/var/folders/b3/k0rx2_y15cz8vmtjk1mw0c8r0000gn/T/vibeos-native-libc-kbvc3cun/test']' returned non-zero exit status 1.

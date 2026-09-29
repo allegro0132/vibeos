@@ -6,15 +6,47 @@
 #include "vibeos-process.h"
 #include "vibeos-files.h"
 #include "vibeos-time.h"
+#include "vibeos-env.h"
 #include <atomic>
 #include <cerrno>
 #include <fcntl.h>
 #include <cstring>
 #include <malloc.h>
+#include <limits>
 #include <stdlib.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+extern "C" char* getenv(const char* name) {
+  if (!name) return nullptr;
+  return const_cast<char*>(vibeos_native_env_get(name, strnlen(name, 256)));
+}
+extern "C" int setenv(const char* name, const char* value, int overwrite) {
+  if (!name || !value) { errno = EINVAL; return -1; }
+  int status = vibeos_native_env_set(name, strnlen(name, 256), value, strnlen(value, 4097), overwrite);
+  if (!status) return 0;
+  errno = status == -9 ? EINVAL : status == -20 ? E2BIG : ENOMEM;
+  return -1;
+}
+extern "C" int unsetenv(const char* name) {
+  if (!name) { errno = EINVAL; return -1; }
+  int status = vibeos_native_env_unset(name, strnlen(name, 256));
+  if (!status) return 0;
+  errno = status == -9 ? EINVAL : status == -20 ? E2BIG : ENOMEM;
+  return -1;
+}
+extern "C" char* _getenv_r(struct _reent*, const char* name) { return getenv(name); }
+extern "C" int _setenv_r(struct _reent* reent, const char* name, const char* value, int overwrite) {
+  int status = setenv(name, value, overwrite);
+  if (status && reent) reent->_errno = errno;
+  return status;
+}
+extern "C" int _unsetenv_r(struct _reent* reent, const char* name) {
+  int status = unsetenv(name);
+  if (status && reent) reent->_errno = errno;
+  return status;
+}
 
 extern "C" int _gettimeofday(struct timeval* value, void*) {
   if (!value) { errno = EFAULT; return -1; }
@@ -84,6 +116,9 @@ _READ_WRITE_RETURN_TYPE io_result(ptrdiff_t result) {
     case -12: errno = ELOOP; break;
     case -13: errno = ENOTSUP; break;
     case -14: errno = EMFILE; break;
+    case -16: errno = ENOMEM; break;
+    case -17: errno = EEXIST; break;
+    case -18: errno = ENOTEMPTY; break;
     default: errno = EIO; break;
   }
   return -1;
@@ -115,6 +150,46 @@ extern "C" int _fstat(int fd, struct stat* output) {
   value.st_blksize = 1024;
   *output = value;
   return 0;
+}
+extern "C" int _stat(const char* path, struct stat* output) {
+  if (!path || !output) { errno = EFAULT; return -1; }
+  vibeos_native_file_stat_t metadata;
+  const int result = vibeos_native_path_stat(path, strnlen(path, 4097), 1, &metadata);
+  if (result < 0) return static_cast<int>(io_result(result));
+  struct stat value = {};
+  if (metadata.file_id > std::numeric_limits<decltype(value.st_ino)>::max() ||
+      metadata.size > static_cast<uint64_t>(std::numeric_limits<decltype(value.st_size)>::max()) ||
+      metadata.links > std::numeric_limits<decltype(value.st_nlink)>::max()) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  switch (metadata.kind) {
+    case 2: value.st_mode = S_IFREG | 0444; break;
+    case 3: value.st_mode = S_IFDIR | 0555; break;
+    default: errno = ENOTSUP; return -1;
+  }
+  value.st_ino = metadata.file_id;
+  value.st_size = metadata.size;
+  value.st_nlink = metadata.links;
+  value.st_blksize = 1024;
+  *output = value;
+  return 0;
+}
+extern "C" int _link(const char*, const char*) {
+  // This native bridge has no granted hard-link creation operation yet.
+  errno = ENOTSUP;
+  return -1;
+}
+namespace {
+int sleep_pending(void*) { return 0; }
+}
+extern "C" unsigned sleep(unsigned seconds) {
+  if (!seconds) return 0;
+  const int result = vibeos_native_wait_until_context(
+      &seconds, sleep_pending, nullptr, static_cast<int64_t>(seconds) * 1000000);
+  if (result == 0) return 0; // The monotonic deadline elapsed.
+  errno = EIO;
+  return seconds;
 }
 extern "C" int _isatty(int fd) {
   const int kind = vibeos_native_fd_kind(fd);
@@ -163,7 +238,7 @@ extern "C" int _unlink(const char* path) {
 
 extern "C" int _open(const char* path, int flags, int) {
   if (!path) { errno = EFAULT; return -1; }
-  const uint32_t mode = flags == O_RDONLY ? 0 : 1;
+  const uint32_t mode = vibeos_native_open_mode(flags);
   return static_cast<int>(io_result(vibeos_native_open(path, strnlen(path, 4097), mode)));
 }
 

@@ -1,0 +1,11 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "libuv"
+  ],
+  "exit_code": 2,
+  "seconds": 3.0350458750035614,
+  "runtime_acceptance": "NOT_RUN"
+}

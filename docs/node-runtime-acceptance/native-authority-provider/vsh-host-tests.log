@@ -1,0 +1,93 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+   Compiling vibeos-vsh v0.1.0 (/Users/ziangwang/Sources/vibeos/components/vsh)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1.33s
+     Running tests/vsh.rs (target/debug/build/vibeos-vsh/16ce616f21330aea/out/vsh-16ce616f21330aea)
+
+running 33 tests
+test capability_path_root_is_lexical_and_tail_remains_structured ... ok
+test async_host_command_waits_for_object_read_and_captures_output ... ok
+test background_cancel_joins_and_releases_the_job ... ok
+test parser_preserves_capability_value_separation_and_quotes ... ok
+test dropping_session_cancels_all_background_tasks ... ok
+test capability_command_retains_full_wasi_exit_detail ... ok
+test capability_command_guard_observes_revocation_during_invocation ... ok
+test completion_candidates_follow_session_commands_and_functions ... ok
+test s5_command_substitution_is_bounded_isolated_and_not_reparsed ... ok
+test expanded_text_cannot_forge_capability ... ok
+test foreground_console_streams_prompts_input_eof_and_cancellation ... ok
+test s5_parser_builds_control_function_and_substitution_nodes ... ok
+test lsblk_lists_only_delegatable_session_block_ranges ... ok
+test parent_revocation_and_ctrl_c_path_fail_closed ... ok
+test prepared_pipeline_rejects_a_foreign_session_without_publishing_stages ... ok
+test retained_native_authority_cannot_outlive_cancelled_job ... ok
+test s4_vertical_echo_wc_pipeline ... ok
+test capability_path_admission_is_complete_before_stage_start ... ok
+test ssh_exec_validation_rejects_every_non_simple_form ... ok
+test s5_function_recursion_and_capability_revalidation_fail_closed ... ok
+test s5_if_while_and_function_scopes_are_bounded_and_local ... ok
+test s5_nested_script_cannot_launder_ambient_authority ... ok
+test s5_read_only_script_artifact_has_an_exact_authority_manifest ... ok
+test s5_while_iteration_budget_returns_typed_failure ... ok
+test shutdown_cancels_and_joins_all_background_tasks ... ok
+test ssh_exec_api_rejects_an_interactive_session ... ok
+test ssh_exec_literal_input_is_bounded_and_remains_literal ... ok
+test ssh_exec_profile_installs_only_the_explicit_command_allowlist ... ok
+test streaming_console_does_not_steal_command_substitution_output ... ok
+test typed_pipefail_prefers_fault_and_denial ... ok
+test unknown_later_stage_executes_nothing ... ok
+test value_and_job_special_forms_are_session_local ... ok
+test wrong_kind_and_missing_grant_fail_during_admission ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+

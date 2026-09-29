@@ -1,0 +1,66 @@
+--- a/src/node_process_methods.cc
++++ b/src/node_process_methods.cc
+@@ -31,9 +31,6 @@
+ #define umask _umask
+ typedef int mode_t;
+ #else
+-#include <pthread.h>
+-#include <sys/resource.h>  // getrlimit, setrlimit
+-#include <termios.h>  // tcgetattr, tcsetattr
+ #include <unistd.h>
+ #endif
+ 
+@@ -267,6 +264,9 @@
+ }
+ 
+ static void Umask(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  return Environment::GetCurrent(args)->ThrowUVException(UV_ENOTSUP, "umask");
++#else
+   Environment* env = Environment::GetCurrent(args);
+   CHECK(env->has_run_bootstrapping_code());
+   CHECK_EQ(args.Length(), 1);
+@@ -283,6 +283,7 @@
+   }
+ 
+   args.GetReturnValue().Set(old);
++#endif
+ }
+ 
+ static void Uptime(const FunctionCallbackInfo<Value>& args) {
+@@ -392,6 +393,9 @@
+ 
+ #ifdef __POSIX__
+ static void DebugProcess(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  return Environment::GetCurrent(args)->ThrowUVException(UV_ENOTSUP, "debugProcess");
++#else
+   Environment* env = Environment::GetCurrent(args);
+ 
+   if (args.Length() < 1) {
+@@ -405,6 +409,7 @@
+   if (r != 0) {
+     return env->ThrowErrnoException(errno, "kill");
+   }
++#endif
+ }
+ #endif  // __POSIX__
+ 
+@@ -522,6 +527,9 @@
+ }
+ 
+ static void Execve(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  return Environment::GetCurrent(args)->ThrowUVException(UV_ENOTSUP, "execve");
++#else
+   Environment* env = Environment::GetCurrent(args);
+   Isolate* isolate = env->isolate();
+   Local<Context> context = env->context();
+@@ -597,6 +605,7 @@
+       isolate, context, error_message.c_str(), message, true);
+   FPrintF(stderr, "%s\n", info);
+   ABORT();
++#endif
+ }
+ #endif
+ 

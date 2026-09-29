@@ -1,0 +1,19 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo "module.exports = 42" | write @home/project/dep.cjs
+@sleep 0.3
+echo "console.log('VSH_NODE_' + 'FILE=' + require('./dep.cjs'))" | write @home/project/main.cjs
+@sleep 0.3
+node --root @home/project -e "console.log('VSH_NODE_' + 'EVAL=' + (1 + 2))"
+@sleep 0.3
+node --root @home/project main.cjs
+@sleep 0.3
+echo stream-input | node --root @home/project -e "process.stdin.setEncoding('utf8'); let s=''; process.stdin.on('data', x => s += x); process.stdin.on('end', () => console.log('VSH_NODE_' + 'STDIN=' + s.trim()))"
+@sleep 0.3
+node --root @home/project -e "const fs=require('fs'); fs.writeFileSync('out.txt','saved'); console.log('VSH_NODE_' + 'FS=' + fs.readFileSync('out.txt','utf8'))"
+@sleep 0.3
+node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'TIMER=done'), 10)"
+@sleep 1
+@quit

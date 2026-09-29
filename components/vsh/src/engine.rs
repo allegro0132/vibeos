@@ -4480,6 +4480,28 @@ impl CapabilityCommandContext {
                 && space.rights_of(source).is_ok_and(|r| r.contains(rights))
         }
     }
+    /// Retain a bounded resource lookup for a supervised native runtime. Each
+    /// call revalidates the job, command and source capability before obtaining
+    /// an invocation lease. No CSpace lock is retained during resource I/O.
+    pub fn resource_lease_provider<T: Resource>(
+        &self,
+        source: Cap,
+        maximum: Rights,
+    ) -> impl Fn(Rights) -> Result<InvocationLease<T>, Status> + Send + Sync + 'static {
+        let space = self.cspace.clone();
+        let command = self.command;
+        let live = self.job.live.clone();
+        move |requested| {
+            if !maximum.contains(requested) || !live.load(Ordering::Acquire) {
+                return Err(Status::Denied);
+            }
+            let space = space.lock();
+            if !space.rights_of(command).is_ok_and(|r| r.contains(Rights::INVOKE)) {
+                return Err(Status::Denied);
+            }
+            space.lookup_lease::<T>(source, requested).map_err(|_| Status::Denied)
+        }
+    }
     pub fn cancelled(&self) -> bool {
         !self.job.live.load(Ordering::Acquire)
     }

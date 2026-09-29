@@ -141,9 +141,21 @@ impl NamespaceState {
         path: &RelPath,
         follow_final: bool,
     ) -> Result<(FileId, Vec<String>), FileError> {
+        self.resolve_canonical_from(ROOT_FILE_ID, path, follow_final)
+    }
+
+    fn resolve_canonical_from(
+        &self,
+        boundary: FileId,
+        path: &RelPath,
+        follow_final: bool,
+    ) -> Result<(FileId, Vec<String>), FileError> {
+        if self.inodes.get(&boundary).ok_or(FileError::NotFound)?.file_type != FileType::Directory {
+            return Err(FileError::NotDirectory);
+        }
         let mut pending = path.components().to_vec();
         let mut resolved_names: Vec<String> = Vec::new();
-        let mut current = ROOT_FILE_ID;
+        let mut current = boundary;
         let mut followed = 0usize;
         let mut index = 0usize;
         while index < pending.len() {
@@ -167,7 +179,7 @@ impl NamespaceState {
                 replacement.extend_from_slice(&pending[index + 1..]);
                 pending = RelPath::from_components(replacement)?.components().to_vec();
                 resolved_names.clear();
-                current = ROOT_FILE_ID;
+                current = boundary;
                 index = 0;
                 continue;
             }
@@ -181,6 +193,26 @@ impl NamespaceState {
     fn resolve(&self, path: &RelPath, follow_final: bool) -> Result<FileId, FileError> {
         self.resolve_canonical(path, follow_final)
             .map(|value| value.0)
+    }
+
+    fn admit_file_id(&self, boundary: FileId, id: FileId) -> Result<(), FileError> {
+        if !self.inodes.contains_key(&id) { return Err(FileError::NotFound); }
+        if boundary == ROOT_FILE_ID || id == boundary { return Ok(()); }
+        // Do not follow symlinks. A file identity must have a real directory
+        // entry below the boundary; existing hard links retain inode semantics.
+        let mut directories = alloc::vec![boundary];
+        let mut visited = BTreeSet::new();
+        while let Some(directory) = directories.pop() {
+            if !visited.insert(directory) { continue; }
+            for ((parent, _), child) in &self.dirents {
+                if *parent != directory { continue; }
+                if *child == id { return Ok(()); }
+                if self.inodes.get(child).is_some_and(|inode| inode.file_type == FileType::Directory) {
+                    directories.push(*child);
+                }
+            }
+        }
+        Err(FileError::EscapeRoot)
     }
 
     /// Link counts of every inode in one pass over the directory entries:
@@ -247,9 +279,26 @@ impl NamespaceState {
 #[derive(Clone)]
 pub struct FsSnapshotLease {
     state: Arc<NamespaceState>,
+    boundary: FileId,
 }
 
 impl FsSnapshotLease {
+    /// Pin a directory as this snapshot's namespace boundary. Symbolic links
+    /// are resolved relative to that boundary, including links encountered in
+    /// intermediate components. This is an immutable read view, not new
+    /// mutation authority or a live capability: callers must still revalidate
+    /// their source capability before admitting a later operation.
+    pub fn directory(&self, path: &RelPath) -> Result<Self, FileError> {
+        let boundary = self.resolve(path, true)?;
+        if self.state.metadata(boundary)?.file_type != FileType::Directory {
+            return Err(FileError::NotDirectory);
+        }
+        Ok(Self { state: self.state.clone(), boundary })
+    }
+    fn resolve(&self, path: &RelPath, follow_final: bool) -> Result<FileId, FileError> {
+        self.state.resolve_canonical_from(self.boundary, path, follow_final).map(|v| v.0)
+    }
+
     pub fn namespace(&self) -> u128 {
         self.state.namespace
     }
@@ -257,10 +306,10 @@ impl FsSnapshotLease {
         self.state.generation
     }
     pub fn stat(&self, path: &RelPath, follow_final: bool) -> Result<Metadata, FileError> {
-        self.state.metadata(self.state.resolve(path, follow_final)?)
+        self.state.metadata(self.resolve(path, follow_final)?)
     }
     pub fn readlink(&self, path: &RelPath) -> Result<&str, FileError> {
-        let id = self.state.resolve(path, false)?;
+        let id = self.resolve(path, false)?;
         match &self
             .state
             .inodes
@@ -273,7 +322,7 @@ impl FsSnapshotLease {
         }
     }
     pub fn read_chunks(&self, path: &RelPath) -> Result<impl Iterator<Item = &[u8]>, FileError> {
-        let id = self.state.resolve(path, true)?;
+        let id = self.resolve(path, true)?;
         match &self
             .state
             .inodes
@@ -287,7 +336,7 @@ impl FsSnapshotLease {
         }
     }
     pub fn read_owned_chunks(&self, path: &RelPath) -> Result<Vec<Arc<[u8]>>, FileError> {
-        let id = self.state.resolve(path, true)?;
+        let id = self.resolve(path, true)?;
         match &self
             .state
             .inodes
@@ -304,7 +353,7 @@ impl FsSnapshotLease {
         &self,
         path: &RelPath,
     ) -> Result<vibeos_segment_store::FsPersistentData, FileError> {
-        let id = self.state.resolve(path, true)?;
+        let id = self.resolve(path, true)?;
         match &self
             .state
             .inodes
@@ -318,7 +367,7 @@ impl FsSnapshotLease {
         }
     }
     pub fn canonical_path(&self, path: &RelPath) -> Result<String, FileError> {
-        let (_, components) = self.state.resolve_canonical(path, true)?;
+        let (_, components) = self.state.resolve_canonical_from(self.boundary, path, true)?;
         Ok(components.join("/"))
     }
     pub fn list(
@@ -326,7 +375,7 @@ impl FsSnapshotLease {
         path: &RelPath,
         follow_final: bool,
     ) -> Result<Vec<(String, Metadata)>, FileError> {
-        let id = self.state.resolve(path, follow_final)?;
+        let id = self.resolve(path, follow_final)?;
         if self
             .state
             .inodes
@@ -473,6 +522,7 @@ impl FsContentStager {
 /// the only way a task can obtain a snapshot or start a writer.
 pub struct FileTreeRoot {
     inner: Arc<FileTreeInner>,
+    boundary: FileId,
 }
 
 struct FileTreeInner {
@@ -534,6 +584,7 @@ impl FileTreeRoot {
             return Err(FileError::InvalidPath);
         }
         Ok(Self {
+            boundary: ROOT_FILE_ID,
             inner: Arc::new(FileTreeInner {
                 state: SpinLock::new(Arc::new(NamespaceState::empty(namespace))),
                 persistent_root: SpinLock::new(None),
@@ -542,6 +593,16 @@ impl FileTreeRoot {
                 backend: None,
             }),
         })
+    }
+    /// Share the live namespace while confining all reads and transactions to
+    /// a directory identity. The caller supplies capability authorization;
+    /// this view itself neither mints nor extends authority.
+    pub fn directory(&self, path: &RelPath) -> Result<Self, FileError> {
+        let snapshot = self.snapshot().directory(path)?;
+        Ok(Self { inner: self.inner.clone(), boundary: snapshot.boundary })
+    }
+    fn resolve_in(&self, snapshot: &NamespaceState, path: &RelPath, follow_final: bool) -> Result<FileId, FileError> {
+        snapshot.resolve_canonical_from(self.boundary, path, follow_final).map(|v| v.0)
     }
     pub fn attach_backend(&mut self, backend: Arc<dyn FileTreeBackend>) -> Result<(), FileError> {
         let inner = Arc::get_mut(&mut self.inner).ok_or(FileError::Busy)?;
@@ -553,6 +614,7 @@ impl FileTreeRoot {
     }
     pub fn snapshot(&self) -> FsSnapshotLease {
         FsSnapshotLease {
+            boundary: self.boundary,
             state: self.inner.state.lock().clone(),
         }
     }
@@ -563,6 +625,7 @@ impl FileTreeRoot {
     pub fn regular_reader(&self, path: &RelPath) -> Result<(Metadata, FsFileReader), FileError> {
         let snapshot = self.inner.state.lock().clone();
         let lease = FsSnapshotLease {
+            boundary: self.boundary,
             state: snapshot.clone(),
         };
         let metadata = lease.stat(path, false)?;
@@ -576,12 +639,33 @@ impl FileTreeRoot {
     pub fn reader(&self, path: &RelPath) -> Result<FsFileReader, FileError> {
         self.reader_in(self.inner.state.lock().clone(), path)
     }
+    /// Follow capability-contained symlinks, pinning metadata and bytes from
+    /// the same namespace generation. Unlike regular_reader this admits links.
+    pub fn resolved_regular_reader(&self, path: &RelPath) -> Result<(Metadata, FsFileReader), FileError> {
+        let snapshot = self.inner.state.lock().clone();
+        let metadata = FsSnapshotLease { state: snapshot.clone(), boundary: self.boundary }.stat(path, true)?;
+        if metadata.file_type == FileType::Directory { return Err(FileError::IsDirectory); }
+        if metadata.file_type != FileType::Regular { return Err(FileError::InvalidType); }
+        Ok((metadata, self.reader_in(snapshot, path)?))
+    }
+    /// Obtain current content for an identity already admitted from this root.
+    pub fn regular_reader_by_id(&self, id: FileId) -> Result<(Metadata, FsFileReader), FileError> {
+        let snapshot = self.inner.state.lock().clone();
+        let metadata = snapshot.metadata(id)?;
+        let reader = self.reader_id_in(snapshot, id)?;
+        Ok((metadata, reader))
+    }
+
     fn reader_in(
         &self,
         snapshot: Arc<NamespaceState>,
         path: &RelPath,
     ) -> Result<FsFileReader, FileError> {
-        let id = snapshot.resolve(path, true)?;
+        let id = self.resolve_in(&snapshot, path, true)?;
+        self.reader_id_in(snapshot, id)
+    }
+    fn reader_id_in(&self, snapshot: Arc<NamespaceState>, id: FileId) -> Result<FsFileReader, FileError> {
+        snapshot.admit_file_id(self.boundary, id)?;
         match &snapshot.inodes.get(&id).ok_or(FileError::NotFound)?.content {
             Content::File(chunks) => Ok(FsFileReader {
                 source: FsFileReaderSource::Volatile(chunks.clone()),
@@ -605,13 +689,14 @@ impl FileTreeRoot {
         path: &RelPath,
         append: bool,
     ) -> Result<FsContentStager, FileError> {
+        let snapshot = self.inner.state.lock().clone();
+        self.resolve_in(&snapshot, &RelPath::root(), true)?;
         let backend = self
             .inner
             .backend
             .clone()
             .ok_or(FileError::ServiceUnavailable)?;
-        let snapshot = self.inner.state.lock().clone();
-        let tail = match snapshot.resolve(path, true) {
+        let tail = match self.resolve_in(&snapshot, path, true) {
             Ok(id) => {
                 let inode = snapshot.inodes.get(&id).ok_or(FileError::NotFound)?;
                 if inode.file_type == FileType::Directory {
@@ -630,7 +715,7 @@ impl FileTreeRoot {
                 }
             }
             Err(FileError::NotFound) => {
-                if snapshot.resolve(path, false).is_ok() {
+                if self.resolve_in(&snapshot, path, false).is_ok() {
                     return Err(FileError::NotFound);
                 }
                 None
@@ -654,11 +739,24 @@ impl FileTreeRoot {
             .map_err(|_| FileError::FileIdExhausted)?;
         self.begin_with_claim(0, token)
     }
+    /// Observe an authoritative generation only when no publication is pending.
+    /// Completed writes already awaited the selected backend's commit policy.
+    /// This adds no persistence guarantee to an intentionally volatile root.
+    pub fn completed_generation(&self) -> Result<u64, FileError> {
+        // Match commit's state -> writer lock order. Keep the publication
+        // snapshot stable while checking its writer claim.
+        let state = self.inner.state.lock();
+        self.resolve_in(&state, &RelPath::root(), true)?;
+        let writer = self.inner.writer_claim.lock();
+        if writer.is_some() { return Err(FileError::Busy); }
+        Ok(state.generation)
+    }
     pub fn begin_with_claim(&self, owner: u64, token: u64) -> Result<FsTransaction, FileError> {
         if token == 0 {
             return Err(FileError::InvalidPath);
         }
         let snapshot = self.inner.state.lock().clone();
+        self.resolve_in(&snapshot, &RelPath::root(), true)?;
         let previous_root = self.inner.persistent_root.lock().clone();
         let claim = FileWriterClaim {
             owner,
@@ -677,6 +775,7 @@ impl FileTreeRoot {
             previous_root,
             base_generation: snapshot.generation,
             working: (*snapshot).clone(),
+            boundary: self.boundary,
             edits: 0,
             committed: false,
             cancellation: None,
@@ -724,12 +823,30 @@ pub struct FsTransaction {
     previous_root: Option<vibeos_segment_store::FsPersistentRoot>,
     base_generation: u64,
     working: NamespaceState,
+    boundary: FileId,
     edits: usize,
     committed: bool,
     cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl FsTransaction {
+    /// Narrow an unmodified transaction to one directory in its pinned working
+    /// generation. Publication still commits the shared namespace atomically.
+    /// Consuming self prevents accidental reuse of an unrestricted transaction
+    /// after failed admission. Previously staged edits cannot be smuggled in.
+    pub fn into_directory(mut self, path: &RelPath) -> Result<Self, FileError> {
+        if self.edits != 0 { return Err(FileError::Conflict); }
+        let boundary = self.resolve(path, true)?;
+        if self.working.inodes.get(&boundary).ok_or(FileError::NotFound)?.file_type != FileType::Directory {
+            return Err(FileError::NotDirectory);
+        }
+        self.boundary = boundary;
+        Ok(self)
+    }
+    fn resolve(&self, path: &RelPath, follow_final: bool) -> Result<FileId, FileError> {
+        self.working.resolve_canonical_from(self.boundary, path, follow_final).map(|v| v.0)
+    }
+
     /// Recheck cancellation after backend waits, before entering the atomic
     /// root-publication operation. Once publication starts it completes atomically.
     pub fn cancel_on(&mut self, flag: Arc<AtomicBool>) {
@@ -785,7 +902,7 @@ impl FsTransaction {
     }
     fn parent(&self, path: &RelPath) -> Result<(FileId, String), FileError> {
         let (parent, name) = path.parent_and_name()?;
-        let id = self.working.resolve(&parent, true)?;
+        let id = self.resolve(&parent, true)?;
         if self
             .working
             .inodes
@@ -813,7 +930,7 @@ impl FsTransaction {
             self.working.dirents.insert((parent, name), id);
             return Ok(());
         }
-        let mut current = ROOT_FILE_ID;
+        let mut current = self.boundary;
         for name in path.components() {
             if let Some(id) = self.working.dirents.get(&(current, name.clone())).copied() {
                 if self
@@ -840,6 +957,84 @@ impl FsTransaction {
         }
         Ok(())
     }
+    /// Resolve a regular file inside this transaction's unpublished generation.
+    pub fn regular_file_id(&self, path: &RelPath) -> Result<FileId, FileError> {
+        let id = self.resolve(path, true)?;
+        match self.working.metadata(id)?.file_type {
+            FileType::Regular => Ok(id),
+            FileType::Directory => Err(FileError::IsDirectory),
+            FileType::Symlink => Err(FileError::InvalidType),
+        }
+    }
+
+    /// Update an already-admitted file identity, independent of its current name.
+    /// Callers must obtain the ID from this root and enforce their capability.
+    /// Publication remains explicit; aborting the transaction discards the edit.
+    pub async fn write_file_range(
+        &mut self, id: FileId, offset: u64, bytes: &[u8],
+    ) -> Result<(), FileError> {
+        let offset = usize::try_from(offset).map_err(|_| FileError::BudgetExceeded)?;
+        let end = offset.checked_add(bytes.len()).ok_or(FileError::BudgetExceeded)?;
+        let mut data = self.file_bytes(id).await?;
+        if bytes.is_empty() { return Ok(()); }
+        if end > data.len() {
+            data.try_reserve(end - data.len()).map_err(|_| FileError::BudgetExceeded)?;
+            data.resize(end, 0);
+        }
+        data[offset..end].copy_from_slice(bytes);
+        self.replace_file_bytes(id, &data)
+    }
+
+    /// Preserve inode identity and hard links while shrinking or zero-extending.
+    pub async fn truncate_file(&mut self, id: FileId, length: u64) -> Result<(), FileError> {
+        let length = usize::try_from(length).map_err(|_| FileError::BudgetExceeded)?;
+        let mut data = self.file_bytes(id).await?;
+        if length > data.len() {
+            data.try_reserve(length - data.len()).map_err(|_| FileError::BudgetExceeded)?;
+        }
+        data.resize(length, 0);
+        self.replace_file_bytes(id, &data)
+    }
+
+    async fn file_bytes(&self, id: FileId) -> Result<Vec<u8>, FileError> {
+        self.working.admit_file_id(self.boundary, id)?;
+        let inode = self.working.inodes.get(&id).ok_or(FileError::NotFound)?;
+        let source = match &inode.content {
+            Content::File(chunks) => FsFileReaderSource::Volatile(chunks.clone()),
+            Content::PersistentFile(data) => FsFileReaderSource::Persistent {
+                backend: self.root.backend.clone().ok_or(FileError::ServiceUnavailable)?,
+                data: data.clone(),
+            },
+            Content::None => return Err(FileError::IsDirectory),
+            Content::Symlink(_) => return Err(FileError::InvalidType),
+        };
+        let expected = usize::try_from(self.working.metadata(id)?.size)
+            .map_err(|_| FileError::BudgetExceeded)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve(expected).map_err(|_| FileError::BudgetExceeded)?;
+        let reader = FsFileReader { source };
+        for index in 0..reader.chunk_count() {
+            let chunk = reader.read_chunk(index).await?.ok_or(FileError::ServiceUnavailable)?;
+            if chunk.len() > expected - bytes.len() { return Err(FileError::ServiceUnavailable); }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.len() != expected { return Err(FileError::ServiceUnavailable); }
+        Ok(bytes)
+    }
+
+    fn replace_file_bytes(&mut self, id: FileId, bytes: &[u8]) -> Result<(), FileError> {
+        let count = bytes.len().div_ceil(DATA_CHUNK_SIZE);
+        let mut chunks = Vec::new();
+        chunks.try_reserve(count).map_err(|_| FileError::BudgetExceeded)?;
+        for chunk in bytes.chunks(DATA_CHUNK_SIZE) { chunks.push(Arc::<[u8]>::from(chunk)); }
+        let generation = self.next_generation()?;
+        self.charge(1)?;
+        let inode = self.working.inodes.get_mut(&id).ok_or(FileError::NotFound)?;
+        inode.content = Content::File(chunks);
+        inode.change_generation = generation;
+        Ok(())
+    }
+
     pub fn write_chunks<I, B>(
         &mut self,
         path: &RelPath,
@@ -867,7 +1062,7 @@ impl FsTransaction {
             data.push(Arc::<[u8]>::from(pending));
         }
         let generation = self.next_generation()?;
-        match self.working.resolve(path, true) {
+        match self.resolve(path, true) {
             Ok(id) => {
                 self.charge(1)?;
                 let inode = self
@@ -948,7 +1143,7 @@ impl FsTransaction {
                     .collect(),
             ),
         };
-        match self.working.resolve(path, true) {
+        match self.resolve(path, true) {
             Ok(id) => {
                 self.charge(1)?;
                 let inode = self
@@ -1007,7 +1202,7 @@ impl FsTransaction {
         destination: &RelPath,
         follow: bool,
     ) -> Result<(), FileError> {
-        let source_id = self.working.resolve(source, follow)?;
+        let source_id = self.resolve(source, follow)?;
         if self
             .working
             .inodes
@@ -1035,7 +1230,7 @@ impl FsTransaction {
         follow_source_symlink: bool,
         follow_all_symlinks: bool,
     ) -> Result<(), FileError> {
-        let source_id = source.state.resolve(source_path, follow_source_symlink)?;
+        let source_id = source.resolve(source_path, follow_source_symlink)?;
         let (parent, name) = self.parent(destination)?;
         let generation = self.next_generation()?;
         let source_inode = source
@@ -1085,6 +1280,7 @@ impl FsTransaction {
         fn clone_inode(
             tx: &mut FsTransaction,
             source: &NamespaceState,
+            boundary: FileId,
             source_id: FileId,
             source_path: &RelPath,
             parent: FileId,
@@ -1122,13 +1318,14 @@ impl FsTransaction {
                 for (child_name, child_id) in children {
                     let child_path = source_path.joined_name(&child_name)?;
                     let child_id = if follow_all_symlinks {
-                        source.resolve(&child_path, true)?
+                        source.resolve_canonical_from(boundary, &child_path, true)?.0
                     } else {
                         child_id
                     };
                     clone_inode(
                         tx,
                         source,
+                        boundary,
                         child_id,
                         &child_path,
                         new_id,
@@ -1146,6 +1343,7 @@ impl FsTransaction {
         clone_inode(
             self,
             &source.state,
+            source.boundary,
             source_id,
             source_path,
             parent,
@@ -1261,7 +1459,7 @@ impl FsTransaction {
             .is_some_and(|i| i.file_type == FileType::Directory)
         {
             let mut cursor = dp;
-            while cursor != ROOT_FILE_ID {
+            while cursor != self.boundary {
                 if cursor == source_id {
                     return Err(FileError::EscapeRoot);
                 }
@@ -1306,8 +1504,242 @@ impl Drop for FsTransaction {
 mod tests {
     use super::*;
 
+    #[test]
+    fn completed_generation_rejects_pending_publication() {
+        let root = FileTreeRoot::new_empty(901).unwrap();
+        let initial = root.completed_generation().unwrap();
+        let transaction = root.begin().unwrap();
+        assert_eq!(root.completed_generation(), Err(FileError::Busy));
+        drop(transaction);
+        assert_eq!(root.completed_generation(), Ok(initial));
+        let mut transaction = root.begin().unwrap();
+        transaction.write_chunks(&RelPath::parse("synced").unwrap(), [b"ok".as_slice()], false).unwrap();
+        assert_eq!(root.completed_generation(), Err(FileError::Busy));
+        let committed = transaction.commit().unwrap();
+        assert!(committed > initial);
+        assert_eq!(root.completed_generation(), Ok(committed));
+        assert_eq!(root.snapshot().generation(), committed);
+    }
+
     fn path(value: &str) -> RelPath {
         RelPath::parse(value).unwrap()
+    }
+
+    fn ready<T>(future: impl core::future::Future<Output = T>) -> T {
+        let mut future = core::pin::pin!(future);
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            core::task::Poll::Ready(value) => value,
+            core::task::Poll::Pending => panic!("volatile test unexpectedly suspended"),
+        }
+    }
+
+    #[test]
+    fn live_directory_view_shares_commits_without_exposing_siblings() {
+        let root = FileTreeRoot::new_empty(915).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&path("project"), false).unwrap();
+        tx.write_chunks(&path("secret"), [b"outside"], false).unwrap();
+        tx.write_chunks(&path("project/value"), [b"initial"], false).unwrap();
+        tx.symlink("../secret", &path("project/escape")).unwrap();
+        tx.commit().unwrap();
+        let outside = root.snapshot().stat(&path("secret"), true).unwrap().file_id;
+        let view = root.directory(&path("project")).unwrap();
+        assert!(matches!(view.reader(&path("escape")), Err(FileError::EscapeRoot)));
+        assert!(matches!(view.regular_reader_by_id(outside), Err(FileError::EscapeRoot)));
+        let mut tx = view.begin().unwrap();
+        // An independently granted source snapshot may be an ancestor of this
+        // view; preserve the copy-into-descendant rejection across boundaries.
+        assert_eq!(tx.copy_from(&root.snapshot(), &RelPath::root(), &path("recursive"), true, true, true),
+                   Err(FileError::EscapeRoot));
+        tx.write_chunks(&path("value"), [b"changed"], false).unwrap();
+        tx.mkdir(&path("nested"), false).unwrap();
+        assert_eq!(ready(tx.truncate_file(outside, 0)), Err(FileError::EscapeRoot));
+        tx.commit().unwrap();
+        assert_eq!(root.snapshot().read_chunks(&path("project/value")).unwrap().flatten().copied().collect::<Vec<_>>(), b"changed");
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("project/value"), [b"parent-change"], false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(view.resolved_regular_reader(&path("value")).unwrap().0.size, 13);
+        let mut tx = root.begin().unwrap();
+        tx.remove(&path("project"), true, false).unwrap();
+        tx.mkdir(&path("project"), false).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(view.begin(), Err(FileError::NotFound)));
+        assert!(matches!(view.begin_content_stager(&path("new"), false), Err(FileError::NotFound)));
+        assert_eq!(view.snapshot().stat(&RelPath::root(), true), Err(FileError::NotFound));
+        assert_eq!(root.snapshot().read_chunks(&path("secret")).unwrap().flatten().copied().collect::<Vec<_>>(), b"outside");
+    }
+
+    #[test]
+    fn directory_transaction_confines_mutations_and_inode_access() {
+        let root = FileTreeRoot::new_empty(913).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&path("project"), false).unwrap();
+        tx.mkdir(&path("outside"), false).unwrap();
+        tx.write_chunks(&path("outside/value"), [b"protected"], false).unwrap();
+        tx.write_chunks(&path("project/value"), [b"inside"], false).unwrap();
+        tx.symlink("../outside", &path("project/escape")).unwrap();
+        tx.symlink("value", &path("project/local")).unwrap();
+        tx.commit().unwrap();
+        let outside = root.snapshot().stat(&path("outside/value"), true).unwrap().file_id;
+        let mut tx = root.begin().unwrap().into_directory(&path("project")).unwrap();
+        assert_eq!(tx.write_chunks(&path("escape/value"), [b"bad"], false), Err(FileError::EscapeRoot));
+        assert_eq!(tx.mkdir(&path("escape/new"), false), Err(FileError::EscapeRoot));
+        assert_eq!(tx.rename(&path("value"), &path("escape/moved"), false), Err(FileError::EscapeRoot));
+        assert_eq!(tx.hard_link(&path("escape/value"), &path("alias"), true), Err(FileError::EscapeRoot));
+        assert_eq!(ready(tx.write_file_range(outside, 0, b"bad")), Err(FileError::EscapeRoot));
+        assert_eq!(ready(tx.truncate_file(outside, 0)), Err(FileError::EscapeRoot));
+        assert_eq!(tx.remove(&RelPath::root(), true, false), Err(FileError::RootProtected));
+        tx.mkdir(&path("sub/deep"), true).unwrap();
+        tx.write_chunks(&path("local"), [b"updated"], false).unwrap();
+        let inside = tx.regular_file_id(&path("value")).unwrap();
+        tx.rename(&path("value"), &path("sub/value"), false).unwrap();
+        ready(tx.write_file_range(inside, 0, b"OK")).unwrap();
+        ready(tx.truncate_file(inside, 2)).unwrap();
+        tx.remove(&path("escape"), false, false).unwrap();
+        tx.commit().unwrap();
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.read_chunks(&path("outside/value")).unwrap().flatten().copied().collect::<Vec<_>>(), b"protected");
+        assert_eq!(snapshot.read_chunks(&path("project/sub/value")).unwrap().flatten().copied().collect::<Vec<_>>(), b"OK");
+        assert_eq!(snapshot.stat(&path("sub"), true), Err(FileError::NotFound));
+        assert_eq!(snapshot.stat(&path("project/escape"), false), Err(FileError::NotFound));
+    }
+
+    #[test]
+    fn narrowing_transaction_rejects_prior_edits_and_cannot_widen() {
+        let root = FileTreeRoot::new_empty(914).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&path("project/sub"), true).unwrap();
+        tx.write_chunks(&path("project/value"), [b"keep"], false).unwrap();
+        tx.commit().unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("outside"), [b"discard"], false).unwrap();
+        assert!(matches!(tx.into_directory(&path("project")), Err(FileError::Conflict)));
+        assert_eq!(root.snapshot().stat(&path("outside"), true), Err(FileError::NotFound));
+        let parent_id = root.snapshot().stat(&path("project/value"), true).unwrap().file_id;
+        let mut tx = root.begin().unwrap().into_directory(&path("project")).unwrap()
+            .into_directory(&path("sub")).unwrap().into_directory(&RelPath::root()).unwrap();
+        assert_eq!(ready(tx.truncate_file(parent_id, 0)), Err(FileError::EscapeRoot));
+        tx.write_chunks(&path("new"), [b"nested"], false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(root.snapshot().read_chunks(&path("project/sub/new")).unwrap().flatten().copied().collect::<Vec<_>>(), b"nested");
+        assert_eq!(root.snapshot().read_chunks(&path("project/value")).unwrap().flatten().copied().collect::<Vec<_>>(), b"keep");
+    }
+
+    #[test]
+    fn directory_snapshot_confines_links_and_hides_parent_names() {
+        let root = FileTreeRoot::new_empty(910).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&path("project/sub"), true).unwrap();
+        tx.write_chunks(&path("secret"), [b"outside"], false).unwrap();
+        tx.write_chunks(&path("project/value"), [b"inside"], false).unwrap();
+        tx.symlink("../value", &path("project/sub/local")).unwrap();
+        tx.symlink("../secret", &path("project/escape")).unwrap();
+        assert_eq!(tx.symlink("/secret", &path("project/absolute")), Err(FileError::EscapeRoot));
+        tx.symlink("../../secret", &path("project/sub/escape")).unwrap();
+        tx.symlink("escape", &path("project/chain")).unwrap();
+        tx.commit().unwrap();
+        let full = root.snapshot();
+        let scoped = full.directory(&path("project")).unwrap();
+        assert_eq!(scoped.stat(&RelPath::root(), true).unwrap().file_id,
+                   full.stat(&path("project"), true).unwrap().file_id);
+        assert_eq!(scoped.canonical_path(&path("sub/local")).unwrap(), "value");
+        assert_eq!(scoped.read_chunks(&path("sub/local")).unwrap().flatten().copied().collect::<Vec<_>>(), b"inside");
+        assert_eq!(scoped.stat(&path("secret"), true), Err(FileError::NotFound));
+        for selector in ["escape", "sub/escape", "chain", "escape/child"] {
+            assert_eq!(scoped.stat(&path(selector), true), Err(FileError::EscapeRoot));
+            assert_eq!(scoped.canonical_path(&path(selector)), Err(FileError::EscapeRoot));
+            assert!(scoped.read_chunks(&path(selector)).is_err());
+        }
+        assert_eq!(scoped.readlink(&path("escape")).unwrap(), "../secret");
+        assert_eq!(scoped.stat(&path("escape"), false).unwrap().file_type, FileType::Symlink);
+        assert!(!scoped.list(&RelPath::root(), true).unwrap().iter().any(|(name, _)| name == "secret"));
+        let nested = scoped.directory(&path("sub")).unwrap();
+        assert_eq!(nested.stat(&path("local"), true), Err(FileError::EscapeRoot));
+        assert!(matches!(scoped.directory(&path("value")), Err(FileError::NotDirectory)));
+        // Pinning does not accidentally switch to a replacement directory.
+        let mut tx = root.begin().unwrap();
+        tx.rename(&path("project"), &path("moved"), false).unwrap();
+        tx.mkdir(&path("project"), false).unwrap();
+        tx.write_chunks(&path("project/value"), [b"replacement"], false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(scoped.read_chunks(&path("value")).unwrap().flatten().copied().collect::<Vec<_>>(), b"inside");
+    }
+
+    #[test]
+    fn recursive_copy_preserves_source_snapshot_boundary() {
+        let source = FileTreeRoot::new_empty(911).unwrap();
+        let destination = FileTreeRoot::new_empty(912).unwrap();
+        let mut tx = source.begin().unwrap();
+        tx.mkdir(&path("project/sub"), true).unwrap();
+        tx.write_chunks(&path("secret"), [b"outside"], false).unwrap();
+        tx.write_chunks(&path("project/value"), [b"inside"], false).unwrap();
+        tx.symlink("../value", &path("project/sub/local")).unwrap();
+        tx.symlink("../../secret", &path("project/sub/escape")).unwrap();
+        tx.commit().unwrap();
+        let scoped = source.snapshot().directory(&path("project")).unwrap();
+        let mut tx = destination.begin().unwrap();
+        assert_eq!(tx.copy_from(&scoped, &path("sub"), &path("copy"), true, true, true),
+                   Err(FileError::EscapeRoot));
+        drop(tx);
+        assert_eq!(destination.snapshot().stat(&path("copy"), true), Err(FileError::NotFound));
+        let mut tx = destination.begin().unwrap();
+        tx.copy_from(&scoped, &path("sub/local"), &path("safe"), false, true, true).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(destination.snapshot().read_chunks(&path("safe")).unwrap().flatten().copied().collect::<Vec<_>>(), b"inside");
+    }
+
+    #[test]
+    fn range_write_preserves_identity_across_rename_and_hardlinks() {
+        let root = FileTreeRoot::new_empty(901).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("old"), [b"abcdef"], false).unwrap();
+        tx.hard_link(&path("old"), &path("alias"), true).unwrap();
+        tx.commit().unwrap();
+        let pinned = root.snapshot();
+        let id = pinned.stat(&path("old"), true).unwrap().file_id;
+        let mut tx = root.begin().unwrap();
+        tx.rename(&path("old"), &path("new"), false).unwrap();
+        tx.write_chunks(&path("old"), [b"unrelated"], false).unwrap();
+        ready(tx.write_file_range(id, 2, b"XY")).unwrap();
+        tx.commit().unwrap();
+        let snapshot = root.snapshot();
+        for name in ["new", "alias"] {
+            assert_eq!(snapshot.read_chunks(&path(name)).unwrap().flatten().copied().collect::<Vec<_>>(), b"abXYef");
+            assert_eq!(snapshot.stat(&path(name), true).unwrap().file_id, id);
+        }
+        assert_eq!(snapshot.read_chunks(&path("old")).unwrap().flatten().copied().collect::<Vec<_>>(), b"unrelated");
+        assert_eq!(pinned.read_chunks(&path("old")).unwrap().flatten().copied().collect::<Vec<_>>(), b"abcdef");
+        let mut tx = root.begin().unwrap();
+        ready(tx.truncate_file(id, 1)).unwrap();
+        drop(tx);
+        assert_eq!(root.snapshot().stat(&path("new"), true).unwrap().size, 6);
+    }
+
+    #[test]
+    fn range_write_zero_fills_and_truncates_across_chunks() {
+        let root = FileTreeRoot::new_empty(902).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("file"), [b"abc"], false).unwrap();
+        tx.commit().unwrap();
+        let id = root.snapshot().stat(&path("file"), true).unwrap().file_id;
+        let mut tx = root.begin().unwrap();
+        ready(tx.write_file_range(id, 4095, b"XYZ")).unwrap();
+        ready(tx.write_file_range(id, u64::MAX, b"overflow")).unwrap_err();
+        tx.commit().unwrap();
+        let bytes = root.snapshot().read_chunks(&path("file")).unwrap().flatten().copied().collect::<Vec<_>>();
+        assert_eq!(&bytes[..3], b"abc");
+        assert!(bytes[3..4095].iter().all(|b| *b == 0));
+        assert_eq!(&bytes[4095..], b"XYZ");
+        let mut tx = root.begin().unwrap();
+        ready(tx.truncate_file(id, 2)).unwrap();
+        ready(tx.truncate_file(id, 5)).unwrap();
+        ready(tx.write_file_range(id, 100, b"")).unwrap();
+        assert_eq!(ready(tx.write_file_range(ROOT_FILE_ID, 0, b"x")), Err(FileError::IsDirectory));
+        assert_eq!(ready(tx.truncate_file(u64::MAX, 0)), Err(FileError::NotFound));
+        tx.commit().unwrap();
+        assert_eq!(root.snapshot().read_chunks(&path("file")).unwrap().flatten().copied().collect::<Vec<_>>(), b"ab\0\0\0");
     }
 
     #[test]
@@ -1410,6 +1842,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             b"ok"
         );
+    }
+
+    #[test]
+    fn resolved_reader_pins_metadata_and_bytes_across_replacement() {
+        let root = FileTreeRoot::new_empty(42).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("target"), [b"old"], false).unwrap();
+        tx.symlink("target", &path("alias")).unwrap();
+        tx.symlink("loop", &path("loop")).unwrap();
+        tx.commit().unwrap();
+        assert!(root.regular_reader(&path("alias")).is_err());
+        let (metadata, reader) = root.resolved_regular_reader(&path("alias")).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path("target"), [b"longer new value"], false).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(metadata.size, 3);
+        let mut read = core::pin::pin!(reader.read_chunk(0));
+        let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+        assert_eq!(read.as_mut().poll(&mut cx), core::task::Poll::Ready(Ok(Some(b"old".to_vec()))));
+        assert_eq!(root.resolved_regular_reader(&path("alias")).unwrap().0.size, 16);
+        assert!(matches!(root.resolved_regular_reader(&path("loop")), Err(FileError::SymlinkLoop)));
+        assert!(matches!(root.resolved_regular_reader(&RelPath::root()), Err(FileError::IsDirectory)));
     }
 
     #[test]

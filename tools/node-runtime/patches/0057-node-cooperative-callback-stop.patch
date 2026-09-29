@@ -1,0 +1,43 @@
+--- a/src/env-inl.h
++++ b/src/env-inl.h
+@@ -27,6 +27,9 @@
+ #include "aliased_buffer-inl.h"
+ #include "callback_queue-inl.h"
+ #include "env.h"
++#if defined(__vibeos__)
++#include "../deps/uv/src/vibeos/vibeos-process.h"
++#endif
+ #include "node.h"
+ #include "node_context_data.h"
+ #include "node_internals.h"
+@@ -608,6 +611,11 @@
+ }
+ 
+ inline bool Environment::can_call_into_js() const {
++#if defined(__vibeos__)
++  // Termination can reach a nested Node catcher before the embedder regains
++  // control. Never retry callbacks or drain JS queues after grant cancellation.
++  if (vibeos_native_is_cancelled()) return false;
++#endif
+   return can_call_into_js_ && !is_stopping();
+ }
+ 
+--- a/src/api/callback.cc
++++ b/src/api/callback.cc
+@@ -118,6 +118,16 @@
+   // async id stack or pop the topmost one from it
+ 
+   auto perform_stopping_check = [&]() {
++#if defined(__vibeos__)
++    // A V8 budget checkpoint unwinds through Node's callback scopes. Mark the
++    // environment stopped before those scopes attempt async-hooks cleanup;
++    // terminated execution may already have cleared the JS async-id stack.
++    // The embedder still owns normal environment disposal after uv_run returns.
++    if (vibeos_native_is_cancelled()) {
++      env_->set_stopping(true);
++      env_->set_can_call_into_js(false);
++    }
++#endif
+     if (env_->is_stopping()) {
+       MarkAsFailed();
+       env_->async_hooks()->clear_async_id_stack();

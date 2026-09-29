@@ -1,0 +1,7 @@
+[
+  "uv_fs_ftruncate",
+  "uv_fs_mkdir",
+  "uv_fs_rename",
+  "uv_fs_rmdir",
+  "uv_fs_scandir"
+]

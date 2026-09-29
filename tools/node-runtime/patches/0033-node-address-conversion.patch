@@ -1,0 +1,33 @@
+--- a/src/node_sockaddr-inl.h
++++ b/src/node_sockaddr-inl.h
+@@ -31,7 +31,11 @@
+ 
+ bool SocketAddress::is_numeric_host(const char* hostname, int family) {
+   in6_addr dst;
++#if defined(__vibeos__)
++  return uv_inet_pton(family, hostname, &dst) == 0;
++#else
+   return inet_pton(family, hostname, &dst) == 1;
++#endif
+ }
+ 
+ int SocketAddress::GetPort(const sockaddr* addr) {
+--- a/deps/uv/include/uv/vibeos.h
++++ b/deps/uv/include/uv/vibeos.h
+@@ -60,6 +60,16 @@
+   return value;
+ #endif
+ }
++static inline uint16_t ntohs(uint16_t value) { return htons(value); }
++static inline uint32_t htonl(uint32_t value) {
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++  return __builtin_bswap32(value);
++#else
++  return value;
++#endif
++}
++static inline uint32_t ntohl(uint32_t value) { return htonl(value); }
++
+ 
+ #define AF_UNSPEC 0
+ #define AF_INET 2

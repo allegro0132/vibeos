@@ -12,14 +12,19 @@ def main():
         # macOS has no newlib malloc.h. Declare only the injected allocator.
         (work / 'malloc.h').write_text(
             '#include <stddef.h>\nextern "C" void *memalign(size_t, size_t);\n')
+        (work / 'reent-test.h').write_text('struct _reent { int _errno; };\n')
         subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror',
             '-I' + str(work), '-I' + str(ROOT / 'tools/node-runtime/platform'),
+            '-include', str(work / 'reent-test.h'),
+            '-Dgetenv=vibeos_test_getenv', '-Dsetenv=vibeos_test_setenv',
+            '-Dunsetenv=vibeos_test_unsetenv',
             '-D_READ_WRITE_RETURN_TYPE=ssize_t', '-D_exit=vibeos_test_exit',
             '-Dposix_memalign=vibeos_test_posix_memalign',
             '-Dmemalign=vibeos_test_memalign', '-c',
             str(ROOT / 'tools/node-runtime/platform/platform-vibeos-libc.cc'),
             '-o', str(work / 'libc.o')], check=True)
         subprocess.run(['c++', '-std=c++20', '-Wall', '-Wextra', '-Werror',
+            '-include', str(work / 'reent-test.h'),
             str(ROOT / 'tools/node-runtime/tests/native-libc-test.cc'),
             str(work / 'libc.o'), '-o', str(work / 'test')], check=True)
         subprocess.run([str(work / 'test')], check=True)

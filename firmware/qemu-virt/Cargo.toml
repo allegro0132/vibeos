@@ -6,6 +6,8 @@ build = "build.rs"
 
 [features]
 node-runtime = ["vibeos-kernel/node-runtime", "vibeos-bsp-qemu-virt/node-runtime"]
+node-runtime-gate = ["node-runtime", "vibeos-kernel/node-runtime-gate"]
+native-uv-probe = ["node-runtime-gate", "vibeos-kernel/native-uv-probe"]
 native-exit-probe = ["vibeos-kernel/native-exit-probe"]
 native-cxx-probe = ["vibeos-kernel/native-cxx-probe"]
 native-call-probe = ["vibeos-kernel/native-call-probe"]

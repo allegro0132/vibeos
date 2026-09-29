@@ -941,11 +941,16 @@ fn wait_for_authority_loss(ctx: vsh::CapabilityCommandContext) -> vsh::Capabilit
             return Err(Status::Faulted);
         };
         let check = ctx.authority_check(root, Rights::READ);
+        let lookup = ctx.resource_lease_provider::<TestFileRoot>(root, Rights::READ);
         assert!(check());
+        assert!(lookup(Rights::READ).is_ok());
+        assert!(matches!(lookup(Rights::WRITE), Err(Status::Denied)));
         AUTHORITY_CHECK_STARTED.store(true, std::sync::atomic::Ordering::Release);
         while check() {
+            drop(lookup(Rights::READ).expect("authority still live"));
             exec::yield_now().await;
         }
+        assert!(matches!(lookup(Rights::READ), Err(Status::Denied)));
         Err(Status::Denied)
     })
 }
@@ -1104,4 +1109,37 @@ fn streaming_console_does_not_steal_command_substitution_output() {
     exec::run_until_idle(100_000);
     assert!(task.try_exit().is_some());
     assert_eq!(*platform.output.lock().unwrap(), "asecretb\n");
+}
+
+static RETAINED_NATIVE_AUTHORITY: Mutex<Option<Box<dyn Fn() -> bool + Send + Sync>>> = Mutex::new(None);
+fn retain_native_authority(ctx: vsh::CapabilityCommandContext) -> vsh::CapabilityCommandFuture {
+    Box::pin(async move {
+        let vsh::ResolvedArgument::CapabilityPath { root, .. } = ctx.args[0] else {
+            return Err(Status::Faulted);
+        };
+        let lookup = ctx.resource_lease_provider::<TestFileRoot>(root, Rights::READ);
+        *RETAINED_NATIVE_AUTHORITY.lock().unwrap() = Some(Box::new(move || lookup(Rights::READ).is_ok()));
+        while !ctx.cancelled() { exec::yield_now().await; }
+        Err(Status::Cancelled)
+    })
+}
+
+#[test]
+fn retained_native_authority_cannot_outlive_cancelled_job() {
+    let _serial = SERIAL.lock().unwrap();
+    *RETAINED_NATIVE_AUTHORITY.lock().unwrap() = None;
+    let mut session = Session::new();
+    session.install_capability_host_command("native-lease", 1, 1,
+        vsh::StreamMode::Closed, read_path_planner, retain_native_authority);
+    session.install_capability("home", Arc::new(TestFileRoot),
+        Rights::READ.union(Rights::GRANT).union(Rights::REVOKE)).unwrap();
+    let (session, admitted) = execute(session, "native-lease @home/project &");
+    assert_eq!(admitted.unwrap()[0].output, "[%1]\n");
+    assert!(RETAINED_NATIVE_AUTHORITY.lock().unwrap().as_ref().unwrap()());
+    let (session, cancelled) = execute(session, "cancel %1");
+    assert!(cancelled.unwrap().is_empty());
+    assert!(!RETAINED_NATIVE_AUTHORITY.lock().unwrap().as_ref().unwrap()());
+    let (_, waited) = execute(session, "wait %1");
+    assert_eq!(waited.unwrap()[0].status, Status::Cancelled);
+    *RETAINED_NATIVE_AUTHORITY.lock().unwrap() = None;
 }

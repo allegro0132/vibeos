@@ -158,6 +158,7 @@ pub struct CommandIo {
     cancel_reason: AtomicU8,
     terminal: SpinLock<Option<WasiTerminal>>,
     completed: SpinLock<Option<Waker>>,
+    cancellation_observer: SpinLock<Option<Waker>>,
 }
 impl Default for CommandIo {
     fn default() -> Self {
@@ -174,10 +175,25 @@ impl CommandIo {
             cancel_reason: AtomicU8::new(0),
             terminal: SpinLock::new(None),
             completed: SpinLock::new(None),
+            cancellation_observer: SpinLock::new(None),
         }
     }
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Acquire)
+    }
+    /// Register the invocation runner, including when it is waiting outside a
+    /// standard stream. Registration and cancellation cannot lose a wakeup.
+    /// The observer must own its state, never borrow a suspended native stack.
+    pub fn watch_cancellation(&self, waker: Waker) {
+        let mut observer = self.cancellation_observer.lock();
+        if self.cancelled() {
+            drop(observer);
+            waker.wake();
+        } else {
+            let old = observer.replace(waker);
+            drop(observer);
+            drop(old);
+        }
     }
     pub fn cancel(&self) {
         self.cancel_with_reason(1);
@@ -193,11 +209,15 @@ impl CommandIo {
             .cancel_reason
             .compare_exchange(0, reason, Ordering::AcqRel, Ordering::Acquire);
         self.cancel.store(true, Ordering::Release);
+        let observer = self.cancellation_observer.lock().take();
+        if let Some(waker) = observer { waker.wake(); }
         self.stdin.close();
         self.stdout.close();
         self.stderr.close();
     }
     pub fn complete(&self, t: WasiTerminal) {
+        let observer = self.cancellation_observer.lock().take();
+        drop(observer);
         let mut terminal = self.terminal.lock();
         if terminal.is_none() {
             *terminal = Some(t);
@@ -551,6 +571,29 @@ mod tests {
     fn counting_waker() -> (Arc<CountingWake>, Waker) {
         let count = Arc::new(CountingWake(core::sync::atomic::AtomicUsize::new(0)));
         (count.clone(), Waker::from(count))
+    }
+    #[test]
+    fn cancellation_wakes_idle_runner_before_or_after_registration() {
+        let io = CommandIo::new();
+        let (before, waker) = counting_waker();
+        io.watch_cancellation(waker);
+        io.deny();
+        io.cancel();
+        assert!(io.denied());
+        assert_eq!(before.0.load(Ordering::SeqCst), 1);
+        let (after, waker) = counting_waker();
+        io.watch_cancellation(waker);
+        assert_eq!(after.0.load(Ordering::SeqCst), 1);
+        assert!(io.cancellation_observer.lock().is_none());
+    }
+    #[test]
+    fn completion_releases_idle_runner_observer() {
+        let io = CommandIo::new();
+        let (observer, waker) = counting_waker();
+        io.watch_cancellation(waker);
+        io.complete(WasiTerminal::Denied);
+        assert!(io.cancellation_observer.lock().is_none());
+        assert_eq!(Arc::strong_count(&observer), 1);
     }
     /// Several guest threads block on one full stdout pipe; draining it must
     /// wake every one of them, not only the last to register.

@@ -35,9 +35,9 @@ def main() -> int:
     pending = bytearray()
 
     with args.log.open("wb") as log:
-        def wait_for_prompt(timeout: float, label: str) -> None:
+        def wait_for_prompt(timeout: float, label: str, marker: bytes = b"vsh> ") -> None:
             deadline = time.monotonic() + timeout
-            while b"vsh> " not in pending:
+            while marker not in pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"timed out waiting for VSH prompt after {label}")
@@ -52,7 +52,7 @@ def main() -> int:
                 pending.extend(chunk)
                 if len(pending) > 1 << 20:
                     del pending[: len(pending) - (1 << 20)]
-            del pending[: pending.index(b"vsh> ") + len(b"vsh> ")]
+            del pending[: pending.index(marker) + len(marker)]
 
         try:
             wait_for_prompt(args.boot_timeout, "boot")
@@ -64,6 +64,18 @@ def main() -> int:
                     continue
                 if raw == "@quit":
                     break
+                if raw.startswith("@send "):
+                    process.stdin.write(raw.removeprefix("@send ").encode("utf-8") + b"\n")
+                    process.stdin.flush()
+                    continue
+                if raw.startswith("@expect "):
+                    wait_for_prompt(args.command_timeout, raw, raw.removeprefix("@expect ").encode("utf-8"))
+                    continue
+                if raw == "@ctrl-c":
+                    process.stdin.write(b"\x03")
+                    process.stdin.flush()
+                    wait_for_prompt(args.command_timeout, raw)
+                    continue
                 process.stdin.write(raw.encode("utf-8") + b"\n")
                 process.stdin.flush()
                 wait_for_prompt(args.command_timeout, repr(raw))

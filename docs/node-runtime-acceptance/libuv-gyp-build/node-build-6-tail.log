@@ -1,0 +1,65 @@
+tools/v8_gypfiles/v8_inspector_headers.target.mk:13: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/js_protocol.stamp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:13: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/js_protocol.stamp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Forward.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Forward.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Protocol.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Protocol.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Protocol.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Protocol.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Console.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/HeapProfiler.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Profiler.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.cpp'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/src/inspector/protocol/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Debugger.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Runtime.h'
+tools/v8_gypfiles/v8_inspector_headers.target.mk:26: warning: overriding commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+tools/v8_gypfiles/v8_inspector_headers.host.mk:26: warning: ignoring old commands for target `/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj/gen/inspector-generated-output-root/include/inspector/Schema.h'
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/async_resource.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/callback.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/embed_helpers.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/encoding.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/environment.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/exceptions.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/hooks.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/api/utils.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/async_context_frame.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/async_wrap.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/base_object.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/cares_wrap.o
+  CXX(target) /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/cleanup_queue.o
+../src/cares_wrap.cc:36:6: error: variable or field 'RegisterExternalReferences' declared void
+   36 | void RegisterExternalReferences(ExternalReferenceRegistry*) {}
+      |      ^~~~~~~~~~~~~~~~~~~~~~~~~~
+../src/cares_wrap.cc:36:33: error: 'ExternalReferenceRegistry' was not declared in this scope
+   36 | void RegisterExternalReferences(ExternalReferenceRegistry*) {}
+      |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~
+../src/cares_wrap.cc:36:59: error: expected primary-expression before ')' token
+   36 | void RegisterExternalReferences(ExternalReferenceRegistry*) {}
+      |                                                           ^
+../src/cares_wrap.cc:39:32: error: expected constructor, destructor, or type conversion before '(' token
+   39 | NODE_BINDING_EXTERNAL_REFERENCE(cares_wrap, node::cares_wrap::RegisterExternalReferences)
+      |                                ^
+make: *** [/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/cares_wrap.o] Error 1
+make: *** Waiting for unfinished jobs....

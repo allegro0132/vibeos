@@ -1,0 +1,5 @@
+{
+  "patch_sha256": "d0c1b5f57d14b12e3c114e3e2b9e1d7e7fe649921fa4de8497a59cd5a901df4f",
+  "exit_code": 0,
+  "stdout": "patching file 'src/node_wasi.cc'\npatching file node.gypi\npatching file 'src/node_metadata.cc'\n"
+}

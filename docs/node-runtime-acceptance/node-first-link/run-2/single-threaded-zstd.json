@@ -1,0 +1,10 @@
+{
+  "deps/zstd/zstd.target.mk": {
+    "sha256": "d8b55cfd285b32b21429a69bcb4b9ac4a537e6e5948b4fdbf2a51e81504174cf",
+    "zstd_multithread_absent": true
+  },
+  "libnode.target.mk": {
+    "sha256": "698e0fca801f443a2a0120dad1fa04b977091f2f12861e6b576d00d1b535287f",
+    "zstd_multithread_absent": true
+  }
+}

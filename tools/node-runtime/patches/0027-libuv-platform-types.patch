@@ -1,0 +1,185 @@
+--- a/deps/uv/include/uv/unix.h
++++ b/deps/uv/include/uv/unix.h
+@@ -25,6 +25,9 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <fcntl.h>
++#if defined(__vibeos__)
++#include "uv/vibeos.h"
++#else
+ #include <dirent.h>
+ 
+ #include <sys/socket.h>
+@@ -42,6 +45,8 @@
+ #endif
+ #include <pthread.h>
+ #include <signal.h>
++
++#endif /* __vibeos__ */
+ 
+ #include "uv/threadpool.h"
+ 
+@@ -127,6 +132,7 @@
+ typedef int uv_os_fd_t;
+ typedef pid_t uv_pid_t;
+ 
++#if !defined(__vibeos__)
+ #define UV_ONCE_INIT PTHREAD_ONCE_INIT
+ 
+ typedef pthread_once_t uv_once_t;
+@@ -160,6 +166,8 @@
+ #else
+ typedef pthread_barrier_t uv_barrier_t;
+ #endif
++
++#endif /* !__vibeos__ */
+ 
+ /* Platform-specific definitions for uv_spawn support. */
+ typedef gid_t uv_gid_t;
+@@ -379,9 +387,14 @@
+ #define UV_WORK_PRIVATE_FIELDS                                                \
+   struct uv__work work_req;
+ 
++#if defined(__vibeos__)
++#define UV_TTY_PRIVATE_FIELDS int mode;
++#else
+ #define UV_TTY_PRIVATE_FIELDS                                                 \
+   struct termios orig_termios;                                                \
+   int mode;
++
++#endif
+ 
+ #define UV_SIGNAL_PRIVATE_FIELDS                                              \
+   /* RB_ENTRY(uv_signal_s) tree_entry; */                                     \
+--- /dev/null
++++ b/deps/uv/include/uv/vibeos.h
+@@ -0,0 +1,70 @@
++/* VibeOS types for the bundled libuv port. No POSIX syscall implementation.
++ * Socket address layouts permit upstream public declarations and pure address
++ * conversion; actual network, process and terminal operations remain unsupported.
++ */
++#ifndef UV_VIBEOS_H
++#define UV_VIBEOS_H
++
++#include <stdint.h>
++#include <sys/types.h>
++
++#define UV_ONCE_INIT {0}
++typedef struct { unsigned state; } uv_once_t;
++typedef uintptr_t uv_thread_t;
++typedef struct { void* semaphore; } uv_mutex_t;
++typedef struct { void* semaphore; } uv_rwlock_t;
++typedef struct { void* semaphore; } uv_sem_t;
++typedef struct { uint64_t generation; } uv_cond_t;
++typedef struct { uintptr_t slot; } uv_key_t;
++struct _uv_barrier {
++  uv_mutex_t mutex;
++  uv_cond_t cond;
++  unsigned threshold;
++  unsigned in;
++  unsigned out;
++};
++typedef struct { struct _uv_barrier* b; } uv_barrier_t;
++
++/* No ambient directory iterator is exposed by the native runtime. */
++typedef struct vibeos_uv_dir DIR;
++/* Owned records for the capability-backed scandir implementation. */
++struct dirent { unsigned char d_type; char d_name[]; };
++struct addrinfo;
++
++typedef uint16_t sa_family_t;
++struct sockaddr { sa_family_t sa_family; char sa_data[14]; };
++struct sockaddr_storage {
++  sa_family_t ss_family;
++  unsigned char padding[118];
++  uint64_t alignment;
++};
++struct in_addr { uint32_t s_addr; };
++struct in6_addr { unsigned char s6_addr[16]; };
++struct sockaddr_in {
++  sa_family_t sin_family;
++  uint16_t sin_port;
++  struct in_addr sin_addr;
++  unsigned char sin_zero[8];
++};
++struct sockaddr_in6 {
++  sa_family_t sin6_family;
++  uint16_t sin6_port;
++  uint32_t sin6_flowinfo;
++  struct in6_addr sin6_addr;
++  uint32_t sin6_scope_id;
++};
++static inline uint16_t htons(uint16_t value) {
++#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++  return __builtin_bswap16(value);
++#else
++  return value;
++#endif
++}
++
++#define AF_UNSPEC 0
++#define AF_INET 2
++#define AF_INET6 10
++#define INET_ADDRSTRLEN 16
++#define INET6_ADDRSTRLEN 46
++
++#endif
+--- a/deps/uv/src/uv-common.c
++++ b/deps/uv/src/uv-common.c
+@@ -32,7 +32,7 @@
+ 
+ #if defined(_WIN32)
+ # include <malloc.h> /* malloc */
+-#else
++#elif !defined(__vibeos__)
+ # include <net/if.h> /* if_nametoindex */
+ # include <sys/un.h> /* AF_UNIX, sockaddr_un */
+ #endif
+@@ -286,7 +286,9 @@
+ 
+     zone_index++; /* skip '%' */
+     /* NOTE: unknown interface (id=0) is silently ignored */
+-#ifdef _WIN32
++#if defined(__vibeos__)
++    return UV_ENOTSUP; /* No ambient interface namespace. */
++#elif defined(_WIN32)
+     addr->sin6_scope_id = atoi(zone_index);
+ #else
+     addr->sin6_scope_id = if_nametoindex(zone_index);
+@@ -653,11 +655,23 @@
+ }
+ 
+ int uv_recv_buffer_size(uv_handle_t* handle, int* value) {
++#if defined(__vibeos__)
++  (void) handle;
++  (void) value;
++  return UV_ENOTSUP;
++#else
+   return uv__socket_sockopt(handle, SO_RCVBUF, value);
++#endif
+ }
+ 
+ int uv_send_buffer_size(uv_handle_t* handle, int *value) {
++#if defined(__vibeos__)
++  (void) handle;
++  (void) value;
++  return UV_ENOTSUP;
++#else
+   return uv__socket_sockopt(handle, SO_SNDBUF, value);
++#endif
+ }
+ 
+ int uv_fs_event_getpath(uv_fs_event_t* handle, char* buffer, size_t* size) {
+--- a/deps/uv/src/strscpy.c
++++ b/deps/uv/src/strscpy.c
+@@ -21,6 +21,10 @@
+ 
+ #include "strscpy.h"
+ #include <limits.h>  /* SSIZE_MAX */
++#if defined(__vibeos__) && !defined(SSIZE_MAX)
++/* The pinned RV64 newlib ABI uses signed pointer-width ssize_t. */
++# define SSIZE_MAX __PTRDIFF_MAX__
++#endif
+ 
+ ssize_t uv__strscpy(char* d, const char* s, size_t n) {
+   size_t i;

@@ -1,0 +1,5 @@
+{
+  "reason": "Fixture allocated a second native stack while main gate stack was reserved. Single native stack admission rejected it; stopped the known fatal case using SIGINT. Fixed fixture ordering instead of relaxing admission.",
+  "session_exit_code": 130,
+  "runtime_acceptance": "FAIL"
+}

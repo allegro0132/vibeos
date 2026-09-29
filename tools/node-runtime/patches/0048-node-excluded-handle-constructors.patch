@@ -1,0 +1,57 @@
+--- a/src/process_wrap.cc
++++ b/src/process_wrap.cc
+@@ -90,6 +90,16 @@
+     // normal function.
+     CHECK(args.IsConstructCall());
+     Environment* env = Environment::GetCurrent(args);
++#if defined(__vibeos__)
++    auto* isolate = args.GetIsolate();
++    auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++        isolate, "VibeOS does not support child processes")).As<v8::Object>();
++    error->Set(isolate->GetCurrentContext(),
++        v8::String::NewFromUtf8Literal(isolate, "code"),
++        v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++    isolate->ThrowException(error);
++    return;
++#endif
+     new ProcessWrap(env, args.This());
+   }
+ 
+--- a/src/signal_wrap.cc
++++ b/src/signal_wrap.cc
+@@ -82,6 +82,16 @@
+     // normal function.
+     CHECK(args.IsConstructCall());
+     Environment* env = Environment::GetCurrent(args);
++#if defined(__vibeos__)
++    auto* isolate = args.GetIsolate();
++    auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++        isolate, "VibeOS does not support host signal handlers")).As<v8::Object>();
++    error->Set(isolate->GetCurrentContext(),
++        v8::String::NewFromUtf8Literal(isolate, "code"),
++        v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++    isolate->ThrowException(error);
++    return;
++#endif
+     new SignalWrap(env, args.This());
+   }
+ 
+--- a/src/node_stat_watcher.cc
++++ b/src/node_stat_watcher.cc
+@@ -98,6 +98,16 @@
+ 
+ void StatWatcher::New(const FunctionCallbackInfo<Value>& args) {
+   CHECK(args.IsConstructCall());
++#if defined(__vibeos__)
++  auto* isolate = args.GetIsolate();
++  auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++      isolate, "VibeOS does not support file polling")).As<v8::Object>();
++  error->Set(isolate->GetCurrentContext(),
++      v8::String::NewFromUtf8Literal(isolate, "code"),
++      v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  isolate->ThrowException(error);
++  return;
++#endif
+   fs::BindingData* binding_data = Realm::GetBindingData<fs::BindingData>(args);
+   new StatWatcher(binding_data, args.This(), args[0]->IsTrue());
+ }

@@ -1,0 +1,14 @@
+--- a/deps/uv/include/uv/vibeos.h
++++ b/deps/uv/include/uv/vibeos.h
+@@ -28,6 +28,11 @@
+ /* No ambient directory iterator is exposed by the native runtime. */
+ typedef struct vibeos_uv_dir DIR;
+ /* Owned records for the capability-backed scandir implementation. */
++// Values owned by the VibeOS directory bridge.
++#define DT_UNKNOWN 0
++#define DT_REG 8
++#define DT_DIR 4
++#define DT_LNK 10
+ struct dirent { unsigned char d_type; char d_name[]; };
+ struct addrinfo;
+ 

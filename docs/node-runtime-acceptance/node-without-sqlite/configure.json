@@ -1,0 +1,22 @@
+{
+  "command": [
+    "python3",
+    "configure.py",
+    "--dest-os=vibeos",
+    "--dest-cpu=riscv64",
+    "--cross-compiling",
+    "--without-intl",
+    "--without-ssl",
+    "--without-inspector",
+    "--without-npm",
+    "--without-corepack",
+    "--without-amaro",
+    "--v8-lite-mode",
+    "--v8-options=--jitless",
+    "--without-node-snapshot",
+    "--without-sqlite"
+  ],
+  "exit_code": 0,
+  "seconds": 0.570208040997386,
+  "scope": "incremental development tree; runtime NOT_RUN"
+}

@@ -1,0 +1,66 @@
+--- a/src/node_wasi.cc
++++ b/src/node_wasi.cc
+@@ -1,3 +1,22 @@
++#if defined(__vibeos__)
++#include "node_binding.h"
++#include "v8.h"
++namespace node::wasi {
++// V8 WebAssembly is disabled. The esbuild transform service runs through
++// VibeOS's independent WASI executor, not through this Node binding.
++void InitializePreview1(v8::Local<v8::Object>, v8::Local<v8::Value>,
++                        v8::Local<v8::Context> context, void*) {
++  auto* isolate = context->GetIsolate();
++  auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++      isolate, "Node WASI requires WebAssembly, disabled in the VibeOS Node port"));
++  error.As<v8::Object>()->Set(context,
++      v8::String::NewFromUtf8Literal(isolate, "code"),
++      v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  isolate->ThrowException(error);
++}
++}  // namespace node::wasi
++NODE_BINDING_CONTEXT_AWARE_INTERNAL(wasi, node::wasi::InitializePreview1)
++#else
+ #include "node_wasi.h"
+ #include "base_object-inl.h"
+ #include "debug_utils-inl.h"
+@@ -1362,3 +1381,5 @@
+ }  // namespace node
+ 
+ NODE_BINDING_CONTEXT_AWARE_INTERNAL(wasi, node::wasi::InitializePreview1)
++
++#endif  // __vibeos__
+--- a/node.gypi
++++ b/node.gypi
+@@ -214,7 +214,7 @@
+       ],
+     }],
+ 
+-    [ 'node_shared_uvwasi=="false"', {
++    [ 'node_shared_uvwasi=="false" and OS!="vibeos"', {
+       'dependencies': [ 'deps/uvwasi/uvwasi.gyp:uvwasi' ],
+     }],
+ 
+--- a/src/node_metadata.cc
++++ b/src/node_metadata.cc
+@@ -19,7 +19,9 @@
+ #include "undici_version.h"
+ #include "util.h"
+ #include "uv.h"
++#if !defined(__vibeos__)
+ #include "uvwasi.h"
++#endif
+ #include "v8.h"
+ #include "zstd.h"
+ 
+@@ -134,7 +136,11 @@
+ 
+   acorn = ACORN_VERSION;
+   merve = MERVE_VERSION;
++#if defined(__vibeos__)
++  uvwasi = "disabled-vibeos";
++#else
+   uvwasi = UVWASI_VERSION_STRING;
++#endif
+   zstd = ZSTD_VERSION_STRING;
+ 
+ #ifndef NODE_SHARED_BUILTIN_AMARO_DIST_INDEX_PATH

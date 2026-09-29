@@ -1,0 +1,4 @@
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c: In function 'uv__fs_get_dirent_type':
+/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/deps/uv/src/uv-common.c:784:55: warning: unused parameter 'dent' [-Wunused-parameter]
+  784 | uv_dirent_type_t uv__fs_get_dirent_type(uv__dirent_t* dent) {
+      |                                         ~~~~~~~~~~~~~~^~~~

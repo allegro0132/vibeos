@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-v8-gate-qemu.py", line 177, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-v8-gate-qemu.py", line 27, in main
+    shutil.copyfile(args.kernel, kernel)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/lib/python3.14/shutil.py", line 313, in copyfile
+    with open(src, 'rb') as fsrc:
+         ~~~~^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'target/node-runtime/node-link-23/v8-gate.elf'

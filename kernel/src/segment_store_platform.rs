@@ -2750,6 +2750,13 @@ impl StorageV2Devices {
     }
 
     #[cfg(feature = "file-tree")]
+    pub(crate) fn admitted_home_file_tree(&self) -> Option<Arc<FileTreeRoot>> {
+        // Share the already recovered authoritative view. Do not recover a
+        // second writer or create a namespace as a side effect of SSH login.
+        self.home_file_tree.lock().clone()
+    }
+
+    #[cfg(feature = "file-tree")]
     pub(crate) async fn recover_file_tree_root(
         &self,
         namespace: u128,

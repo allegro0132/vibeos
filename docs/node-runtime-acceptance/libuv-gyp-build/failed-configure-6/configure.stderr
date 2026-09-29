@@ -1,0 +1,1 @@
+gyp: link_settings not allowed in the Debug configuration, found in target /Users/ziangwang/Sources/vibeos/target/node-runtime/native-qualified-6/source/node-v24.14.0/deps/uv/uv.gyp:libuv#target

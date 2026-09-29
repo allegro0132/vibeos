@@ -1923,6 +1923,26 @@ impl SshdPlatform for SshPlatform {
             crate::vsh_platform::install_remote_commands(session);
         }
     }
+    fn install_vsh_project_roots(&self, session: &mut vibeos_vsh::Session,
+                                 profile: AuthorizedProfile) {
+        #[cfg(all(feature = "node-runtime", feature = "file-tree", not(feature = "node-runtime-gate")))]
+        {
+            #[cfg(feature = "provisioned-command")]
+            let admitted = crate::ssh_provisioning::command_profile_current(profile);
+            #[cfg(not(feature = "provisioned-command"))]
+            let admitted = cfg!(feature = "ssh-test") && profile.profile.get() == 1 && profile.generation == 1;
+            if !admitted { return; }
+            let Some(root) = crate::world::world().storage_v2.as_ref()
+                .and_then(|storage| storage.admitted_home_file_tree()) else { return; };
+            // VSH needs GRANT to derive bounded per-command capabilities;
+            // command stages receive only their requested READ/WRITE rights.
+            // The remote session cannot revoke the shared home namespace.
+            let _ = session.install_capability("home", root,
+                Rights::READ.union(Rights::WRITE).union(Rights::GRANT));
+        }
+        #[cfg(not(all(feature = "node-runtime", feature = "file-tree", not(feature = "node-runtime-gate"))))]
+        let _ = (session, profile);
+    }
 
     fn install_ssh_exec_component_commands(
         &self,

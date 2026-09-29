@@ -52,7 +52,7 @@ def main():
         for name in ['runtime/riscv/src/bare.rs', 'kernel/src/lib.rs',
                      'kernel/Cargo.toml', 'firmware/qemu-virt/Cargo.toml',
                      'kernel/src/mmu.rs', 'kernel/src/trap.rs', 'kernel/src/native_call.rs',
-                     'kernel/src/native_files.rs', 'kernel/src/native_process.rs', 'kernel/src/native_stdio.rs', 'kernel/src/native_libc_heap.rs', 'kernel/src/native_clock.rs', 'kernel/src/wasi_clock.rs', 'kernel/src/native_entropy.rs', 'kernel/src/world.rs', 'kernel/src/native_semaphore.rs', 'kernel/src/native_wait.rs', 'kernel/src/native_notify.rs', 'kernel/src/native_memory.rs', 'kernel/src/native_page_pool.rs', 'kernel/src/native_pages.rs', 'kernel/src/native_tcb_pages.rs', 'kernel/src/native_tls.rs',
+                     'kernel/src/native_files.rs', 'kernel/src/native_env.rs', 'kernel/src/native_process.rs', 'kernel/src/native_stdio.rs', 'kernel/src/native_libc_heap.rs', 'kernel/src/native_clock.rs', 'kernel/src/wasi_clock.rs', 'kernel/src/native_entropy.rs', 'kernel/src/world.rs', 'kernel/src/native_semaphore.rs', 'kernel/src/native_wait.rs', 'kernel/src/native_notify.rs', 'kernel/src/native_memory.rs', 'kernel/src/native_page_pool.rs', 'kernel/src/native_pages.rs', 'kernel/src/native_tcb_pages.rs', 'kernel/src/native_tls.rs',
                      'firmware/qemu-virt/linker.ld', 'firmware/qemu-virt/build.rs',
                      'kernel/build.rs', 'tools/node-runtime/tests/native-cxx-probe.cc',
                      'tools/node-runtime/toolchain.lock.json',
@@ -67,6 +67,10 @@ def main():
             try:
                 while time.monotonic() - started < 60:
                     text = log.read_text(errors='replace')
+                    report['no_fatal'] = not any(marker in text.lower() for marker in
+                        ('panicked', 'fatal trap', 'native fatal exit'))
+                    if not report['no_fatal']:
+                        raise RuntimeError('native ABI regression reported a fatal failure; see serial.log')
                     pairs = {(int(p), int(l)) for p, l in re.findall(
                         r'NATIVE TLS identity physical=(\d+) logical=(\d+) PASS', text)}
                     if 'vsh> ' in text and not sent:

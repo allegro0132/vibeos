@@ -1,0 +1,355 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+warning: `vibeos-durable-format` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+warning: `vibeos-core` (lib) generated 1 warning (1 duplicate)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (2 duplicates)
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_tls.rs:55:26
+   |
+55 |         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                          ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+55 -         let id = NEXT_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+55 +         let id = NEXT_ID.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+ --> kernel/src/native_semaphore.rs:9:25
+  |
+9 |         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+  |                         ^^^^^^^^^^^^
+  |
+help: replace the use of the deprecated method
+  |
+9 -         if self.permits.fetch_update(Ordering::Release, Ordering::Relaxed,
+9 +         if self.permits.try_update(Ordering::Release, Ordering::Relaxed,
+  |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u32>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:15:22
+   |
+15 |         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+   |                      ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+15 -         self.permits.fetch_update(Ordering::Acquire, Ordering::Relaxed,
+15 +         self.permits.try_update(Ordering::Acquire, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_semaphore.rs:26:34
+   |
+26 |         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                  ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+26 -         let Ok(id) = NEXT_HANDLE.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+26 +         let Ok(id) = NEXT_HANDLE.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+  --> kernel/src/native_files.rs:66:36
+   |
+66 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                    ^^^^^^^^^^^^
+   |
+help: replace the use of the deprecated method
+   |
+66 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+66 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> kernel/src/native_files.rs:151:36
+    |
+151 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    |                                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+151 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+151 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+    |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> kernel/src/native_files.rs:607:36
+    |
+607 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    |                                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+607 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+607 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+    |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> kernel/src/native_files.rs:653:36
+    |
+653 |         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+    |                                    ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+653 -         let Ok(id) = NEXT_MUTATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+653 +         let Ok(id) = NEXT_MUTATION.try_update(Ordering::Relaxed, Ordering::Relaxed,
+    |
+
+warning: `vibeos-kernel` (lib) generated 8 warnings (run `cargo fix --lib -p vibeos-kernel` to apply 8 suggestions)
+   Compiling vibeos-firmware-qemu-virt v0.1.0 (/Users/ziangwang/Sources/vibeos/firmware/qemu-virt)
+error: linking with `ld.lld` failed: exit status: 1
+  |
+  = note:  "ld.lld" "<1 object files omitted>" "--as-needed" "-Bstatic" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/5c51483c7ea51ccd/out/rustcPSHoyR/libvibeos_kernel-50a5fdf863362907.rlib" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/compiler_builtins/5d9c8ad9a097c700/out/libcompiler_builtins-5d9c8ad9a097c700.rlib" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/5c51483c7ea51ccd/out/rustcPSHoyR/raw-dylibs" "-Bdynamic" "-z" "noexecstack" "-L" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-kernel/5f5a6f9da12c48f5/out" "-o" "/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/5c51483c7ea51ccd/out/vibeos_qemu_virt" "--gc-sections" "--undefined=vibeos_v8_smoke" "/Users/ziangwang/Sources/vibeos/target/node-runtime/node-link-17/v8-smoke.o" "/Users/ziangwang/Sources/vibeos/target/node-runtime/node-link-17/node-snapshot-stub.o" "--start-group" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_snapshot.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_base_without_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_compiler.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libbase.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_libplatform.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libabseil.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libv8_zlib.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libsimdutf.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/tools/v8_gypfiles/libhighway.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libstdc++.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libm.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/riscv-none-elf/lib/rv64imafdc_zicsr/lp64d/libc.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/toolchain/xpack-riscv-none-elf-gcc-14.2.0-3/lib/gcc/riscv-none-elf/14.2.0/rv64imafdc_zicsr/lp64d/libgcc.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/uv/libuv.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/ada/libada.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/brotli/libbrotli.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/histogram/libhistogram.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/llhttp/libllhttp.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/merve/libmerve.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nbytes/libnbytes.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/nghttp2/libnghttp2.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/simdjson/libsimdjson.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/zlib/libzlib.a" "/Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/deps/zstd/libzstd.a" "--end-group" "--error-limit=0" "--gc-sections" "-T/Users/ziangwang/Sources/vibeos/target/riscv64gc-unknown-none-elf/release/build/vibeos-firmware-qemu-virt/037b93ae5f0cc787/out/linker.ld"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: ld.lld: error: undefined symbol: uv_queue_work
+          >>> referenced by node_api.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_api.o:(napi_queue_async_work) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_zlib.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_zlib.o:(node::ThreadPoolWork::ScheduleWork()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_if_indextoiid
+          >>> referenced by tcp_wrap.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/tcp_wrap.o:(node::AddressToJS(node::Environment*, sockaddr const*, v8::Local<v8::Object>)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_getrusage_thread
+          >>> referenced by node_worker.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_worker.o:(node::CallbackQueue<void, node::Environment*>::CallbackImpl<node::worker::Worker::CpuUsage(v8::FunctionCallbackInfo<v8::Value> const&)::'lambda'(node::Environment*)>::Call(node::Environment*)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::ThreadCPUUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_uname
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetOSInformation(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_cpu_info
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetCPUInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_gethostname
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetHostname(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_interface_addresses
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_free_interface_addresses
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::PrintVersionInformation(node::JSONWriter*, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetInterfaceAddresses(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_getrusage
+          >>> referenced by node_report.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_report.o:(node::report::WriteNodeReport(v8::Isolate*, node::Environment*, char const*, char const*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char>> const&, std::ostream&, v8::Local<v8::Value>, bool, bool, bool)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::CPUUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_process_methods.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_process_methods.o:(node::ResourceUsage(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_loadavg
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetLoadAvg(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_homedir
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetHomeDirectory(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_getpriority
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_setpriority
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::SetPriority(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_os_get_passwd
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetUserInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_os.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_os.o:(node::os::GetUserInfo(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_copyfile
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CpSyncOverrideFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CopyFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::CopyFile(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_mkdtemp
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Mkdtemp(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::Mkdtemp(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_mkstemp
+          >>> referenced by compile_cache.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/compile_cache.o:(node::CompileCacheHandler::Persist()) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+          ld.lld: error: undefined symbol: uv_fs_statfs
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::StatFs(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          >>> referenced by node_file.cc
+          >>>               /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode/src/node_file.o:(node::fs::StatFs(v8::FunctionCallbackInfo<v8::Value> const&)) in archive /Users/ziangwang/Sources/vibeos/target/node-runtime/source/node-v24.14.0/out/Release/obj.target/libnode.a
+          
+
+error: could not compile `vibeos-firmware-qemu-virt` (bin "vibeos-qemu-virt") due to 1 previous error

@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-tls-qemu.py", line 139, in <module>
+    main()
+    ~~~~^^
+  File "/Users/ziangwang/Sources/vibeos/scripts/test-native-tls-qemu.py", line 120, in main
+    raise RuntimeError('required checks missing within 60 seconds: ' +
+                       json.dumps(report.get('observed_checks', {})))
+RuntimeError: required checks missing within 60 seconds: {"harts": true, "shell": true, "call": true, "suspend": true, "cxx": true, "park": false, "pages": true, "cache": false, "cxx_tls": true, "tls_dtor": false, "tcb_pages": false, "page_pool": true, "memory_abi": true, "static_flags": true, "notify": true, "wait_abi": true, "semaphore": true, "semaphore_owner": true, "semaphore_wake": true, "entropy": false, "libc_heap": true, "stdio": true, "native_fd": true, "unlink": true, "file_open": false}

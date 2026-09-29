@@ -1,0 +1,10 @@
+--- a/deps/uv/uv.gyp
++++ b/deps/uv/uv.gyp
+@@ -179,6 +179,7 @@
+             'src/vibeos/vibeos-time.c',
+             'src/vibeos/vibeos-stream.c',
+             'src/vibeos/vibeos-unavailable.c',
++            'src/vibeos/vibeos-env.c',
+           ],
+           'include_dirs': ['src/vibeos'],
+           'cflags': ['-ffunction-sections', '-fdata-sections'],

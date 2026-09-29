@@ -1,0 +1,141 @@
+--- a/src/cares_wrap.cc
++++ b/src/cares_wrap.cc
+@@ -19,6 +19,97 @@
+ // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+ // USE OR OTHER DEALINGS IN THE SOFTWARE.
+ 
++#if defined(__vibeos__)
++#include "node_binding.h"
++#include "node_buffer.h"
++#include "node_external_reference.h"
++#include "util-inl.h"
++#include "uv.h"
++namespace node::cares_wrap {
++using namespace v8;
++// Keep pure address conversion available: net.js imports this binding for stdio.
++void CanonicalizeIP(const FunctionCallbackInfo<Value>& args) {
++  Isolate* isolate = args.GetIsolate();
++  node::Utf8Value ip(isolate, args[0]);
++
++  int af;
++  unsigned char result[16];
++  if (uv_inet_pton(af = AF_INET, *ip, result) != 0 &&
++      uv_inet_pton(af = AF_INET6, *ip, result) != 0)
++    return;
++
++  char canonical_ip[INET6_ADDRSTRLEN]{};
++  CHECK_EQ(0, uv_inet_ntop(af, result, canonical_ip, sizeof(canonical_ip)));
++  args.GetReturnValue().Set(OneByteString(isolate, canonical_ip));
++}
++
++void ConvertIpv6StringToBuffer(const FunctionCallbackInfo<Value>& args) {
++  Isolate* isolate = args.GetIsolate();
++  node::Utf8Value ip(isolate, args[0]);
++  unsigned char dst[16];  // IPv6 addresses are 128 bits (16 bytes)
++
++  if (uv_inet_pton(AF_INET6, *ip, dst) != 0) {
++    isolate->ThrowException(Exception::Error(
++        FIXED_ONE_BYTE_STRING(isolate, "Invalid IPv6 address")));
++    return;
++  }
++
++  Local<Object> buffer;
++  if (node::Buffer::Copy(
++          isolate, reinterpret_cast<const char*>(dst), sizeof(dst))
++          .ToLocal(&buffer)) {
++    args.GetReturnValue().Set(buffer);
++  }
++}
++
++
++void Unsupported(const FunctionCallbackInfo<Value>& args) {
++  auto* isolate = args.GetIsolate();
++  auto context = isolate->GetCurrentContext();
++  auto error = Exception::Error(String::NewFromUtf8Literal(
++      isolate, "DNS is not supported by the VibeOS Node port"));
++  error.As<Object>()->Set(context,
++      String::NewFromUtf8Literal(isolate, "code"),
++      String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++  isolate->ThrowException(error);
++}
++// Importing dns creates its default resolver. This object owns no native
++// channel; every operation rejects explicitly instead of opening sockets.
++void EmptyConstructor(const FunctionCallbackInfo<Value>&) {}
++void Initialize(Local<Object> target, Local<Value>, Local<Context> context, void*) {
++  auto* isolate = context->GetIsolate();
++  SetMethodNoSideEffect(context, target, "canonicalizeIP", CanonicalizeIP);
++  SetMethodNoSideEffect(context, target, "convertIpv6StringToBuffer", ConvertIpv6StringToBuffer);
++  for (const char* name : {"getaddrinfo", "getnameinfo", "strerror"})
++    SetMethod(context, target, name, Unsupported);
++  for (const char* name : {"GetAddrInfoReqWrap", "GetNameInfoReqWrap", "QueryReqWrap"})
++    SetConstructorFunction(context, target, name, FunctionTemplate::New(isolate, EmptyConstructor));
++  auto channel = FunctionTemplate::New(isolate, EmptyConstructor);
++  for (const char* name : {"queryA", "queryAaaa", "queryAny", "queryCaa",
++       "queryCname", "queryMx", "queryNaptr", "queryNs", "queryPtr", "querySrv",
++       "querySoa", "queryTlsa", "queryTxt", "getHostByAddr", "getServers",
++       "setServers", "setLocalAddress", "cancel"})
++    SetProtoMethod(isolate, channel, name, Unsupported);
++  SetConstructorFunction(context, target, "ChannelWrap", channel);
++  const struct { const char* name; int value; } constants[] = {
++    {"AF_INET", AF_INET}, {"AF_INET6", AF_INET6}, {"AF_UNSPEC", AF_UNSPEC},
++    {"AI_ADDRCONFIG", 0x20}, {"AI_ALL", 0x10}, {"AI_V4MAPPED", 0x08},
++    {"DNS_ORDER_VERBATIM", 0}, {"DNS_ORDER_IPV4_FIRST", 1}, {"DNS_ORDER_IPV6_FIRST", 2}
++  };
++  for (const auto& constant : constants)
++    target->Set(context, OneByteString(isolate, constant.name),
++                Integer::New(isolate, constant.value)).Check();
++}
++void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
++  registry->Register(CanonicalizeIP);
++  registry->Register(ConvertIpv6StringToBuffer);
++  registry->Register(Unsupported);
++  registry->Register(EmptyConstructor);
++}
++}  // namespace node::cares_wrap
++NODE_BINDING_CONTEXT_AWARE_INTERNAL(cares_wrap, node::cares_wrap::Initialize)
++NODE_BINDING_EXTERNAL_REFERENCE(cares_wrap, node::cares_wrap::RegisterExternalReferences)
++#else
+ #include "cares_wrap.h"
+ #include "ada.h"
+ #include "async_wrap-inl.h"
+@@ -2354,3 +2445,5 @@
+ NODE_BINDING_CONTEXT_AWARE_INTERNAL(cares_wrap, node::cares_wrap::Initialize)
+ NODE_BINDING_EXTERNAL_REFERENCE(cares_wrap,
+                                 node::cares_wrap::RegisterExternalReferences)
++
++#endif  // __vibeos__
+--- a/src/node_metadata.cc
++++ b/src/node_metadata.cc
+@@ -2,7 +2,9 @@
+ #include "acorn_version.h"
+ #include "ada.h"
+ #include "amaro_version.h"
++#if !defined(__vibeos__)
+ #include "ares.h"
++#endif
+ #include "brotli/encode.h"
+ #include "llhttp.h"
+ #include "merve.h"
+@@ -105,7 +107,11 @@
+ #else
+   zlib = zlibVersion();
+ #endif  // NODE_BUNDLED_ZLIB
++#if defined(__vibeos__)
++  ares = "disabled-vibeos";
++#else
+   ares = ARES_VERSION_STR;
++#endif
+   modules = NODE_STRINGIFY(NODE_MODULE_VERSION);
+   nghttp2 = NGHTTP2_VERSION;
+   napi = NODE_STRINGIFY(NODE_API_SUPPORTED_VERSION_MAX);
+--- a/node.gypi
++++ b/node.gypi
+@@ -181,7 +181,7 @@
+       ],
+     } ],
+ 
+-    [ 'node_shared_cares=="false"', {
++    [ 'node_shared_cares=="false" and OS!="vibeos"', {
+       'dependencies': [ 'deps/cares/cares.gyp:cares' ],
+     }],
+ 

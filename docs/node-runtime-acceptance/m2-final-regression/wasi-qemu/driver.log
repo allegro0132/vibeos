@@ -1,0 +1,35 @@
+   Compiling smallvec v1.15.2
+   Compiling wasm-encoder v0.255.0
+   Compiling vibeos-wasmi-collections-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/collections)
+   Compiling bumpalo v3.20.3
+   Compiling wasmparser v0.255.0
+   Compiling vibeos-hal v0.1.0 (/Users/ziangwang/Sources/vibeos/hal)
+   Compiling vibeos-durable-format v0.1.0 (/Users/ziangwang/Sources/vibeos/durable-format)
+   Compiling vibeos-component-format v0.1.0 (/Users/ziangwang/Sources/vibeos/component-format)
+   Compiling rustc_apfloat v0.2.3+llvm-462a31f5a5ab
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling vibeos-core v0.1.0 (/Users/ziangwang/Sources/vibeos/core)
+   Compiling wast v255.0.0
+   Compiling vibeos-wasmi-core-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/core)
+warning: `vibeos-durable-format` (lib) generated 1 warning
+   Compiling vibeos-wasmi-ir-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/ir)
+   Compiling vibeos-wasmi-softfloat v1.1.0-vibeos-f2.1 (/Users/ziangwang/Sources/vibeos/vendor/wasmi-softfloat/crates/wasmi)
+   Compiling wat v1.255.0
+   Compiling vibeos-wasi-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasi-runtime)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 17.55s
+     Running `target/debug/examples/fixtures /Users/ziangwang/Sources/vibeos/target/m2-wasi-final-qemu-2/fixtures`
+PASS standard Rust/C commands, arguments, binary stdin, stderr, exit
+wrote OpenSSH private key to /Users/ziangwang/Sources/vibeos/target/m2-wasi-final-qemu-2/rejected_key
+PASS upload failures, containment and disconnect recovery
+PASS local pipeline, post-boot compilation, 100 reclaimed invocations
+PASS WASI_QEMU: upload, execution, lifecycle, restart; evidence: /Users/ziangwang/Sources/vibeos/target/m2-wasi-final-qemu-2

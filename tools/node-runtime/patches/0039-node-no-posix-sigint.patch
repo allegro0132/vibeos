@@ -1,0 +1,199 @@
+--- a/src/node_watchdog.h
++++ b/src/node_watchdog.h
+@@ -31,7 +31,7 @@
+ #include "uv.h"
+ #include "v8.h"
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+ #include <pthread.h>
+ #endif
+ 
+@@ -143,7 +143,7 @@
+   std::vector<SigintWatchdogBase*> watchdogs_;
+   bool has_pending_signal_;
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   pthread_t thread_;
+   uv_sem_t sem_;
+   bool has_running_thread_;
+@@ -151,7 +151,7 @@
+ 
+   static void* RunSigintWatchdog(void* arg);
+   static void HandleSignal(int signum, siginfo_t* info, void* ucontext);
+-#else
++#elif defined(_WIN32)
+   bool watchdog_disabled_;
+   static BOOL WINAPI WinCtrlCHandlerRoutine(DWORD dwCtrlType);
+ #endif
+--- a/src/node_watchdog.cc
++++ b/src/node_watchdog.cc
+@@ -107,7 +107,7 @@
+   // Register this watchdog with the global SIGINT/Ctrl+C listener.
+   SigintWatchdogHelper::GetInstance()->Register(this);
+   // Start the helper thread, if that has not already happened.
+-  SigintWatchdogHelper::GetInstance()->Start();
++  CHECK_EQ(0, SigintWatchdogHelper::GetInstance()->Start());
+ }
+ 
+ 
+@@ -143,10 +143,17 @@
+   // normal function.
+   CHECK(args.IsConstructCall());
+   Environment* env = Environment::GetCurrent(args);
++#if defined(__vibeos__)
++  return env->ThrowUVException(UV_ENOTSUP, "TraceSigintWatchdog");
++#else
+   new TraceSigintWatchdog(env, args.This());
++#endif
+ }
+ 
+ void TraceSigintWatchdog::Start(const FunctionCallbackInfo<Value>& args) {
++#if defined(__vibeos__)
++  return Environment::GetCurrent(args)->ThrowUVException(UV_ENOTSUP, "SIGINT watchdog");
++#endif
+   TraceSigintWatchdog* watchdog;
+   ASSIGN_OR_RETURN_UNWRAP(&watchdog, args.This());
+   Mutex::ScopedLock lock(SigintWatchdogHelper::GetInstanceActionMutex());
+@@ -228,7 +235,7 @@
+   raise(SIGINT);
+ }
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+ void* SigintWatchdogHelper::RunSigintWatchdog(void* arg) {
+   uv_thread_setname("SigintWatchdog");
+   // Inside the helper thread.
+@@ -247,7 +254,7 @@
+   uv_sem_post(&instance.sem_);
+ }
+ 
+-#else
++#elif defined(_WIN32)
+ 
+ // Windows starts a separate thread for executing the handler, so no extra
+ // helper thread is required.
+@@ -269,7 +276,7 @@
+   Mutex::ScopedLock list_lock(instance.list_mutex_);
+ 
+   bool is_stopping = false;
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   is_stopping = instance.stopping_;
+ #endif
+ 
+@@ -292,13 +299,17 @@
+ 
+ 
+ int SigintWatchdogHelper::Start() {
++#if defined(__vibeos__)
++  // VSH task cancellation is handled by the embedder, not POSIX SIGINT.
++  return UV_ENOTSUP;
++#endif
+   Mutex::ScopedLock lock(mutex_);
+ 
+   if (start_stop_count_++ > 0) {
+     return 0;
+   }
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   CHECK_EQ(has_running_thread_, false);
+   has_pending_signal_ = false;
+   stopping_ = false;
+@@ -319,7 +330,7 @@
+   has_running_thread_ = true;
+ 
+   RegisterSignalHandler(SIGINT, HandleSignal);
+-#else
++#elif defined(_WIN32)
+   if (watchdog_disabled_) {
+     watchdog_disabled_ = false;
+   } else {
+@@ -332,6 +343,9 @@
+ 
+ 
+ bool SigintWatchdogHelper::Stop() {
++#if defined(__vibeos__)
++  return false;  // Start never acquires a signal listener on this platform.
++#endif
+   bool had_pending_signal;
+   Mutex::ScopedLock lock(mutex_);
+ 
+@@ -345,7 +359,7 @@
+       return had_pending_signal;
+     }
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+     // Set stopping now because it's only protected by list_mutex_.
+     stopping_ = true;
+ #endif
+@@ -353,7 +367,7 @@
+     watchdogs_.clear();
+   }
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   if (!has_running_thread_) {
+     has_pending_signal_ = false;
+     return had_pending_signal;
+@@ -367,7 +381,7 @@
+   has_running_thread_ = false;
+ 
+   RegisterSignalHandler(SIGINT, SignalExit, true);
+-#else
++#elif defined(_WIN32)
+   watchdog_disabled_ = true;
+ #endif
+ 
+@@ -403,11 +417,11 @@
+ SigintWatchdogHelper::SigintWatchdogHelper()
+     : start_stop_count_(0),
+       has_pending_signal_(false) {
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   has_running_thread_ = false;
+   stopping_ = false;
+   CHECK_EQ(0, uv_sem_init(&sem_, 0));
+-#else
++#elif defined(_WIN32)
+   watchdog_disabled_ = false;
+ #endif
+ }
+@@ -417,7 +431,7 @@
+   start_stop_count_ = 0;
+   Stop();
+ 
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   CHECK_EQ(has_running_thread_, false);
+   uv_sem_destroy(&sem_);
+ #endif
+--- a/src/node_contextify.cc
++++ b/src/node_contextify.cc
+@@ -1232,6 +1232,10 @@
+ 
+   CHECK(args[3]->IsBoolean());
+   bool break_on_sigint = args[3]->IsTrue();
++#if defined(__vibeos__)
++  if (break_on_sigint)
++    return env->ThrowUVException(UV_ENOTSUP, "breakOnSigint");
++#endif
+ 
+   CHECK(args[4]->IsBoolean());
+   bool break_on_first_line = args[4]->IsTrue();
+--- a/src/module_wrap.cc
++++ b/src/module_wrap.cc
+@@ -751,6 +751,10 @@
+ 
+   CHECK(args[1]->IsBoolean());
+   bool break_on_sigint = args[1]->IsTrue();
++#if defined(__vibeos__)
++  if (break_on_sigint)
++    return realm->env()->ThrowUVException(UV_ENOTSUP, "breakOnSigint");
++#endif
+ 
+   ShouldNotAbortOnUncaughtScope no_abort_scope(realm->env());
+   TryCatchScope try_catch(realm->env());

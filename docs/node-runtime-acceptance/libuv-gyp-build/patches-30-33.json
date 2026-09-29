@@ -1,0 +1,10 @@
+{
+  "scope": "Patches 30\u201333 apply with zero fuzz to affected files from prepared tree 10 (patches 1\u201329). Not a fresh full build or runtime qualification.",
+  "patches": {
+    "0033-node-address-conversion.patch": "86f5f1cb6149921dae3fdc0cd3b37a73a538037003a1a36c1e8a59b26226d726",
+    "0032-node-static-debug-context.patch": "a88984fbd42f75b9d14c3de99f80f0f8b5d967c44290b43a5b2e651597227952",
+    "0031-node-disable-dns.patch": "cbe2b5c05a2036f512fcce977b02f359411bb070c23e04a519e7f91c17f587c6",
+    "0030-node-disable-native-addons.patch": "f98746ef431b0ff2651384562b30e7706f8ffc88a9faad50536d8d53a9541e77"
+  },
+  "result": "PASS"
+}

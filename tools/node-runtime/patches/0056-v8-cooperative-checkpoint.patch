@@ -1,0 +1,39 @@
+--- a/deps/v8/src/runtime/runtime-internal.cc
++++ b/deps/v8/src/runtime/runtime-internal.cc
+@@ -3,6 +3,10 @@
+ // found in the LICENSE file.
+ 
+ #include <memory>
++
++#if defined(__vibeos__)
++#include "src/base/platform/vibeos-process.h"
++#endif
+ 
+ #include "src/api/api-inl.h"
+ #include "src/api/api.h"
+@@ -375,6 +379,12 @@
+   DCHECK_EQ(1, args.length());
+   DirectHandle<JSFunction> function = args.at<JSFunction>(0);
+   TRACE_EVENT0("v8.execute", "V8.BytecodeBudgetInterruptWithStackCheck");
++#if defined(__vibeos__)
++  // The interpreter must yield even when no external V8 interrupt is pending.
++  // The Rust runner retains this stack and cannot enter this isolate while
++  // parked. Cancellation is observed after resumption on the same stack.
++  if (vibeos_native_checkpoint() != 0) return isolate->TerminateExecution();
++#endif
+ 
+   // Check for stack interrupts here so that we can fold the interrupt check
+   // into bytecode budget interrupts.
+@@ -403,6 +413,12 @@
+   function->TraceOptimizationStatus("budget from %s",
+                                     CodeKindToString(code_kind));
+   TRACE_EVENT0("v8.execute", "V8.BytecodeBudgetInterrupt");
++#if defined(__vibeos__)
++  // The interpreter must yield even when no external V8 interrupt is pending.
++  // The Rust runner retains this stack and cannot enter this isolate while
++  // parked. Cancellation is observed after resumption on the same stack.
++  if (vibeos_native_checkpoint() != 0) return isolate->TerminateExecution();
++#endif
+ 
+   isolate->tiering_manager()->OnInterruptTick(function, code_kind);
+   return ReadOnlyRoots(isolate).undefined_value();

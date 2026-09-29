@@ -24,7 +24,8 @@ def validate_configuration(source):
     required = {'OS': 'vibeos', 'target_arch': 'riscv64', 'host_arch': 'x64',
                 'v8_enable_lite_mode': 1, 'v8_enable_webassembly': 0,
                 'v8_enable_i18n_support': 0, 'v8_enable_pointer_compression': 0,
-                'v8_enable_pointer_compression_shared_cage': 0, 'v8_enable_sandbox': 0}
+                'v8_enable_pointer_compression_shared_cage': 0, 'v8_enable_sandbox': 0,
+                'node_use_sqlite': 'false'}
     for key, expected in required.items():
         if values.get(key) != expected:
             raise ValueError(f'configuration drift: {key}={values.get(key)!r}, expected {expected!r}')
@@ -57,7 +58,8 @@ def validate_configuration(source):
 def smoke_command(source, cxx, output, input_source=None, library='v8_libplatform'):
     # Use the generated target library's definitions, including V8's public
     # ABI/build-configuration bits. Do not guess a smaller set of -D flags.
-    makefile = source / f'out/tools/v8_gypfiles/{library}.target.mk'
+    makefile = (source / 'out/libnode.target.mk' if library == 'node' else
+                source / f'out/tools/v8_gypfiles/{library}.target.mk')
     settings = makefile.read_text().replace('\\\n', ' ')
     flags = []
     for name in ('DEFS_Release', 'CFLAGS_Release', 'CFLAGS_CC_Release', 'INCS_Release'):
@@ -66,6 +68,8 @@ def smoke_command(source, cxx, output, input_source=None, library='v8_libplatfor
             raise ValueError(f'missing target compiler settings: {name}')
         for flag in shlex.split(match.group(1)):
             flag = flag.replace('$(srcdir)', str(source))
+            flag = flag.replace('$(obj)', str(source / 'out/Release/obj'))
+            flag = flag.replace('$(builddir)', str(source / 'out/Release'))
             if '$(' in flag:
                 raise ValueError(f'unresolved target setting: {flag}')
             flags.append(flag)
@@ -73,9 +77,22 @@ def smoke_command(source, cxx, output, input_source=None, library='v8_libplatfor
             str(input_source or PORT / 'tests/v8-smoke.cc'), '-o', str(output)]
 
 
+def validate_uv_configuration(source):
+    generated = (source / 'out/deps/uv/libuv.target.mk').read_text()
+    for required in ('src/unix/loop-watcher.o', 'src/vibeos/vibeos-loop.o',
+                     'src/vibeos/vibeos-fs.o', 'src/vibeos/vibeos-sync.o', 'src/vibeos/vibeos-time.o', 'src/vibeos/vibeos-stream.o', 'src/vibeos/vibeos-unavailable.o', 'src/vibeos/vibeos-env.o', '-D__vibeos__=1',
+                     '-march=rv64gc', '-mabi=lp64d'):
+        if required not in generated:
+            raise ValueError('libuv target lost required input: ' + required)
+    for excluded in ('-pthread', 'src/unix/core.o', 'src/unix/fs.o',
+                     'src/unix/thread.o', 'src/threadpool.o'):
+        if excluded in generated:
+            raise ValueError('libuv target unexpectedly imports POSIX backend: ' + excluded)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('phase', choices=['prepare', 'configure', 'base', 'support', 'snapshot', 'engine', 'smoke'])
+    parser.add_argument('phase', choices=['prepare', 'configure', 'base', 'support', 'snapshot', 'engine', 'smoke', 'uv', 'node', 'node-deps'])
     parser.add_argument('--work', type=Path, default=ROOT / 'target/node-runtime/native')
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
@@ -93,7 +110,8 @@ def main():
     patches = sorted((PORT / 'patches').glob('*.patch'))
     overlays = sorted(p for p in (PORT / 'platform').iterdir()
                       if p.suffix in ('.h', '.inc', '.cc'))
-    port_hashes = {str(p.relative_to(ROOT)): inputs.digest(p) for p in patches + overlays}
+    uv_overlays = sorted(p for p in (PORT / 'libuv').iterdir() if p.suffix in ('.h', '.c'))
+    port_hashes = {str(p.relative_to(ROOT)): inputs.digest(p) for p in patches + overlays + uv_overlays}
     marker = work / 'prepared.json'
     if args.phase == 'prepare':
         if work.exists():
@@ -105,6 +123,10 @@ def main():
             subprocess.run(['patch', '-p1', '--fuzz=0', '--batch', '-i', str(patch)], cwd=source, check=True)
         for header in overlays:
             shutil.copyfile(header, source / 'deps/v8/src/base/platform' / header.name)
+        uv_directory = source / 'deps/uv/src/vibeos'
+        uv_directory.mkdir(parents=True, exist_ok=True)
+        for path in uv_overlays + [p for p in overlays if p.suffix == '.h']:
+            shutil.copyfile(path, uv_directory / path.name)
         marker.write_text(json.dumps({'source_sha256': inputs.digest(archive),
             'port_inputs': port_hashes}, indent=2) + '\n')
         print(source)
@@ -138,10 +160,13 @@ def main():
         command = [sys.executable, 'configure.py', '--dest-os=vibeos', '--dest-cpu=riscv64',
             '--cross-compiling', '--without-intl', '--without-ssl', '--without-inspector',
             '--without-npm', '--without-corepack', '--without-amaro', '--v8-lite-mode',
-            '--v8-options=--jitless', '--without-node-snapshot']
+            '--v8-options=--jitless', '--without-node-snapshot', '--without-sqlite']
         cwd = source
     else:
-        targets = {'base': ['v8_libbase'], 'support': ['abseil', 'v8_libplatform'], 'snapshot': ['mksnapshot'],
+        targets = {'uv': ['libuv'], 'node': ['libnode'],
+            'node-deps': ['histogram', 'zlib', 'llhttp', 'nghttp2', 'ada', 'merve',
+                          'simdjson', 'brotli', 'zstd', 'nbytes'],
+            'base': ['v8_libbase'], 'support': ['abseil', 'v8_libplatform'], 'snapshot': ['mksnapshot'],
             'engine': ['v8_snapshot', 'v8_base', 'v8_libbase', 'v8_libplatform', 'abseil', 'v8_zlib', 'simdutf', 'highway']}
         command = ['make', f'-j{args.jobs}', 'BUILDTYPE=Release', *targets[args.phase]]
         cwd = source / 'out'
@@ -150,6 +175,8 @@ def main():
     before_config = None
     if args.phase != 'configure':
         validate_configuration(source)
+        if args.phase in ('uv', 'node'):
+            validate_uv_configuration(source)
         before_config = inputs.digest(source / 'config.gypi')
     result = inputs.check(args.phase, command, evidence, cwd=cwd, timeout=14400, env=env)
     result.update(runtime_acceptance='NOT_RUN', port_inputs=port_hashes,
@@ -160,6 +187,8 @@ def main():
         result['smoke_source_sha256'] = inputs.digest(PORT / 'tests/v8-smoke.cc')
     try:
         result['configuration'] = validate_configuration(source)
+        if args.phase in ('configure', 'uv', 'node'):
+            validate_uv_configuration(source)
         result['config_sha256'] = inputs.digest(source / 'config.gypi')
         if before_config is not None and before_config != result['config_sha256']:
             raise ValueError('build changed config.gypi; rerun configure and investigate regeneration')

@@ -1,0 +1,12 @@
+[
+  {
+    "patch": "0041-nghttp2-byte-order.patch",
+    "sha256": "5e3f39b0189fcd8bb2ce3b78338361f375bc4c2a9079b4040beb2eca30276b48",
+    "stdout": "patching file 'deps/nghttp2/lib/nghttp2_net.h'\n"
+  },
+  {
+    "patch": "0042-zstd-single-threaded.patch",
+    "sha256": "ca9c47bcbe27c0806089ca10c0fdff0480bc4bdd1154c18a5e14f989c313a30c",
+    "stdout": "patching file 'deps/zstd/zstd.gyp'\n"
+  }
+]

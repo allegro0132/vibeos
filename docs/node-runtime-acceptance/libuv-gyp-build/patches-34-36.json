@@ -1,0 +1,23 @@
+{
+  "scope": "Affected files from prepared tree 10; zero-fuzz application only, not execution acceptance",
+  "results": [
+    {
+      "patch": "0034-node-embedded-platform-init.patch",
+      "sha256": "a8c05d874a30d38938d9e0e6f4b6f0108c8f42865537caf9c5ac605b38aa6714",
+      "exit_code": 0,
+      "stdout": "patching file 'src/node.cc'\n"
+    },
+    {
+      "patch": "0035-node-static-constants.patch",
+      "sha256": "e82f5a08891b100e5774d661c86f3294ba193ec3321987b323780aea70d13b5e",
+      "exit_code": 0,
+      "stdout": "patching file 'src/node_constants.cc'\n"
+    },
+    {
+      "patch": "0036-node-capability-credentials.patch",
+      "sha256": "db6be7b81646756adbe43a73d4cc3d61b2bed07cd43ad3c08f476e3bd5d19cd1",
+      "exit_code": 0,
+      "stdout": "patching file 'src/node_internals.h'\npatching file 'src/node_credentials.cc'\n"
+    }
+  ]
+}

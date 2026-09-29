@@ -1,0 +1,20 @@
+{
+  "command": [
+    "make",
+    "-j4",
+    "BUILDTYPE=Release",
+    "histogram",
+    "zlib",
+    "llhttp",
+    "nghttp2",
+    "ada",
+    "merve",
+    "simdjson",
+    "brotli",
+    "zstd",
+    "nbytes"
+  ],
+  "exit_code": 2,
+  "seconds": 3.2030442919931374,
+  "runtime_acceptance": "NOT_RUN"
+}

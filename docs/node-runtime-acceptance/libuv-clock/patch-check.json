@@ -1,0 +1,12 @@
+[
+  {
+    "patch": "0043-libuv-native-sync.patch",
+    "sha256": "55223ce90365b2ecd7cef82d14043975dd7e854092f7ae9626ccb5a4e617c36b",
+    "stdout": "patching file 'deps/uv/uv.gyp'\n"
+  },
+  {
+    "patch": "0045-libuv-native-time.patch",
+    "sha256": "4735a4d6535956337d2f84a13e75e91094681c30a5a9b7951b02beb64bfe2b13",
+    "stdout": "patching file 'deps/uv/uv.gyp'\n"
+  }
+]

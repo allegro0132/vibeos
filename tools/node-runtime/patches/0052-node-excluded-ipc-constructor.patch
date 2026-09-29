@@ -1,0 +1,21 @@
+--- a/src/pipe_wrap.cc
++++ b/src/pipe_wrap.cc
+@@ -147,6 +147,18 @@
+       UNREACHABLE();
+   }
+ 
++#if defined(__vibeos__)
++  if (ipc) {
++    auto* isolate = args.GetIsolate();
++    auto error = v8::Exception::Error(v8::String::NewFromUtf8Literal(
++        isolate, "VibeOS Node has no IPC capability")).As<v8::Object>();
++    error->Set(isolate->GetCurrentContext(),
++        v8::String::NewFromUtf8Literal(isolate, "code"),
++        v8::String::NewFromUtf8Literal(isolate, "ERR_VIBEOS_UNSUPPORTED")).Check();
++    isolate->ThrowException(error);
++    return;
++  }
++#endif
+   new PipeWrap(env, args.This(), provider, ipc);
+ }
+ 

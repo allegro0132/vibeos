@@ -1,0 +1,7 @@
+[
+  "uv__read_start",
+  "uv_read_stop",
+  "uv_shutdown",
+  "uv_write",
+  "uv_write2"
+]

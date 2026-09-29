@@ -1,0 +1,44 @@
+--- a/src/node_binding.h
++++ b/src/node_binding.h
+@@ -3,7 +3,7 @@
+ 
+ #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+ 
+-#if defined(__POSIX__)
++#if defined(__POSIX__) && !defined(__vibeos__)
+ #include <dlfcn.h>
+ #endif
+ 
+@@ -116,7 +116,7 @@
+ 
+ class DLib {
+  public:
+-#ifdef __POSIX__
++#if defined(__POSIX__) && !defined(__vibeos__)
+   static const int kDefaultFlags = RTLD_LAZY;
+ #else
+   static const int kDefaultFlags = 0;
+--- a/src/node_binding.cc
++++ b/src/node_binding.cc
+@@ -343,7 +343,20 @@
+ DLib::DLib(const char* filename, int flags)
+     : filename_(filename), flags_(flags), handle_(nullptr) {}
+ 
+-#ifdef __POSIX__
++#if defined(__vibeos__)
++bool DLib::Open() {
++  errmsg_ = "Native addons are not supported by the VibeOS Node port";
++  return false;
++}
++
++void DLib::Close() {
++  CHECK_NULL(handle_);
++}
++
++void* DLib::GetSymbolAddress(const char* name) {
++  return nullptr;
++}
++#elif defined(__POSIX__)
+ bool DLib::Open() {
+   handle_ = dlopen(filename_.c_str(), flags_);
+   if (handle_ != nullptr) return true;

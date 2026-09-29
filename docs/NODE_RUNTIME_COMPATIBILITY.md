@@ -12,7 +12,8 @@ The [fresh build and execution](node-runtime-acceptance/node-fresh-57/README.md)
 qualifies M2, including local VSH, authenticated SSH and 100 successful launcher
 cycles after the process-page ownership fix. The [fresh toolkit qualification](node-runtime-acceptance/toolkit-fresh-build/README.md)
 completes M3, including official tsc, adapted tsx, esbuild sync/Promise APIs and
-SSH use. The broader M4 inventory/security audit and final M5 remain incomplete.
+SSH use. The [M4 lifecycle/security audit](node-runtime-acceptance/lifecycle-audit/README.md)
+also passes; final M5 regression qualification remains incomplete.
 
 | Area | Verified behavior / current boundary | Evidence |
 |---|---|---|
@@ -34,6 +35,8 @@ SSH use. The broader M4 inventory/security audit and final M5 remain incomplete.
 | TypeScript | Optional `node-toolkit` registers `tsc`; official 5.9.3 project/noEmit/JS/declaration/type-error checks pass on QEMU | [tsc](node-runtime-acceptance/tsc-qemu/README.md) |
 | tsx | Current-instance VSH command passes CJS/ESM, dynamic import, offline modules, TSX/custom factory, mapped exceptions and restart on the fresh QEMU build | [Final tsx](node-runtime-acceptance/toolkit-fresh-build/final/tsx) |
 | esbuild | Adapted official JS transform API and tsx pass TS/TSX via official WASI; API checks include custom JSX factory, maps and diagnostics, and native transport checks include sync/Promise/exit | [Final JS API](node-runtime-acceptance/toolkit-fresh-build/final/api), [Final Node transport](node-runtime-acceptance/toolkit-fresh-build/final/binding) |
+| Lifecycle | 100 file-entry, eval-entry and uncaught-error cycles each pass exact allocator and synchronization stability plus file/TLS/page/grant/I/O reclamation; live project/tool revocation cleans up and permits fresh-authority restart | [M4 audit](node-runtime-acceptance/lifecycle-audit/README.md) |
+| V8 fatal | Separate deliberately invalid initialization hits symbolized V8 fatal/Abort and whole-image shutdown; no instance recovery | [Fatal evidence](node-runtime-acceptance/lifecycle-audit/fresh/fatal) |
 | Unrecoverable OOM | Retained JavaScript arrays exhaust V8; symbolized fatal-OOM and allocator frames lead to whole-image firmware shutdown, without instance recovery | [Separate QEMU OOM](node-runtime-acceptance/node-oom) |
 
 Excluded first-release facilities include npm online installation, network

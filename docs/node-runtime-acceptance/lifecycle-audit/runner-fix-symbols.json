@@ -1,0 +1,46 @@
+{
+  "0x22": [
+    "??",
+    "??:0"
+  ],
+  "0x8061703c": [
+    "__wrap__malloc_r",
+    "??:?"
+  ],
+  "0x806170a4": [
+    "__wrap__calloc_r",
+    "??:?"
+  ],
+  "0x80617164": [
+    "__wrap__Znwm",
+    "??:?"
+  ],
+  "0x806526a6": [
+    "v8::internal::MaybeHandle<v8::internal::Object> v8::internal::(anonymous namespace)::HandleApiCallHelper<true>(v8::internal::Isolate*, v8::internal::DirectHandle<v8::internal::HeapObject>, v8::internal::DirectHandle<v8::internal::FunctionTemplateInfo>, v8::internal::DirectHandle<v8::internal::Object>, unsigned long*, int) [clone .isra.0]",
+    "builtins-api.cc:?"
+  ],
+  "0x806528f0": [
+    "v8::internal::Builtin_HandleApiConstruct(int, unsigned long*, v8::internal::Isolate*)",
+    "builtins-api.cc:?"
+  ],
+  "0x8087cc44": [
+    "Builtins_CEntry_Return1_ArgvOnStack_BuiltinExit",
+    "basic-block-profiler.cc:?"
+  ],
+  "0x8159a0ae": [
+    "_Balloc",
+    "??:?"
+  ],
+  "0x815a5d82": [
+    "_strdup_r",
+    "??:?"
+  ],
+  "0x8167ed5c": [
+    "node::contextify::ContextifyScript::New(node::Environment*, v8::Local<v8::Object>)",
+    "??:?"
+  ],
+  "0x8167f216": [
+    "node::contextify::ContextifyScript::New(v8::FunctionCallbackInfo<v8::Value> const&)",
+    "??:?"
+  ]
+}

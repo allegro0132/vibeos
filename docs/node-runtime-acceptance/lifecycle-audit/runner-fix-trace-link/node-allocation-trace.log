@@ -1,0 +1,104 @@
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap_malloc(size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:57:1: note: in expansion of macro 'ALLOCATE'
+   57 | ALLOCATE(malloc, (size_t n), (n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:57:1: note: in expansion of macro 'ALLOCATE'
+   57 | ALLOCATE(malloc, (size_t n), (n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap_calloc(size_t, size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:58:1: note: in expansion of macro 'ALLOCATE'
+   58 | ALLOCATE(calloc, (size_t n, size_t s), (n,s), n*s)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:58:1: note: in expansion of macro 'ALLOCATE'
+   58 | ALLOCATE(calloc, (size_t n, size_t s), (n,s), n*s)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap_memalign(size_t, size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:59:1: note: in expansion of macro 'ALLOCATE'
+   59 | ALLOCATE(memalign, (size_t a, size_t n), (a,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:59:1: note: in expansion of macro 'ALLOCATE'
+   59 | ALLOCATE(memalign, (size_t a, size_t n), (a,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap__malloc_r(_reent*, size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:60:1: note: in expansion of macro 'ALLOCATE'
+   60 | ALLOCATE(_malloc_r, (_reent* r, size_t n), (r,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:60:1: note: in expansion of macro 'ALLOCATE'
+   60 | ALLOCATE(_malloc_r, (_reent* r, size_t n), (r,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap__calloc_r(_reent*, size_t, size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:61:1: note: in expansion of macro 'ALLOCATE'
+   61 | ALLOCATE(_calloc_r, (_reent* r, size_t n, size_t s), (r,n,s), n*s)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:61:1: note: in expansion of macro 'ALLOCATE'
+   61 | ALLOCATE(_calloc_r, (_reent* r, size_t n, size_t s), (r,n,s), n*s)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap__memalign_r(_reent*, size_t, size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:62:1: note: in expansion of macro 'ALLOCATE'
+   62 | ALLOCATE(_memalign_r, (_reent* r, size_t a, size_t n), (r,a,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:62:1: note: in expansion of macro 'ALLOCATE'
+   62 | ALLOCATE(_memalign_r, (_reent* r, size_t a, size_t n), (r,a,n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap__Znwm(size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:65:1: note: in expansion of macro 'ALLOCATE'
+   65 | ALLOCATE(_Znwm, (size_t n), (n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:65:1: note: in expansion of macro 'ALLOCATE'
+   65 | ALLOCATE(_Znwm, (size_t n), (n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc: In function 'void* __wrap__Znam(size_t)':
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |   ^~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:66:1: note: in expansion of macro 'ALLOCATE'
+   66 | ALLOCATE(_Znam, (size_t n), (n), n)
+      | ^~~~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:56:34: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+   56 |   if (guard.outer) Add(p, size); return p; }
+      |                                  ^~~~~~
+/Users/ziangwang/Sources/vibeos/tools/node-runtime/runtime/node-allocation-trace.cc:66:1: note: in expansion of macro 'ALLOCATE'
+   66 | ALLOCATE(_Znam, (size_t n), (n), n)
+      | ^~~~~~~~

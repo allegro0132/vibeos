@@ -47,6 +47,12 @@ extern "C" int vibeos_node_run(unsigned argc, const char* const* argv,
     return 64;
   const int initialized = vibeos::InitializeNodeProcess();
   if (initialized != 0) return initialized;
+#ifdef VIBEOS_NODE_FATAL_PROBE
+  // Independent trusted-image failure fixture: invoke the real upstream V8
+  // initialization-order FATAL after successful process initialization.
+  // This is never compiled into a normal runtime image.
+  v8::V8::InitializePlatform(vibeos::NodePlatform());
+#endif
   std::vector<std::string> args;
   size_t argument_bytes = 0;
   for (unsigned i = 0; i < argc; ++i) {
@@ -138,8 +144,7 @@ extern "C" int vibeos_node_run(unsigned argc, const char* const* argv,
     }
     node::FreeIsolateData(data);
   }
-  v8::platform::NotifyIsolateShutdown(platform, isolate);
-  isolate->Dispose();
+  vibeos::DisposeNodeIsolate(isolate);
   // A busy loop after full environment disposal is a trusted-runtime fault;
   // never return and release a stack still referenced by native callbacks.
   if (uv_loop_close(&loop) != 0) vibeos_native_fatal_exit(70);

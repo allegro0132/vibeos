@@ -1,0 +1,94 @@
+45:
+46: #if !defined(V8_USE_PERFETTO)
+47: static const size_t kMaxCategoryGroups = 200;
+48:
+49: // Parallel arrays g_category_groups and g_category_group_enabled are separate
+50: // so that a pointer to a member of g_category_group_enabled can be easily
+51: // converted to an index into g_category_groups. This allows macros to deal
+52: // only with char enabled pointers from g_category_group_enabled, and we can
+53: // convert internally to determine the category name from the char enabled
+54: // pointer.
+55: const char* g_category_groups[kMaxCategoryGroups] = {
+56:     "toplevel",
+57:     "tracing categories exhausted; must increase kMaxCategoryGroups",
+58:     "__metadata"};
+59:
+60: // The enabled flag is char instead of bool so that the API can be used from C.
+61: unsigned char g_category_group_enabled[kMaxCategoryGroups] = {0};
+62: // Indexes here have to match the g_category_groups array indexes above.
+63: const int g_category_categories_exhausted = 1;
+64: // Metadata category not used in V8.
+65: // const int g_category_metadata = 2;
+66: const int g_num_builtin_categories = 3;
+67:
+68: // Skip default categories.
+69: v8::base::AtomicWord g_category_index = g_num_builtin_categories;
+70: #endif  // !defined(V8_USE_PERFETTO)
+71:
+72: TracingController::TracingController() { mutex_.reset(new base::Mutex()); }
+73:
+74: TracingController::~TracingController() {
+75:   StopTracing();
+76:
+77: #if !defined(V8_USE_PERFETTO)
+78:   {
+79:     // Free memory for category group names allocated via strdup.
+80:     base::MutexGuard lock(mutex_.get());
+81:     for (size_t i = g_category_index - 1; i >= g_num_builtin_categories; --i) {
+82:       const char* group = g_category_groups[i];
+83:       g_category_groups[i] = nullptr;
+84:       free(const_cast<char*>(group));
+85:     }
+86:     g_category_index = g_num_builtin_categories;
+87:   }
+292: }
+293:
+294: const uint8_t* TracingController::GetCategoryGroupEnabled(
+295:     const char* category_group) {
+296:   // Check that category group does not contain double quote
+297:   DCHECK(!strchr(category_group, '"'));
+298:
+299:   // The g_category_groups is append only, avoid using a lock for the fast path.
+300:   size_t category_index = base::Acquire_Load(&g_category_index);
+301:
+302:   // Search for pre-existing category group.
+303:   for (size_t i = 0; i < category_index; ++i) {
+304:     if (strcmp(g_category_groups[i], category_group) == 0) {
+305:       return &g_category_group_enabled[i];
+306:     }
+307:   }
+308:
+309:   // Slow path. Grab the lock.
+310:   base::MutexGuard lock(mutex_.get());
+311:
+312:   // Check the list again with lock in hand.
+313:   unsigned char* category_group_enabled = nullptr;
+314:   category_index = base::Acquire_Load(&g_category_index);
+315:   for (size_t i = 0; i < category_index; ++i) {
+316:     if (strcmp(g_category_groups[i], category_group) == 0) {
+317:       return &g_category_group_enabled[i];
+318:     }
+319:   }
+320:
+321:   // Create a new category group.
+322:   // Check that there is a slot for the new category_group.
+323:   DCHECK(category_index < kMaxCategoryGroups);
+324:   if (category_index < kMaxCategoryGroups) {
+325:     // Don't hold on to the category_group pointer, so that we can create
+326:     // category groups with strings not known at compile time (this is
+327:     // required by SetWatchEvent).
+328:     const char* new_group = strdup(category_group);
+329:     g_category_groups[category_index] = new_group;
+330:     DCHECK(!g_category_group_enabled[category_index]);
+331:     // Note that if both included and excluded patterns in the
+332:     // TraceConfig are empty, we exclude nothing,
+333:     // thereby enabling this category group.
+334:     UpdateCategoryGroupEnabledFlag(category_index);
+335:     category_group_enabled = &g_category_group_enabled[category_index];
+336:     // Update the max index now.
+337:     base::Release_Store(&g_category_index, category_index + 1);
+338:   } else {
+339:     category_group_enabled =
+340:         &g_category_group_enabled[g_category_categories_exhausted];
+341:   }
+342:   return category_group_enabled;

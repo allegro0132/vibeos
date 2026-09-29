@@ -1,0 +1,66 @@
+
+target/node-runtime/m4-audit-link-3/node-shell.elf:     file format elf64-littleriscv
+
+
+Disassembly of section .text:
+
+0000000081599f02 <_mallinfo_r>:
+    81599f02:	715d                	addi	sp,sp,-80
+    81599f04:	e0a2                	sd	s0,64(sp)
+    81599f06:	842a                	mv	s0,a0
+    81599f08:	852e                	mv	a0,a1
+    81599f0a:	e486                	sd	ra,72(sp)
+    81599f0c:	fc26                	sd	s1,56(sp)
+    81599f0e:	84ae                	mv	s1,a1
+    81599f10:	a66ff0ef          	jal	81599176 <__malloc_lock>
+    81599f14:	f8dff0ef          	jal	81599ea0 <__malloc_update_mallinfo>
+    81599f18:	038a8797          	auipc	a5,0x38a8
+    81599f1c:	ce878793          	addi	a5,a5,-792 # 84e41c00 <__malloc_current_mallinfo>
+    81599f20:	0047ae03          	lw	t3,4(a5)
+    81599f24:	0087a303          	lw	t1,8(a5)
+    81599f28:	00c7a883          	lw	a7,12(a5)
+    81599f2c:	0107a803          	lw	a6,16(a5)
+    81599f30:	4bcc                	lw	a1,20(a5)
+    81599f32:	4f90                	lw	a2,24(a5)
+    81599f34:	4fd4                	lw	a3,28(a5)
+    81599f36:	5398                	lw	a4,32(a5)
+    81599f38:	0007ae83          	lw	t4,0(a5)
+    81599f3c:	53dc                	lw	a5,36(a5)
+    81599f3e:	8526                	mv	a0,s1
+    81599f40:	c672                	sw	t3,12(sp)
+    81599f42:	c81a                	sw	t1,16(sp)
+    81599f44:	ca46                	sw	a7,20(sp)
+    81599f46:	cc42                	sw	a6,24(sp)
+    81599f48:	ce2e                	sw	a1,28(sp)
+    81599f4a:	d032                	sw	a2,32(sp)
+    81599f4c:	d236                	sw	a3,36(sp)
+    81599f4e:	d43a                	sw	a4,40(sp)
+    81599f50:	d63e                	sw	a5,44(sp)
+    81599f52:	c476                	sw	t4,8(sp)
+    81599f54:	a2eff0ef          	jal	81599182 <__malloc_unlock>
+    81599f58:	4562                	lw	a0,24(sp)
+    81599f5a:	4e22                	lw	t3,8(sp)
+    81599f5c:	4332                	lw	t1,12(sp)
+    81599f5e:	48c2                	lw	a7,16(sp)
+    81599f60:	4852                	lw	a6,20(sp)
+    81599f62:	45f2                	lw	a1,28(sp)
+    81599f64:	5602                	lw	a2,32(sp)
+    81599f66:	5692                	lw	a3,36(sp)
+    81599f68:	5722                	lw	a4,40(sp)
+    81599f6a:	57b2                	lw	a5,44(sp)
+    81599f6c:	c808                	sw	a0,16(s0)
+    81599f6e:	60a6                	ld	ra,72(sp)
+    81599f70:	01c42023          	sw	t3,0(s0)
+    81599f74:	00642223          	sw	t1,4(s0)
+    81599f78:	01142423          	sw	a7,8(s0)
+    81599f7c:	01042623          	sw	a6,12(s0)
+    81599f80:	c84c                	sw	a1,20(s0)
+    81599f82:	cc10                	sw	a2,24(s0)
+    81599f84:	cc54                	sw	a3,28(s0)
+    81599f86:	d018                	sw	a4,32(s0)
+    81599f88:	d05c                	sw	a5,36(s0)
+    81599f8a:	8522                	mv	a0,s0
+    81599f8c:	6406                	ld	s0,64(sp)
+    81599f8e:	74e2                	ld	s1,56(sp)
+    81599f90:	6161                	addi	sp,sp,80
+    81599f92:	8082                	ret

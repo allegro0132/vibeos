@@ -83,6 +83,8 @@ impl Drop for NativeMemory {
             assert_eq!(stats.live_allocations, 0);
             crate::HEAP.unregister_owner(owner).expect("native memory owner teardown");
         }
+        #[cfg(feature = "node-lifecycle-audit")]
+        crate::println!("NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0");
     }
 }
 fn permission_from_abi(permission: i32) -> Option<Permission> {

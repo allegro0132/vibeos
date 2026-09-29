@@ -10,6 +10,9 @@ impl alloc::task::Wake for NativeNotify {
     fn wake_by_ref(self: &Arc<Self>) { self.signal(); }
 }
 impl NativeNotify {
+    pub(super) fn assert_idle(&self) {
+        assert!(self.state.lock().waiter.is_none(), "native notification wait outlived invocation");
+    }
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self { state: SpinLock::new(State { generation: 0, next: 1, waiter: None }) })
     }

@@ -1,0 +1,55 @@
+
+target/node-runtime/m4-libc-cache-analysis/libc_a-mprec.o:     file format elf64-littleriscv
+
+
+Disassembly of section .text._Balloc:
+
+Disassembly of section .text._Bfree:
+
+0000000000000000 <_Bfree>:
+   0:	c981                	beqz	a1,10 <.L14>
+			0: R_RISCV_RVC_BRANCH	.L14
+   2:	4598                	lw	a4,8(a1)
+   4:	753c                	ld	a5,104(a0)
+   6:	070e                	slli	a4,a4,0x3
+   8:	97ba                	add	a5,a5,a4
+   a:	6398                	ld	a4,0(a5)
+   c:	e198                	sd	a4,0(a1)
+   e:	e38c                	sd	a1,0(a5)
+
+0000000000000010 <.L14>:
+  10:	8082                	ret
+
+Disassembly of section .text.__multadd:
+
+Disassembly of section .text.__s2b:
+
+Disassembly of section .text.__hi0bits:
+
+Disassembly of section .text.__lo0bits:
+
+Disassembly of section .text.__i2b:
+
+Disassembly of section .text.__multiply:
+
+Disassembly of section .text.__pow5mult:
+
+Disassembly of section .text.__lshift:
+
+Disassembly of section .text.__mcmp:
+
+Disassembly of section .text.__mdiff:
+
+Disassembly of section .text.__ulp:
+
+Disassembly of section .text.__b2d:
+
+Disassembly of section .text.__d2b:
+
+Disassembly of section .text.__ratio:
+
+Disassembly of section .text._mprec_log10:
+
+Disassembly of section .text.__copybits:
+
+Disassembly of section .text.__any_on:

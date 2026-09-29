@@ -19,6 +19,12 @@ impl Semaphore {
 pub(super) struct Semaphores { entries: Vec<(usize, Arc<Semaphore>)> }
 impl Semaphores {
     pub(super) fn new() -> Self { Self { entries: Vec::new() } }
+    #[cfg(feature = "node-lifecycle-audit")]
+    pub(super) fn audit_idle(&self) -> usize {
+        assert!(self.entries.iter().all(|(_, sem)| Arc::strong_count(sem) == 1),
+                "native semaphore posting or waiting rights outlived invocation");
+        self.entries.len()
+    }
     fn create(&mut self, count: i32, notify: Arc<NativeNotify>) -> *mut c_void {
         if count < 0 || self.entries.len() >= 256 || self.entries.try_reserve(1).is_err() {
             return core::ptr::null_mut();

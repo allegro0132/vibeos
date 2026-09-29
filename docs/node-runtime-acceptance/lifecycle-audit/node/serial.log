@@ -1,0 +1,181 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x8558d000..0xc0000000  (960972 KiB)
+  traps     stvec armed, PLIC ctx S/hart0, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x84e8d000..0x8508d000, MXR clear, RFENCE ready
+  read-only 50560 KiB .rodata 0x819b8000..0x84b18000; 4096 KiB COW capability-table pool
+  world     15 capability spaces, 1 typed channel, 6 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> quiet
+background component output muted
+[2Kvsh> mkdir @home/project
+[2Kvsh> echo "module.exports = 42" | write @home/project/dep.cjs
+[2Kvsh> echo "console.log('VSH_NODE_' + 'FILE=' + require('./dep.cjs'))" | write @home/project/main.cjs
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'EVAL=' + (1 + 2))"
+VSH_NODE_EVAL=3
+NATIVE TLS RECLAIM id=1 released_slots=17 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project main.cjs
+VSH_NODE_FILE=42
+NATIVE TLS RECLAIM id=2 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> echo stream-input | node --root @home/project -e "process.stdin.setEncoding('utf8'); let s=''; process.stdin.on('data', x => s += x); process.stdin.on('end', () => console.log('VSH_NODE_' + 'STDIN=' + s.trim()))"
+VSH_NODE_STDIN=stream-input
+NATIVE TLS RECLAIM id=3 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "const fs=require('fs'); fs.writeFileSync('out.txt','saved'); console.log('VSH_NODE_' + 'FS=' + fs.readFileSync('out.txt','utf8'))"
+VSH_NODE_FS=saved
+NATIVE TLS RECLAIM id=4 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'TIMER=done'), 10)"
+VSH_NODE_TIMER=done
+NATIVE TLS RECLAIM id=5 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> echo "export default 99" | write @home/project/dep.mjs
+[2Kvsh> node --root @home/project -e "import('./dep.mjs').then(m => console.log('VSH_NODE_' + 'ESM=' + m.default))"
+VSH_NODE_ESM=99
+NATIVE TLS RECLAIM id=6 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'REDIRECT=console')" > @console
+VSH_NODE_REDIRECT=console
+NATIVE TLS RECLAIM id=7 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "process.exit(7)"
+NATIVE TLS RECLAIM id=8 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %13: Returned(7)
+[2Kvsh> if node --root @home/project -e "process.exit(7)"; then node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=bad')"; else node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=nonzero')"; fi
+NATIVE TLS RECLAIM id=9 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+VSH_NODE_EXIT=nonzero
+NATIVE TLS RECLAIM id=10 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "throw new Error('VSH_NODE_' + 'EXPECTED_ERROR')"
+NATIVE TLS RECLAIM id=11 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[eval]:1
+throw new Error('VSH_NODE_' + 'EXPECTED_ERROR')
+^
+
+Error: VSH_NODE_EXPECTED_ERROR
+    at [eval]:1:7
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:92:30)
+    at evalScript (node:internal/process/execution:104:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.14.0
+  vsh job %16: Returned(1)
+[2Kvsh> node --root @home/project -e "for(let once=true;;){if(once){console.log('VSH_NODE_' + 'CPU_READY');once=false}}"
+VSH_NODE_CPU_READY
+^C
+NATIVE TLS RECLAIM id=12 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %17: Cancelled
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_CPU=ok')"
+VSH_NODE_AFTER_CPU=ok
+NATIVE TLS RECLAIM id=13 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'IDLE_MISSED'),60000); console.log('VSH_NODE_' + 'IDLE_READY')"
+VSH_NODE_IDLE_READY
+^C
+NATIVE TLS RECLAIM id=14 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %19: Cancelled
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_IDLE=ok')"
+VSH_NODE_AFTER_IDLE=ok
+NATIVE TLS RECLAIM id=15 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> 

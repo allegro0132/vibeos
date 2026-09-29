@@ -63,35 +63,57 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
             io.complete(WasiTerminal::LimitExceeded);
             return;
         };
+        #[cfg(feature = "node-lifecycle-audit")]
+        let (files, project_audit) = files.audited();
+        #[cfg(feature = "node-lifecycle-audit")]
+        let (tools, tool_audit) = match tools {
+            Some(grant) => { let (grant, audit) = grant.audited(); (Some(grant), Some(audit)) }
+            None => (None, None),
+        };
         run.tls().set_files(files.clone());
         if let Some(tools) = tools.as_ref() { run.tls().set_tools(tools.clone()); }
         run.tls().set_entropy(entropy);
         run.tls().set_stdio(crate::native_stdio::StdioGrant::new(io.clone()));
         // No host environment is inherited; explicit empty initial environment.
         run.tls().set_environment(&[]).expect("empty Node environment");
-        let monitor = async {
-            loop {
-                exec::sleep_ms(10).await;
-                if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) { io.deny(); }
-            }
+        let (result, _) = {
+            let monitor = async {
+                loop {
+                    exec::sleep_ms(10).await;
+                    if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) { io.deny(); }
+                }
+            };
+            let mut monitor = pin!(monitor);
+            let mut run = pin!(run.run());
+            poll_fn(|cx| {
+                let _ = monitor.as_mut().poll(cx);
+                match run.as_mut().poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => Poll::Pending,
+                }
+            }).await
         };
-        let mut monitor = pin!(monitor);
-        let mut run = pin!(run.run());
-        let (result, _) = poll_fn(|cx| {
-            let _ = monitor.as_mut().poll(cx);
-            match run.as_mut().poll(cx) {
-                Poll::Ready(result) => Poll::Ready(result),
-                Poll::Pending => Poll::Pending,
-            }
-        }).await;
         // Completion is published only after NativeAsync has returned and its
         // protected stack/TLS/page-owner cleanup has run.
+        // End the monitor and release invocation authority before publication.
+        drop(files);
+        drop(tools);
+        #[cfg(feature = "node-lifecycle-audit")]
+        {
+            project_audit.assert_reclaimed("project");
+            if let Some(audit) = tool_audit { audit.assert_reclaimed("tools"); }
+        }
         // Release admission before waking a command on another hart, so a
         // sequential VSH command never observes the previous invocation busy.
         drop(_admission);
         io.complete(if io.denied() { WasiTerminal::Denied }
                     else if io.cancelled() { WasiTerminal::Cancelled }
                     else { WasiTerminal::Exited(result as u32) });
+        #[cfg(feature = "node-lifecycle-audit")]
+        {
+            assert_eq!(io.pending_waiters(), 0, "native I/O waiters survived terminal closure");
+            crate::println!("NATIVE IO RECLAIM waiters=0");
+        }
     });
     Ok(())
 }

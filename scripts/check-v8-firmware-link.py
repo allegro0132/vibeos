@@ -94,7 +94,19 @@ def main():
     parser.add_argument('--toolkit', type=Path, help='prepared offline tool directory; requires --node-shell')
     parser.add_argument('--esbuild-probe', action='store_true', help='run the native/WASI transform bridge gate')
     parser.add_argument('--js-esbuild-probe', action='store_true', help='register the tool-authorized Node fixture command')
+    parser.add_argument('--lifecycle-audit', action='store_true', help='record native teardown counters in the guest')
+    parser.add_argument('--allocation-trace', action='store_true', help='trace surviving newlib allocations in fixed diagnostic storage')
+    parser.add_argument('--authority-probe', action='store_true', help='qualify live project/tool revocation through the Node supervisor')
+    parser.add_argument('--fatal-probe', action='store_true', help='inject an actual V8 startup-order fatal error in a separate test image')
     args = parser.parse_args()
+    if args.fatal_probe and (not args.node_shell or args.authority_probe or args.esbuild_probe or args.js_esbuild_probe):
+        parser.error('--fatal-probe requires --node-shell and excludes other probes')
+    if args.authority_probe and (not args.toolkit or not args.lifecycle_audit or args.esbuild_probe or args.js_esbuild_probe):
+        parser.error('--authority-probe requires --toolkit --lifecycle-audit and excludes other boot probes')
+    if args.allocation_trace and not args.lifecycle_audit:
+        parser.error('--allocation-trace requires --lifecycle-audit')
+    if args.lifecycle_audit and not args.node_shell:
+        parser.error('--lifecycle-audit requires --node-shell')
     if args.toolkit and not args.node_shell:
         parser.error('--toolkit requires --node-shell')
     if args.esbuild_probe and not args.toolkit:
@@ -220,8 +232,15 @@ def main():
             obj = work / (runtime.stem + '.o')
             cmd = builder.smoke_command(source, cxx, obj, input_source=runtime, library='node')
             cmd += ['-I' + str(ROOT / 'tools/node-runtime/runtime'), '-I' + str(ROOT / 'tools/node-runtime/platform')]
+            cmd += ['-I' + str(source / 'deps/v8')]
             if args.toolkit:
                 cmd += ['-DVIBEOS_NODE_TOOLKIT=1']
+            if args.lifecycle_audit:
+                cmd += ['-DVIBEOS_NODE_LIFECYCLE_AUDIT=1']
+            if args.allocation_trace:
+                cmd += ['-DVIBEOS_NODE_ALLOCATION_TRACE=1']
+            if args.fatal_probe:
+                cmd += ['-DVIBEOS_NODE_FATAL_PROBE=1']
             with (work / (runtime.stem + '.log')).open('w') as log:
                 subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
             uv_objects.append(obj)
@@ -243,15 +262,22 @@ def main():
     entry_objects = ['--undefined=vibeos_node_run'] if args.node_shell else ['--undefined=vibeos_v8_smoke', str(smoke)]
     link_args = [*entry_objects, *map(str, uv_objects), '--start-group',
                  *map(str, archives), '--end-group', '--error-limit=0']
+    if args.allocation_trace:
+        link_args += ['--wrap=' + name for name in
+                      ('malloc', 'calloc', 'realloc', 'free', 'memalign',
+                       '_malloc_r', '_calloc_r', '_realloc_r', '_free_r', '_memalign_r',
+                       '_Znwm', '_Znam')]
     command = ['rustup', 'run', 'nightly-2026-08-01', 'cargo', 'rustc', '--locked',
                '--offline', '--release', '--target', 'riscv64gc-unknown-none-elf',
                '--features', ('wasi-ssh-upload,native-uv-probe' if args.uv_loop else
+                              'wasi-ssh-upload,node-authority-probe' if args.authority_probe else
                               'wasi-ssh-upload,node-toolkit-probe' if args.js_esbuild_probe else
                               'wasi-ssh-upload,node-esbuild-probe' if args.esbuild_probe else
                               'wasi-ssh-upload,node-toolkit' if args.toolkit else
                               'wasi-ssh-upload,node-runtime' if args.node_shell else
                               'wasi-ssh-upload,node-runtime-gate' if args.gate else
-                              'wasi-ssh-upload,native-runtime-probe,native-cxx-probe'),
+                              'wasi-ssh-upload,native-runtime-probe,native-cxx-probe') +
+                             (',node-lifecycle-audit' if args.lifecycle_audit else ''),
                '--bin', 'vibeos-qemu-virt', '--',
                *[f'-Clink-arg={arg}' for arg in link_args]]
     env = dict(os.environ)
@@ -289,6 +315,7 @@ def main():
     if args.node:
         report['scope'] = ('Native Node VSH image; execution still required' if args.node_shell else
                            f'Real Node embedding gate ({args.node_repeat} invocation(s)); execution still required')
+    report['fatal_probe'] = args.fatal_probe
     report['smoke_source'] = str(smoke_source)
     report['smoke_source_sha256'] = digest(smoke_source)
     report['smoke_object_sha256'] = digest(smoke)

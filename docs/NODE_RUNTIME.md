@@ -5,8 +5,8 @@ runs through capability-rooted local VSH and authorized OpenSSH PTY sessions.
 CJS/ESM, files, stdio/pipes, timers, exact exit status and cooperative cancellation
 pass target tests. Official tsc now checks projects, emits JS/declarations,
 and reports type errors on target. Adapted upstream tsx also executes TS/TSX
-projects on target. Complete fresh-build M3 qualification passes; the full
-safety/lifecycle audit and final regression milestone remain incomplete.**
+projects on target. Complete fresh-build M3 and M4 safety/lifecycle qualification pass;
+the final regression milestone remains incomplete.**
 
 [Current compatibility and limits](NODE_RUNTIME_COMPATIBILITY.md).
 
@@ -43,15 +43,14 @@ retains its original internal milestone labels.
   The final production image passes tsc, tsx, Node, directory boundaries,
   transform cancellation, backpressure, OOM and 100 launches; a matching
   probe profile passes the official esbuild API and Promise/exit-cleanup suite.
-- **M4 — safety and lifecycle:** partial. Existing Node tests cover root
-  boundaries, parent-capability revocation, and CPU/idle cancellation. Toolkit
-  tests cover read-only tools, cwd boundaries, [output backpressure](node-runtime-acceptance/node-backpressure/README.md),
-  [100 production launches](node-runtime-acceptance/node-cycles/README.md),
-  [transform cancellation](node-runtime-acceptance/tsx-cancel/README.md), and
-  [unrecoverable OOM](node-runtime-acceptance/node-oom/README.md).
-  The production cycle test's rounded heap samples do not prove precise
-  handle/capability reclamation. Complete final-image authority/revocation and
-  resource-inventory qualification remain outstanding.
+- **M4 — safety and lifecycle:** complete. The [lifecycle audit](node-runtime-acceptance/lifecycle-audit/README.md)
+  qualifies path/readonly boundaries, live project/tool parent revocation,
+  CPU/idle and WASI-transform cancellation, backpressure, and separate fatal/OOM
+  behavior. A fresh patched build fixes foreground-runner and cppgc wrapper
+  retention. File, eval and uncaught-error workloads each pass 100 QEMU launches
+  with exact stable non-cache allocator occupancy and synchronization counts;
+  file/TLS/page owners, invocation grants, leases and I/O waiters are reclaimed.
+  Intentional bounded process caches remain explicitly inventoried.
 - **M5 — regression and evidence:** partial. Fresh complete build records,
   toolkit timings, memory observations, host tests and default-image file-tree
   regression are retained. Final WASI/MMU and affected-suite qualification
@@ -59,7 +58,7 @@ retains its original internal milestone labels.
 
 Completed milestones are committed and pushed to `implement_nodejs`. The full
 goal stays open until all agreed target execution and qualification requirements
-pass; the full M4 audit and final M5 qualification remain outstanding.
+pass; final M5 qualification remains outstanding.
 
 The implementation uses real Node.js with its bundled V8/libuv, statically linked
 into an opt-in QEMU image. V8 starts JIT-less. Resource access remains rooted in

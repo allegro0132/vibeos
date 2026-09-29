@@ -9,7 +9,36 @@ pub(super) struct FileGrant {
     #[cfg(feature = "native-cxx-probe")]
     probe_authority: Option<(Arc<Space>, Cap)>,
 }
+#[cfg(feature = "node-lifecycle-audit")]
+pub(super) struct GrantAudit(alloc::sync::Weak<()>);
+#[cfg(feature = "node-lifecycle-audit")]
+impl GrantAudit {
+    pub(super) fn assert_reclaimed(self, kind: &str) {
+        assert_eq!(self.0.strong_count(), 0, "native grant provider or lease outlived invocation");
+        crate::println!("NATIVE GRANT RECLAIM kind={} providers=0 leases=0", kind);
+    }
+}
 impl FileGrant {
+    /// Observe this invocation's provider and all leases acquired through it.
+    /// The process-wide tool provider remains independently owned by its cache.
+    #[cfg(feature = "node-lifecycle-audit")]
+    pub(super) fn audited(self) -> (Self, GrantAudit) {
+        let lifetime = Arc::new(());
+        let audit = GrantAudit(Arc::downgrade(&lifetime));
+        #[cfg(feature = "native-cxx-probe")]
+        let probe_authority = self.probe_authority.clone();
+        let grant = Self {
+            lookup: Arc::new(move |rights| {
+                let mut lease = self.lease(rights)?;
+                assert!(lease.audit.is_none(), "grant already has an invocation audit owner");
+                lease.audit = Some(lifetime.clone());
+                Some(lease)
+            }),
+            #[cfg(feature = "native-cxx-probe")]
+            probe_authority,
+        };
+        (grant, audit)
+    }
     #[cfg(feature = "node-toolkit")]
     pub(super) async fn load_module(&self, path: &RelPath) -> Result<Vec<u8>, i32> {
         let lease = self.lease(Rights::READ).ok_or(-3)?;
@@ -48,7 +77,11 @@ impl FileGrant {
         lookup: impl Fn(Rights) -> Option<InvocationLease<FileTreeRoot>> + Send + Sync + 'static,
     ) -> Option<Self> {
         let grant = Self {
-            lookup: Arc::new(move |rights| lookup(rights).map(|authority| FileLease { authority, view: None })),
+            lookup: Arc::new(move |rights| lookup(rights).map(|authority| FileLease {
+                authority, view: None,
+                #[cfg(feature = "node-lifecycle-audit")]
+                audit: None,
+            })),
             #[cfg(feature = "native-cxx-probe")]
             probe_authority: None,
         };
@@ -85,6 +118,9 @@ impl FileGrant {
 struct FileLease {
     authority: InvocationLease<FileTreeRoot>,
     view: Option<FileTreeRoot>,
+    // Last field: retained until both the actual authority and view are dropped.
+    #[cfg(feature = "node-lifecycle-audit")]
+    audit: Option<Arc<()>>,
 }
 impl FileLease {
     fn with<R>(&self, operation: impl for<'a> FnOnce(&'a FileTreeRoot) -> R) -> R {
@@ -542,6 +578,13 @@ impl Drop for FileTable {
     fn drop(&mut self) {
         assert!(self.mutations.is_empty(), "native mutation must complete before invocation teardown");
         assert!(self.reads.is_empty(), "native reads must complete before invocation teardown");
+        assert!(self.entries.iter().all(|(_, file)| Arc::strong_count(file) == 1),
+                "native file users outlived invocation");
+        // Release descriptors and their grant providers before recording the
+        // audit. Pending operations have already relinquished their leases.
+        self.entries.clear();
+        #[cfg(feature = "node-lifecycle-audit")]
+        crate::println!("NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0");
     }
 }
 fn lookup(fd: i32) -> Option<Arc<OpenFile>> {

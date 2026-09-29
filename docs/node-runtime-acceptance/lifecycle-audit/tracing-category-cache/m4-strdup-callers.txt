@@ -1,0 +1,11 @@
+
+00000000815a5d4e <strdup>:
+    815a5d4e:	85aa                	mv	a1,a0
+    815a5d50:	03574517          	auipc	a0,0x3574
+    815a5d54:	40853503          	ld	a0,1032(a0) # 84b1a158 <_impure_ptr>
+    815a5d58:	a009                	j	815a5d5a <_strdup_r>
+
+00000000815a5d5a <_strdup_r>:
+    815a5d5a:	1101                	addi	sp,sp,-32
+    815a5d5c:	e822                	sd	s0,16(sp)
+    815a5d5e:	842a                	mv	s0,a0

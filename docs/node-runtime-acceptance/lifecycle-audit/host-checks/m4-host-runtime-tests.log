@@ -1,0 +1,8 @@
+..failure: BLOCKED (exit 7)
+..missing: BLOCKED (exit 127)
+...timeout: BLOCKED (exit 124)
+.
+----------------------------------------------------------------------
+Ran 8 tests in 0.086s
+
+OK

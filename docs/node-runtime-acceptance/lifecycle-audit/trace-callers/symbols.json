@@ -1,0 +1,106 @@
+{
+  "0x22": [
+    "??",
+    "??:0"
+  ],
+  "0x8061703c": [
+    "__wrap__malloc_r",
+    "??:?"
+  ],
+  "0x806170a4": [
+    "__wrap__calloc_r",
+    "??:?"
+  ],
+  "0x80617164": [
+    "__wrap__Znwm",
+    "??:?"
+  ],
+  "0x8065221a": [
+    "v8::internal::MaybeHandle<v8::internal::Object> v8::internal::(anonymous namespace)::HandleApiCallHelper<true>(v8::internal::Isolate*, v8::internal::DirectHandle<v8::internal::HeapObject>, v8::internal::DirectHandle<v8::internal::FunctionTemplateInfo>, v8::internal::DirectHandle<v8::internal::Object>, unsigned long*, int) [clone .isra.0]",
+    "builtins-api.cc:?"
+  ],
+  "0x80652464": [
+    "v8::internal::Builtin_HandleApiConstruct(int, unsigned long*, v8::internal::Isolate*)",
+    "builtins-api.cc:?"
+  ],
+  "0x8077def2": [
+    "v8::internal::Isolate::Deinit()",
+    "isolate.cc:?"
+  ],
+  "0x8087c7a4": [
+    "Builtins_CEntry_Return1_ArgvOnStack_BuiltinExit",
+    "basic-block-profiler.cc:?"
+  ],
+  "0x80a497e6": [
+    "v8::internal::(anonymous namespace)::CppgcPlatformAdapter::GetForegroundTaskRunner(v8::TaskPriority)",
+    "cpp-heap.cc:?"
+  ],
+  "0x80a4a85c": [
+    "non-virtual thunk to v8::internal::CppHeap::~CppHeap()",
+    "cpp-heap.cc:?"
+  ],
+  "0x80a9689c": [
+    "v8::internal::Heap::TearDown()",
+    "heap.cc:?"
+  ],
+  "0x80f123fe": [
+    "cppgc::internal::HeapBase::Terminate()",
+    "heap-base.cc:?"
+  ],
+  "0x80f2979e": [
+    "cppgc::internal::Sweeper::Start(cppgc::internal::SweepingConfig)",
+    "sweeper.cc:?"
+  ],
+  "0x815059f6": [
+    "v8::platform::DefaultPlatform::GetForegroundTaskRunner(v8::Isolate*, v8::TaskPriority)",
+    "??:?"
+  ],
+  "0x81505a1e": [
+    "v8::platform::DefaultPlatform::GetForegroundTaskRunner(v8::Isolate*, v8::TaskPriority)",
+    "??:?"
+  ],
+  "0x81505ad2": [
+    "v8::platform::DefaultPlatform::GetForegroundTaskRunner(v8::Isolate*, v8::TaskPriority)",
+    "??:?"
+  ],
+  "0x81505b10": [
+    "v8::platform::DefaultPlatform::GetForegroundTaskRunner(v8::Isolate*, v8::TaskPriority)",
+    "??:?"
+  ],
+  "0x81508898": [
+    "v8::platform::DefaultForegroundTaskRunner::DefaultForegroundTaskRunner(v8::platform::IdleTaskSupport, double (*)())",
+    "??:?"
+  ],
+  "0x815088b2": [
+    "v8::platform::DefaultForegroundTaskRunner::DefaultForegroundTaskRunner(v8::platform::IdleTaskSupport, double (*)())",
+    "??:?"
+  ],
+  "0x81508906": [
+    "v8::platform::DefaultForegroundTaskRunner::DefaultForegroundTaskRunner(v8::platform::IdleTaskSupport, double (*)())",
+    "??:?"
+  ],
+  "0x81508920": [
+    "v8::platform::DefaultForegroundTaskRunner::DefaultForegroundTaskRunner(v8::platform::IdleTaskSupport, double (*)())",
+    "??:?"
+  ],
+  "0x81599ca0": [
+    "_Balloc",
+    "??:?"
+  ],
+  "0x8159a028": [
+    "__i2b",
+    "??:?"
+  ],
+  "0x815a5974": [
+    "_strdup_r",
+    "??:?"
+  ],
+  "0x8167e94e": [
+    "node::contextify::ContextifyScript::New(node::Environment*, v8::Local<v8::Object>)",
+    "??:?"
+  ],
+  "0x8167ee08": [
+    "node::contextify::ContextifyScript::New(v8::FunctionCallbackInfo<v8::Value> const&)",
+    "??:?"
+  ]
+}

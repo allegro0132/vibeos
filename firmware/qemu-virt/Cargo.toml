@@ -6,6 +6,8 @@ build = "build.rs"
 
 [features]
 node-runtime = ["vibeos-kernel/node-runtime", "vibeos-bsp-qemu-virt/node-runtime"]
+node-lifecycle-audit = ["node-runtime", "vibeos-kernel/node-lifecycle-audit"]
+node-authority-probe = ["node-toolkit", "node-lifecycle-audit", "vibeos-kernel/node-authority-probe"]
 node-toolkit = ["node-runtime", "vibeos-kernel/node-toolkit"]
 node-esbuild-probe = ["node-toolkit", "vibeos-kernel/node-esbuild-probe"]
 node-toolkit-probe = ["node-toolkit", "vibeos-kernel/node-toolkit-probe"]

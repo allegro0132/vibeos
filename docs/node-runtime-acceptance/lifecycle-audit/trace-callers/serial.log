@@ -1,0 +1,313 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 2
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 2
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x85b0f000..0xc0000000  (955332 KiB)
+  traps     stvec armed, PLIC ctx S/hart2, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x8540f000..0x8560f000, MXR clear, RFENCE ready
+  read-only 50560 KiB .rodata 0x819ba000..0x84b1a000; 4096 KiB COW capability-table pool
+  world     15 capability spaces, 1 typed channel, 6 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> quiet
+background component output muted
+[2Kvsh> mkdir @home/project
+[2Kvsh> echo "module.exports = 42" | write @home/project/dep.cjs
+[2Kvsh> echo "console.log('VSH_NODE_' + 'FILE=' + require('./dep.cjs'))" | write @home/project/main.cjs
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'EVAL=' + (1 + 2))"
+VSH_NODE_EVAL=3
+NATIVE ALLOCATION TOTAL count=3370 requested_bytes=203752 overflow=0
+NATIVE LIBC SNAPSHOT id=1 arena=1892352 live=252272 free=1640080 free_chunks=21
+NATIVE TLS RECLAIM id=1 released_slots=17 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project main.cjs
+VSH_NODE_FILE=42
+NATIVE ALLOCATION born=2 ptr=0x85ee5240 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=2 ptr=0x85ee1ed0 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=2 ptr=0x85fa80c0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=2 ptr=0x85f0c8e0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=2 ptr=0x85e38490 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=2 ptr=0x85f3cc00 size=56 frames=[80617164, 81505b10, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3370 requested_bytes=203752 overflow=0
+NATIVE LIBC SNAPSHOT id=2 arena=1892352 live=252288 free=1640064 free_chunks=21
+NATIVE TLS RECLAIM id=2 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> echo stream-input | node --root @home/project -e "process.stdin.setEncoding('utf8'); let s=''; process.stdin.on('data', x => s += x); process.stdin.on('end', () => console.log('VSH_NODE_' + 'STDIN=' + s.trim()))"
+VSH_NODE_STDIN=stream-input
+NATIVE ALLOCATION born=3 ptr=0x85e319d0 size=56 frames=[80617164, 81505b10, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=3 ptr=0x85e317c0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=3 ptr=0x85f9c2a0 size=36 frames=[806170a4, 8159a028, 0, 0, 0, 0, 0, 0]
+NATIVE ALLOCATION born=3 ptr=0x85ec8ef0 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=3 ptr=0x85f52a00 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=3 ptr=0x85e93430 size=44 frames=[806170a4, 81599ca0, 0, 0, 0, 0, 0, 0]
+NATIVE ALLOCATION born=3 ptr=0x85f9c310 size=44 frames=[806170a4, 81599ca0, 0, 0, 0, 0, 0, 0]
+NATIVE ALLOCATION born=3 ptr=0x85f7b410 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=3 ptr=0x85f9c2d0 size=44 frames=[806170a4, 81599ca0, 0, 0, 0, 0, 0, 0]
+NATIVE ALLOCATION born=3 ptr=0x85f598f0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=3 ptr=0x85e42bf0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3381 requested_bytes=205424 overflow=0
+NATIVE LIBC SNAPSHOT id=3 arena=1847296 live=254128 free=1593168 free_chunks=29
+NATIVE TLS RECLAIM id=3 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "const fs=require('fs'); fs.writeFileSync('out.txt','saved'); console.log('VSH_NODE_' + 'FS=' + fs.readFileSync('out.txt','utf8'))"
+VSH_NODE_FS=saved
+NATIVE ALLOCATION born=4 ptr=0x85e5a580 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=4 ptr=0x85e5a370 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=4 ptr=0x85f84c30 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=4 ptr=0x85e685b0 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=4 ptr=0x85f64660 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=4 ptr=0x85f64770 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=4 ptr=0x85e4f240 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3388 requested_bytes=206928 overflow=0
+NATIVE LIBC SNAPSHOT id=4 arena=1921024 live=255728 free=1665296 free_chunks=33
+NATIVE TLS RECLAIM id=4 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'TIMER=done'), 10)"
+VSH_NODE_TIMER=done
+NATIVE ALLOCATION born=5 ptr=0x85fb6a60 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=5 ptr=0x85f71130 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=5 ptr=0x85fb6d80 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=5 ptr=0x85fb6b70 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=5 ptr=0x85ec6260 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=5 ptr=0x85e45990 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=5 ptr=0x85f5ba20 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION TOTAL count=3389 requested_bytes=206960 overflow=0
+NATIVE LIBC SNAPSHOT id=5 arena=1908736 live=255776 free=1652960 free_chunks=35
+NATIVE TLS RECLAIM id=5 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> echo "export default 99" | write @home/project/dep.mjs
+[2Kvsh> node --root @home/project -e "import('./dep.mjs').then(m => console.log('VSH_NODE_' + 'ESM=' + m.default))"
+VSH_NODE_ESM=99
+NATIVE ALLOCATION born=6 ptr=0x85e42bb0 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=6 ptr=0x85ee19d0 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=6 ptr=0x85fd03f0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=6 ptr=0x85fd01e0 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=6 ptr=0x85e45a70 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=6 ptr=0x85f2c800 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=6 ptr=0x85e7c390 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3390 requested_bytes=206992 overflow=0
+NATIVE LIBC SNAPSHOT id=6 arena=2043904 live=255824 free=1788080 free_chunks=36
+NATIVE TLS RECLAIM id=6 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'REDIRECT=console')" > @console
+VSH_NODE_REDIRECT=console
+NATIVE ALLOCATION born=7 ptr=0x85e42b30 size=56 frames=[80617164, 81505b10, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=7 ptr=0x85ef2ee0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=7 ptr=0x85ef2ff0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=7 ptr=0x85fdcea0 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=7 ptr=0x85f7b410 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=7 ptr=0x85fc16f0 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=7 ptr=0x85ecdfa0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3391 requested_bytes=207024 overflow=0
+NATIVE LIBC SNAPSHOT id=7 arena=2072576 live=255872 free=1816704 free_chunks=38
+NATIVE TLS RECLAIM id=7 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "process.exit(7)"
+NATIVE ALLOCATION born=8 ptr=0x85fa81a0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=8 ptr=0x85f6f8d0 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=8 ptr=0x85f15f30 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=8 ptr=0x85f61350 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=8 ptr=0x85f292a0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=8 ptr=0x85f295c0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=8 ptr=0x85f293b0 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3398 requested_bytes=208528 overflow=0
+NATIVE LIBC SNAPSHOT id=8 arena=2146304 live=257472 free=1888832 free_chunks=43
+NATIVE TLS RECLAIM id=8 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %13: Returned(7)
+[2Kvsh> if node --root @home/project -e "process.exit(7)"; then node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=bad')"; else node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=nonzero')"; fi
+NATIVE ALLOCATION born=9 ptr=0x85f57210 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=9 ptr=0x85e4b3c0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=9 ptr=0x85e23030 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=9 ptr=0x85f63280 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=9 ptr=0x85ec9d90 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=9 ptr=0x85ef3290 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=9 ptr=0x85e23a30 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3405 requested_bytes=210032 overflow=0
+NATIVE LIBC SNAPSHOT id=9 arena=2146304 live=259072 free=1887232 free_chunks=49
+NATIVE TLS RECLAIM id=9 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+VSH_NODE_EXIT=nonzero
+NATIVE ALLOCATION born=10 ptr=0x85eaac00 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=10 ptr=0x85f56e70 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=10 ptr=0x85ef9000 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=10 ptr=0x85f1e6a0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=10 ptr=0x85f1e490 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=10 ptr=0x85f252d0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=10 ptr=0x85f4cdc0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3412 requested_bytes=211536 overflow=0
+NATIVE LIBC SNAPSHOT id=10 arena=2060288 live=260672 free=1799616 free_chunks=55
+NATIVE TLS RECLAIM id=10 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "throw new Error('VSH_NODE_' + 'EXPECTED_ERROR')"
+NATIVE ALLOCATION born=11 ptr=0x85e65f70 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=11 ptr=0x85e7dab0 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=11 ptr=0x85e4b760 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=11 ptr=0x85eb53f0 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=11 ptr=0x85eb51e0 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=11 ptr=0x85ee7d20 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=11 ptr=0x85fb7b50 size=35 frames=[8061703c, 815a5974, 0, 0, 0, 0, 0, 0]
+NATIVE ALLOCATION born=11 ptr=0x85f5b910 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3420 requested_bytes=213075 overflow=0
+NATIVE LIBC SNAPSHOT id=11 arena=2060288 live=262320 free=1797968 free_chunks=61
+NATIVE TLS RECLAIM id=11 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[eval]:1
+throw new Error('VSH_NODE_' + 'EXPECTED_ERROR')
+^
+
+Error: VSH_NODE_EXPECTED_ERROR
+    at [eval]:1:7
+    at runScriptInThisContext (node:internal/vm:219:10)
+    at node:internal/process/execution:451:12
+    at [eval]-wrapper:6:24
+    at runScriptInContext (node:internal/process/execution:449:60)
+    at evalFunction (node:internal/process/execution:92:30)
+    at evalScript (node:internal/process/execution:104:3)
+    at node:internal/main/eval_string:71:3
+
+Node.js v24.14.0
+  vsh job %16: Returned(1)
+[2Kvsh> node --root @home/project -e "for(let once=true;;){if(once){console.log('VSH_NODE_' + 'CPU_READY');once=false}}"
+VSH_NODE_CPU_READY
+^C
+NATIVE ALLOCATION born=12 ptr=0x85ee1a00 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=12 ptr=0x85efbc10 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=12 ptr=0x85fc1390 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=12 ptr=0x85efbed0 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=12 ptr=0x85e23790 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=12 ptr=0x85e80950 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=12 ptr=0x85e95e20 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3427 requested_bytes=214579 overflow=0
+NATIVE LIBC SNAPSHOT id=12 arena=2080768 live=263920 free=1816848 free_chunks=66
+NATIVE TLS RECLAIM id=12 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %17: Cancelled
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_CPU=ok')"
+VSH_NODE_AFTER_CPU=ok
+NATIVE ALLOCATION born=13 ptr=0x85f60760 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=13 ptr=0x85e23240 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=13 ptr=0x85eaae60 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=13 ptr=0x85f4cf60 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=13 ptr=0x85f607b0 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=13 ptr=0x85e2d820 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=13 ptr=0x85e96140 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3434 requested_bytes=216083 overflow=0
+NATIVE LIBC SNAPSHOT id=13 arena=2113536 live=265520 free=1848016 free_chunks=71
+NATIVE TLS RECLAIM id=13 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'IDLE_MISSED'),60000); console.log('VSH_NODE_' + 'IDLE_READY')"
+VSH_NODE_IDLE_READY
+^C
+NATIVE ALLOCATION born=14 ptr=0x85ee1a00 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=14 ptr=0x85f6feb0 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=14 ptr=0x85e9d570 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=14 ptr=0x85e23790 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=14 ptr=0x85f67910 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=14 ptr=0x85e587f0 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=14 ptr=0x85e605d0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION TOTAL count=3435 requested_bytes=216115 overflow=0
+NATIVE LIBC SNAPSHOT id=14 arena=2084864 live=265568 free=1819296 free_chunks=72
+NATIVE TLS RECLAIM id=14 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+  vsh job %19: Cancelled
+[2Kvsh> node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_IDLE=ok')"
+VSH_NODE_AFTER_IDLE=ok
+NATIVE ALLOCATION born=15 ptr=0x85ee1c10 size=512 frames=[80617164, 81508920, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=15 ptr=0x85e55c20 size=32 frames=[80617164, 8167e94e, 8167ee08, 8065221a, 80652464, 8087c7a4, 22, 0]
+NATIVE ALLOCATION born=15 ptr=0x85e51160 size=64 frames=[80617164, 81508906, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=15 ptr=0x85e23240 size=512 frames=[80617164, 815088b2, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION born=15 ptr=0x85f6da40 size=56 frames=[80617164, 81505ad2, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=15 ptr=0x85f9c3e0 size=264 frames=[80617164, 815059f6, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c, 8077def2]
+NATIVE ALLOCATION born=15 ptr=0x85f26d40 size=64 frames=[80617164, 81508898, 81505a1e, 80a497e6, 80f2979e, 80f123fe, 80a4a85c, 80a9689c]
+NATIVE ALLOCATION TOTAL count=3436 requested_bytes=216147 overflow=0
+NATIVE LIBC SNAPSHOT id=15 arena=2125824 live=265616 free=1860208 free_chunks=73
+NATIVE TLS RECLAIM id=15 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+[2Kvsh> 

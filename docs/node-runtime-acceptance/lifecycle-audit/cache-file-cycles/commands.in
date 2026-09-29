@@ -1,0 +1,645 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'export default value => value + 1;' | write @home/project/helper.mjs
+@sleep 0.3
+echo 'const fs = require("fs"), id = Number(process.argv[process.argv.length-1]); let input = "";' | write @home/project/cycle.cjs
+@sleep 0.3
+echo 'process.stdin.setEncoding("utf8"); process.stdin.on("data", data => input += data);' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'process.stdin.on("end", async () => {' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'const previous = fs.existsSync("counter") ? Number(fs.readFileSync("counter","utf8")) : 0;' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'if (previous+1 !== id || input.trim() !== "payload") throw Error("cycle sequence/stdin");' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'fs.writeFileSync("counter", String(id)); fs.openSync("counter", "r");' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'if (await fs.promises.readFile("counter","utf8") !== String(id)) throw Error("async file");' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'const module = await import("./helper.mjs"); if(module.default(41)!==42) throw Error("module import");' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'await new Promise(resolve => setTimeout(resolve,1));' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'const buffer = Buffer.alloc(65536, id); if(buffer[65535] !== id) throw Error("buffer");' | write --append @home/project/cycle.cjs
+@sleep 0.3
+echo 'console.log("NODE_CYCLE_" + "OK=" + id); });' | write --append @home/project/cycle.cjs
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 1
+@sleep 0.3
+@expect NODE_CYCLE_OK=1
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send vtop --once
+@sleep 0.3
+@expect --: awaiting interval sample.
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 2
+@sleep 0.3
+@expect NODE_CYCLE_OK=2
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 3
+@sleep 0.3
+@expect NODE_CYCLE_OK=3
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 4
+@sleep 0.3
+@expect NODE_CYCLE_OK=4
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 5
+@sleep 0.3
+@expect NODE_CYCLE_OK=5
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 6
+@sleep 0.3
+@expect NODE_CYCLE_OK=6
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 7
+@sleep 0.3
+@expect NODE_CYCLE_OK=7
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 8
+@sleep 0.3
+@expect NODE_CYCLE_OK=8
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 9
+@sleep 0.3
+@expect NODE_CYCLE_OK=9
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 10
+@sleep 0.3
+@expect NODE_CYCLE_OK=10
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send vtop --once
+@sleep 0.3
+@expect --: awaiting interval sample.
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 11
+@sleep 0.3
+@expect NODE_CYCLE_OK=11
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 12
+@sleep 0.3
+@expect NODE_CYCLE_OK=12
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 13
+@sleep 0.3
+@expect NODE_CYCLE_OK=13
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 14
+@sleep 0.3
+@expect NODE_CYCLE_OK=14
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 15
+@sleep 0.3
+@expect NODE_CYCLE_OK=15
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 16
+@sleep 0.3
+@expect NODE_CYCLE_OK=16
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 17
+@sleep 0.3
+@expect NODE_CYCLE_OK=17
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 18
+@sleep 0.3
+@expect NODE_CYCLE_OK=18
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 19
+@sleep 0.3
+@expect NODE_CYCLE_OK=19
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 20
+@sleep 0.3
+@expect NODE_CYCLE_OK=20
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 21
+@sleep 0.3
+@expect NODE_CYCLE_OK=21
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 22
+@sleep 0.3
+@expect NODE_CYCLE_OK=22
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 23
+@sleep 0.3
+@expect NODE_CYCLE_OK=23
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 24
+@sleep 0.3
+@expect NODE_CYCLE_OK=24
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 25
+@sleep 0.3
+@expect NODE_CYCLE_OK=25
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 26
+@sleep 0.3
+@expect NODE_CYCLE_OK=26
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 27
+@sleep 0.3
+@expect NODE_CYCLE_OK=27
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 28
+@sleep 0.3
+@expect NODE_CYCLE_OK=28
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 29
+@sleep 0.3
+@expect NODE_CYCLE_OK=29
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 30
+@sleep 0.3
+@expect NODE_CYCLE_OK=30
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 31
+@sleep 0.3
+@expect NODE_CYCLE_OK=31
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 32
+@sleep 0.3
+@expect NODE_CYCLE_OK=32
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 33
+@sleep 0.3
+@expect NODE_CYCLE_OK=33
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 34
+@sleep 0.3
+@expect NODE_CYCLE_OK=34
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 35
+@sleep 0.3
+@expect NODE_CYCLE_OK=35
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 36
+@sleep 0.3
+@expect NODE_CYCLE_OK=36
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 37
+@sleep 0.3
+@expect NODE_CYCLE_OK=37
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 38
+@sleep 0.3
+@expect NODE_CYCLE_OK=38
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 39
+@sleep 0.3
+@expect NODE_CYCLE_OK=39
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 40
+@sleep 0.3
+@expect NODE_CYCLE_OK=40
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 41
+@sleep 0.3
+@expect NODE_CYCLE_OK=41
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 42
+@sleep 0.3
+@expect NODE_CYCLE_OK=42
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 43
+@sleep 0.3
+@expect NODE_CYCLE_OK=43
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 44
+@sleep 0.3
+@expect NODE_CYCLE_OK=44
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 45
+@sleep 0.3
+@expect NODE_CYCLE_OK=45
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 46
+@sleep 0.3
+@expect NODE_CYCLE_OK=46
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 47
+@sleep 0.3
+@expect NODE_CYCLE_OK=47
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 48
+@sleep 0.3
+@expect NODE_CYCLE_OK=48
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 49
+@sleep 0.3
+@expect NODE_CYCLE_OK=49
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 50
+@sleep 0.3
+@expect NODE_CYCLE_OK=50
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send vtop --once
+@sleep 0.3
+@expect --: awaiting interval sample.
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 51
+@sleep 0.3
+@expect NODE_CYCLE_OK=51
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 52
+@sleep 0.3
+@expect NODE_CYCLE_OK=52
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 53
+@sleep 0.3
+@expect NODE_CYCLE_OK=53
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 54
+@sleep 0.3
+@expect NODE_CYCLE_OK=54
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 55
+@sleep 0.3
+@expect NODE_CYCLE_OK=55
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 56
+@sleep 0.3
+@expect NODE_CYCLE_OK=56
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 57
+@sleep 0.3
+@expect NODE_CYCLE_OK=57
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 58
+@sleep 0.3
+@expect NODE_CYCLE_OK=58
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 59
+@sleep 0.3
+@expect NODE_CYCLE_OK=59
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 60
+@sleep 0.3
+@expect NODE_CYCLE_OK=60
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 61
+@sleep 0.3
+@expect NODE_CYCLE_OK=61
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 62
+@sleep 0.3
+@expect NODE_CYCLE_OK=62
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 63
+@sleep 0.3
+@expect NODE_CYCLE_OK=63
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 64
+@sleep 0.3
+@expect NODE_CYCLE_OK=64
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 65
+@sleep 0.3
+@expect NODE_CYCLE_OK=65
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 66
+@sleep 0.3
+@expect NODE_CYCLE_OK=66
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 67
+@sleep 0.3
+@expect NODE_CYCLE_OK=67
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 68
+@sleep 0.3
+@expect NODE_CYCLE_OK=68
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 69
+@sleep 0.3
+@expect NODE_CYCLE_OK=69
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 70
+@sleep 0.3
+@expect NODE_CYCLE_OK=70
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 71
+@sleep 0.3
+@expect NODE_CYCLE_OK=71
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 72
+@sleep 0.3
+@expect NODE_CYCLE_OK=72
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 73
+@sleep 0.3
+@expect NODE_CYCLE_OK=73
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 74
+@sleep 0.3
+@expect NODE_CYCLE_OK=74
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 75
+@sleep 0.3
+@expect NODE_CYCLE_OK=75
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 76
+@sleep 0.3
+@expect NODE_CYCLE_OK=76
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 77
+@sleep 0.3
+@expect NODE_CYCLE_OK=77
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 78
+@sleep 0.3
+@expect NODE_CYCLE_OK=78
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 79
+@sleep 0.3
+@expect NODE_CYCLE_OK=79
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 80
+@sleep 0.3
+@expect NODE_CYCLE_OK=80
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 81
+@sleep 0.3
+@expect NODE_CYCLE_OK=81
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 82
+@sleep 0.3
+@expect NODE_CYCLE_OK=82
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 83
+@sleep 0.3
+@expect NODE_CYCLE_OK=83
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 84
+@sleep 0.3
+@expect NODE_CYCLE_OK=84
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 85
+@sleep 0.3
+@expect NODE_CYCLE_OK=85
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 86
+@sleep 0.3
+@expect NODE_CYCLE_OK=86
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 87
+@sleep 0.3
+@expect NODE_CYCLE_OK=87
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 88
+@sleep 0.3
+@expect NODE_CYCLE_OK=88
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 89
+@sleep 0.3
+@expect NODE_CYCLE_OK=89
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 90
+@sleep 0.3
+@expect NODE_CYCLE_OK=90
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 91
+@sleep 0.3
+@expect NODE_CYCLE_OK=91
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 92
+@sleep 0.3
+@expect NODE_CYCLE_OK=92
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 93
+@sleep 0.3
+@expect NODE_CYCLE_OK=93
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 94
+@sleep 0.3
+@expect NODE_CYCLE_OK=94
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 95
+@sleep 0.3
+@expect NODE_CYCLE_OK=95
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 96
+@sleep 0.3
+@expect NODE_CYCLE_OK=96
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 97
+@sleep 0.3
+@expect NODE_CYCLE_OK=97
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 98
+@sleep 0.3
+@expect NODE_CYCLE_OK=98
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 99
+@sleep 0.3
+@expect NODE_CYCLE_OK=99
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send echo payload | node --root @home/project cycle.cjs 100
+@sleep 0.3
+@expect NODE_CYCLE_OK=100
+@sleep 0.3
+@expect NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+@sleep 0.3
+@send vtop --once
+@sleep 0.3
+@expect --: awaiting interval sample.
+@sleep 1
+@quit

@@ -1,0 +1,19 @@
+    8150c36a:	03eb3497          	auipc	s1,0x3eb3
+    8150c36e:	c1f48493          	addi	s1,s1,-993 # 853bef89 <_ZN2v88platform7tracing24g_category_group_enabledE+0x1>
+    8150c372:	fefa05e3          	beq	s4,a5,8150c35c <.L73>
+
+000000008150c376 <.L71>:
+    8150c376:	854e                	mv	a0,s3
+    8150c378:	1d7990ef          	jal	815a5d4e <strdup>
+    8150c37c:	003a1793          	slli	a5,s4,0x3
+    8150c380:	9bbe                	add	s7,s7,a5
+--
+    815a5d44:	6442                	ld	s0,16(sp)
+    815a5d46:	65a2                	ld	a1,8(sp)
+    815a5d48:	60e2                	ld	ra,24(sp)
+    815a5d4a:	6105                	addi	sp,sp,32
+    815a5d4c:	b719                	j	815a5c52 <_fgetwc_r>
+
+00000000815a5d4e <strdup>:
+    815a5d4e:	85aa                	mv	a1,a0
+    815a5d50:	03574517          	auipc	a0,0x3574

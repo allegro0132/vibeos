@@ -1,0 +1,9 @@
+{
+  "source": "target/node-runtime/m4-clean-1/source/node-v24.14.0/deps/v8/src/libplatform/tracing/tracing-controller.cc",
+  "sha256": "1f8532701c753dcc568e2ec08733bdbddc5db90431a13faf4387c05398489c12",
+  "diagnostic_elf": "target/node-runtime/m4-reclaim-link-1/node-shell.elf",
+  "caller_pc": "0x8150c378",
+  "caller_symbol": "v8::platform::tracing::TracingController::GetCategoryGroupEnabled(char const*)",
+  "allocation_pc": "0x815a5d82",
+  "allocation_symbol": "_strdup_r"
+}

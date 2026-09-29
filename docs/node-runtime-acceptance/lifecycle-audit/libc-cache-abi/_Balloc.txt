@@ -1,0 +1,112 @@
+
+target/node-runtime/m4-libc-cache-analysis/libc_a-mprec.o:     file format elf64-littleriscv
+
+
+Disassembly of section .text._Balloc:
+
+0000000000000000 <_Balloc>:
+   0:	753c                	ld	a5,104(a0)
+   2:	1101                	addi	sp,sp,-32
+   4:	e822                	sd	s0,16(sp)
+   6:	e426                	sd	s1,8(sp)
+   8:	ec06                	sd	ra,24(sp)
+   a:	842a                	mv	s0,a0
+   c:	84ae                	mv	s1,a1
+   e:	cf99                	beqz	a5,2c <.L13>
+			e: R_RISCV_RVC_BRANCH	.L13
+
+0000000000000010 <.L2>:
+  10:	00349713          	slli	a4,s1,0x3
+  14:	97ba                	add	a5,a5,a4
+  16:	6388                	ld	a0,0(a5)
+  18:	c515                	beqz	a0,44 <.L4>
+			18: R_RISCV_RVC_BRANCH	.L4
+  1a:	6118                	ld	a4,0(a0)
+  1c:	e398                	sd	a4,0(a5)
+
+000000000000001e <.L5>:
+  1e:	00053823          	sd	zero,16(a0)
+
+0000000000000022 <.L1>:
+  22:	60e2                	ld	ra,24(sp)
+  24:	6442                	ld	s0,16(sp)
+  26:	64a2                	ld	s1,8(sp)
+  28:	6105                	addi	sp,sp,32
+  2a:	8082                	ret
+
+000000000000002c <.L13>:
+  2c:	04100613          	li	a2,65
+  30:	45a1                	li	a1,8
+  32:	00000097          	auipc	ra,0x0
+			32: R_RISCV_CALL_PLT	_calloc_r
+			32: R_RISCV_RELAX	*ABS*
+  36:	000080e7          	jalr	ra # 32 <.L13+0x6>
+  3a:	f428                	sd	a0,104(s0)
+  3c:	87aa                	mv	a5,a0
+  3e:	f969                	bnez	a0,10 <.L2>
+			3e: R_RISCV_RVC_BRANCH	.L2
+  40:	4501                	li	a0,0
+  42:	b7c5                	j	22 <.L1>
+			42: R_RISCV_RVC_JUMP	.L1
+
+0000000000000044 <.L4>:
+  44:	e04a                	sd	s2,0(sp)
+  46:	4905                	li	s2,1
+  48:	0099193b          	sllw	s2,s2,s1
+  4c:	00790613          	addi	a2,s2,7
+  50:	8522                	mv	a0,s0
+  52:	060a                	slli	a2,a2,0x2
+  54:	4585                	li	a1,1
+  56:	00000097          	auipc	ra,0x0
+			56: R_RISCV_CALL_PLT	_calloc_r
+			56: R_RISCV_RELAX	*ABS*
+  5a:	000080e7          	jalr	ra # 56 <.L4+0x12>
+  5e:	c511                	beqz	a0,6a <.L11>
+			5e: R_RISCV_RVC_BRANCH	.L11
+  60:	01252623          	sw	s2,12(a0)
+  64:	c504                	sw	s1,8(a0)
+  66:	6902                	ld	s2,0(sp)
+  68:	bf5d                	j	1e <.L5>
+			68: R_RISCV_RVC_JUMP	.L5
+
+000000000000006a <.L11>:
+  6a:	6902                	ld	s2,0(sp)
+  6c:	4501                	li	a0,0
+  6e:	bf55                	j	22 <.L1>
+			6e: R_RISCV_RVC_JUMP	.L1
+
+Disassembly of section .text._Bfree:
+
+Disassembly of section .text.__multadd:
+
+Disassembly of section .text.__s2b:
+
+Disassembly of section .text.__hi0bits:
+
+Disassembly of section .text.__lo0bits:
+
+Disassembly of section .text.__i2b:
+
+Disassembly of section .text.__multiply:
+
+Disassembly of section .text.__pow5mult:
+
+Disassembly of section .text.__lshift:
+
+Disassembly of section .text.__mcmp:
+
+Disassembly of section .text.__mdiff:
+
+Disassembly of section .text.__ulp:
+
+Disassembly of section .text.__b2d:
+
+Disassembly of section .text.__d2b:
+
+Disassembly of section .text.__ratio:
+
+Disassembly of section .text._mprec_log10:
+
+Disassembly of section .text.__copybits:
+
+Disassembly of section .text.__any_on:

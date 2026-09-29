@@ -1,0 +1,9 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+@send node --root @home/project -e "console.log('NODE_FATAL_'+'UNREACHED')"
+@sleep 0.3
+@expect NATIVE FATAL EXIT
+@sleep 0.3
+@wait-exit

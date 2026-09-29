@@ -1,0 +1,42 @@
+{
+  "configure/configure.stdout.gz": {
+    "original_sha256": "d227db2fd41bd538b2c1ef17d06795c6c12a1638f6dbd621680c82017c4a0ffc",
+    "original_bytes": 39
+  },
+  "configure/configure.stderr.gz": {
+    "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "original_bytes": 0
+  },
+  "engine/engine.stderr.gz": {
+    "original_sha256": "401ef251e273726cee9f332da386a250855dfef903b3ce1367579a1487b83b63",
+    "original_bytes": 54277725
+  },
+  "engine/engine.stdout.gz": {
+    "original_sha256": "599686bdef679ec506036b477dd35ad78b0fb5c0544117bad6b0de28ba3b1aee",
+    "original_bytes": 504716
+  },
+  "uv/uv.stdout.gz": {
+    "original_sha256": "5e065c17abb638eba540f99e70bd1b616fcaacc7464cdf15779aad304a89c639",
+    "original_bytes": 8368
+  },
+  "uv/uv.stderr.gz": {
+    "original_sha256": "1c81a9b1a979e958e2f3faa6dfc4ceba8502e7d5aa98d47fa437825d3463e35c",
+    "original_bytes": 564495
+  },
+  "node-deps/node-deps.stdout.gz": {
+    "original_sha256": "b64af060282d7cd2fb58c04d7ad6938f689bb600a00650acc47b1921407068c4",
+    "original_bytes": 19013
+  },
+  "node-deps/node-deps.stderr.gz": {
+    "original_sha256": "cfaa47e53dbff49d1719928b6e14fe153154c10d71c9afe119431ae8164eafc6",
+    "original_bytes": 562872
+  },
+  "node/node.stdout.gz": {
+    "original_sha256": "3caad27ceaab029904ef41f80a47f90a5cd5db63f07cf6887038e3cacbbb2443",
+    "original_bytes": 19317
+  },
+  "node/node.stderr.gz": {
+    "original_sha256": "46b2c5f840e3762abe8509256ec276601eadd0e74368c93aa01c7032f880ebd8",
+    "original_bytes": 563265
+  }
+}

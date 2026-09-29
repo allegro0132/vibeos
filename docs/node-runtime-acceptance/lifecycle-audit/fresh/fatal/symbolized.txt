@@ -1,0 +1,10 @@
+v8::platform::(anonymous namespace)::PrintStackTrace()
+default-platform.cc:?
+V8_Fatal(char const*, ...)
+??:?
+v8::internal::V8::InitializePlatform(v8::Platform*)
+v8.cc:?
+vibeos_node_run
+??:?
+v8::base::OS::Abort()
+??:?

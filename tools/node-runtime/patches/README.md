@@ -128,3 +128,10 @@ exception and GC gate is still open.
   must enforce root/permission boundaries; these wrappers are not authorization.
   Integrated compilation passes, and the firmware link has 16 missing runtime
   symbols after resolving the final three missing V8 OS methods.
+- `0058`: release owning `CppgcWrapperListNode` entries during realm destruction.
+  The intrusive base list only unlinks nodes; surviving weak-persistent wrapper
+  registrations must be destroyed while the isolate's cppgc heap still exists.
+  Pointees remain cppgc-owned. This fixes the 32-byte per-wrapper survivors
+  identified by the native allocation trace. The fresh patched build passes
+  100 file-entry and 100 eval-entry QEMU cycles with exact stable non-cache
+  allocator occupancy; see `docs/node-runtime-acceptance/lifecycle-audit/`.

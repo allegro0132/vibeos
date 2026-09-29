@@ -1182,6 +1182,8 @@ mod native_files;
 mod native_env;
 #[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
 mod native_node;
+#[cfg(feature = "node-authority-probe")]
+mod native_authority_probe;
 #[cfg(feature = "node-toolkit")]
 mod native_toolkit;
 #[cfg(feature = "node-toolkit")]
@@ -2115,6 +2117,8 @@ fn start_services(boot_time: u64) -> ! {
     exec::spawn_pinned_on(exec::HartId::BOOT, "v8-gate", native_call::v8_gate());
     #[cfg(feature = "node-esbuild-probe")]
     exec::spawn_pinned_on(exec::HartId::BOOT, "esbuild-bridge-probe", native_esbuild::probe());
+    #[cfg(feature = "node-authority-probe")]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "node-authority-probe", native_authority_probe::run());
 
     trap::enable_interrupts();
     uart::early_write("[VibeOS] interrupts enabled\r\n");

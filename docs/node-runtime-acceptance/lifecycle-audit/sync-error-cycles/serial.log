@@ -1,0 +1,2465 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 1
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 1
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x8558e000..0xc0000000  (960968 KiB)
+  traps     stvec armed, PLIC ctx S/hart1, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x84e8e000..0x8508e000, MXR clear, RFENCE ready
+  read-only 50560 KiB .rodata 0x819b9000..0x84b19000; 4096 KiB COW capability-table pool
+  world     15 capability spaces, 1 typed channel, 6 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> quiet
+background component output muted
+[2Kvsh> mkdir @home/project
+[2Kvsh> echo 'export default value => value + 1;' | write @home/project/helper.mjs
+[2Kvsh> echo 'const fs = require("fs"), id = Number(process.argv[process.argv.length-1]); let input = "";' | write @home/project/cycle.cjs
+[2Kvsh> echo 'process.stdin.setEncoding("utf8"); process.stdin.on("data", data => input += data);' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'process.stdin.on("end", async () => {' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const previous = fs.existsSync("counter") ? Number(fs.readFileSync("counter","utf8")) : 0;' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'if (previous+1 !== id || input.trim() !== "payload") throw Error("cycle sequence/stdin");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'fs.writeFileSync("counter", String(id)); fs.openSync("counter", "r");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'if (await fs.promises.readFile("counter","utf8") !== String(id)) throw Error("async file");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const module = await import("./helper.mjs"); if(module.default(41)!==42) throw Error("module import");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'await new Promise(resolve => setTimeout(resolve,1));' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const buffer = Buffer.alloc(65536, id); if(buffer[65535] !== id) throw Error("buffer");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });' | write --append @home/project/cycle.cjs
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 1
+NODE_CYCLE_OK=1
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC SNAPSHOT id=1 arena=2064384 live=250752 free=1813632 free_chunks=15 cached_blocks=1 cached_bytes=48
+NATIVE SYNC SNAPSHOT id=1 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=1 released_slots=17 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_1
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %15: Returned(1)
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:00:06 | 4 CPUs | 11 tasks
+CPU 0.3% | heap 143.0 MiB / 938.4 MiB | peak 400.8 MiB | untouched 537.2 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      256 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 2
+NODE_CYCLE_OK=2
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC SNAPSHOT id=2 arena=2064384 live=250752 free=1813632 free_chunks=15 cached_blocks=1 cached_bytes=48
+NATIVE SYNC SNAPSHOT id=2 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=2 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_2
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %17: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 3
+NODE_CYCLE_OK=3
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC SNAPSHOT id=3 arena=2064384 live=250752 free=1813632 free_chunks=15 cached_blocks=1 cached_bytes=48
+NATIVE SYNC SNAPSHOT id=3 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=3 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_3
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %18: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 4
+NODE_CYCLE_OK=4
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC SNAPSHOT id=4 arena=2158592 live=250752 free=1907840 free_chunks=15 cached_blocks=1 cached_bytes=48
+NATIVE SYNC SNAPSHOT id=4 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=4 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_4
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %19: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 5
+NODE_CYCLE_OK=5
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=5 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=5 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=5 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_5
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %20: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 6
+NODE_CYCLE_OK=6
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=6 arena=2146304 live=250992 free=1895312 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=6 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=6 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_6
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %21: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 7
+NODE_CYCLE_OK=7
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=7 arena=2105344 live=250992 free=1854352 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=7 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=7 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_7
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %22: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 8
+NODE_CYCLE_OK=8
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=8 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=8 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=8 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_8
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %23: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 9
+NODE_CYCLE_OK=9
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=9 arena=2162688 live=250992 free=1911696 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=9 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=9 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_9
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %24: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 10
+NODE_CYCLE_OK=10
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=10 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=10 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=10 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_10
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %25: Returned(1)
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:00:17 | 4 CPUs | 11 tasks
+CPU 0.0% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 536.0 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 11
+NODE_CYCLE_OK=11
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=11 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=11 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=11 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_11
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %27: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 12
+NODE_CYCLE_OK=12
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=12 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=12 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=12 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_12
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %28: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 13
+NODE_CYCLE_OK=13
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=13 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=13 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=13 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_13
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %29: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 14
+NODE_CYCLE_OK=14
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=14 arena=2121728 live=250992 free=1870736 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=14 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=14 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_14
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %30: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 15
+NODE_CYCLE_OK=15
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=15 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=15 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=15 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_15
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %31: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 16
+NODE_CYCLE_OK=16
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=16 arena=2109440 live=250992 free=1858448 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=16 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=16 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_16
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %32: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 17
+NODE_CYCLE_OK=17
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=17 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=17 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=17 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_17
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %33: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 18
+NODE_CYCLE_OK=18
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=18 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=18 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=18 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_18
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %34: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 19
+NODE_CYCLE_OK=19
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=19 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=19 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=19 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_19
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %35: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 20
+NODE_CYCLE_OK=20
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=20 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=20 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=20 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_20
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %36: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 21
+NODE_CYCLE_OK=21
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=21 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=21 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=21 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_21
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %37: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 22
+  pgcache: 8126 of 8192 page reads served from cache
+NODE_CYCLE_OK=22
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=22 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=22 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=22 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_22
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %38: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 23
+NODE_CYCLE_OK=23
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=23 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=23 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=23 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_23
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %39: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 24
+NODE_CYCLE_OK=24
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=24 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=24 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=24 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_24
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %40: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 25
+NODE_CYCLE_OK=25
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=25 arena=2150400 live=250992 free=1899408 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=25 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=25 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_25
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %41: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 26
+NODE_CYCLE_OK=26
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=26 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=26 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=26 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_26
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %42: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 27
+NODE_CYCLE_OK=27
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=27 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=27 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=27 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_27
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %43: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 28
+NODE_CYCLE_OK=28
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=28 arena=2138112 live=250992 free=1887120 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=28 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=28 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_28
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %44: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 29
+NODE_CYCLE_OK=29
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=29 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=29 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=29 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_29
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %45: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 30
+NODE_CYCLE_OK=30
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=30 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=30 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=30 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_30
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %46: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 31
+NODE_CYCLE_OK=31
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=31 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=31 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=31 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_31
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %47: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 32
+NODE_CYCLE_OK=32
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=32 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=32 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=32 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_32
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %48: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 33
+NODE_CYCLE_OK=33
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=33 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=33 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=33 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_33
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %49: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 34
+NODE_CYCLE_OK=34
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=34 arena=2154496 live=250992 free=1903504 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=34 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=34 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_34
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %50: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 35
+NODE_CYCLE_OK=35
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=35 arena=2158592 live=250992 free=1907600 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=35 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=35 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_35
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %51: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 36
+NODE_CYCLE_OK=36
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=36 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=36 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=36 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_36
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %52: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 37
+NODE_CYCLE_OK=37
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=37 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=37 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=37 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_37
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %53: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 38
+NODE_CYCLE_OK=38
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=38 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=38 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=38 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_38
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %54: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 39
+NODE_CYCLE_OK=39
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=39 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=39 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=39 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_39
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %55: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 40
+NODE_CYCLE_OK=40
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=40 arena=2109440 live=250992 free=1858448 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=40 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=40 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_40
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %56: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 41
+NODE_CYCLE_OK=41
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=41 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=41 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=41 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_41
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %57: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 42
+NODE_CYCLE_OK=42
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=42 arena=2084864 live=250992 free=1833872 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=42 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=42 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_42
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %58: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 43
+NODE_CYCLE_OK=43
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=43 arena=2088960 live=250992 free=1837968 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=43 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=43 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_43
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %59: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 44
+NODE_CYCLE_OK=44
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=44 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=44 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=44 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_44
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %60: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 45
+NODE_CYCLE_OK=45
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=45 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=45 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=45 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_45
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %61: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 46
+NODE_CYCLE_OK=46
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=46 arena=2162688 live=250992 free=1911696 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=46 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=46 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_46
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %62: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 47
+  pgcache: 16310 of 16384 page reads served from cache
+NODE_CYCLE_OK=47
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=47 arena=2068480 live=250992 free=1817488 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=47 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=47 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_47
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %63: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 48
+NODE_CYCLE_OK=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=48 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=48 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=48 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_48
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %64: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 49
+NODE_CYCLE_OK=49
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=49 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=49 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=49 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_49
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %65: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 50
+NODE_CYCLE_OK=50
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=50 arena=2162688 live=250992 free=1911696 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=50 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=50 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_50
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %66: Returned(1)
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:01:05 | 4 CPUs | 11 tasks
+CPU 0.1% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 535.7 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 51
+NODE_CYCLE_OK=51
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=51 arena=2117632 live=250992 free=1866640 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=51 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=51 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_51
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %68: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 52
+NODE_CYCLE_OK=52
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=52 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=52 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=52 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_52
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %69: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 53
+NODE_CYCLE_OK=53
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=53 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=53 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=53 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_53
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %70: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 54
+NODE_CYCLE_OK=54
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=54 arena=2076672 live=250992 free=1825680 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=54 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=54 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_54
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %71: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 55
+NODE_CYCLE_OK=55
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=55 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=55 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=55 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_55
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %72: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 56
+NODE_CYCLE_OK=56
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=56 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=56 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=56 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_56
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %73: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 57
+NODE_CYCLE_OK=57
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=57 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=57 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=57 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_57
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %74: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 58
+NODE_CYCLE_OK=58
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=58 arena=2113536 live=250992 free=1862544 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=58 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=58 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_58
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %75: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 59
+NODE_CYCLE_OK=59
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=59 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=59 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=59 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_59
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %76: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 60
+NODE_CYCLE_OK=60
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=60 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=60 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=60 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_60
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %77: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 61
+NODE_CYCLE_OK=61
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=61 arena=2068480 live=250992 free=1817488 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=61 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=61 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_61
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %78: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 62
+NODE_CYCLE_OK=62
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=62 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=62 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=62 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_62
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %79: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 63
+NODE_CYCLE_OK=63
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=63 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=63 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=63 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_63
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %80: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 64
+NODE_CYCLE_OK=64
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=64 arena=2064384 live=250992 free=1813392 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=64 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=64 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_64
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %81: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 65
+NODE_CYCLE_OK=65
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=65 arena=2068480 live=250992 free=1817488 free_chunks=19 cached_blocks=5 cached_bytes=288
+NATIVE SYNC SNAPSHOT id=65 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=65 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_65
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %82: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 66
+NODE_CYCLE_OK=66
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=66 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=66 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=66 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_66
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %83: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 67
+NODE_CYCLE_OK=67
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=67 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=67 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=67 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_67
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %84: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 68
+NODE_CYCLE_OK=68
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=68 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=68 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=68 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_68
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %85: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 69
+NODE_CYCLE_OK=69
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=69 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=69 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=69 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_69
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %86: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 70
+NODE_CYCLE_OK=70
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=70 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=70 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=70 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_70
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %87: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 71
+NODE_CYCLE_OK=71
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=71 arena=2179072 live=251040 free=1928032 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=71 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=71 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_71
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %88: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 72
+  pgcache: 24492 of 24576 page reads served from cache
+NODE_CYCLE_OK=72
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=72 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=72 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=72 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_72
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %89: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 73
+NODE_CYCLE_OK=73
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=73 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=73 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=73 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_73
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %90: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 74
+NODE_CYCLE_OK=74
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=74 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=74 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=74 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_74
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %91: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 75
+NODE_CYCLE_OK=75
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=75 arena=2068480 live=251040 free=1817440 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=75 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=75 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_75
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %92: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 76
+NODE_CYCLE_OK=76
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=76 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=76 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=76 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_76
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %93: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 77
+NODE_CYCLE_OK=77
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=77 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=77 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=77 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_77
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %94: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 78
+NODE_CYCLE_OK=78
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=78 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=78 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=78 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_78
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %95: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 79
+NODE_CYCLE_OK=79
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=79 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=79 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=79 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_79
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %96: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 80
+NODE_CYCLE_OK=80
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=80 arena=2068480 live=251040 free=1817440 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=80 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=80 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_80
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %97: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 81
+NODE_CYCLE_OK=81
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=81 arena=2068480 live=251040 free=1817440 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=81 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=81 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_81
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %98: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 82
+NODE_CYCLE_OK=82
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=82 arena=2183168 live=251040 free=1932128 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=82 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=82 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_82
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %99: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 83
+NODE_CYCLE_OK=83
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=83 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=83 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=83 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_83
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %100: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 84
+NODE_CYCLE_OK=84
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=84 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=84 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=84 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_84
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %101: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 85
+NODE_CYCLE_OK=85
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=85 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=85 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=85 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_85
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %102: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 86
+NODE_CYCLE_OK=86
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=86 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=86 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=86 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_86
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %103: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 87
+NODE_CYCLE_OK=87
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=87 arena=2113536 live=251040 free=1862496 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=87 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=87 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_87
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %104: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 88
+NODE_CYCLE_OK=88
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=88 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=88 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=88 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_88
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %105: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 89
+NODE_CYCLE_OK=89
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=89 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=89 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=89 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_89
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %106: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 90
+NODE_CYCLE_OK=90
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=90 arena=2154496 live=251040 free=1903456 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=90 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=90 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_90
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %107: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 91
+NODE_CYCLE_OK=91
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=91 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=91 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=91 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_91
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %108: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 92
+NODE_CYCLE_OK=92
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=92 arena=2138112 live=251040 free=1887072 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=92 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=92 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_92
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %109: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 93
+NODE_CYCLE_OK=93
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=93 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=93 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=93 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_93
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %110: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 94
+NODE_CYCLE_OK=94
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=94 arena=2068480 live=251040 free=1817440 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=94 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=94 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_94
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %111: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 95
+NODE_CYCLE_OK=95
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=95 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=95 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=95 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_95
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %112: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 96
+  pgcache: 32676 of 32768 page reads served from cache
+NODE_CYCLE_OK=96
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=96 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=96 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=96 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_96
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %113: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 97
+NODE_CYCLE_OK=97
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=97 arena=2162688 live=251040 free=1911648 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=97 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=97 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_97
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %114: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 98
+NODE_CYCLE_OK=98
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=98 arena=2170880 live=251040 free=1919840 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=98 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=98 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_98
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %115: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 99
+NODE_CYCLE_OK=99
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=99 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=99 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=99 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_99
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %116: Returned(1)
+[2Kvsh> echo payload | node --root @home/project -e 'require("./cycle.cjs")' 100
+NODE_CYCLE_OK=100
+NATIVE LIBC CACHE ptr=0x85c28d40 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85cdcbf0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d3c0f0 chunk_bytes=48
+NATIVE LIBC CACHE ptr=0x85d1f6c0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d2fad0 chunk_bytes=64
+NATIVE LIBC CACHE ptr=0x85d01930 chunk_bytes=64
+NATIVE LIBC SNAPSHOT id=100 arena=2064384 live=251040 free=1813344 free_chunks=20 cached_blocks=6 cached_bytes=336
+NATIVE SYNC SNAPSHOT id=100 handles=13 external_refs=0 waiters=0
+NATIVE TLS RECLAIM id=100 released_slots=12 slots=0 destructors=0 waiters=0
+NATIVE FILE RECLAIM descriptors=0 reads=0 mutations=0
+NATIVE PAGE RECLAIM live_bytes=0 live_allocations=0 owner_registered=0
+NATIVE GRANT RECLAIM kind=project providers=0 leases=0
+NATIVE IO RECLAIM waiters=0
+/cycle.cjs:11
+console.log("NODE_CYCLE_" + "OK=" + id); throw Error("CYCLE_FAILURE_" + id); });
+                                               ^
+
+Error: CYCLE_FAILURE_100
+    at Socket.<anonymous> (/cycle.cjs:11:48)
+
+Node.js v24.14.0
+  vsh job %117: Returned(1)
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:02:04 | 4 CPUs | 11 tasks
+CPU 0.0% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 535.7 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> 

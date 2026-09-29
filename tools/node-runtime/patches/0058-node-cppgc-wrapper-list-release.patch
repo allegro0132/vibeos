@@ -1,0 +1,28 @@
+--- a/src/node_realm.h
++++ b/src/node_realm.h
+@@ -53,6 +53,7 @@
+                       &CppgcWrapperListNode::wrapper_list_node>,
+       public MemoryRetainer {
+  public:
++  ~CppgcWrapperList() override;
+   void Cleanup();
+   void PurgeEmpty();
+ 
+--- a/src/cppgc_helpers.cc
++++ b/src/cppgc_helpers.cc
+@@ -3,6 +3,15 @@
+ 
+ namespace node {
+ 
++CppgcWrapperList::~CppgcWrapperList() {
++  // ListHead only unlinks its intrusive nodes. This list owns the nodes
++  // allocated by TrackCppgcWrapper, including wrappers that survived the
++  // last GC. Release their weak persistent registrations while the isolate's
++  // cppgc heap still exists. Cleanup already finalized the pointees; cppgc
++  // retains ownership of their eventual destruction.
++  while (auto* node = PopFront()) delete node;
++}
++
+ void CppgcWrapperList::Cleanup() {
+   for (auto node : *this) {
+     CppgcMixin* ptr = node->persistent.Get();

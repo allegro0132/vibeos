@@ -139,6 +139,19 @@ impl Drop for NativeTls {
         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
         assert!(self.state.destructors.borrow().is_empty(),
                 "TLS destructors must finish on the native stack before release");
+        self.state.notify.assert_idle();
+        #[cfg(feature = "node-lifecycle-audit")]
+        {
+            let handles = self.state.sync_domain.semaphores.lock().audit_idle();
+            self.state.sync_domain.notify.assert_idle();
+            crate::println!("NATIVE SYNC SNAPSHOT id={} handles={} external_refs=0 waiters=0",
+                            self.state.id, handles);
+            let slots = self.state.slots.get_mut();
+            let released = slots.len();
+            slots.clear();
+            crate::println!("NATIVE TLS RECLAIM id={} released_slots={} slots=0 destructors=0 waiters=0",
+                            self.state.id, released);
+        }
     }
 }
 
@@ -154,8 +167,35 @@ pub(super) fn finish_current() -> usize {
         unsafe { (next.callback)(next.object as *mut core::ffi::c_void); }
         count += 1;
     }
+    #[cfg(feature = "node-lifecycle-audit")]
+    {
+        unsafe extern "C" { fn vibeos_node_libc_snapshot(output: *mut usize); }
+        let mut stats = [0usize; 6];
+        unsafe { vibeos_node_libc_snapshot(stats.as_mut_ptr()); }
+        assert_eq!(stats[0], stats[1].checked_add(stats[2]).expect("newlib accounting overflow"));
+        crate::println!("NATIVE LIBC SNAPSHOT id={} arena={} live={} free={} free_chunks={} cached_blocks={} cached_bytes={}",
+                        state.id, stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]);
+    }
     state.phase.set(2);
     count
+}
+
+#[cfg(feature = "node-lifecycle-audit")]
+#[no_mangle]
+unsafe extern "C" fn vibeos_node_allocation_record(id: i32, pointer: usize, size: usize, frames: *const usize) {
+    let f = unsafe { core::slice::from_raw_parts(frames, 8) };
+    crate::println!("NATIVE ALLOCATION born={} ptr={:#x} size={} frames={:x?}", id, pointer, size, f);
+}
+#[cfg(feature = "node-lifecycle-audit")]
+#[no_mangle]
+extern "C" fn vibeos_node_libc_cache_record(pointer: usize, chunk_bytes: usize) {
+    crate::println!("NATIVE LIBC CACHE ptr={:#x} chunk_bytes={}", pointer, chunk_bytes);
+}
+#[cfg(feature = "node-lifecycle-audit")]
+#[no_mangle]
+extern "C" fn vibeos_node_allocation_totals(count: usize, bytes: usize, overflow: usize) {
+    assert_eq!(overflow, 0, "native allocation trace capacity exhausted");
+    crate::println!("NATIVE ALLOCATION TOTAL count={} requested_bytes={} overflow={}", count, bytes, overflow);
 }
 
 #[no_mangle]

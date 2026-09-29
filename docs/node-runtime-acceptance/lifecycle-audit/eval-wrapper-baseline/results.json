@@ -1,0 +1,1521 @@
+{
+  "passed": false,
+  "checks": {
+    "100_ordered_invocations": true,
+    "four_memory_samples": true,
+    "late_heap_spread_under_2MiB": true,
+    "ordered_teardown_for_every_cycle": true,
+    "100_distinct_tls_owners": true,
+    "100_file_tables_reclaimed": true,
+    "100_page_owners_reclaimed": true,
+    "100_libc_snapshots": true,
+    "libc_accounting_consistent": true,
+    "libc_noncache_live_bytes_stable_after_10": false,
+    "no_fatal": true,
+    "qemu_exit": true,
+    "source_unchanged": true
+  },
+  "command": [
+    "qemu-system-riscv64",
+    "-machine",
+    "virt",
+    "-m",
+    "1G",
+    "-smp",
+    "4",
+    "-nographic",
+    "-bios",
+    "default",
+    "-kernel",
+    "/Users/ziangwang/Sources/vibeos/target/node-runtime/m4-eval-baseline-1/kernel.elf",
+    "-net",
+    "none",
+    "-object",
+    "rng-random,id=node_rng,filename=/dev/urandom",
+    "-device",
+    "virtio-rng-device,rng=node_rng",
+    "-drive",
+    "if=none,id=project,format=raw,file=/Users/ziangwang/Sources/vibeos/target/node-runtime/m4-eval-baseline-1/project.raw,cache=writeback",
+    "-device",
+    "virtio-blk-device,drive=project,queue-size=8",
+    "-global",
+    "virtio-mmio.force-legacy=false"
+  ],
+  "memory_samples_rounded": [
+    {
+      "live": 149946368,
+      "peak": 420269260
+    },
+    {
+      "live": 150051225,
+      "peak": 421003264
+    },
+    {
+      "live": 150051225,
+      "peak": 421003264
+    },
+    {
+      "live": 150051225,
+      "peak": 421003264
+    }
+  ],
+  "entrypoint": "eval",
+  "lifecycle_audit": {
+    "tls": [
+      {
+        "id": 1,
+        "released_slots": 17
+      },
+      {
+        "id": 2,
+        "released_slots": 12
+      },
+      {
+        "id": 3,
+        "released_slots": 12
+      },
+      {
+        "id": 4,
+        "released_slots": 12
+      },
+      {
+        "id": 5,
+        "released_slots": 12
+      },
+      {
+        "id": 6,
+        "released_slots": 12
+      },
+      {
+        "id": 7,
+        "released_slots": 12
+      },
+      {
+        "id": 8,
+        "released_slots": 12
+      },
+      {
+        "id": 9,
+        "released_slots": 12
+      },
+      {
+        "id": 10,
+        "released_slots": 12
+      },
+      {
+        "id": 11,
+        "released_slots": 12
+      },
+      {
+        "id": 12,
+        "released_slots": 12
+      },
+      {
+        "id": 13,
+        "released_slots": 12
+      },
+      {
+        "id": 14,
+        "released_slots": 12
+      },
+      {
+        "id": 15,
+        "released_slots": 12
+      },
+      {
+        "id": 16,
+        "released_slots": 12
+      },
+      {
+        "id": 17,
+        "released_slots": 12
+      },
+      {
+        "id": 18,
+        "released_slots": 12
+      },
+      {
+        "id": 19,
+        "released_slots": 12
+      },
+      {
+        "id": 20,
+        "released_slots": 12
+      },
+      {
+        "id": 21,
+        "released_slots": 12
+      },
+      {
+        "id": 22,
+        "released_slots": 12
+      },
+      {
+        "id": 23,
+        "released_slots": 12
+      },
+      {
+        "id": 24,
+        "released_slots": 12
+      },
+      {
+        "id": 25,
+        "released_slots": 12
+      },
+      {
+        "id": 26,
+        "released_slots": 12
+      },
+      {
+        "id": 27,
+        "released_slots": 12
+      },
+      {
+        "id": 28,
+        "released_slots": 12
+      },
+      {
+        "id": 29,
+        "released_slots": 12
+      },
+      {
+        "id": 30,
+        "released_slots": 12
+      },
+      {
+        "id": 31,
+        "released_slots": 12
+      },
+      {
+        "id": 32,
+        "released_slots": 12
+      },
+      {
+        "id": 33,
+        "released_slots": 12
+      },
+      {
+        "id": 34,
+        "released_slots": 12
+      },
+      {
+        "id": 35,
+        "released_slots": 12
+      },
+      {
+        "id": 36,
+        "released_slots": 12
+      },
+      {
+        "id": 37,
+        "released_slots": 12
+      },
+      {
+        "id": 38,
+        "released_slots": 12
+      },
+      {
+        "id": 39,
+        "released_slots": 12
+      },
+      {
+        "id": 40,
+        "released_slots": 12
+      },
+      {
+        "id": 41,
+        "released_slots": 12
+      },
+      {
+        "id": 42,
+        "released_slots": 12
+      },
+      {
+        "id": 43,
+        "released_slots": 12
+      },
+      {
+        "id": 44,
+        "released_slots": 12
+      },
+      {
+        "id": 45,
+        "released_slots": 12
+      },
+      {
+        "id": 46,
+        "released_slots": 12
+      },
+      {
+        "id": 47,
+        "released_slots": 12
+      },
+      {
+        "id": 48,
+        "released_slots": 12
+      },
+      {
+        "id": 49,
+        "released_slots": 12
+      },
+      {
+        "id": 50,
+        "released_slots": 12
+      },
+      {
+        "id": 51,
+        "released_slots": 12
+      },
+      {
+        "id": 52,
+        "released_slots": 12
+      },
+      {
+        "id": 53,
+        "released_slots": 12
+      },
+      {
+        "id": 54,
+        "released_slots": 12
+      },
+      {
+        "id": 55,
+        "released_slots": 12
+      },
+      {
+        "id": 56,
+        "released_slots": 12
+      },
+      {
+        "id": 57,
+        "released_slots": 12
+      },
+      {
+        "id": 58,
+        "released_slots": 12
+      },
+      {
+        "id": 59,
+        "released_slots": 12
+      },
+      {
+        "id": 60,
+        "released_slots": 12
+      },
+      {
+        "id": 61,
+        "released_slots": 12
+      },
+      {
+        "id": 62,
+        "released_slots": 12
+      },
+      {
+        "id": 63,
+        "released_slots": 12
+      },
+      {
+        "id": 64,
+        "released_slots": 12
+      },
+      {
+        "id": 65,
+        "released_slots": 12
+      },
+      {
+        "id": 66,
+        "released_slots": 12
+      },
+      {
+        "id": 67,
+        "released_slots": 12
+      },
+      {
+        "id": 68,
+        "released_slots": 12
+      },
+      {
+        "id": 69,
+        "released_slots": 12
+      },
+      {
+        "id": 70,
+        "released_slots": 12
+      },
+      {
+        "id": 71,
+        "released_slots": 12
+      },
+      {
+        "id": 72,
+        "released_slots": 12
+      },
+      {
+        "id": 73,
+        "released_slots": 12
+      },
+      {
+        "id": 74,
+        "released_slots": 12
+      },
+      {
+        "id": 75,
+        "released_slots": 12
+      },
+      {
+        "id": 76,
+        "released_slots": 12
+      },
+      {
+        "id": 77,
+        "released_slots": 12
+      },
+      {
+        "id": 78,
+        "released_slots": 12
+      },
+      {
+        "id": 79,
+        "released_slots": 12
+      },
+      {
+        "id": 80,
+        "released_slots": 12
+      },
+      {
+        "id": 81,
+        "released_slots": 12
+      },
+      {
+        "id": 82,
+        "released_slots": 12
+      },
+      {
+        "id": 83,
+        "released_slots": 12
+      },
+      {
+        "id": 84,
+        "released_slots": 12
+      },
+      {
+        "id": 85,
+        "released_slots": 12
+      },
+      {
+        "id": 86,
+        "released_slots": 12
+      },
+      {
+        "id": 87,
+        "released_slots": 12
+      },
+      {
+        "id": 88,
+        "released_slots": 12
+      },
+      {
+        "id": 89,
+        "released_slots": 12
+      },
+      {
+        "id": 90,
+        "released_slots": 12
+      },
+      {
+        "id": 91,
+        "released_slots": 12
+      },
+      {
+        "id": 92,
+        "released_slots": 12
+      },
+      {
+        "id": 93,
+        "released_slots": 12
+      },
+      {
+        "id": 94,
+        "released_slots": 12
+      },
+      {
+        "id": 95,
+        "released_slots": 12
+      },
+      {
+        "id": 96,
+        "released_slots": 12
+      },
+      {
+        "id": 97,
+        "released_slots": 12
+      },
+      {
+        "id": 98,
+        "released_slots": 12
+      },
+      {
+        "id": 99,
+        "released_slots": 12
+      },
+      {
+        "id": 100,
+        "released_slots": 12
+      }
+    ],
+    "file_tables": 100,
+    "page_owners": 100,
+    "libc": [
+      {
+        "id": 1,
+        "arena": 1839104,
+        "live": 250752,
+        "free": 1588352,
+        "free_chunks": 15,
+        "cached_blocks": 1,
+        "cached_bytes": 48,
+        "noncache_live": 250704
+      },
+      {
+        "id": 2,
+        "arena": 1851392,
+        "live": 250800,
+        "free": 1600592,
+        "free_chunks": 16,
+        "cached_blocks": 1,
+        "cached_bytes": 48,
+        "noncache_live": 250752
+      },
+      {
+        "id": 3,
+        "arena": 1794048,
+        "live": 250848,
+        "free": 1543200,
+        "free_chunks": 17,
+        "cached_blocks": 1,
+        "cached_bytes": 48,
+        "noncache_live": 250800
+      },
+      {
+        "id": 4,
+        "arena": 1789952,
+        "live": 251136,
+        "free": 1538816,
+        "free_chunks": 19,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 250848
+      },
+      {
+        "id": 5,
+        "arena": 1789952,
+        "live": 251184,
+        "free": 1538768,
+        "free_chunks": 20,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 250896
+      },
+      {
+        "id": 6,
+        "arena": 1789952,
+        "live": 251232,
+        "free": 1538720,
+        "free_chunks": 21,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 250944
+      },
+      {
+        "id": 7,
+        "arena": 1904640,
+        "live": 251280,
+        "free": 1653360,
+        "free_chunks": 22,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 250992
+      },
+      {
+        "id": 8,
+        "arena": 1789952,
+        "live": 251328,
+        "free": 1538624,
+        "free_chunks": 23,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251040
+      },
+      {
+        "id": 9,
+        "arena": 1822720,
+        "live": 251376,
+        "free": 1571344,
+        "free_chunks": 24,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251088
+      },
+      {
+        "id": 10,
+        "arena": 1814528,
+        "live": 251424,
+        "free": 1563104,
+        "free_chunks": 25,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251136
+      },
+      {
+        "id": 11,
+        "arena": 1814528,
+        "live": 251472,
+        "free": 1563056,
+        "free_chunks": 26,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251184
+      },
+      {
+        "id": 12,
+        "arena": 1814528,
+        "live": 251520,
+        "free": 1563008,
+        "free_chunks": 27,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251232
+      },
+      {
+        "id": 13,
+        "arena": 1880064,
+        "live": 251568,
+        "free": 1628496,
+        "free_chunks": 28,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251280
+      },
+      {
+        "id": 14,
+        "arena": 1814528,
+        "live": 251616,
+        "free": 1562912,
+        "free_chunks": 29,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251328
+      },
+      {
+        "id": 15,
+        "arena": 1814528,
+        "live": 251664,
+        "free": 1562864,
+        "free_chunks": 30,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251376
+      },
+      {
+        "id": 16,
+        "arena": 1814528,
+        "live": 251712,
+        "free": 1562816,
+        "free_chunks": 31,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251424
+      },
+      {
+        "id": 17,
+        "arena": 1814528,
+        "live": 251760,
+        "free": 1562768,
+        "free_chunks": 32,
+        "cached_blocks": 5,
+        "cached_bytes": 288,
+        "noncache_live": 251472
+      },
+      {
+        "id": 18,
+        "arena": 1814528,
+        "live": 251856,
+        "free": 1562672,
+        "free_chunks": 34,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251520
+      },
+      {
+        "id": 19,
+        "arena": 1880064,
+        "live": 251904,
+        "free": 1628160,
+        "free_chunks": 35,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251568
+      },
+      {
+        "id": 20,
+        "arena": 1814528,
+        "live": 251952,
+        "free": 1562576,
+        "free_chunks": 36,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251616
+      },
+      {
+        "id": 21,
+        "arena": 1814528,
+        "live": 252000,
+        "free": 1562528,
+        "free_chunks": 37,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251664
+      },
+      {
+        "id": 22,
+        "arena": 1814528,
+        "live": 252048,
+        "free": 1562480,
+        "free_chunks": 38,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251712
+      },
+      {
+        "id": 23,
+        "arena": 1814528,
+        "live": 252096,
+        "free": 1562432,
+        "free_chunks": 39,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251760
+      },
+      {
+        "id": 24,
+        "arena": 1814528,
+        "live": 252144,
+        "free": 1562384,
+        "free_chunks": 40,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251808
+      },
+      {
+        "id": 25,
+        "arena": 1835008,
+        "live": 252192,
+        "free": 1582816,
+        "free_chunks": 41,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251856
+      },
+      {
+        "id": 26,
+        "arena": 1847296,
+        "live": 252240,
+        "free": 1595056,
+        "free_chunks": 42,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251904
+      },
+      {
+        "id": 27,
+        "arena": 1847296,
+        "live": 252288,
+        "free": 1595008,
+        "free_chunks": 43,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 251952
+      },
+      {
+        "id": 28,
+        "arena": 1847296,
+        "live": 252336,
+        "free": 1594960,
+        "free_chunks": 44,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252000
+      },
+      {
+        "id": 29,
+        "arena": 1847296,
+        "live": 252400,
+        "free": 1594896,
+        "free_chunks": 45,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252064
+      },
+      {
+        "id": 30,
+        "arena": 1847296,
+        "live": 252448,
+        "free": 1594848,
+        "free_chunks": 46,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252112
+      },
+      {
+        "id": 31,
+        "arena": 1847296,
+        "live": 252496,
+        "free": 1594800,
+        "free_chunks": 47,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252160
+      },
+      {
+        "id": 32,
+        "arena": 1847296,
+        "live": 252544,
+        "free": 1594752,
+        "free_chunks": 48,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252208
+      },
+      {
+        "id": 33,
+        "arena": 1859584,
+        "live": 252592,
+        "free": 1606992,
+        "free_chunks": 49,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252256
+      },
+      {
+        "id": 34,
+        "arena": 1847296,
+        "live": 252640,
+        "free": 1594656,
+        "free_chunks": 50,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252304
+      },
+      {
+        "id": 35,
+        "arena": 1847296,
+        "live": 252688,
+        "free": 1594608,
+        "free_chunks": 51,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252352
+      },
+      {
+        "id": 36,
+        "arena": 1847296,
+        "live": 252736,
+        "free": 1594560,
+        "free_chunks": 51,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252400
+      },
+      {
+        "id": 37,
+        "arena": 1847296,
+        "live": 252784,
+        "free": 1594512,
+        "free_chunks": 52,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252448
+      },
+      {
+        "id": 38,
+        "arena": 1847296,
+        "live": 252832,
+        "free": 1594464,
+        "free_chunks": 53,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252496
+      },
+      {
+        "id": 39,
+        "arena": 1847296,
+        "live": 252880,
+        "free": 1594416,
+        "free_chunks": 54,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252544
+      },
+      {
+        "id": 40,
+        "arena": 1986560,
+        "live": 252928,
+        "free": 1733632,
+        "free_chunks": 55,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252592
+      },
+      {
+        "id": 41,
+        "arena": 1884160,
+        "live": 252976,
+        "free": 1631184,
+        "free_chunks": 56,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252640
+      },
+      {
+        "id": 42,
+        "arena": 1884160,
+        "live": 253024,
+        "free": 1631136,
+        "free_chunks": 57,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252688
+      },
+      {
+        "id": 43,
+        "arena": 1884160,
+        "live": 253072,
+        "free": 1631088,
+        "free_chunks": 58,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252736
+      },
+      {
+        "id": 44,
+        "arena": 1884160,
+        "live": 253120,
+        "free": 1631040,
+        "free_chunks": 59,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252784
+      },
+      {
+        "id": 45,
+        "arena": 1884160,
+        "live": 253168,
+        "free": 1630992,
+        "free_chunks": 60,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252832
+      },
+      {
+        "id": 46,
+        "arena": 1884160,
+        "live": 253216,
+        "free": 1630944,
+        "free_chunks": 61,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252880
+      },
+      {
+        "id": 47,
+        "arena": 1884160,
+        "live": 253264,
+        "free": 1630896,
+        "free_chunks": 62,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252928
+      },
+      {
+        "id": 48,
+        "arena": 1884160,
+        "live": 253312,
+        "free": 1630848,
+        "free_chunks": 63,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 252976
+      },
+      {
+        "id": 49,
+        "arena": 1884160,
+        "live": 253360,
+        "free": 1630800,
+        "free_chunks": 64,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253024
+      },
+      {
+        "id": 50,
+        "arena": 1884160,
+        "live": 253408,
+        "free": 1630752,
+        "free_chunks": 65,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253072
+      },
+      {
+        "id": 51,
+        "arena": 1884160,
+        "live": 253456,
+        "free": 1630704,
+        "free_chunks": 66,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253120
+      },
+      {
+        "id": 52,
+        "arena": 1884160,
+        "live": 253504,
+        "free": 1630656,
+        "free_chunks": 67,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253168
+      },
+      {
+        "id": 53,
+        "arena": 1884160,
+        "live": 253552,
+        "free": 1630608,
+        "free_chunks": 68,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253216
+      },
+      {
+        "id": 54,
+        "arena": 1884160,
+        "live": 253600,
+        "free": 1630560,
+        "free_chunks": 69,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253264
+      },
+      {
+        "id": 55,
+        "arena": 1884160,
+        "live": 253648,
+        "free": 1630512,
+        "free_chunks": 70,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253312
+      },
+      {
+        "id": 56,
+        "arena": 1884160,
+        "live": 253696,
+        "free": 1630464,
+        "free_chunks": 71,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253360
+      },
+      {
+        "id": 57,
+        "arena": 1884160,
+        "live": 253744,
+        "free": 1630416,
+        "free_chunks": 72,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253408
+      },
+      {
+        "id": 58,
+        "arena": 1884160,
+        "live": 253792,
+        "free": 1630368,
+        "free_chunks": 73,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253456
+      },
+      {
+        "id": 59,
+        "arena": 1884160,
+        "live": 253840,
+        "free": 1630320,
+        "free_chunks": 74,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253504
+      },
+      {
+        "id": 60,
+        "arena": 1884160,
+        "live": 253888,
+        "free": 1630272,
+        "free_chunks": 75,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253552
+      },
+      {
+        "id": 61,
+        "arena": 1884160,
+        "live": 253936,
+        "free": 1630224,
+        "free_chunks": 76,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253600
+      },
+      {
+        "id": 62,
+        "arena": 1884160,
+        "live": 253984,
+        "free": 1630176,
+        "free_chunks": 77,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253648
+      },
+      {
+        "id": 63,
+        "arena": 1884160,
+        "live": 254032,
+        "free": 1630128,
+        "free_chunks": 78,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253696
+      },
+      {
+        "id": 64,
+        "arena": 1884160,
+        "live": 254080,
+        "free": 1630080,
+        "free_chunks": 79,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253744
+      },
+      {
+        "id": 65,
+        "arena": 1884160,
+        "live": 254128,
+        "free": 1630032,
+        "free_chunks": 80,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253792
+      },
+      {
+        "id": 66,
+        "arena": 1884160,
+        "live": 254176,
+        "free": 1629984,
+        "free_chunks": 81,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253840
+      },
+      {
+        "id": 67,
+        "arena": 1884160,
+        "live": 254224,
+        "free": 1629936,
+        "free_chunks": 82,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253888
+      },
+      {
+        "id": 68,
+        "arena": 1884160,
+        "live": 254272,
+        "free": 1629888,
+        "free_chunks": 83,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253936
+      },
+      {
+        "id": 69,
+        "arena": 1884160,
+        "live": 254320,
+        "free": 1629840,
+        "free_chunks": 84,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 253984
+      },
+      {
+        "id": 70,
+        "arena": 1884160,
+        "live": 254368,
+        "free": 1629792,
+        "free_chunks": 85,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254032
+      },
+      {
+        "id": 71,
+        "arena": 1884160,
+        "live": 254416,
+        "free": 1629744,
+        "free_chunks": 86,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254080
+      },
+      {
+        "id": 72,
+        "arena": 1884160,
+        "live": 254464,
+        "free": 1629696,
+        "free_chunks": 87,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254128
+      },
+      {
+        "id": 73,
+        "arena": 1884160,
+        "live": 254512,
+        "free": 1629648,
+        "free_chunks": 88,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254176
+      },
+      {
+        "id": 74,
+        "arena": 1884160,
+        "live": 254560,
+        "free": 1629600,
+        "free_chunks": 89,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254224
+      },
+      {
+        "id": 75,
+        "arena": 1884160,
+        "live": 254608,
+        "free": 1629552,
+        "free_chunks": 90,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254272
+      },
+      {
+        "id": 76,
+        "arena": 1921024,
+        "live": 254656,
+        "free": 1666368,
+        "free_chunks": 91,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254320
+      },
+      {
+        "id": 77,
+        "arena": 1884160,
+        "live": 254704,
+        "free": 1629456,
+        "free_chunks": 92,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254368
+      },
+      {
+        "id": 78,
+        "arena": 1884160,
+        "live": 254752,
+        "free": 1629408,
+        "free_chunks": 93,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254416
+      },
+      {
+        "id": 79,
+        "arena": 1884160,
+        "live": 254800,
+        "free": 1629360,
+        "free_chunks": 94,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254464
+      },
+      {
+        "id": 80,
+        "arena": 1884160,
+        "live": 254848,
+        "free": 1629312,
+        "free_chunks": 94,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254512
+      },
+      {
+        "id": 81,
+        "arena": 1884160,
+        "live": 254896,
+        "free": 1629264,
+        "free_chunks": 95,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254560
+      },
+      {
+        "id": 82,
+        "arena": 1884160,
+        "live": 254944,
+        "free": 1629216,
+        "free_chunks": 96,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254608
+      },
+      {
+        "id": 83,
+        "arena": 1912832,
+        "live": 254992,
+        "free": 1657840,
+        "free_chunks": 97,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254656
+      },
+      {
+        "id": 84,
+        "arena": 1884160,
+        "live": 255040,
+        "free": 1629120,
+        "free_chunks": 97,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254704
+      },
+      {
+        "id": 85,
+        "arena": 1884160,
+        "live": 255088,
+        "free": 1629072,
+        "free_chunks": 98,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254752
+      },
+      {
+        "id": 86,
+        "arena": 1884160,
+        "live": 255136,
+        "free": 1629024,
+        "free_chunks": 99,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254800
+      },
+      {
+        "id": 87,
+        "arena": 1884160,
+        "live": 255184,
+        "free": 1628976,
+        "free_chunks": 100,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254848
+      },
+      {
+        "id": 88,
+        "arena": 1884160,
+        "live": 255232,
+        "free": 1628928,
+        "free_chunks": 101,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254896
+      },
+      {
+        "id": 89,
+        "arena": 1884160,
+        "live": 255280,
+        "free": 1628880,
+        "free_chunks": 102,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254944
+      },
+      {
+        "id": 90,
+        "arena": 1884160,
+        "live": 255328,
+        "free": 1628832,
+        "free_chunks": 103,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 254992
+      },
+      {
+        "id": 91,
+        "arena": 1884160,
+        "live": 255376,
+        "free": 1628784,
+        "free_chunks": 104,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255040
+      },
+      {
+        "id": 92,
+        "arena": 1884160,
+        "live": 255424,
+        "free": 1628736,
+        "free_chunks": 105,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255088
+      },
+      {
+        "id": 93,
+        "arena": 1884160,
+        "live": 255472,
+        "free": 1628688,
+        "free_chunks": 106,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255136
+      },
+      {
+        "id": 94,
+        "arena": 1884160,
+        "live": 255520,
+        "free": 1628640,
+        "free_chunks": 107,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255184
+      },
+      {
+        "id": 95,
+        "arena": 1884160,
+        "live": 255568,
+        "free": 1628592,
+        "free_chunks": 108,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255232
+      },
+      {
+        "id": 96,
+        "arena": 1884160,
+        "live": 255616,
+        "free": 1628544,
+        "free_chunks": 109,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255280
+      },
+      {
+        "id": 97,
+        "arena": 1884160,
+        "live": 255664,
+        "free": 1628496,
+        "free_chunks": 110,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255328
+      },
+      {
+        "id": 98,
+        "arena": 1884160,
+        "live": 255712,
+        "free": 1628448,
+        "free_chunks": 111,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255376
+      },
+      {
+        "id": 99,
+        "arena": 1884160,
+        "live": 255760,
+        "free": 1628400,
+        "free_chunks": 112,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255424
+      },
+      {
+        "id": 100,
+        "arena": 1884160,
+        "live": 255808,
+        "free": 1628352,
+        "free_chunks": 113,
+        "cached_blocks": 6,
+        "cached_bytes": 336,
+        "noncache_live": 255472
+      }
+    ]
+  },
+  "seconds": 149.6563851669198,
+  "kernel_sha256": "cd6c420b35725210f2e5715428207f66dd328b44e2e5743545954a9bac14f405",
+  "source_sha256": {
+    "services/file-store/src/lib.rs": "e3d0df2880ee07a171ed2d5ffd4f8f797b7432f96ec4fb53dd24b2207c0c10fe",
+    "scripts/test-node-cycles-qemu.py": "4fa027a2e896e094384582b3448fbea90e1518ecab0e00990fdd371096b06f33",
+    "scripts/qemu-vsh-driver.py": "eb3e0d0f79db688183d6a632c0e155adbb8aabe6f770251d123e625510ae0083",
+    "kernel/src/vsh_platform.rs": "05743cac828feb28df5923de32de193256738cf4cebe3fa5d01790d0b92c920e",
+    "kernel/Cargo.toml": "1ed9aa83f86016f20e402ca687933f20dd8e31d70b9201ea8d4c807cd8a6feb8",
+    "services/wasi-command/src/lib.rs": "29486024d377853d185971abcf90ec1081247d061ca6d15f63c592f5d4b5b341",
+    "components/vsh/src/engine.rs": "e13cdd5aecd53c9e56c2d64179d502a11fc1777b7e29a3bb2fc499cddd3a7b74",
+    "kernel/src/native_call.rs": "e3efc5c8e256ac0dc0c8139326924bd7290b4626f2c25989276c53a353b09f03",
+    "kernel/src/native_clock.rs": "59455406375cd6518d5804a6c1dd5aea1713814134abc208cb21d796b2773270",
+    "kernel/src/native_entropy.rs": "2d22b5954b5db11aa6963a81de7015e62b978e7aab45d2bfdc6ddd1c549940c7",
+    "kernel/src/native_env.rs": "b717daf2768937d84e570ddfc15eef13556b596523ae1563e486dd0b756763b0",
+    "kernel/src/native_esbuild.rs": "6cefa98771ca4730d81a45212ba354332d5d0dfe452d423d2349ef59c529ae02",
+    "kernel/src/native_esbuild_protocol.rs": "faadeabc228d03f02cf0fa3f46ce70c37c74b042d9f19217b425c62c7b64aeb0",
+    "kernel/src/native_files.rs": "8dd0601c339d1e3f4f766e996ee8731d5a8d60af05b413e96f11cd98c73b4dab",
+    "kernel/src/native_libc_heap.rs": "8863dc5e72e8a0db03542b481c66f6fb0078f993165deb2f1ce020ca84cf24f6",
+    "kernel/src/native_memory.rs": "a85c843a4079cafa3a627e6a7013e07472e60b30f4202cd5fabc814387ab7065",
+    "kernel/src/native_node.rs": "3ed714bb60ae1ea8ec7b380c7dd7ee04d352fdcac5bf788a89eb62c200b0f61d",
+    "kernel/src/native_notify.rs": "95b6a7b8659108ba134050c2e3ee0001172cb0a2e03aaaa4c56bf6c26b4c26d4",
+    "kernel/src/native_page_pool.rs": "516d9c1f016193dc4a24d6943ef202a90bf5f374b0dc31304af4361f70537c97",
+    "kernel/src/native_pages.rs": "c60bee39e6d57b96771fdbbc5916f8bf056e72fe05670fbc40ad26c6c13a0e4e",
+    "kernel/src/native_pending_shadow_model.rs": "ad7f21a1ae6bc3527e03e19517141402a972ba9b3246237c4a01a9dcbee0761c",
+    "kernel/src/native_process.rs": "fcfe14a1dad20557f7d82abfec844ef90149ed2ca137dab684082d2974f4ddda",
+    "kernel/src/native_semaphore.rs": "9ecc56afca9be3317117c7d21d9ef92a21636cccd8abf712b0cb89e1440e17a2",
+    "kernel/src/native_stdio.rs": "55a8e1f0e4a69e8d3d54f80e3ec3c983cdce88fba20d27e1bc11d2209f5219c4",
+    "kernel/src/native_tcb_pages.rs": "b3eb67f0816c4393a66127160d25684fc54e5b994a3932d712383de0df6f152f",
+    "kernel/src/native_tls.rs": "c7431268bb4109ba9ba063fe6c1bda4c2149722755ed96cadca41e6474f8c501",
+    "kernel/src/native_toolkit.rs": "0441ef7bd44bb1fd7ef9d3de300d97a7338cf5c15ea424b9890c8c742301bf60",
+    "kernel/src/native_wait.rs": "3aca458ecc0b48e83395c47b10fd74992f28b303b3a4eb9d9d0e841a7edc9ecc",
+    "tools/node-runtime/runtime/node-allocation-trace.cc": "9b094faaf1f787fb02fe5f95126b6581e9a2cafe2b6d3c8e27429f14bf62f50a",
+    "tools/node-runtime/runtime/node-allocation-trace.h": "7962e20811e9a1d22713a41697bc5fb0b4ea1d1af21ac093e43dafe12adb9027",
+    "tools/node-runtime/runtime/node-esbuild.cc": "04e024d31fc67f44bf5cee024b2ae0825fbd9c8290af7afd6f21b0e00a7a5ae5",
+    "tools/node-runtime/runtime/node-esbuild.h": "1fab33b3632cc9cb21d023383b2bb02b1378a48f32d4af9f154c200d95006405",
+    "tools/node-runtime/runtime/node-invocation.cc": "b54231ff16f4537d562feeff748d0f4db633220ae9de5bf6f5e5d5c1b2b2f682",
+    "tools/node-runtime/runtime/node-invocation.h": "c5902b8b294541315a8e7239dc2e33bb47e2a9a05acd6aecab4a06fea66b4673",
+    "tools/node-runtime/runtime/node-lifecycle.cc": "752e45d92b5d89fd2768a4851f2c2db429acd3d3ba577870cb4cc39785bb1f1a",
+    "tools/node-runtime/runtime/node-lifecycle.h": "1a09f063424f5b890917c07fd7c52eaf465dd3288cc8e6ab74a00bdf04c2b4cc",
+    "tools/node-runtime/runtime/node-process.cc": "056da78f1b2580db1d71902f2ec68c291d6963712e57a9929b43b68633b4428b",
+    "tools/node-runtime/runtime/node-process.h": "5fd2415f5dda4241d9ffb984d38dbf4533590119451fb8760b8777fce6532e65",
+    "tools/node-runtime/libuv/vibeos-loop.c": "77d6fa9067244af67a6f5dfa3a9a4a9ad92e00433fde3bd81660c1fc140522ab",
+    "tools/node-runtime/libuv/vibeos-fs.c": "d99ee564ce9c0bfedd58de5e21f990dbee7d60a111564947a6ee5e33e751a910",
+    "tools/node-runtime/platform/vibeos-esbuild.h": "23c97c565ea432208149d6d5381d8569efcd3ce63711f7f4f123c15fbc5f8787",
+    "tools/node-runtime/toolkit/README.md": "31c44c0b4ee5ffd44db80337dfbad9a63709aa73d9231c42f03fca1512bf4367",
+    "tools/node-runtime/toolkit/adapt.py": "a724ce11e36e99ac04823b29425a0a1d71585f97668242845b796f06ea093a18",
+    "tools/node-runtime/toolkit/esbuild-platform.js": "b6bf4f3f98fd3f871f7e47c38674cf45a166c54a783682307146576a6eacb649",
+    "tools/node-runtime/toolkit/tsx-adapt.py": "3b154397706a8b324a5eb2021f4a7d34cb5c35176b53214720119b17f60b3217",
+    "tools/node-runtime/toolkit/tsx-launcher.mjs": "3c199ee250fea131becc368ed5a0dd0e0fa6a3fedeb1429a7dbe2ac43a17af13"
+  }
+}

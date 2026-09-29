@@ -42,6 +42,9 @@ struct State {
     environment: RefCell<crate::native_env::Environment>,
     file_table: RefCell<crate::native_files::FileTable>,
     files: RefCell<Option<crate::native_files::FileGrant>>,
+    tools: RefCell<Option<crate::native_files::FileGrant>>,
+    #[cfg(feature = "node-toolkit")]
+    esbuild: RefCell<crate::native_esbuild::State>,
     stdio: RefCell<Option<crate::native_stdio::StdioGrant>>,
     #[cfg(feature = "queued-entropy")]
     entropy: RefCell<Option<crate::native_entropy::EntropyGrant>>,
@@ -79,6 +82,9 @@ impl NativeTls {
             environment: RefCell::new(crate::native_env::Environment::new()),
             file_table: RefCell::new(crate::native_files::FileTable::new()),
             files: RefCell::new(None),
+            tools: RefCell::new(None),
+            #[cfg(feature = "node-toolkit")]
+            esbuild: RefCell::new(crate::native_esbuild::State::new()),
             stdio: RefCell::new(None),
             #[cfg(feature = "queued-entropy")]
             entropy: RefCell::new(None),
@@ -95,6 +101,10 @@ impl NativeTls {
     pub(super) fn set_files(&self, grant: crate::native_files::FileGrant) {
         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
         *self.state.files.borrow_mut() = Some(grant);
+    }
+    pub(super) fn set_tools(&self, grant: crate::native_files::FileGrant) {
+        assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+        *self.state.tools.borrow_mut() = Some(grant.read_only());
     }
     pub(super) fn set_title(&self, title: &str) -> Result<(), i32> {
         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
@@ -283,6 +293,13 @@ pub(super) fn io_notification() -> alloc::sync::Arc<crate::native_notify::Native
 
 pub(super) fn file_grant() -> Option<crate::native_files::FileGrant> {
     unsafe { current_state() }.files.borrow().clone()
+}
+pub(super) fn tool_grant() -> Option<crate::native_files::FileGrant> {
+    unsafe { current_state() }.tools.borrow().clone()
+}
+#[cfg(feature = "node-toolkit")]
+pub(super) fn with_esbuild<R>(f: impl FnOnce(&mut crate::native_esbuild::State) -> R) -> R {
+    f(&mut unsafe { current_state() }.esbuild.borrow_mut())
 }
 
 pub(super) fn with_file_table<R>(f: impl FnOnce(&mut crate::native_files::FileTable) -> R) -> R {

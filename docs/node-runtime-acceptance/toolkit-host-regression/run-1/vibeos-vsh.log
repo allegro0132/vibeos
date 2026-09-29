@@ -1,0 +1,343 @@
+   Compiling libm v0.2.16
+   Compiling bitflags v2.13.1
+   Compiling foldhash v0.2.0
+   Compiling semver v1.0.28
+   Compiling anyhow v1.0.104
+   Compiling equivalent v1.0.2
+   Compiling wasmi_collections v1.1.0
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling spin v0.9.9
+warning: `vibeos-durable-format` (lib) generated 1 warning
+   Compiling vibeos-component-format v0.1.0 (/Users/ziangwang/Sources/vibeos/component-format)
+   Compiling unicode-ident v1.0.24
+   Compiling wasmparser v0.239.0
+   Compiling hashbrown v0.17.1
+   Compiling id-arena v2.3.0
+   Compiling log v0.4.33
+   Compiling wasmparser v0.255.0
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+warning: unused import: `DecodeStatus`
+  --> segment-store/src/scrub.rs:13:70
+   |
+13 |     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
+   |                                                                      ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `alloc::collections::BTreeMap`
+ --> segment-store/src/store.rs:4:5
+  |
+4 | use alloc::collections::BTreeMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ScratchExtent` is more private than the item `StagedObjectCommit::extents`
+    --> segment-store/src/cas.rs:4297:5
+     |
+4297 |     pub(crate) extents: Vec<ScratchExtent>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::extents` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchExtent` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:955:1
+     |
+ 955 | struct ScratchExtent {
+     | ^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ScratchSegment` is more private than the item `StagedObjectCommit::segments`
+    --> segment-store/src/cas.rs:4298:5
+     |
+4298 |     pub(crate) segments: Vec<ScratchSegment>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `StagedObjectCommit::segments` is reachable at visibility `pub(crate)`
+     |
+note: but type `ScratchSegment` is only usable at visibility `pub(self)`
+    --> segment-store/src/cas.rs:985:1
+     |
+ 985 | struct ScratchSegment {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> segment-store/src/authority_snapshot.rs:673:19
+    |
+630 | impl PersistentAuthoritySnapshot {
+    | -------------------------------- associated function in this implementation
+...
+673 |     pub(crate) fn new(
+    |                   ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `staged_segment_count` is never used
+    --> segment-store/src/cas.rs:4681:12
+     |
+4673 | impl StagedBlobBatch {
+     | -------------------- method in this implementation
+...
+4681 |     pub fn staged_segment_count(&self) -> usize {
+     |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: method `len` is never used
+   --> segment-store/src/gc.rs:495:19
+    |
+415 | impl TypedEdgeCache {
+    | ------------------- method in this implementation
+...
+495 |     pub(crate) fn len(&self) -> usize {
+    |                   ^^^
+
+warning: function `read_pointer_authority_payload` is never used
+    --> segment-store/src/store.rs:3297:21
+     |
+3297 | pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the `objects:` in this pattern is redundant
+    --> segment-store/src/store.rs:3822:17
+     |
+3822 |                 objects: mut objects,
+     |                 ^^^^^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut objects`
+     |
+     = note: `#[warn(non_shorthand_field_patterns)]` on by default
+
+warning: the `blobs:` in this pattern is redundant
+    --> segment-store/src/store.rs:3823:17
+     |
+3823 |                 blobs: mut blobs,
+     |                 ^^^^^^^^^^^^^^^^ help: use shorthand field pattern: `mut blobs`
+
+warning: `vibeos-segment-store` (lib) generated 10 warnings (run `cargo fix --lib -p vibeos-segment-store` to apply 4 suggestions)
+warning: methods `resolve_canonical` and `resolve` are never used
+   --> services/file-store/src/lib.rs:139:8
+    |
+102 | impl NamespaceState {
+    | ------------------- methods in this implementation
+...
+139 |     fn resolve_canonical(
+    |        ^^^^^^^^^^^^^^^^^
+...
+193 |     fn resolve(&self, path: &RelPath, follow_final: bool) -> Result<FileId, FileError> {
+    |        ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-file-store` (lib) generated 1 warning
+   Compiling indexmap v2.14.0
+   Compiling wasmi_core v1.1.0
+   Compiling wit-parser v0.255.0
+   Compiling wasmi_ir v1.1.0
+   Compiling wasmi v1.1.0
+   Compiling vibeos-wasm-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasm-runtime)
+   Compiling vibeos-component-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/component-runtime)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+   Compiling vibeos-component-host v0.1.0 (/Users/ziangwang/Sources/vibeos/services/component-host)
+   Compiling vibeos-vsh v0.1.0 (/Users/ziangwang/Sources/vibeos/components/vsh)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+   --> components/vsh/tests/component_commands.rs:416:22
+    |
+416 |                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+    |                      ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+    |
+416 -                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+416 +                     .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+    |
+
+warning: `vibeos-vsh` (test "component_commands") generated 1 warning (run `cargo fix --test "component_commands" -p vibeos-vsh` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 26.54s
+     Running unittests src/lib.rs (target/debug/deps/vibeos_vsh-2849503a449e30a7)
+
+running 1 test
+test engine::managed_reaper_boundary_tests::lost_terminal_edges_quarantine_all_sixteen_slots_without_stranding_reapers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/component_commands.rs (target/debug/deps/component_commands-ce7b600ebc07f38a)
+
+running 41 tests
+test component_manifest_rejects_a_zero_memory_ceiling ... ok
+test component_terminal_formatting_never_contains_pointer_like_text ... ok
+test both_managed_stream_worlds_cannot_enter_the_legacy_ssh_runner_path ... ok
+test component_results_are_bounded_and_returned_output_is_preserved ... ok
+test component_conditionals_background_wait_and_ctrl_c_keep_typed_semantics ... ok
+test component_terminal_details_do_not_fold_security_or_backend_failures ... ok
+test component_manifest_and_debug_views_are_owned_and_redacted ... ok
+test component_runner_transforms_a_bounded_pipeline_surrogate ... ok
+test cancellation_signal_is_pretriggered_idempotent_and_single_waiter_bounded ... ok
+test duplicate_component_install_is_rejected_without_growing_authority ... ok
+test effect_free_value_expansion_can_still_select_a_session_local_command ... ok
+test later_redirect_or_authority_denial_precedes_substitution_and_runner_hooks ... ok
+test managed_cancel_busy_yields_and_retries_without_inventing_a_terminal ... ok
+test managed_cancel_lost_and_already_complete_fail_closed_without_retry ... ok
+test managed_completion_scalars_preserve_terminal_status ... ok
+test managed_foreground_cancellation_is_cooperative_and_token_only ... ok
+test managed_future_drop_reuses_one_system_reaper_slot_for_seventeen_invocations ... ok
+test managed_grammar_denials_happen_before_lifecycle_start ... ok
+test managed_installer_rejects_non_stream_component_contracts ... ok
+test managed_installer_requires_exact_image_and_session_policy ... ok
+test managed_io_is_claimed_once_by_the_first_prepared_pipeline ... ok
+test managed_manifest_change_after_installation_is_rejected_before_start ... ok
+test ssh_component_io_pump_exposes_only_data_directions ... ok
+test shutdown_reaps_a_managed_token_after_the_execution_future_is_dropped ... ok
+test managed_prepublication_cancellation_never_starts_a_child ... ok
+test managed_prestart_command_revocation_denies_and_finalizes_both_streams ... ok
+test ssh_exec_policy_installation_cannot_target_an_interactive_session ... ok
+test managed_running_state_parks_until_an_exact_event_without_poll_spin ... ok
+test ssh_policy_snapshots_the_exact_manifest_that_was_authorized ... ok
+test managed_stream_accepts_closed_stderr_without_ambient_authority ... ok
+test one_foreground_watcher_parks_and_fans_cancel_out_to_a_multistage_pipeline ... ok
+test ps_caps_mem_boundary_rejects_opaque_identifiers_before_output ... ok
+test managed_preparation_is_bound_to_the_exact_authorized_session ... ok
+test ssh_default_profile_does_not_gain_component_commands_implicitly ... ok
+test ssh_exec_installs_only_an_exact_explicit_image_session_policy ... ok
+test ssh_exec_rejects_a_runner_that_differs_from_the_image_pin ... ok
+test managed_running_wait_is_woken_by_fail_stop_and_returns_lost ... ok
+test sync_and_native_managed_installers_are_exact_and_do_not_cross ... ok
+test tracked_kernel_domain_keeps_builtins_working_and_components_fail_closed ... ok
+test tracked_ssh_exec_uses_only_the_explicit_managed_lifecycle ... ok
+test unpublished_managed_start_errors_finalize_both_pump_streams ... ok
+
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/terminal.rs (target/debug/deps/terminal-2aa4ace58a51b183)
+
+running 17 tests
+test control_d_ends_empty_input_and_submits_partial_line ... ok
+test frontend_instances_do_not_share_state_or_backpressure ... ok
+test frontend_backpressure_is_atomic_and_retryable ... ok
+test frontend_partial_consumption_preserves_fifo_order ... ok
+test adjacent_duplicate_and_empty_lines_do_not_replace_history ... ok
+test fragmented_escape_editing_submits_the_exact_line ... ok
+test frontend_preserves_partial_output_before_prompt_and_across_eof ... ok
+test frontend_preserves_editing_state_around_async_output ... ok
+test frontend_renders_exact_editing_and_control_bytes ... ok
+test frontend_streams_one_async_transaction_across_chunks_and_drains ... ok
+test input_cursor_draft_and_history_are_isolated_per_session ... ok
+test interrupt_and_transport_eof_are_distinct_and_session_local ... ok
+test input_limit_accepts_exactly_the_bound_then_bells_without_mutation ... ok
+test tab_completes_unique_and_common_command_prefixes ... ok
+test frontend_bounds_prompts_chunks_and_maximum_redraw_encoding ... ok
+test tab_only_completes_command_positions_and_replaces_the_current_token ... ok
+test unsupported_parameterized_csi_does_not_leak_into_input ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/vsh.rs (target/debug/deps/vsh-a5260642f0366fe2)
+
+running 35 tests
+test capability_path_root_is_lexical_and_tail_remains_structured ... ok
+test async_host_command_waits_for_object_read_and_captures_output ... ok
+test capability_command_guard_observes_revocation_during_invocation ... ok
+test background_cancel_joins_and_releases_the_job ... ok
+test capability_path_admission_is_complete_before_stage_start ... ok
+test completion_candidates_follow_session_commands_and_functions ... ok
+test parser_preserves_capability_value_separation_and_quotes ... ok
+test capability_command_retains_full_wasi_exit_detail ... ok
+test cp_overwrite_and_ln_force_preserve_linux_inode_semantics ... ok
+test dropping_session_cancels_all_background_tasks ... ok
+test expanded_text_cannot_forge_capability ... ok
+test file_applets_use_one_capability_root_and_real_pipeline_streams ... ok
+test foreground_console_streams_prompts_input_eof_and_cancellation ... ok
+test s5_parser_builds_control_function_and_substitution_nodes ... ok
+test lsblk_lists_only_delegatable_session_block_ranges ... ok
+test parent_revocation_and_ctrl_c_path_fail_closed ... ok
+test prepared_pipeline_rejects_a_foreign_session_without_publishing_stages ... ok
+test retained_native_authority_cannot_outlive_cancelled_job ... ok
+test s4_vertical_echo_wc_pipeline ... ok
+test s5_command_substitution_is_bounded_isolated_and_not_reparsed ... ok
+test ssh_exec_validation_rejects_every_non_simple_form ... ok
+test s5_function_recursion_and_capability_revalidation_fail_closed ... ok
+test s5_if_while_and_function_scopes_are_bounded_and_local ... ok
+test s5_nested_script_cannot_launder_ambient_authority ... ok
+test s5_read_only_script_artifact_has_an_exact_authority_manifest ... ok
+test s5_while_iteration_budget_returns_typed_failure ... ok
+test shutdown_cancels_and_joins_all_background_tasks ... ok
+test ssh_exec_api_rejects_an_interactive_session ... ok
+test ssh_exec_literal_input_is_bounded_and_remains_literal ... ok
+test ssh_exec_profile_installs_only_the_explicit_command_allowlist ... ok
+test streaming_console_does_not_steal_command_substitution_output ... ok
+test typed_pipefail_prefers_fault_and_denial ... ok
+test unknown_later_stage_executes_nothing ... ok
+test value_and_job_special_forms_are_session_local ... ok
+test wrong_kind_and_missing_grant_fail_during_admission ... ok
+
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.81s
+
+     Running tests/vsh_fuzz.rs (target/debug/deps/vsh_fuzz-e10b4dd98a30c22b)
+
+running 2 tests
+test every_single_byte_ascii_input_is_diagnostic_or_ast ... ok
+test bounded_parser_survives_generated_operator_quote_and_reference_corpus ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/vtop.rs (target/debug/deps/vtop-fab090ba2ca7881d)
+
+running 9 tests
+test restricted_profiles_and_shell_syntax_cannot_open_or_smuggle_vtop ... ok
+test unavailable_zero_interval_and_reset_cpu_samples_never_claim_zero_load ... ok
+test confirmation_binds_generation_and_removal_revokes_interactive_access ... ok
+test pending_actions_are_bounded_and_no_duplicate_confirmations_are_dispatched ... ok
+test cpu_uses_idle_deltas_and_service_rates_use_time_and_generation ... ok
+test reused_name_and_generation_cannot_retarget_an_old_confirmation ... ok
+test frames_are_bounded_ascii_and_do_not_admit_terminal_injection ... ok
+test command_failures_have_nonzero_status_and_cancelled_waits_do_not_restart ... ok
+test filtering_sorting_paging_and_protected_rows_are_transport_independent ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vibeos_vsh
+
+running 1 test
+test components/vsh/src/engine.rs - engine::SshExecComponentIoPump (line 2287) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+

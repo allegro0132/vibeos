@@ -1,0 +1,91 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'const bridge = globalThis[Symbol.for("vibeos.esbuild")];' | write @home/project/common.cjs
+@sleep 0.3
+echo 'let encoded = "";' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'encoded += "0QAAAAAAAAAGBAAAAAcAAABjb21tYW5kAwkAAAB0cmFuc2Zvcm0HAAAAaW5wdXRGUwEABQAAAGlucHV0BBsAAABjb25zdCBh";' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'encoded += "bnN3ZXI6IG51bWJlciA9IDQyOwoFAAAAZmxhZ3MFBQAAAAMLAAAALS1sb2FkZXI9dHMDDAAAAC0tZm9ybWF0PWNqcwMPAAAA";' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'encoded += "LS1qc3gtZmFjdG9yeT1oAxQAAAAtLXNvdXJjZW1hcD1leHRlcm5hbAMYAAAALS1zb3VyY2VmaWxlPXNyYy9tYWluLnRz";' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'const packet = Buffer.from(encoded, "base64");' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'function check(data) { if (!Buffer.from(data).includes(Buffer.from("const answer = 42;"))) throw Error("bad transform"); }' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'module.exports = { bridge, packet, check };' | write --append @home/project/common.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/sync.cjs
+@sleep 0.3
+echo 'check(bridge.transformSync(packet));' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'console.log("NODE_ESBUILD_" + "SYNC=ok");' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/async.cjs
+@sleep 0.3
+echo 'let ticks = 0; const clock = setInterval(() => ticks++, 10);' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'Promise.all([bridge.transform(packet), bridge.transform(packet)]).then(results => {' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'for (const result of results) check(result); clearInterval(clock);' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'if (ticks < 2) throw Error("timer starved"); console.log("NODE_ESBUILD_" + "ASYNC=ok ticks=" + ticks);' | write --append @home/project/async.cjs
+@sleep 0.3
+echo '}).catch(error => { clearInterval(clock); throw error; });' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/mixed.cjs
+@sleep 0.3
+echo 'const pending = bridge.transform(packet); check(bridge.transformSync(packet));' | write --append @home/project/mixed.cjs
+@sleep 0.3
+echo 'pending.then(data => { check(data); console.log("NODE_ESBUILD_" + "MIXED=ok"); });' | write --append @home/project/mixed.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/idle.cjs
+@sleep 0.3
+echo 'Promise.all([bridge.transform(packet), bridge.transform(packet)]).then(results => {' | write --append @home/project/idle.cjs
+@sleep 0.3
+echo 'for (const result of results) check(result); console.log("NODE_ESBUILD_" + "IDLE=ok"); });' | write --append @home/project/idle.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/exit.cjs
+@sleep 0.3
+echo 'bridge.transform(packet); setTimeout(() => process.exit(7), 20);' | write --append @home/project/exit.cjs
+@sleep 0.3
+echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/denied.cjs
+@sleep 0.3
+echo 'let rejected = false; try { bridge.transformSync(packet); } catch (e) { rejected = e.message.includes("status -3"); }' | write --append @home/project/denied.cjs
+@sleep 0.3
+echo 'if (!rejected) throw Error("unexpected authority"); console.log("NODE_ESBUILD_" + "DENIED=ok");' | write --append @home/project/denied.cjs
+@sleep 0.3
+@send node --root @home/project denied.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_DENIED=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project sync.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_SYNC=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project async.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_ASYNC=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project idle.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_IDLE=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project mixed.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_MIXED=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project exit.cjs
+@sleep 0.3
+@expect Returned(7)
+@sleep 0.3
+@send node-tool-probe --root @home/project sync.cjs
+@sleep 0.3
+@expect NODE_ESBUILD_SYNC=ok
+@sleep 0.3
+vtop --once
+@sleep 1
+@quit

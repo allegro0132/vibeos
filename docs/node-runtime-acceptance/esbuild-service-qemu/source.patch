@@ -1,0 +1,803 @@
+diff --git a/docs/NODE_RUNTIME.md b/docs/NODE_RUNTIME.md
+index ae3c3262..da690c5d 100644
+--- a/docs/NODE_RUNTIME.md
++++ b/docs/NODE_RUNTIME.md
+@@ -3,8 +3,9 @@
+ **Status: real V8 and official esbuild WASI execute on QEMU. Native Node now
+ runs through capability-rooted local VSH and authorized OpenSSH PTY sessions.
+ CJS/ESM, files, stdio/pipes, timers, exact exit status and cooperative cancellation
+-pass target tests. Official tsc/tsx execution and final safety/regression
+-qualification remain incomplete.**
++pass target tests. Official tsc now checks projects, emits JS/declarations,
++and reports type errors on target. Adapted tsx execution and final
++safety/regression qualification remain incomplete.**
+ 
+ [Current compatibility and limits](NODE_RUNTIME_COMPATIBILITY.md).
+ 
+@@ -27,8 +28,10 @@ retains its original internal milestone labels.
+   The SSH/VSH transport retains its existing buffered command-output semantics.
+   [Launcher lifecycle evidence](node-runtime-acceptance/node-launcher-entry/README.md)
+   records earlier 100-cycle execution and the subsequent ownership fixes.
+-- **M3 — TypeScript tools:** pending official tsc and adapted upstream tsx
+-  project execution, diagnostics, declarations, TSX and source locations.
++- **M3 — TypeScript tools:** partial. [Official tsc evidence](node-runtime-acceptance/tsc-qemu/README.md)
++  covers project checking, noEmit, JS/declaration emission, running emitted JS
++  and source-positioned type diagnostics. Adapted upstream tsx, TSX and its
++  esbuild WASI channel remain pending.
+ - **M4 — safety and lifecycle:** pending complete authority/revocation,
+   infinite-loop cancellation, output backpressure and 100-cycle reclamation.
+ - **M5 — regression and evidence:** pending final affected host/QEMU suites,
+diff --git a/docs/NODE_RUNTIME_COMPATIBILITY.md b/docs/NODE_RUNTIME_COMPATIBILITY.md
+index 2c0af9f6..e7f25335 100644
+--- a/docs/NODE_RUNTIME_COMPATIBILITY.md
++++ b/docs/NODE_RUNTIME_COMPATIBILITY.md
+@@ -11,7 +11,8 @@ The table records target execution evidence for the implementation to date.
+ The [fresh build and execution](node-runtime-acceptance/node-fresh-57/README.md)
+ qualifies M2, including local VSH, authenticated SSH and 100 successful launcher
+ cycles after the process-page ownership fix. The broader M4 inventory/security
+-audit and M3 official TypeScript/tsx toolchain remain incomplete.
++audit and M3 tsx/esbuild integration remain incomplete. Official tsc now passes
++the target project gate described below.
+ 
+ | Area | Verified behavior / current boundary | Evidence |
+ |---|---|---|
+@@ -29,7 +30,8 @@ audit and M3 official TypeScript/tsx toolchain remain incomplete.
+ | Environment | Explicit empty initial environment in the production launcher; invocation-local mutable environment, no host inheritance | [Environment](node-runtime-acceptance/libuv-environment) |
+ | Concurrency | One active native Node invocation; busy admission rejected; process synchronization shared across serial invocations | [Launcher](node-runtime-acceptance/node-launcher-entry/README.md), [VSH](node-runtime-acceptance/node-vsh/README.md) |
+ | Runtime memory | Invocation page pools plus bounded process-lifetime TCB storage; 4 MiB process page pool retains global cppgc metadata | [Ownership failure and correction](node-runtime-acceptance/node-vsh/README.md) |
+-| TypeScript / tsx | Official tsc/tsx have not yet executed on target; commands are not registered | M3 pending |
++| TypeScript | Optional `node-toolkit` registers `tsc`; official 5.9.3 project/noEmit/JS/declaration/type-error checks pass on QEMU | [tsc](node-runtime-acceptance/tsc-qemu/README.md) |
++| tsx | Platform-adapted loader/transform channel and command registration remain pending | M3 pending |
+ | esbuild | Official WASI Preview 1 TS/TSX transforms passed separately; the Node/tsx transform bridge remains pending | [esbuild](node-runtime-acceptance/esbuild-qemu) |
+ 
+ Excluded first-release facilities include npm online installation, network
+@@ -38,8 +40,10 @@ watch mode and V8 WebAssembly. The platform uses explicit unavailable errors;
+ it does not substitute host execution. The existing WASI service used by
+ esbuild is separate from V8 WebAssembly and Node's unavailable WASI binding.
+ 
+-The production launcher currently requests a read/write project root. Read-only
+-tool mounts and the TypeScript wrapper admission policies remain to be added.
++The production launcher requests a read/write project root. The tsc wrapper
++adds an independent read-only tool grant at `/.vibeos-tools`; the ordinary node
++command receives only the project. The optional toolkit retains a bounded
++64 MiB libc arena and immutable tool file storage for the image lifetime.
+ Node CLI option coverage beyond the documented file and eval forms is not
+ claimed. V8 fatal faults and unrecoverable OOM remain failures of the trusted
+ runtime image; they are not recovered by dropping or jumping over native stacks.
+diff --git a/firmware/qemu-virt/Cargo.toml b/firmware/qemu-virt/Cargo.toml
+index 0c88f14f..dbda79ac 100644
+--- a/firmware/qemu-virt/Cargo.toml
++++ b/firmware/qemu-virt/Cargo.toml
+@@ -6,6 +6,7 @@ build = "build.rs"
+ 
+ [features]
+ node-runtime = ["vibeos-kernel/node-runtime", "vibeos-bsp-qemu-virt/node-runtime"]
++node-toolkit = ["node-runtime", "vibeos-kernel/node-toolkit"]
+ node-runtime-gate = ["node-runtime", "vibeos-kernel/node-runtime-gate"]
+ native-uv-probe = ["node-runtime-gate", "vibeos-kernel/native-uv-probe"]
+ native-exit-probe = ["vibeos-kernel/native-exit-probe"]
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 61f5250c..42813b4b 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -11,6 +11,7 @@ native-call-probe = ["native-stacks", "native-memory"]
+ native-cxx-probe = ["native-call-probe", "dep:vibeos-file-store", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
+ native-runtime-probe = []
+ node-runtime = ["native-cxx-probe", "queued-entropy"]
++node-toolkit = ["node-runtime"]
+ node-runtime-gate = ["node-runtime"]
+ native-uv-probe = ["node-runtime-gate"]
+ native-exit-probe = ["native-cxx-probe"]
+diff --git a/kernel/build.rs b/kernel/build.rs
+index 67aa48bb..f8304bf8 100644
+--- a/kernel/build.rs
++++ b/kernel/build.rs
+@@ -1,5 +1,6 @@
+ fn main() {
+     build_native_cxx_probe();
++    build_node_toolkit();
+     println!("cargo:rerun-if-env-changed=VIBEOS_WASMTIME_COREMARK");
+     println!("cargo:rerun-if-env-changed=VIBEOS_COREMARK_ITERATIONS");
+     println!("cargo:rerun-if-env-changed=VIBEOS_COREMARK_VALIDATION");
+@@ -25,6 +26,19 @@ fn main() {
+     println!("cargo:rustc-env=VIBEOS_COREMARK_ITERATIONS={iterations}");
+ }
+ 
++fn build_node_toolkit() {
++    println!("cargo:rerun-if-env-changed=VIBEOS_NODE_TOOLKIT");
++    if std::env::var_os("CARGO_FEATURE_NODE_TOOLKIT").is_none() { return; }
++    let path = std::path::PathBuf::from(std::env::var_os("VIBEOS_NODE_TOOLKIT")
++        .expect("node-toolkit requires VIBEOS_NODE_TOOLKIT from prepare-node-toolkit.py"))
++        .canonicalize().expect("toolkit input");
++    println!("cargo:rerun-if-changed={}", path.display());
++    let bytes = std::fs::read(path).expect("read toolkit");
++    assert!(bytes.len() <= 64 * 1024 * 1024 && bytes.starts_with(b"VIBETOOL1"));
++    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
++    std::fs::write(out.join("node-toolkit.pack"), bytes).expect("stage toolkit");
++}
++
+ 
+ fn build_native_cxx_probe() {
+     if std::env::var_os("CARGO_FEATURE_NATIVE_CXX_PROBE").is_none() { return; }
+diff --git a/kernel/src/lib.rs b/kernel/src/lib.rs
+index c9352a1b..0b90c1e2 100644
+--- a/kernel/src/lib.rs
++++ b/kernel/src/lib.rs
+@@ -1182,6 +1182,8 @@ mod native_files;
+ mod native_env;
+ #[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
+ mod native_node;
++#[cfg(feature = "node-toolkit")]
++mod native_toolkit;
+ #[cfg(feature = "native-cxx-probe")]
+ mod native_clock;
+ #[cfg(all(feature = "native-call-probe", not(target_feature = "d")))]
+diff --git a/kernel/src/native_call.rs b/kernel/src/native_call.rs
+index f813cc74..25333a9e 100644
+--- a/kernel/src/native_call.rs
++++ b/kernel/src/native_call.rs
+@@ -573,6 +573,7 @@ pub(super) async fn parking_probe() {
+     native_async_wait_probe().await;
+     native_stdio_probe().await;
+     native_unlink_probe().await;
++    native_tool_mount_probe().await;
+     native_open_probe().await;
+     #[cfg(feature = "queued-entropy")]
+     native_entropy_probe().await;
+@@ -849,6 +850,69 @@ async fn native_stdio_probe() {
+     crate::println!("NATIVE STDIO PASS no_grant=1 backpressure=1 ordered=1 read=1 eof=1 revoked=1 waiters=0");
+ }
+ 
++#[cfg(feature = "native-cxx-probe")]
++async fn native_tool_mount_probe() {
++    use alloc::{boxed::Box, sync::Arc};
++    use crate::{cap::Rights, native_files::*, native_tls::NativeSyncDomain};
++    use vibeos_file_store::{FileTreeRoot, RelPath};
++    let project = Arc::new(FileTreeRoot::new_empty(0x746f6f6c70726f6a).unwrap());
++    let tools = Arc::new(FileTreeRoot::new_empty(0x746f6f6c726f6f74).unwrap());
++    let mut tx = tools.begin().unwrap();
++    tx.mkdir(&RelPath::parse("tools").unwrap(), false).unwrap();
++    tx.write_chunks(&RelPath::parse("secret").unwrap(), [b"outside".as_slice()], false).unwrap();
++    tx.write_chunks(&RelPath::parse("tools/compiler.js").unwrap(), [b"official-tool".as_slice()], false).unwrap();
++    tx.symlink("compiler.js", &RelPath::parse("tools/alias.js").unwrap()).unwrap();
++    tx.symlink("../secret", &RelPath::parse("tools/escape").unwrap()).unwrap();
++    tx.commit_authoritative().await.unwrap();
++    let space = crate::world::Space::new("native-tools-authority");
++    let project_cap = space.0.lock().mint(project, Rights::ALL);
++    let tool_cap = space.0.lock().mint(tools.clone(), Rights::ALL);
++    let project_grant = FileGrant::new(space.clone(), project_cap).unwrap();
++    let tool_grant = FileGrant::new(space.clone(), tool_cap).unwrap()
++        .directory(RelPath::parse("tools").unwrap()).unwrap();
++    let run = NativeAsync::try_owned_entry(Box::new(move || {
++        let path = b"/.vibeos-tools/compiler.js";
++        let fd = unsafe { vibeos_native_open(path.as_ptr(), path.len(), 0) };
++        assert!(fd >= 3);
++        let mut bytes = [0u8; 64];
++        assert_eq!(unsafe { vibeos_native_file_read_at(fd, bytes.as_mut_ptr(), bytes.len(), 0) }, b"official-tool".len() as isize);
++        assert_eq!(&bytes[..b"official-tool".len()], b"official-tool");
++        for mode in [1, 2, 4, 5, 17, 33] {
++            assert_eq!(unsafe { vibeos_native_open(path.as_ptr(), path.len(), mode) }, -3);
++        }
++        assert_eq!(unsafe { vibeos_native_unlink(path.as_ptr(), path.len()) }, -3);
++        let alias = b"/.vibeos-tools/alias.js";
++        assert_eq!(unsafe { vibeos_native_realpath(alias.as_ptr(), alias.len(), bytes.as_mut_ptr(), bytes.len()) }, path.len() as isize);
++        assert_eq!(&bytes[..path.len()], path);
++        let escape = b"/.vibeos-tools/escape";
++        assert_eq!(unsafe { vibeos_native_open(escape.as_ptr(), escape.len(), 0) }, -3);
++        let dir = b"/.vibeos-tools";
++        assert_eq!(unsafe { vibeos_native_chdir(dir.as_ptr(), dir.len()) }, 0);
++        assert_eq!(unsafe { vibeos_native_getcwd(bytes.as_mut_ptr(), bytes.len()) }, dir.len() as isize);
++        assert_eq!(&bytes[..dir.len()], dir);
++        let relative = b"compiler.js";
++        let relative_fd = unsafe { vibeos_native_open(relative.as_ptr(), relative.len(), 0) };
++        assert!(relative_fd > fd);
++        assert_eq!(unsafe { vibeos_native_unlink(relative.as_ptr(), relative.len()) }, -3);
++        assert_eq!(unsafe { vibeos_native_chdir(b"/".as_ptr(), 1) }, 0);
++        // A read-only tool mount must not make the independent project read-only.
++        let writable = unsafe { vibeos_native_open(b"output.js".as_ptr(), 9, 5) };
++        assert!(writable > relative_fd);
++        assert_eq!(close(writable), 0);
++        space.0.lock().revoke(tool_cap).unwrap();
++        assert_eq!(unsafe { vibeos_native_file_read_at(fd, bytes.as_mut_ptr(), bytes.len(), 0) }, -3);
++        assert_eq!(unsafe { vibeos_native_open(path.as_ptr(), path.len(), 0) }, -3);
++        assert_eq!(close(fd), 0);
++        assert_eq!(close(relative_fd), 0);
++        42
++    }), 1024 * 1024, NativeSyncDomain::new()).unwrap();
++    run.tls().set_files(project_grant);
++    run.tls().set_tools(tool_grant);
++    assert_eq!(run.run().await.0, 42);
++    assert!(tools.snapshot().stat(&RelPath::parse("tools/compiler.js").unwrap(), true).is_ok());
++    crate::println!("NATIVE TOOL MOUNT read=1 readonly=1 cwd=1 realpath=1 escape=denied revoked_fd=denied project_write=1 PASS");
++}
++
+ #[cfg(feature = "native-cxx-probe")]
+ async fn native_unlink_probe() {
+     use crate::{native_files::{FileGrant, vibeos_native_unlink}, cap::Rights};
+diff --git a/kernel/src/native_files.rs b/kernel/src/native_files.rs
+index f6fc887a..ec68b9af 100644
+--- a/kernel/src/native_files.rs
++++ b/kernel/src/native_files.rs
+@@ -10,6 +10,20 @@ pub(super) struct FileGrant {
+     probe_authority: Option<(Arc<Space>, Cap)>,
+ }
+ impl FileGrant {
++    /// Attenuate a tool mount without disconnecting its original revocation
++    /// lineage. Open descriptors retain this same restricted provider.
++    pub(super) fn read_only(self) -> Self {
++        #[cfg(feature = "native-cxx-probe")]
++        let probe_authority = self.probe_authority.clone();
++        Self {
++            lookup: Arc::new(move |rights| {
++                if !Rights::READ.contains(rights) { return None; }
++                self.lease(rights)
++            }),
++            #[cfg(feature = "native-cxx-probe")]
++            probe_authority,
++        }
++    }
+     pub(super) fn live(&self) -> bool { self.lease(Rights::READ).is_some() }
+     pub(super) fn new(space: Arc<Space>, root: Cap) -> Option<Self> {
+         let source = space.clone();
+@@ -298,7 +312,17 @@ pub(super) unsafe extern "C" fn vibeos_native_file_stat(fd: i32, output: *mut Na
+     0
+ }
+ 
++const TOOL_MOUNT: &str = ".vibeos-tools";
++
++// Mutation operations use the project-only selector. They must never fall
++// through to a project entry shadowed by the separately admitted tool mount.
+ unsafe fn native_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
++    let path = unsafe { virtual_path(input, length) }?;
++    if is_tool_path(&path) && crate::native_tls::tool_grant().is_some() { return Err(-3); }
++    Ok(path)
++}
++
++unsafe fn virtual_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
+     if length == 0 { return Err(-6); }
+     if length > 4096 { return Err(-10); }
+     if input.is_null() { return Err(-2); }
+@@ -311,14 +335,41 @@ unsafe fn native_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
+     RelPath::parse(&directory).map_err(error)
+ }
+ 
++fn is_tool_path(path: &RelPath) -> bool {
++    path.components().first().is_some_and(|name| name == TOOL_MOUNT)
++}
++
++struct RoutedPath { grant: FileGrant, path: RelPath, tool: bool }
++impl RoutedPath {
++    fn canonical(&self, path: String) -> String {
++        if !self.tool { return path; }
++        let mut mounted = String::from(TOOL_MOUNT);
++        if !path.is_empty() { mounted.push('/'); mounted.push_str(&path); }
++        mounted
++    }
++}
++
++fn route_path(path: RelPath) -> Result<RoutedPath, i32> {
++    if is_tool_path(&path) {
++        if let Some(grant) = crate::native_tls::tool_grant() {
++            let path = RelPath::parse(&path.components()[1..].join("/")).map_err(error)?;
++            return Ok(RoutedPath { grant, path, tool: true });
++        }
++    }
++    Ok(RoutedPath { grant: crate::native_tls::file_grant().ok_or(-3)?, path, tool: false })
++}
++
++unsafe fn resolve_path(input: *const u8, length: usize) -> Result<RoutedPath, i32> {
++    route_path(unsafe { virtual_path(input, length) }?)
++}
++
+ // The cwd is invocation-owned and canonical within the admitted root. Remember
+ // its identity so deleting/replacing that directory cannot silently retarget it.
+ fn current_directory() -> Result<String, i32> {
+-    let grant = crate::native_tls::file_grant().ok_or(-3)?;
+-    let lease = grant.lease(Rights::READ).ok_or(-3)?;
+     let (path, identity) = crate::native_tls::with_file_table(|table| (table.cwd.clone(), table.cwd_id));
+-    let parsed = RelPath::parse(&path).map_err(error)?;
+-    let metadata = lease.with(|root| root.snapshot().stat(&parsed, true)).map_err(error)?;
++    let routed = route_path(RelPath::parse(&path).map_err(error)?)?;
++    let lease = routed.grant.lease(Rights::READ).ok_or(-3)?;
++    let metadata = lease.with(|root| root.snapshot().stat(&routed.path, true)).map_err(error)?;
+     if metadata.file_type != vibeos_file_store::FileType::Directory { return Err(-11); }
+     if identity.is_some_and(|id| id != metadata.file_id) { return Err(-6); }
+     Ok(path)
+@@ -326,9 +377,10 @@ fn current_directory() -> Result<String, i32> {
+ 
+ #[no_mangle]
+ pub(super) unsafe extern "C" fn vibeos_native_chdir(input: *const u8, length: usize) -> i32 {
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let grant = &routed.grant;
+     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let path = &routed.path;
+     let resolved = lease.with(|root| {
+         let snapshot = root.snapshot();
+         let metadata = snapshot.stat(&path, true)?;
+@@ -336,7 +388,7 @@ pub(super) unsafe extern "C" fn vibeos_native_chdir(input: *const u8, length: us
+         Ok((snapshot.canonical_path(&path)?, metadata.file_id))
+     });
+     let (canonical, id) = match resolved { Ok(value) => value, Err(e) => return error(e) };
+-    crate::native_tls::with_file_table(|table| { table.cwd = canonical; table.cwd_id = Some(id); });
++    crate::native_tls::with_file_table(|table| { table.cwd = routed.canonical(canonical); table.cwd_id = Some(id); });
+     0
+ }
+ 
+@@ -360,11 +412,12 @@ pub(super) unsafe extern "C" fn vibeos_native_getcwd(output: *mut u8, capacity:
+ pub(super) unsafe extern "C" fn vibeos_native_path_stat(
+     input: *const u8, length: usize, follow: i32, output: *mut NativeFileStat,
+ ) -> i32 {
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let grant = &routed.grant;
+     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
+     if output.is_null() { return -2; }
+     if follow != 0 && follow != 1 { return -9; }
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let path = &routed.path;
+     let metadata = match lease.with(|root| root.snapshot().stat(&path, follow == 1)) {
+         Ok(metadata) => metadata, Err(e) => return error(e),
+     };
+@@ -377,10 +430,11 @@ pub(super) unsafe extern "C" fn vibeos_native_path_stat(
+ #[no_mangle]
+ pub(super) unsafe extern "C" fn vibeos_native_access(input: *const u8, length: usize, mode: u32) -> i32 {
+     if mode & !7 != 0 { return -9; }
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let grant = &routed.grant;
+     let rights = if mode & 2 != 0 { Rights::READ.union(Rights::WRITE) } else { Rights::READ };
+     let Some(lease) = grant.lease(rights) else { return -3; };
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let path = &routed.path;
+     if let Err(e) = lease.with(|root| root.snapshot().stat(&path, true)) { return error(e); }
+     // Native executable-file permission is not part of the first port.
+     if mode & 1 != 0 { return -13; }
+@@ -395,9 +449,10 @@ pub(super) unsafe extern "C" fn vibeos_native_scandir(
+     emit: unsafe extern "C" fn(*mut core::ffi::c_void, *const u8, usize, u32) -> i32,
+     context: *mut core::ffi::c_void,
+ ) -> i32 {
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let grant = &routed.grant;
+     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let path = &routed.path;
+     let entries = match lease.with(|root| root.snapshot().list(&path, true)) {
+         Ok(entries) => entries, Err(e) => return error(e),
+     };
+@@ -415,13 +470,15 @@ pub(super) unsafe extern "C" fn vibeos_native_scandir(
+ pub(super) unsafe extern "C" fn vibeos_native_realpath(
+     input: *const u8, length: usize, output: *mut u8, capacity: usize,
+ ) -> isize {
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
++    let grant = &routed.grant;
+     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
+     if output.is_null() { return -2; }
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
++    let path = &routed.path;
+     let canonical = match lease.with(|root| root.snapshot().canonical_path(&path)) {
+         Ok(path) => path, Err(e) => return error(e) as isize,
+     };
++    let canonical = routed.canonical(canonical);
+     let length = canonical.len() + 1;
+     if capacity <= length { return -10; }
+     unsafe {
+@@ -437,10 +494,11 @@ pub(super) unsafe extern "C" fn vibeos_native_realpath(
+ pub(super) unsafe extern "C" fn vibeos_native_readlink(
+     input: *const u8, length: usize, output: *mut u8, capacity: usize,
+ ) -> isize {
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
++    let grant = &routed.grant;
+     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
+     if output.is_null() { return -2; }
+-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
++    let path = &routed.path;
+     let snapshot = lease.with(|root| root.snapshot());
+     let target = match snapshot.readlink(&path) { Ok(value) => value, Err(e) => return error(e) as isize };
+     if capacity <= target.len() { return -10; }
+@@ -528,12 +586,13 @@ pub(super) unsafe extern "C" fn vibeos_native_open(input: *const u8, length: usi
+     if flags & !63 != 0 || mode == 3 { return -13; }
+     if flags & 8 != 0 && flags & 4 == 0 { return -9; }
+     if flags & (16 | 32) != 0 && mode == 0 { return -9; }
+-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
++    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
++    let grant = &routed.grant;
+     let rights = if mode != 0 || flags & 4 != 0 {
+         Rights::READ.union(Rights::WRITE)
+     } else { Rights::READ };
+     let Some(lease) = grant.lease(rights) else { return -3; };
+-    let path = match unsafe { native_path(input, length) } { Ok(path) => path, Err(e) => return e };
++    let path = &routed.path;
+     // Reserve descriptor capacity before a create/truncate can publish.
+     let room = crate::native_tls::with_file_table(|table| {
+         table.entries.len() < 64 && table.next < i32::MAX && table.entries.try_reserve(1).is_ok()
+@@ -579,7 +638,7 @@ pub(super) unsafe extern "C" fn vibeos_native_open(input: *const u8, length: usi
+     };
+     if metadata.size > i64::MAX as u64 { return -5; }
+     crate::native_tls::with_file_table(|table| table.insert(OpenFile {
+-        grant, file_id, mode, append: flags & 32 != 0, position: AtomicU64::new(0),
++        grant: routed.grant.clone(), file_id, mode, append: flags & 32 != 0, position: AtomicU64::new(0),
+     }))
+ }
+ pub(super) unsafe fn read(fd: i32, output: *mut u8, length: usize) -> isize {
+diff --git a/kernel/src/native_libc_heap.rs b/kernel/src/native_libc_heap.rs
+index b1086c4b..204b3cd6 100644
+--- a/kernel/src/native_libc_heap.rs
++++ b/kernel/src/native_libc_heap.rs
+@@ -3,6 +3,11 @@
+ use crate::{native_pages::NativePages, sync::SpinLock};
+ use vibeos_core::heap::{enter_owner, OwnerId};
+ const PAGE: usize = 4096;
++// Official TypeScript's multi-megabyte compiler needs overlapping source and
++// parser buffers. Keep the larger retained arena opt-in with the tool package.
++#[cfg(feature = "node-toolkit")]
++const CAPACITY: usize = 64 * 1024 * 1024;
++#[cfg(not(feature = "node-toolkit"))]
+ const CAPACITY: usize = 16 * 1024 * 1024;
+ const QUOTA: usize = CAPACITY * 4;
+ struct Heap { owner: Option<OwnerId>, pages: Option<NativePages>, offset: usize }
+@@ -14,7 +19,10 @@ extern "C" fn vibeos_native_sbrk(increment: isize) -> *mut u8 {
+     let failure = usize::MAX as *mut u8;
+     let mut heap = HEAP.lock();
+     let Some(next) = heap.offset.checked_add_signed(increment) else { return failure; };
+-    if next > CAPACITY { return failure; }
++    if next > CAPACITY {
++        crate::println!("NATIVE LIBC LIMIT used={} requested={} capacity={}", heap.offset, increment, CAPACITY);
++        return failure;
++    }
+     if heap.pages.is_none() {
+         let owner = match heap.owner {
+             Some(owner) => owner,
+diff --git a/kernel/src/native_node.rs b/kernel/src/native_node.rs
+index c60f9512..68e83bdc 100644
+--- a/kernel/src/native_node.rs
++++ b/kernel/src/native_node.rs
+@@ -18,7 +18,7 @@ impl Drop for Admission {
+ /// Callers construct grants and streams in SYSTEM, as they can outlive the
+ /// originating job. Arguments are copied into SYSTEM before publishing a task.
+ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
+-                     io: Arc<CommandIo>) -> Result<(), vibeos_vsh::Status> {
++                     tools: Option<FileGrant>, io: Arc<CommandIo>) -> Result<(), vibeos_vsh::Status> {
+     use vibeos_vsh::Status;
+     if argv.is_empty() || argv.len() > 128 ||
+        argv.iter().try_fold(0usize, |n, a| n.checked_add(a.len())).is_none_or(|n| n > 65536) ||
+@@ -37,7 +37,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
+     let domain = DOMAIN.lock().get_or_insert_with(NativeSyncDomain::new).clone();
+     exec::spawn_pinned_on(exec::HartId::BOOT, "node-supervisor", async move {
+         let _admission = admission;
+-        if !files.live() {
++        if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) {
+             drop(_admission);
+             io.complete(WasiTerminal::Denied);
+             return;
+@@ -64,6 +64,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
+             return;
+         };
+         run.tls().set_files(files.clone());
++        if let Some(tools) = tools.as_ref() { run.tls().set_tools(tools.clone()); }
+         run.tls().set_entropy(entropy);
+         run.tls().set_stdio(crate::native_stdio::StdioGrant::new(io.clone()));
+         // No host environment is inherited; explicit empty initial environment.
+@@ -71,7 +72,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
+         let monitor = async {
+             loop {
+                 exec::sleep_ms(10).await;
+-                if !files.live() { io.deny(); }
++                if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) { io.deny(); }
+             }
+         };
+         let mut monitor = pin!(monitor);
+@@ -104,7 +105,21 @@ use vibeos_core::cap::Rights;
+ pub(super) fn install(session: &mut vibeos_vsh::Session) {
+     session.install_capability_host_command("node", 3, 128,
+         vibeos_vsh::StreamMode::Optional, planner, run_local);
++    #[cfg(feature = "node-toolkit")]
++    session.install_capability_host_command("tsc", 2, 128,
++        vibeos_vsh::StreamMode::Optional, tool_planner, run_tsc);
+ }
++#[cfg(feature = "node-toolkit")]
++fn tool_planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerError> {
++    if args.len() < 2 || args[0].value() != Some("--root") || args[1].path().is_none() ||
++       args[2..].iter().any(|a| a.value().is_none()) {
++        return Err(PlannerError { span: Span { start: 0, end: 0 },
++            message: "usage: tsc --root @ROOT/project [compiler options]" });
++    }
++    Ok(alloc::vec![PathRequirement { argument: 1, rights: Rights::READ.union(Rights::WRITE) }])
++}
++#[cfg(feature = "node-toolkit")]
++fn run_tsc(ctx: CapabilityCommandContext) -> CapabilityCommandFuture { run_command(ctx, true) }
+ fn planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerError> {
+     if args.len() < 3 || args[0].value() != Some("--root") || args[1].path().is_none() ||
+        args[2..].iter().any(|a| a.value().is_none()) ||
+@@ -115,6 +130,9 @@ fn planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerErr
+     Ok(alloc::vec![PathRequirement { argument: 1, rights: Rights::READ.union(Rights::WRITE) }])
+ }
+ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
++    run_command(ctx, false)
++}
++fn run_command(ctx: CapabilityCommandContext, compiler: bool) -> CapabilityCommandFuture {
+     Box::pin(async move {
+         let Some(ResolvedArgument::CapabilityPath { root, tail, .. }) = ctx.args.get(1) else {
+             return Err(Status::Usage);
+@@ -127,7 +145,15 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
+             values.push(value.clone());
+         }
+         let mut argv = alloc::vec![String::from("node")];
+-        let eval = if values.first().is_some_and(|s| s == "-e") {
++        let eval = if compiler {
++            if values.iter().any(|arg| arg.eq_ignore_ascii_case("--watch") || arg.eq_ignore_ascii_case("-w")) {
++                let _ = ctx.write_stderr(b"tsc: watch is unavailable in the VibeOS port\n".to_vec()).await;
++                return Err(Status::Unavailable);
++            }
++            argv.push(String::from("/.vibeos-tools/node_modules/typescript/lib/tsc.js"));
++            argv.extend(values.iter().cloned());
++            None
++        } else if values.first().is_some_and(|s| s == "-e") {
+             if values.len() < 2 { return Err(Status::Usage); }
+             argv.extend(values[2..].iter().cloned());
+             Some(values[1].as_str())
+@@ -143,7 +169,11 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
+             let grant = FileGrant::from_provider(move |rights| provider(rights).ok())
+                 .and_then(|grant| grant.directory(path)).ok_or(Status::Denied)?;
+             let io = Arc::new(CommandIo::new());
+-            launch(&argv, eval, grant, io.clone())?;
++            #[cfg(feature = "node-toolkit")]
++            let tools = if compiler { Some(crate::native_toolkit::grant().map_err(|_| Status::Unavailable)?) } else { None };
++            #[cfg(not(feature = "node-toolkit"))]
++            let tools = None;
++            launch(&argv, eval, grant, tools, io.clone())?;
+             io
+         };
+         let _cancel = CancelOnDrop(io.clone());
+diff --git a/kernel/src/native_tls.rs b/kernel/src/native_tls.rs
+index ac7ba652..0c2e0771 100644
+--- a/kernel/src/native_tls.rs
++++ b/kernel/src/native_tls.rs
+@@ -42,6 +42,7 @@ struct State {
+     environment: RefCell<crate::native_env::Environment>,
+     file_table: RefCell<crate::native_files::FileTable>,
+     files: RefCell<Option<crate::native_files::FileGrant>>,
++    tools: RefCell<Option<crate::native_files::FileGrant>>,
+     stdio: RefCell<Option<crate::native_stdio::StdioGrant>>,
+     #[cfg(feature = "queued-entropy")]
+     entropy: RefCell<Option<crate::native_entropy::EntropyGrant>>,
+@@ -79,6 +80,7 @@ impl NativeTls {
+             environment: RefCell::new(crate::native_env::Environment::new()),
+             file_table: RefCell::new(crate::native_files::FileTable::new()),
+             files: RefCell::new(None),
++            tools: RefCell::new(None),
+             stdio: RefCell::new(None),
+             #[cfg(feature = "queued-entropy")]
+             entropy: RefCell::new(None),
+@@ -96,6 +98,10 @@ impl NativeTls {
+         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+         *self.state.files.borrow_mut() = Some(grant);
+     }
++    pub(super) fn set_tools(&self, grant: crate::native_files::FileGrant) {
++        assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
++        *self.state.tools.borrow_mut() = Some(grant.read_only());
++    }
+     pub(super) fn set_title(&self, title: &str) -> Result<(), i32> {
+         assert_ne!(ACTIVE.load(Ordering::Acquire), self.pointer());
+         self.state.process.borrow_mut().set_title(title.as_bytes())
+@@ -284,6 +290,9 @@ pub(super) fn io_notification() -> alloc::sync::Arc<crate::native_notify::Native
+ pub(super) fn file_grant() -> Option<crate::native_files::FileGrant> {
+     unsafe { current_state() }.files.borrow().clone()
+ }
++pub(super) fn tool_grant() -> Option<crate::native_files::FileGrant> {
++    unsafe { current_state() }.tools.borrow().clone()
++}
+ 
+ pub(super) fn with_file_table<R>(f: impl FnOnce(&mut crate::native_files::FileTable) -> R) -> R {
+     f(&mut unsafe { current_state() }.file_table.borrow_mut())
+diff --git a/scripts/check-v8-firmware-link.py b/scripts/check-v8-firmware-link.py
+index 4767ab70..9d9c3358 100644
+--- a/scripts/check-v8-firmware-link.py
++++ b/scripts/check-v8-firmware-link.py
+@@ -14,6 +14,7 @@ import importlib.util
+ import json
+ import os
+ import re
++import struct
+ from collections import Counter
+ from pathlib import Path
+ import subprocess
+@@ -46,6 +47,29 @@ def archive_inputs(archives, ar):
+                 inputs[str(member)] = digest(member)
+     return inputs
+ 
++def validate_toolkit(directory):
++    manifest = json.loads((directory / 'manifest.json').read_text())
++    if manifest['schema'] != 1:
++        raise ValueError('unsupported toolkit manifest')
++    for name in ('sources.lock.json', 'toolkit.lock.json'):
++        if manifest['locks'][name] != digest(ROOT / 'tools/node-runtime' / name):
++            raise ValueError('toolkit source lock changed; prepare again')
++    packed = hashlib.sha256(b'VIBETOOL1' + struct.pack('<I', len(manifest['files'])))
++    for name, metadata in sorted(manifest['files'].items()):
++        path = Path(name)
++        if path.is_absolute() or '..' in path.parts or path.as_posix() != name:
++            raise ValueError('invalid toolkit selector')
++        data = (directory / path).read_bytes()
++        if len(data) != metadata['bytes'] or hashlib.sha256(data).hexdigest() != metadata['sha256']:
++            raise ValueError(f'toolkit file changed: {name}')
++        encoded = name.encode('utf-8')
++        packed.update(struct.pack('<HI', len(encoded), len(data)))
++        packed.update(encoded)
++        packed.update(data)
++    if packed.hexdigest() != digest(directory / 'toolkit.pack'):
++        raise ValueError('toolkit pack does not match manifest')
++    return dict(pack_sha256=packed.hexdigest(), manifest_sha256=digest(directory / 'manifest.json'))
++
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument('--node', action='store_true', help='link the one-shot Node embedding gate; requires --gate and --uv-archive')
+@@ -64,7 +88,10 @@ def main():
+     parser.add_argument('--node-eval', action='store_true', help='exercise upstream -e through launcher ABI')
+     parser.add_argument('--node-idle-cancel', action='store_true', help='cancel a native event loop parked on a 60-second timer')
+     parser.add_argument('--node-shell', action='store_true', help='build native Node VSH commands without the automatic gate')
++    parser.add_argument('--toolkit', type=Path, help='prepared offline tool directory; requires --node-shell')
+     args = parser.parse_args()
++    if args.toolkit and not args.node_shell:
++        parser.error('--toolkit requires --node-shell')
+     if args.node_shell and (not args.node or args.node_entry or args.node_main or args.node_eval or args.node_cancel or args.node_idle_cancel or args.node_revoke or args.node_explicit_exit or args.node_exit_code or args.node_repeat != 1):
+         parser.error('--node-shell requires --node and excludes gate fixture modes')
+     if args.node_idle_cancel and (not args.node_eval or args.node_exit_code != 130 or args.node_cancel or args.node_revoke or args.node_explicit_exit):
+@@ -208,12 +235,22 @@ def main():
+     command = ['rustup', 'run', 'nightly-2026-08-01', 'cargo', 'rustc', '--locked',
+                '--offline', '--release', '--target', 'riscv64gc-unknown-none-elf',
+                '--features', ('wasi-ssh-upload,native-uv-probe' if args.uv_loop else
++                              'wasi-ssh-upload,node-toolkit' if args.toolkit else
+                               'wasi-ssh-upload,node-runtime' if args.node_shell else
+                               'wasi-ssh-upload,node-runtime-gate' if args.gate else
+                               'wasi-ssh-upload,native-runtime-probe,native-cxx-probe'),
+                '--bin', 'vibeos-qemu-virt', '--',
+                *[f'-Clink-arg={arg}' for arg in link_args]]
+     env = dict(os.environ)
++    toolkit = None
++    if args.toolkit:
++        toolkit = validate_toolkit(args.toolkit.resolve())
++        frozen = work / 'toolkit.pack'
++        shutil.copyfile(args.toolkit / 'toolkit.pack', frozen)
++        if digest(frozen) != toolkit['pack_sha256']:
++            raise ValueError('toolkit changed during copy')
++        shutil.copyfile(args.toolkit / 'manifest.json', work / 'toolkit-manifest.json')
++        env['VIBEOS_NODE_TOOLKIT'] = str(frozen)
+     for variable, binary in [('RUSTC', 'rustc'), ('RUSTDOC', 'rustdoc')]:
+         env[variable] = subprocess.check_output(
+             ['rustup', 'which', '--toolchain', 'nightly-2026-08-01', binary], text=True).strip()
+@@ -230,6 +267,8 @@ def main():
+                   scope=('Dedicated V8 gate image; execution still required' if args.gate else
+                          'Diagnostic fixture firmware link; not a runnable V8 acceptance image'))
+     report['compiler_sha256'] = digest(cxx)
++    if toolkit:
++        report['toolkit'] = toolkit
+     if args.uv_loop:
+         report['libuv_scope'] = 'timer/async loop prerequisite only; not full libuv or Node'
+         report['libuv_inputs_sha256'] = uv_inputs
+diff --git a/scripts/test-esbuild-qemu.py b/scripts/test-esbuild-qemu.py
+index 77662657..8600fb20 100644
+--- a/scripts/test-esbuild-qemu.py
++++ b/scripts/test-esbuild-qemu.py
+@@ -30,6 +30,8 @@ def main():
+     parser.add_argument('--module', type=Path,
+                         default=ROOT / 'target/node-runtime/unpacked/esbuild/package/esbuild.wasm')
+     parser.add_argument('--skip-build', action='store_true')
++    parser.add_argument('--service-only', action='store_true',
++                        help='qualify the binary transform service needed by the native Node bridge')
+     args = parser.parse_args()
+     os.chdir(ROOT)
+     work = args.work.resolve()
+@@ -99,6 +101,33 @@ def main():
+         print(f'{name}: PASS ({case["seconds"]}s)', flush=True)
+         return result
+ 
++    def service_cases():
++        protocol = load('esbuild_protocol', ROOT / 'scripts/esbuild-protocol.py')
++        (work / 'esbuild-protocol.py').write_bytes((ROOT / 'scripts/esbuild-protocol.py').read_bytes())
++        fixtures = [
++            ('service-ts', 'ts', b'const answer: number = 42;\n', b'const answer = 42;\n'),
++            ('service-tsx', 'tsx', b'const view = <box value={42}/>;\n',
++             b'const view = /* @__PURE__ */ h("box", { value: 42 });\n'),
++        ]
++        for name, loader, source, expected in fixtures:
++            packet = protocol.request(dict(command='transform', inputFS=False, input=source,
++                flags=[f'--loader={loader}', '--format=cjs', '--jsx-factory=h',
++                       '--sourcemap=external', f'--sourcefile=src/main.{loader}']))
++            result = run(name, ['--service=0.25.0'], packet)
++            decoded = protocol.response(result.stdout)
++            if decoded.get('errors') or decoded.get('warnings') or decoded.get('code') != expected.decode():
++                raise RuntimeError(f'{name}: unexpected transform response {decoded!r}')
++            mapping = json.loads(decoded['map'])
++            if mapping.get('sourcesContent') != [source.decode()] or not mapping.get('mappings'):
++                raise RuntimeError(f'{name}: source map lacks original input or mappings')
++            (work / f'{name}.response.json').write_text(json.dumps(decoded, indent=2)+'\n')
++        result = run('service-error', ['--service=0.25.0'], protocol.request(dict(
++            command='transform', inputFS=False, input=b'const value: = ;\n', flags=['--loader=ts'])))
++        decoded = protocol.response(result.stdout)
++        if not decoded.get('errors') or decoded['errors'][0]['location']['line'] != 1:
++            raise RuntimeError('missing structured compiler diagnostic')
++        (work / 'service-error.response.json').write_text(json.dumps(decoded, indent=2)+'\n')
++
+     save()
+     qemu = None
+     try:
+@@ -117,27 +146,30 @@ def main():
+         if upload.returncode:
+             raise RuntimeError(f'upload failed: {upload.stderr[-2000:]!r}')
+         print('official esbuild module uploaded', flush=True)
+-        run('version', ['--version'], expected=b'0.25.0\n')
+-        source = b'const answer: number = 42; console.log(answer);\n'
+-        expected = b'const answer = 42;\nconsole.log(answer);\n'
+-        run('typescript', ['--loader=ts', '--format=cjs'], source, expected=expected)
+-        run('tsx', ['--loader=tsx', '--jsx-factory=h'],
+-            b'const view = <box value={42}/>; console.log(view);\n',
+-            expected=b'const view = /* @__PURE__ */ h("box", { value: 42 });\nconsole.log(view);\n')
+-        mapped = run('source-map', ['--loader=ts', '--sourcemap=inline', '--sourcefile=example.ts'], source)
+-        marker = b'//# sourceMappingURL=data:application/json;base64,'
+-        if marker not in mapped.stdout:
+-            raise RuntimeError('inline source map missing')
+-        source_map = json.loads(base64.b64decode(mapped.stdout.split(marker)[1].strip(), validate=True))
+-        if source_map.get('sourcesContent') != [source.decode()] or not source_map.get('mappings'):
+-            raise RuntimeError('source map does not contain original source and mappings')
+-        invalid = run('syntax-error', ['--loader=ts'], b'const value: = ;\n', status=1)
+-        if b'ERROR' not in invalid.stderr:
+-            raise RuntimeError('missing real compiler diagnostic')
+-        denied = run('no-ambient-files', ['--loader=ts', '--outfile=/outside.js'], source, status=1)
+-        if b'ERROR' not in denied.stderr:
+-            raise RuntimeError('missing denied-file diagnostic')
+-        run('reuse', ['--loader=ts', '--format=cjs'], source, expected=expected)
++        if args.service_only:
++            service_cases()
++        else:
++            run('version', ['--version'], expected=b'0.25.0\n')
++            source = b'const answer: number = 42; console.log(answer);\n'
++            expected = b'const answer = 42;\nconsole.log(answer);\n'
++            run('typescript', ['--loader=ts', '--format=cjs'], source, expected=expected)
++            run('tsx', ['--loader=tsx', '--jsx-factory=h'],
++                b'const view = <box value={42}/>; console.log(view);\n',
++                expected=b'const view = /* @__PURE__ */ h("box", { value: 42 });\nconsole.log(view);\n')
++            mapped = run('source-map', ['--loader=ts', '--sourcemap=inline', '--sourcefile=example.ts'], source)
++            marker = b'//# sourceMappingURL=data:application/json;base64,'
++            if marker not in mapped.stdout:
++                raise RuntimeError('inline source map missing')
++            source_map = json.loads(base64.b64decode(mapped.stdout.split(marker)[1].strip(), validate=True))
++            if source_map.get('sourcesContent') != [source.decode()] or not source_map.get('mappings'):
++                raise RuntimeError('source map does not contain original source and mappings')
++            invalid = run('syntax-error', ['--loader=ts'], b'const value: = ;\n', status=1)
++            if b'ERROR' not in invalid.stderr:
++                raise RuntimeError('missing real compiler diagnostic')
++            denied = run('no-ambient-files', ['--loader=ts', '--outfile=/outside.js'], source, status=1)
++            if b'ERROR' not in denied.stderr:
++                raise RuntimeError('missing denied-file diagnostic')
++            run('reuse', ['--loader=ts', '--format=cjs'], source, expected=expected)
+         deadline = time.monotonic() + 10
+         while log.read_bytes().count(b'reclaimed=true caps=0 waiters=0') < len(report['cases']):
+             if time.monotonic() >= deadline:
+diff --git a/scripts/test-native-tls-qemu.py b/scripts/test-native-tls-qemu.py
+index 2d2f48e2..f6c80e70 100644
+--- a/scripts/test-native-tls-qemu.py
++++ b/scripts/test-native-tls-qemu.py
+@@ -93,6 +93,7 @@ def main():
+                     native_wait = 'NATIVE WAIT ABI PASS timeouts=2 immediate=1 cpp_return=1 peer_progress=1' in text
+                     native_notify = 'NATIVE NOTIFY PASS early=1 parked=1 exclusive=1 cancelled=1 reclaimed=1' in text
+                     file_open = 'NATIVE OPEN PASS read=1 seek=1 chunks=1 eof=1 close=1 revoked=1 readonly=1' in text
++                    tool_mount = 'NATIVE TOOL MOUNT read=1 readonly=1 cwd=1 realpath=1 escape=denied revoked_fd=denied project_write=1 PASS' in text
+                     unlink = 'NATIVE UNLINK PASS no_grant=1 readonly=1 escape=1 directory=1 removed=1 revoked=1' in text
+                     native_fd = 'NATIVE FD PASS pipe=1 close=1 stale=1 revoked_cleanup=1 drained=1' in text
+                     stdio = 'NATIVE STDIO PASS no_grant=1 backpressure=1 ordered=1 read=1 eof=1 revoked=1 waiters=0' in text
+@@ -106,8 +107,8 @@ def main():
+                     shell = text.count('NATIVE_TLS_SHELL_OK') >= 2
+                     report['observed_checks'] = dict(harts=harts, shell=shell,
+                         call=native_call, suspend=native_suspend, cxx=native_cxx,
+-                        park=native_park, pages=native_pages, cache=native_cache, cxx_tls=native_cxx_tls, tls_dtor=native_tls_dtor, tcb_pages=native_tcb, page_pool=native_pool, memory_abi=native_memory, static_flags=native_flags, notify=native_notify, wait_abi=native_wait, semaphore=native_semaphore, semaphore_owner=semaphore_owner, semaphore_wake=semaphore_wake, entropy=entropy, libc_heap=libc_heap, stdio=stdio, native_fd=native_fd, unlink=unlink, file_open=file_open)
+-                    if harts and shell and (not args.entropy or entropy) and (not args.native_call or (native_call and native_suspend)) and (not args.native_cxx or (native_cxx and native_park and native_pages and native_cache and native_cxx_tls and native_tls_dtor and native_tcb and native_pool and native_memory and native_flags and native_notify and native_wait and native_semaphore and semaphore_owner and semaphore_wake and libc_heap and stdio and native_fd and unlink and file_open)):
++                        park=native_park, pages=native_pages, cache=native_cache, cxx_tls=native_cxx_tls, tls_dtor=native_tls_dtor, tcb_pages=native_tcb, page_pool=native_pool, memory_abi=native_memory, static_flags=native_flags, notify=native_notify, wait_abi=native_wait, semaphore=native_semaphore, semaphore_owner=semaphore_owner, semaphore_wake=semaphore_wake, entropy=entropy, libc_heap=libc_heap, stdio=stdio, native_fd=native_fd, unlink=unlink, file_open=file_open, tool_mount=tool_mount)
++                    if harts and shell and (not args.entropy or entropy) and (not args.native_call or (native_call and native_suspend)) and (not args.native_cxx or (native_cxx and native_park and native_pages and native_cache and native_cxx_tls and native_tls_dtor and native_tcb and native_pool and native_memory and native_flags and native_notify and native_wait and native_semaphore and semaphore_owner and semaphore_wake and libc_heap and stdio and native_fd and unlink and file_open and tool_mount)):
+                         report.update(passed=True, hart_pairs=sorted(pairs))
+                         if args.native_call:
+                             report['native_call_passed'] = True

@@ -14,6 +14,7 @@ import importlib.util
 import json
 import os
 import re
+import struct
 from collections import Counter
 from pathlib import Path
 import subprocess
@@ -46,6 +47,32 @@ def archive_inputs(archives, ar):
                 inputs[str(member)] = digest(member)
     return inputs
 
+def validate_toolkit(directory):
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    if manifest['schema'] != 1:
+        raise ValueError('unsupported toolkit manifest')
+    for name, expected in manifest.get('adaptations', {}).get('inputs', {}).items():
+        if Path(name).name != name or digest(ROOT / 'tools/node-runtime/toolkit' / name) != expected:
+            raise ValueError('toolkit adapter changed; prepare again')
+    for name in ('sources.lock.json', 'toolkit.lock.json'):
+        if manifest['locks'][name] != digest(ROOT / 'tools/node-runtime' / name):
+            raise ValueError('toolkit source lock changed; prepare again')
+    packed = hashlib.sha256(b'VIBETOOL1' + struct.pack('<I', len(manifest['files'])))
+    for name, metadata in sorted(manifest['files'].items()):
+        path = Path(name)
+        if path.is_absolute() or '..' in path.parts or path.as_posix() != name:
+            raise ValueError('invalid toolkit selector')
+        data = (directory / path).read_bytes()
+        if len(data) != metadata['bytes'] or hashlib.sha256(data).hexdigest() != metadata['sha256']:
+            raise ValueError(f'toolkit file changed: {name}')
+        encoded = name.encode('utf-8')
+        packed.update(struct.pack('<HI', len(encoded), len(data)))
+        packed.update(encoded)
+        packed.update(data)
+    if packed.hexdigest() != digest(directory / 'toolkit.pack'):
+        raise ValueError('toolkit pack does not match manifest')
+    return dict(pack_sha256=packed.hexdigest(), manifest_sha256=digest(directory / 'manifest.json'))
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--node', action='store_true', help='link the one-shot Node embedding gate; requires --gate and --uv-archive')
@@ -64,7 +91,16 @@ def main():
     parser.add_argument('--node-eval', action='store_true', help='exercise upstream -e through launcher ABI')
     parser.add_argument('--node-idle-cancel', action='store_true', help='cancel a native event loop parked on a 60-second timer')
     parser.add_argument('--node-shell', action='store_true', help='build native Node VSH commands without the automatic gate')
+    parser.add_argument('--toolkit', type=Path, help='prepared offline tool directory; requires --node-shell')
+    parser.add_argument('--esbuild-probe', action='store_true', help='run the native/WASI transform bridge gate')
+    parser.add_argument('--js-esbuild-probe', action='store_true', help='register the tool-authorized Node fixture command')
     args = parser.parse_args()
+    if args.toolkit and not args.node_shell:
+        parser.error('--toolkit requires --node-shell')
+    if args.esbuild_probe and not args.toolkit:
+        parser.error('--esbuild-probe requires --toolkit')
+    if args.js_esbuild_probe and (not args.toolkit or args.esbuild_probe):
+        parser.error('--js-esbuild-probe requires --toolkit and excludes --esbuild-probe')
     if args.node_shell and (not args.node or args.node_entry or args.node_main or args.node_eval or args.node_cancel or args.node_idle_cancel or args.node_revoke or args.node_explicit_exit or args.node_exit_code or args.node_repeat != 1):
         parser.error('--node-shell requires --node and excludes gate fixture modes')
     if args.node_idle_cancel and (not args.node_eval or args.node_exit_code != 130 or args.node_cancel or args.node_revoke or args.node_explicit_exit):
@@ -184,6 +220,8 @@ def main():
             obj = work / (runtime.stem + '.o')
             cmd = builder.smoke_command(source, cxx, obj, input_source=runtime, library='node')
             cmd += ['-I' + str(ROOT / 'tools/node-runtime/runtime'), '-I' + str(ROOT / 'tools/node-runtime/platform')]
+            if args.toolkit:
+                cmd += ['-DVIBEOS_NODE_TOOLKIT=1']
             with (work / (runtime.stem + '.log')).open('w') as log:
                 subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
             uv_objects.append(obj)
@@ -208,12 +246,24 @@ def main():
     command = ['rustup', 'run', 'nightly-2026-08-01', 'cargo', 'rustc', '--locked',
                '--offline', '--release', '--target', 'riscv64gc-unknown-none-elf',
                '--features', ('wasi-ssh-upload,native-uv-probe' if args.uv_loop else
+                              'wasi-ssh-upload,node-toolkit-probe' if args.js_esbuild_probe else
+                              'wasi-ssh-upload,node-esbuild-probe' if args.esbuild_probe else
+                              'wasi-ssh-upload,node-toolkit' if args.toolkit else
                               'wasi-ssh-upload,node-runtime' if args.node_shell else
                               'wasi-ssh-upload,node-runtime-gate' if args.gate else
                               'wasi-ssh-upload,native-runtime-probe,native-cxx-probe'),
                '--bin', 'vibeos-qemu-virt', '--',
                *[f'-Clink-arg={arg}' for arg in link_args]]
     env = dict(os.environ)
+    toolkit = None
+    if args.toolkit:
+        toolkit = validate_toolkit(args.toolkit.resolve())
+        frozen = work / 'toolkit.pack'
+        shutil.copyfile(args.toolkit / 'toolkit.pack', frozen)
+        if digest(frozen) != toolkit['pack_sha256']:
+            raise ValueError('toolkit changed during copy')
+        shutil.copyfile(args.toolkit / 'manifest.json', work / 'toolkit-manifest.json')
+        env['VIBEOS_NODE_TOOLKIT'] = str(frozen)
     for variable, binary in [('RUSTC', 'rustc'), ('RUSTDOC', 'rustdoc')]:
         env[variable] = subprocess.check_output(
             ['rustup', 'which', '--toolchain', 'nightly-2026-08-01', binary], text=True).strip()
@@ -230,6 +280,8 @@ def main():
                   scope=('Dedicated V8 gate image; execution still required' if args.gate else
                          'Diagnostic fixture firmware link; not a runnable V8 acceptance image'))
     report['compiler_sha256'] = digest(cxx)
+    if toolkit:
+        report['toolkit'] = toolkit
     if args.uv_loop:
         report['libuv_scope'] = 'timer/async loop prerequisite only; not full libuv or Node'
         report['libuv_inputs_sha256'] = uv_inputs

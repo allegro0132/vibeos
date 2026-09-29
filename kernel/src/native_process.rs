@@ -78,3 +78,11 @@ pub(super) extern "C" fn vibeos_native_is_cancelled() -> i32 {
     crate::native_tls::require_current();
     i32::from(crate::native_tls::stdio_grant().is_some_and(|grant| grant.cancelled()))
 }
+#[no_mangle]
+pub(super) extern "C" fn vibeos_native_external_ready() -> i32 {
+    crate::native_tls::require_current();
+    #[cfg(feature = "node-toolkit")]
+    { return i32::from(crate::native_esbuild::ready()); }
+    #[cfg(not(feature = "node-toolkit"))]
+    0
+}

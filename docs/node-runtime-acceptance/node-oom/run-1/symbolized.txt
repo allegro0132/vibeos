@@ -1,0 +1,26 @@
+vibeos_native_fatal_exit
+??:?
+_kill
+platform-vibeos-libc.cc:?
+__assert_func
+??:?
+v8::Utils::ReportOOMFailure(v8::internal::Isolate*, char const*, v8::OOMDetails const&)
+api.cc:?
+v8::internal::V8::FatalProcessOutOfMemory(v8::internal::Isolate*, char const*, v8::OOMDetails const&)
+api.cc:?
+v8::internal::HeapAllocator::AllocateRawWithRetryOrFailSlowPath(int, v8::internal::AllocationType, v8::internal::AllocationOrigin, v8::internal::AllocationAlignment)
+heap-allocator.cc:?
+v8::internal::Factory::AllocateRaw(int, v8::internal::AllocationType, v8::internal::AllocationAlignment)
+factory.cc:?
+v8::internal::FactoryBase<v8::internal::Factory>::NewFixedArray(int, v8::internal::AllocationType)
+factory-base.cc:?
+v8::internal::(anonymous namespace)::ElementsAccessorBase<v8::internal::(anonymous namespace)::FastHoleySmiElementsAccessor, v8::internal::(anonymous namespace)::ElementsKindTraits<(v8::internal::ElementsKind)1> >::GrowCapacityAndConvertImpl(v8::internal::DirectHandle<v8::internal::JSObject>, unsigned int)
+elements.cc:?
+v8::internal::(anonymous namespace)::ElementsAccessorBase<v8::internal::(anonymous namespace)::FastHoleySmiElementsAccessor, v8::internal::(anonymous namespace)::ElementsKindTraits<(v8::internal::ElementsKind)1> >::SetLengthImpl(v8::internal::Isolate*, v8::internal::DirectHandle<v8::internal::JSArray>, unsigned int, v8::internal::DirectHandle<v8::internal::FixedArrayBase>)
+elements.cc:?
+v8::internal::ArrayConstructInitializeElements(v8::internal::DirectHandle<v8::internal::JSArray>, v8::internal::Arguments<(v8::internal::ArgumentsType)1>*)
+elements.cc:?
+v8::internal::Runtime_NewArray(int, unsigned long*, v8::internal::Isolate*)
+runtime-array.cc:?
+Builtins_CEntry_Return1_ArgvOnStack_NoBuiltinExit
+basic-block-profiler.cc:?

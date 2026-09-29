@@ -1,0 +1,19 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'const value: number = 42; console.log("TSX_CANCEL_" + "RELAUNCH=" + value);' | write @home/project/main.ts
+@sleep 0.3
+@send tsx --root @home/project main.ts
+@sleep 0.3
+@expect WASI running
+@sleep 0.3
+@ctrl-c
+@sleep 0.3
+@sleep 1
+@sleep 0.3
+@send tsx --root @home/project main.ts
+@sleep 0.3
+@expect TSX_CANCEL_RELAUNCH=42
+@sleep 1
+@quit

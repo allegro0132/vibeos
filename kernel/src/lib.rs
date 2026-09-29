@@ -1182,6 +1182,12 @@ mod native_files;
 mod native_env;
 #[cfg(all(feature = "node-runtime", not(feature = "node-runtime-gate")))]
 mod native_node;
+#[cfg(feature = "node-toolkit")]
+mod native_toolkit;
+#[cfg(feature = "node-toolkit")]
+mod native_esbuild_protocol;
+#[cfg(feature = "node-toolkit")]
+mod native_esbuild;
 #[cfg(feature = "native-cxx-probe")]
 mod native_clock;
 #[cfg(all(feature = "native-call-probe", not(target_feature = "d")))]
@@ -2107,6 +2113,8 @@ fn start_services(boot_time: u64) -> ! {
     exec::spawn_pinned_on(exec::HartId::BOOT, "native-cxx-park", native_call::parking_probe());
     #[cfg(feature = "node-runtime-gate")]
     exec::spawn_pinned_on(exec::HartId::BOOT, "v8-gate", native_call::v8_gate());
+    #[cfg(feature = "node-esbuild-probe")]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "esbuild-bridge-probe", native_esbuild::probe());
 
     trap::enable_interrupts();
     uart::early_write("[VibeOS] interrupts enabled\r\n");

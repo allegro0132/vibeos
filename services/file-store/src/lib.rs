@@ -409,6 +409,32 @@ enum FsFileReaderSource {
 }
 
 impl FsFileReader {
+    /// Read a bounded prefix at a byte offset. A result may stop at a chunk
+    /// boundary; callers needing more bytes continue at the returned offset.
+    /// Volatile files skip prefix metadata without copying preceding chunks.
+    pub async fn read_at(&self, mut offset: u64, maximum: usize) -> Result<Vec<u8>, FileError> {
+        if maximum == 0 { return Ok(Vec::new()); }
+        if let FsFileReaderSource::Volatile(chunks) = &self.source {
+            for chunk in chunks {
+                if offset >= chunk.len() as u64 { offset -= chunk.len() as u64; continue; }
+                let start = offset as usize;
+                let length = maximum.min(chunk.len() - start);
+                return Ok(chunk[start..start + length].to_vec());
+            }
+            return Ok(Vec::new());
+        }
+        // Persistent streams may contain differently sized chunks; preserve
+        // their backend's verified reads rather than assuming a fixed stride.
+        for index in 0..self.chunk_count() {
+            let chunk = self.read_chunk(index).await?.ok_or(FileError::ServiceUnavailable)?;
+            if offset >= chunk.len() as u64 { offset -= chunk.len() as u64; continue; }
+            let start = offset as usize;
+            let length = maximum.min(chunk.len() - start);
+            return Ok(chunk[start..start + length].to_vec());
+        }
+        Ok(Vec::new())
+    }
+
     pub fn chunk_count(&self) -> u64 {
         match &self.source {
             FsFileReaderSource::Volatile(chunks) => chunks.len() as u64,
@@ -1503,6 +1529,20 @@ impl Drop for FsTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_byte_offsets_preserve_variable_chunk_boundaries() {
+        let reader = FsFileReader { source: FsFileReaderSource::Volatile(alloc::vec![
+            Arc::from(&b"abc"[..]), Arc::from(&b""[..]), Arc::from(&b"defgh"[..]),
+        ]) };
+        assert_eq!(ready(reader.read_at(0, 2)).unwrap(), b"ab");
+        assert_eq!(ready(reader.read_at(2, 4)).unwrap(), b"c");
+        assert_eq!(ready(reader.read_at(3, 99)).unwrap(), b"defgh");
+        assert_eq!(ready(reader.read_at(6, 2)).unwrap(), b"gh");
+        assert!(ready(reader.read_at(8, 1)).unwrap().is_empty());
+        assert!(ready(reader.read_at(u64::MAX, 1)).unwrap().is_empty());
+        assert!(ready(reader.read_at(0, 0)).unwrap().is_empty());
+    }
 
     #[test]
     fn completed_generation_rejects_pending_publication() {

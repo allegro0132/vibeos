@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "scope": "Offline JS tool packages; esbuild platform adaptation is not yet applied",
+  "artifacts": {
+    "esbuild": {
+      "package": "esbuild",
+      "version": "0.25.0",
+      "url": "https://registry.npmjs.org/esbuild/-/esbuild-0.25.0.tgz",
+      "archive": "esbuild-0.25.0.tgz",
+      "integrity": "sha512-BXq5mqc8ltbaN34cDqWuYKyNhX8D/Z0J1xdtdQ8UcIIIyJyz+ZMKUt58tF3SrZ85jcfN/PZYhjR5uDQAYNVbuw==",
+      "member": "package/package.json",
+      "dependencies": {}
+    },
+    "get-tsconfig": {
+      "package": "get-tsconfig",
+      "version": "4.7.5",
+      "url": "https://registry.npmjs.org/get-tsconfig/-/get-tsconfig-4.7.5.tgz",
+      "archive": "get-tsconfig-4.7.5.tgz",
+      "integrity": "sha512-ZCuZCnlqNzjb4QprAzXKdpp/gh6KTxSJuw3IBsPnV/7fV4NxC9ckB+vPTt8w7fJA0TaSD7c55BR47JD6MEDyDw==",
+      "member": "package/package.json",
+      "dependencies": {
+        "resolve-pkg-maps": "^1.0.0"
+      }
+    },
+    "resolve-pkg-maps": {
+      "package": "resolve-pkg-maps",
+      "version": "1.0.0",
+      "url": "https://registry.npmjs.org/resolve-pkg-maps/-/resolve-pkg-maps-1.0.0.tgz",
+      "archive": "resolve-pkg-maps-1.0.0.tgz",
+      "integrity": "sha512-seS2Tj26TBVOC2NIc2rOe2y2ZO7efxITtLZcGSOnHHNOQ7CkiUBfw0Iw2ck6xkIhPwLhKNLS8BO+hEpngQlqzw==",
+      "member": "package/package.json",
+      "dependencies": {}
+    }
+  }
+}

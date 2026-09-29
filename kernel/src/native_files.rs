@@ -10,6 +10,30 @@ pub(super) struct FileGrant {
     probe_authority: Option<(Arc<Space>, Cap)>,
 }
 impl FileGrant {
+    #[cfg(feature = "node-toolkit")]
+    pub(super) async fn load_module(&self, path: &RelPath) -> Result<Vec<u8>, i32> {
+        let lease = self.lease(Rights::READ).ok_or(-3)?;
+        let (metadata, reader) = lease.with(|root| root.regular_reader(path)).map_err(error)?;
+        let result = vibeos_wasi_command::load_reader(reader, metadata.size).await
+            .map_err(|_| -5)?;
+        if !self.live() { return Err(-3); }
+        drop(lease);
+        Ok(result)
+    }
+    /// Attenuate a tool mount without disconnecting its original revocation
+    /// lineage. Open descriptors retain this same restricted provider.
+    pub(super) fn read_only(self) -> Self {
+        #[cfg(feature = "native-cxx-probe")]
+        let probe_authority = self.probe_authority.clone();
+        Self {
+            lookup: Arc::new(move |rights| {
+                if !Rights::READ.contains(rights) { return None; }
+                self.lease(rights)
+            }),
+            #[cfg(feature = "native-cxx-probe")]
+            probe_authority,
+        }
+    }
     pub(super) fn live(&self) -> bool { self.lease(Rights::READ).is_some() }
     pub(super) fn new(space: Arc<Space>, root: Cap) -> Option<Self> {
         let source = space.clone();
@@ -298,7 +322,17 @@ pub(super) unsafe extern "C" fn vibeos_native_file_stat(fd: i32, output: *mut Na
     0
 }
 
+const TOOL_MOUNT: &str = ".vibeos-tools";
+
+// Mutation operations use the project-only selector. They must never fall
+// through to a project entry shadowed by the separately admitted tool mount.
 unsafe fn native_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
+    let path = unsafe { virtual_path(input, length) }?;
+    if is_tool_path(&path) && crate::native_tls::tool_grant().is_some() { return Err(-3); }
+    Ok(path)
+}
+
+unsafe fn virtual_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
     if length == 0 { return Err(-6); }
     if length > 4096 { return Err(-10); }
     if input.is_null() { return Err(-2); }
@@ -311,14 +345,41 @@ unsafe fn native_path(input: *const u8, length: usize) -> Result<RelPath, i32> {
     RelPath::parse(&directory).map_err(error)
 }
 
+fn is_tool_path(path: &RelPath) -> bool {
+    path.components().first().is_some_and(|name| name == TOOL_MOUNT)
+}
+
+struct RoutedPath { grant: FileGrant, path: RelPath, tool: bool }
+impl RoutedPath {
+    fn canonical(&self, path: String) -> String {
+        if !self.tool { return path; }
+        let mut mounted = String::from(TOOL_MOUNT);
+        if !path.is_empty() { mounted.push('/'); mounted.push_str(&path); }
+        mounted
+    }
+}
+
+fn route_path(path: RelPath) -> Result<RoutedPath, i32> {
+    if is_tool_path(&path) {
+        if let Some(grant) = crate::native_tls::tool_grant() {
+            let path = RelPath::parse(&path.components()[1..].join("/")).map_err(error)?;
+            return Ok(RoutedPath { grant, path, tool: true });
+        }
+    }
+    Ok(RoutedPath { grant: crate::native_tls::file_grant().ok_or(-3)?, path, tool: false })
+}
+
+unsafe fn resolve_path(input: *const u8, length: usize) -> Result<RoutedPath, i32> {
+    route_path(unsafe { virtual_path(input, length) }?)
+}
+
 // The cwd is invocation-owned and canonical within the admitted root. Remember
 // its identity so deleting/replacing that directory cannot silently retarget it.
 fn current_directory() -> Result<String, i32> {
-    let grant = crate::native_tls::file_grant().ok_or(-3)?;
-    let lease = grant.lease(Rights::READ).ok_or(-3)?;
     let (path, identity) = crate::native_tls::with_file_table(|table| (table.cwd.clone(), table.cwd_id));
-    let parsed = RelPath::parse(&path).map_err(error)?;
-    let metadata = lease.with(|root| root.snapshot().stat(&parsed, true)).map_err(error)?;
+    let routed = route_path(RelPath::parse(&path).map_err(error)?)?;
+    let lease = routed.grant.lease(Rights::READ).ok_or(-3)?;
+    let metadata = lease.with(|root| root.snapshot().stat(&routed.path, true)).map_err(error)?;
     if metadata.file_type != vibeos_file_store::FileType::Directory { return Err(-11); }
     if identity.is_some_and(|id| id != metadata.file_id) { return Err(-6); }
     Ok(path)
@@ -326,9 +387,10 @@ fn current_directory() -> Result<String, i32> {
 
 #[no_mangle]
 pub(super) unsafe extern "C" fn vibeos_native_chdir(input: *const u8, length: usize) -> i32 {
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let grant = &routed.grant;
     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let path = &routed.path;
     let resolved = lease.with(|root| {
         let snapshot = root.snapshot();
         let metadata = snapshot.stat(&path, true)?;
@@ -336,7 +398,7 @@ pub(super) unsafe extern "C" fn vibeos_native_chdir(input: *const u8, length: us
         Ok((snapshot.canonical_path(&path)?, metadata.file_id))
     });
     let (canonical, id) = match resolved { Ok(value) => value, Err(e) => return error(e) };
-    crate::native_tls::with_file_table(|table| { table.cwd = canonical; table.cwd_id = Some(id); });
+    crate::native_tls::with_file_table(|table| { table.cwd = routed.canonical(canonical); table.cwd_id = Some(id); });
     0
 }
 
@@ -360,11 +422,12 @@ pub(super) unsafe extern "C" fn vibeos_native_getcwd(output: *mut u8, capacity: 
 pub(super) unsafe extern "C" fn vibeos_native_path_stat(
     input: *const u8, length: usize, follow: i32, output: *mut NativeFileStat,
 ) -> i32 {
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let grant = &routed.grant;
     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
     if output.is_null() { return -2; }
     if follow != 0 && follow != 1 { return -9; }
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let path = &routed.path;
     let metadata = match lease.with(|root| root.snapshot().stat(&path, follow == 1)) {
         Ok(metadata) => metadata, Err(e) => return error(e),
     };
@@ -377,10 +440,11 @@ pub(super) unsafe extern "C" fn vibeos_native_path_stat(
 #[no_mangle]
 pub(super) unsafe extern "C" fn vibeos_native_access(input: *const u8, length: usize, mode: u32) -> i32 {
     if mode & !7 != 0 { return -9; }
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let grant = &routed.grant;
     let rights = if mode & 2 != 0 { Rights::READ.union(Rights::WRITE) } else { Rights::READ };
     let Some(lease) = grant.lease(rights) else { return -3; };
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let path = &routed.path;
     if let Err(e) = lease.with(|root| root.snapshot().stat(&path, true)) { return error(e); }
     // Native executable-file permission is not part of the first port.
     if mode & 1 != 0 { return -13; }
@@ -395,9 +459,10 @@ pub(super) unsafe extern "C" fn vibeos_native_scandir(
     emit: unsafe extern "C" fn(*mut core::ffi::c_void, *const u8, usize, u32) -> i32,
     context: *mut core::ffi::c_void,
 ) -> i32 {
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let grant = &routed.grant;
     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let path = &routed.path;
     let entries = match lease.with(|root| root.snapshot().list(&path, true)) {
         Ok(entries) => entries, Err(e) => return error(e),
     };
@@ -415,13 +480,15 @@ pub(super) unsafe extern "C" fn vibeos_native_scandir(
 pub(super) unsafe extern "C" fn vibeos_native_realpath(
     input: *const u8, length: usize, output: *mut u8, capacity: usize,
 ) -> isize {
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
+    let grant = &routed.grant;
     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
     if output.is_null() { return -2; }
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
+    let path = &routed.path;
     let canonical = match lease.with(|root| root.snapshot().canonical_path(&path)) {
         Ok(path) => path, Err(e) => return error(e) as isize,
     };
+    let canonical = routed.canonical(canonical);
     let length = canonical.len() + 1;
     if capacity <= length { return -10; }
     unsafe {
@@ -437,10 +504,11 @@ pub(super) unsafe extern "C" fn vibeos_native_realpath(
 pub(super) unsafe extern "C" fn vibeos_native_readlink(
     input: *const u8, length: usize, output: *mut u8, capacity: usize,
 ) -> isize {
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
+    let grant = &routed.grant;
     let Some(lease) = grant.lease(Rights::READ) else { return -3; };
     if output.is_null() { return -2; }
-    let path = match unsafe { native_path(input, length) } { Ok(p) => p, Err(e) => return e as isize };
+    let path = &routed.path;
     let snapshot = lease.with(|root| root.snapshot());
     let target = match snapshot.readlink(&path) { Ok(value) => value, Err(e) => return error(e) as isize };
     if capacity <= target.len() { return -10; }
@@ -528,12 +596,13 @@ pub(super) unsafe extern "C" fn vibeos_native_open(input: *const u8, length: usi
     if flags & !63 != 0 || mode == 3 { return -13; }
     if flags & 8 != 0 && flags & 4 == 0 { return -9; }
     if flags & (16 | 32) != 0 && mode == 0 { return -9; }
-    let Some(grant) = crate::native_tls::file_grant() else { return -3; };
+    let routed = match unsafe { resolve_path(input, length) } { Ok(p) => p, Err(e) => return e };
+    let grant = &routed.grant;
     let rights = if mode != 0 || flags & 4 != 0 {
         Rights::READ.union(Rights::WRITE)
     } else { Rights::READ };
     let Some(lease) = grant.lease(rights) else { return -3; };
-    let path = match unsafe { native_path(input, length) } { Ok(path) => path, Err(e) => return e };
+    let path = &routed.path;
     // Reserve descriptor capacity before a create/truncate can publish.
     let room = crate::native_tls::with_file_table(|table| {
         table.entries.len() < 64 && table.next < i32::MAX && table.entries.try_reserve(1).is_ok()
@@ -579,7 +648,7 @@ pub(super) unsafe extern "C" fn vibeos_native_open(input: *const u8, length: usi
     };
     if metadata.size > i64::MAX as u64 { return -5; }
     crate::native_tls::with_file_table(|table| table.insert(OpenFile {
-        grant, file_id, mode, append: flags & 32 != 0, position: AtomicU64::new(0),
+        grant: routed.grant.clone(), file_id, mode, append: flags & 32 != 0, position: AtomicU64::new(0),
     }))
 }
 pub(super) unsafe fn read(fd: i32, output: *mut u8, length: usize) -> isize {
@@ -599,20 +668,15 @@ pub(super) unsafe extern "C" fn vibeos_native_file_read_at(fd: i32, output: *mut
     let mut bytes = [0u8; 1024];
     let mut result = Err(FileError::ServiceUnavailable);
     if !crate::native_tls::park(async {
-        let mut skip = position;
-        for index in 0..reader.chunk_count() {
-            let chunk = match reader.read_chunk(index).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(e) => { result = Err(e); return; }
-            };
-            if skip >= chunk.len() as u64 { skip -= chunk.len() as u64; continue; }
-            let start = skip as usize;
-            let size = count.min(chunk.len() - start);
-            bytes[..size].copy_from_slice(&chunk[start..start + size]);
-            result = Ok(size);
-            return;
-        }
+        // Even memory-backed reads must bound a synchronous native turn: a
+        // large readFileSync otherwise resumes thousands of ready reads in
+        // one scheduler poll and starves SSH keepalives/cancellation.
+        crate::exec::yield_now().await;
+        result = reader.read_at(position, count).await.and_then(|chunk| {
+            if chunk.is_empty() { return Err(FileError::ServiceUnavailable); }
+            bytes[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        });
     }) { return -5; }
     let size = match result { Ok(size) => size, Err(e) => return error(e) as isize };
     // Revalidate before exposing data obtained during suspended backend IO.
@@ -684,15 +748,10 @@ pub(super) extern "C" fn vibeos_native_file_read_begin_at(fd: i32, length: usize
     let count = length.min(1024).min(metadata.size.saturating_sub(position) as usize);
     let future: ReadFuture = alloc::boxed::Box::pin(async move {
         if count == 0 { return Ok(Vec::new()); }
-        let mut skip = position;
-        for index in 0..reader.chunk_count() {
-            let chunk = reader.read_chunk(index).await?.ok_or(FileError::ServiceUnavailable)?;
-            if skip >= chunk.len() as u64 { skip -= chunk.len() as u64; continue; }
-            let start = skip as usize;
-            let size = count.min(chunk.len() - start);
-            return Ok(chunk[start..start + size].to_vec());
-        }
-        Err(FileError::ServiceUnavailable)
+        crate::exec::yield_now().await;
+        let bytes = reader.read_at(position, count).await?;
+        if bytes.is_empty() { return Err(FileError::ServiceUnavailable); }
+        Ok(bytes)
     });
     crate::native_tls::with_file_table(|table| {
         if table.reads.len() >= 64 || table.reads.try_reserve(1).is_err() { return -14; }

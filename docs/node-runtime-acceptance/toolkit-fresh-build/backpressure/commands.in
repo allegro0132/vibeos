@@ -1,0 +1,33 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'const fs = require("fs"); const data = Buffer.alloc(131072, 97);' | write @home/project/flood.cjs
+@sleep 0.3
+echo 'const accepted = process.stdout.write(data, () => fs.writeFileSync("write-callback", "ok"));' | write --append @home/project/flood.cjs
+@sleep 0.3
+echo 'if (accepted) throw Error("expected stream backpressure");' | write --append @home/project/flood.cjs
+@sleep 0.3
+echo 'process.stdout.once("drain", () => fs.writeFileSync("write-drain", "ok"));' | write --append @home/project/flood.cjs
+@sleep 0.3
+echo 'const fs = require("fs"); const data = fs.readFileSync("output");' | write @home/project/verify.cjs
+@sleep 0.3
+echo 'if (data.length !== 131072 || !data.every(x => x === 97)) throw Error("output corrupted");' | write --append @home/project/verify.cjs
+@sleep 0.3
+echo 'if (fs.readFileSync("write-callback", "utf8") !== "ok") throw Error("write callback missing");' | write --append @home/project/verify.cjs
+@sleep 0.3
+echo 'if (fs.readFileSync("write-drain", "utf8") !== "ok") throw Error("drain missing");' | write --append @home/project/verify.cjs
+@sleep 0.3
+echo 'console.log("NODE_BACKPRESSURE_" + "PASS=131072");' | write --append @home/project/verify.cjs
+@sleep 0.3
+echo 'console.log("NODE_BACKPRESSURE_" + "RELAUNCH=ok");' | write @home/project/again.cjs
+@sleep 0.3
+@send node --root @home/project flood.cjs | write @home/project/output; node --root @home/project verify.cjs
+@sleep 0.3
+@expect NODE_BACKPRESSURE_PASS=131072
+@sleep 0.3
+@send node --root @home/project again.cjs
+@sleep 0.3
+@expect NODE_BACKPRESSURE_RELAUNCH=ok
+@sleep 1
+@quit

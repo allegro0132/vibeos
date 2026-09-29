@@ -1,0 +1,8 @@
+{
+  "code": "const view = /* @__PURE__ */ h(\"box\", { value: 42 });\n",
+  "codeFS": false,
+  "errors": [],
+  "map": "{\n  \"version\": 3,\n  \"sources\": [\"src/main.tsx\"],\n  \"sourcesContent\": [\"const view = <box value={42}/>;\\n\"],\n  \"mappings\": \"AAAA,MAAM,OAAO,kBAAC,SAAI,OAAO,IAAG;\",\n  \"names\": []\n}\n",
+  "mapFS": false,
+  "warnings": []
+}

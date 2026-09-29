@@ -1,0 +1,47 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo "module.exports = 42" | write @home/project/dep.cjs
+@sleep 0.3
+echo "console.log('VSH_NODE_' + 'FILE=' + require('./dep.cjs'))" | write @home/project/main.cjs
+@sleep 0.3
+node --root @home/project -e "console.log('VSH_NODE_' + 'EVAL=' + (1 + 2))"
+@sleep 0.3
+node --root @home/project main.cjs
+@sleep 0.3
+echo stream-input | node --root @home/project -e "process.stdin.setEncoding('utf8'); let s=''; process.stdin.on('data', x => s += x); process.stdin.on('end', () => console.log('VSH_NODE_' + 'STDIN=' + s.trim()))"
+@sleep 0.3
+node --root @home/project -e "const fs=require('fs'); fs.writeFileSync('out.txt','saved'); console.log('VSH_NODE_' + 'FS=' + fs.readFileSync('out.txt','utf8'))"
+@sleep 0.3
+node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'TIMER=done'), 10)"
+@sleep 0.3
+echo "export default 99" | write @home/project/dep.mjs
+@sleep 0.3
+node --root @home/project -e "import('./dep.mjs').then(m => console.log('VSH_NODE_' + 'ESM=' + m.default))"
+@sleep 0.3
+node --root @home/project -e "console.log('VSH_NODE_' + 'REDIRECT=console')" > @console
+@sleep 0.3
+node --root @home/project -e "process.exit(7)"
+@sleep 0.3
+if node --root @home/project -e "process.exit(7)"; then node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=bad')"; else node --root @home/project -e "console.log('VSH_NODE_' + 'EXIT=nonzero')"; fi
+@sleep 0.3
+node --root @home/project -e "throw new Error('VSH_NODE_' + 'EXPECTED_ERROR')"
+@sleep 0.3
+@send node --root @home/project -e "for(let once=true;;){if(once){console.log('VSH_NODE_' + 'CPU_READY');once=false}}"
+@sleep 0.3
+@expect VSH_NODE_CPU_READY
+@sleep 0.3
+@ctrl-c
+@sleep 0.3
+node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_CPU=ok')"
+@sleep 0.3
+@send node --root @home/project -e "setTimeout(() => console.log('VSH_NODE_' + 'IDLE_MISSED'),60000); console.log('VSH_NODE_' + 'IDLE_READY')"
+@sleep 0.3
+@expect VSH_NODE_IDLE_READY
+@sleep 0.3
+@ctrl-c
+@sleep 0.3
+node --root @home/project -e "console.log('VSH_NODE_' + 'AFTER_IDLE=ok')"
+@sleep 1
+@quit

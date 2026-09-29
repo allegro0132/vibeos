@@ -3,6 +3,11 @@
 use crate::{native_pages::NativePages, sync::SpinLock};
 use vibeos_core::heap::{enter_owner, OwnerId};
 const PAGE: usize = 4096;
+// Official TypeScript's multi-megabyte compiler needs overlapping source and
+// parser buffers. Keep the larger retained arena opt-in with the tool package.
+#[cfg(feature = "node-toolkit")]
+const CAPACITY: usize = 64 * 1024 * 1024;
+#[cfg(not(feature = "node-toolkit"))]
 const CAPACITY: usize = 16 * 1024 * 1024;
 const QUOTA: usize = CAPACITY * 4;
 struct Heap { owner: Option<OwnerId>, pages: Option<NativePages>, offset: usize }
@@ -14,7 +19,10 @@ extern "C" fn vibeos_native_sbrk(increment: isize) -> *mut u8 {
     let failure = usize::MAX as *mut u8;
     let mut heap = HEAP.lock();
     let Some(next) = heap.offset.checked_add_signed(increment) else { return failure; };
-    if next > CAPACITY { return failure; }
+    if next > CAPACITY {
+        crate::println!("NATIVE LIBC LIMIT used={} requested={} capacity={}", heap.offset, increment, CAPACITY);
+        return failure;
+    }
     if heap.pages.is_none() {
         let owner = match heap.owner {
             Some(owner) => owner,

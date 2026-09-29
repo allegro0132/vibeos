@@ -1,0 +1,41 @@
+quiet
+@sleep 0.3
+mkdir @home/ts-project
+@sleep 0.3
+echo "if(require('fs').existsSync('dist')) throw Error('unexpected emit'); console.log('TSC_GUEST_' + 'CHECK=ok')" | write @home/ts-project/check.cjs
+@sleep 0.3
+echo "console.log('TSC_GUEST_' + 'CHECK=failed')" | write @home/ts-project/check-fail.cjs
+@sleep 0.3
+echo "if(!require('fs').readFileSync('dist/main.d.ts','utf8').includes('result: number')) throw Error('declaration'); console.log('TSC_GUEST_' + 'EMIT=' + require('./dist/main.js').result)" | write @home/ts-project/emit.cjs
+@sleep 0.3
+echo "console.log('TSC_GUEST_' + 'EMIT=failed')" | write @home/ts-project/emit-fail.cjs
+@sleep 0.3
+echo "console.log('TSC_GUEST_' + 'DIAGNOSTIC=nonzero')" | write @home/ts-project/diag.cjs
+@sleep 0.3
+echo "console.log('TSC_GUEST_' + 'DIAGNOSTIC=missing')" | write @home/ts-project/diag-fail.cjs
+@sleep 0.3
+echo '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true,"declaration":true,"outDir":"dist"},"include":["*.ts"]}' | write @home/ts-project/tsconfig.json
+@sleep 0.3
+echo 'export const answer: number = 42;' | write @home/ts-project/dep.ts
+@sleep 0.3
+echo "import { answer } from './dep'; export const result: number = answer + 1;" | write @home/ts-project/main.ts
+@sleep 0.3
+@send tsc --root @home/ts-project --version
+@sleep 0.3
+@expect Version 5.9.3
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json --noEmit; then node --root @home/ts-project check.cjs; else node --root @home/ts-project check-fail.cjs; fi
+@sleep 0.3
+@expect TSC_GUEST_CHECK=
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json; then node --root @home/ts-project emit.cjs; else node --root @home/ts-project emit-fail.cjs; fi
+@sleep 0.3
+@expect TSC_GUEST_EMIT=
+@sleep 0.3
+echo 'export const bad: number = "wrong";' | write @home/ts-project/bad.ts
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json --noEmit; then node --root @home/ts-project diag-fail.cjs; else node --root @home/ts-project diag.cjs; fi
+@sleep 0.3
+@expect TSC_GUEST_DIAGNOSTIC=
+@sleep 1
+@quit

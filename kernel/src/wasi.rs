@@ -254,7 +254,7 @@ fn launch(
 
 // The SSH request already owns its loaded snapshot in SYSTEM. Transfer it
 // directly instead of retaining a second full module buffer during admission.
-fn launch_owned(
+pub(super) fn launch_owned(
     bytes: Vec<u8>,
     argv: &[String],
     io: Arc<CommandIo>,

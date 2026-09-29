@@ -93,6 +93,7 @@ def main():
                     native_wait = 'NATIVE WAIT ABI PASS timeouts=2 immediate=1 cpp_return=1 peer_progress=1' in text
                     native_notify = 'NATIVE NOTIFY PASS early=1 parked=1 exclusive=1 cancelled=1 reclaimed=1' in text
                     file_open = 'NATIVE OPEN PASS read=1 seek=1 chunks=1 eof=1 close=1 revoked=1 readonly=1' in text
+                    tool_mount = 'NATIVE TOOL MOUNT read=1 readonly=1 cwd=1 realpath=1 escape=denied revoked_fd=denied project_write=1 PASS' in text
                     unlink = 'NATIVE UNLINK PASS no_grant=1 readonly=1 escape=1 directory=1 removed=1 revoked=1' in text
                     native_fd = 'NATIVE FD PASS pipe=1 close=1 stale=1 revoked_cleanup=1 drained=1' in text
                     stdio = 'NATIVE STDIO PASS no_grant=1 backpressure=1 ordered=1 read=1 eof=1 revoked=1 waiters=0' in text
@@ -106,8 +107,8 @@ def main():
                     shell = text.count('NATIVE_TLS_SHELL_OK') >= 2
                     report['observed_checks'] = dict(harts=harts, shell=shell,
                         call=native_call, suspend=native_suspend, cxx=native_cxx,
-                        park=native_park, pages=native_pages, cache=native_cache, cxx_tls=native_cxx_tls, tls_dtor=native_tls_dtor, tcb_pages=native_tcb, page_pool=native_pool, memory_abi=native_memory, static_flags=native_flags, notify=native_notify, wait_abi=native_wait, semaphore=native_semaphore, semaphore_owner=semaphore_owner, semaphore_wake=semaphore_wake, entropy=entropy, libc_heap=libc_heap, stdio=stdio, native_fd=native_fd, unlink=unlink, file_open=file_open)
-                    if harts and shell and (not args.entropy or entropy) and (not args.native_call or (native_call and native_suspend)) and (not args.native_cxx or (native_cxx and native_park and native_pages and native_cache and native_cxx_tls and native_tls_dtor and native_tcb and native_pool and native_memory and native_flags and native_notify and native_wait and native_semaphore and semaphore_owner and semaphore_wake and libc_heap and stdio and native_fd and unlink and file_open)):
+                        park=native_park, pages=native_pages, cache=native_cache, cxx_tls=native_cxx_tls, tls_dtor=native_tls_dtor, tcb_pages=native_tcb, page_pool=native_pool, memory_abi=native_memory, static_flags=native_flags, notify=native_notify, wait_abi=native_wait, semaphore=native_semaphore, semaphore_owner=semaphore_owner, semaphore_wake=semaphore_wake, entropy=entropy, libc_heap=libc_heap, stdio=stdio, native_fd=native_fd, unlink=unlink, file_open=file_open, tool_mount=tool_mount)
+                    if harts and shell and (not args.entropy or entropy) and (not args.native_call or (native_call and native_suspend)) and (not args.native_cxx or (native_cxx and native_park and native_pages and native_cache and native_cxx_tls and native_tls_dtor and native_tcb and native_pool and native_memory and native_flags and native_notify and native_wait and native_semaphore and semaphore_owner and semaphore_wake and libc_heap and stdio and native_fd and unlink and file_open and tool_mount)):
                         report.update(passed=True, hart_pairs=sorted(pairs))
                         if args.native_call:
                             report['native_call_passed'] = True

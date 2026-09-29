@@ -1,0 +1,163 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x8558d000..0xc0000000  (960972 KiB)
+  traps     stvec armed, PLIC ctx S/hart0, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x84e8d000..0x8508d000, MXR clear, RFENCE ready
+  read-only 50560 KiB .rodata 0x819b8000..0x84b18000; 4096 KiB COW capability-table pool
+  net map   net0 <- mmio@0x10001000 (virtio-mmio)
+  world     19 capability spaces, 1 typed channel, 9 components
+  sched     async executor, no threads, no preemption
+ssh-test listening on 10.0.2.15:2222
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> [2KNODE DIAGNOSTIC stage=2 ns=674680000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=1210573000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=1348249000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=1481420000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=1803976000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=1889156000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=2010937000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=2330948000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=2414499000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=2547713000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=2873434000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=2907042000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=3022473000
+vsh> [2K[logger] reading #1 = 21.537 C
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=3349292000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=4048193000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=4479489000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=4837847000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=4931959000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=5041218000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=5368101000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=5477898000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=5586598000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=5920599000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=6028701000
+vsh> [2KNODE DIAGNOSTIC stage=0 ns=6136643000
+vsh> [2K[logger] reading #2 = 21.574 C
+vsh> [2KNODE DIAGNOSTIC stage=1 ns=6221046000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=6222064000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=6558369000
+vsh> [2KNODE DIAGNOSTIC stage=5 ns=6624768000
+vsh> [2KNODE DIAGNOSTIC stage=6 ns=7088668000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=7740164000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=7861711000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=8185368000
+vsh> [2KNODE DIAGNOSTIC stage=5 ns=8223260000
+vsh> [2KNODE DIAGNOSTIC stage=6 ns=8698926000
+vsh> [2K[guest]  heartbeat 1
+vsh> [2K[logger] reading #3 = 21.611 C
+vsh> [2KNODE DIAGNOSTIC stage=5 ns=10751010000
+vsh> [2KNODE DIAGNOSTIC stage=6 ns=10872730000
+vsh> [2K[logger] reading #4 = 21.648 C
+vsh> [2K[logger] reading #5 = 21.685 C
+vsh> [2K[guest]  heartbeat 2
+vsh> [2K[logger] reading #6 = 21.722 C
+vsh> [2K[logger] reading #7 = 21.759 C
+vsh> [2K[logger] reading #8 = 21.796 C
+vsh> [2K[guest]  heartbeat 3
+vsh> [2K[logger] reading #9 = 21.833 C
+vsh> [2K[logger] reading #10 = 21.870 C
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=30372521000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=30621792000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=30953762000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=31044191000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=31154522000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=31487621000
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=31569717000
+vsh> [2KNODE DIAGNOSTIC stage=2 ns=31701700000
+vsh> [2KNODE DIAGNOSTIC stage=3 ns=32030548000
+vsh> [2KNODE DIAGNOSTIC stage=7 ns=32338274000
+vsh> [2KNODE DIAGNOSTIC stage=8 ns=32355144000
+vsh> [2KNODE DIAGNOSTIC stage=10 ns=32356783000
+vsh> [2KNODE DIAGNOSTIC stage=9 ns=32356798000
+vsh> [2K[logger] reading #11 = 21.907 C
+vsh> [2K[guest]  heartbeat 4
+vsh> [2K[logger] reading #12 = 21.944 C
+vsh> [2K[logger] reading #13 = 21.981 C
+vsh> [2K[logger] reading #14 = 22.018 C
+vsh> [2KNODE DIAGNOSTIC stage=11 ns=43954617000
+vsh> [2KWASI running
+vsh> [2KWASI esbuild fuel=1754607687 max_required_fuel=131072
+vsh> [2KWASI esbuild owner_peak_bytes=96523904
+vsh> [2KWASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+vsh> [2KNODE DIAGNOSTIC stage=4 ns=44882736000
+vsh> [2Kssh-test connection reset: SSH shell became defunct
+vsh> [2K[guest]  heartbeat 5
+vsh> [2K[logger] reading #15 = 22.055 C
+vsh> [2K[logger] reading #16 = 22.092 C
+vsh> qemu-system-riscv64: terminating on signal 15 from pid 70674 (<unknown process>)

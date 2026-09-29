@@ -1,0 +1,6 @@
+{
+  "command": "KEEP_FILE_TREE_EVIDENCE=1 sh scripts/qemu-file-tree-test.sh",
+  "kernel_sha256": "843634cd9b4ce0359e6eacfe695dc8fb58a88b436ee0e84cde7757bd63fd0062",
+  "scope": "default 128 MiB file-tree image; three cold boots, not Node/toolkit image",
+  "passed": true
+}

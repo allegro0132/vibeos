@@ -1,0 +1,117 @@
+{
+  "kernel_sha256": "c50dd05c6fe479aabff7ea63c8708c37595eae9e4889ea609f5fcc2912167364",
+  "results": [
+    {
+      "name": "tsc",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-tsc-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/tsc"
+      ],
+      "exit_code": 0,
+      "seconds": 78.7111466670176,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "tsx",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-tsx-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/tsx"
+      ],
+      "exit_code": 0,
+      "seconds": 149.08777450001799,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "node",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-node-shell-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/node"
+      ],
+      "exit_code": 0,
+      "seconds": 16.566366165992804,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "boundary",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-toolkit-boundary-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/boundary"
+      ],
+      "exit_code": 0,
+      "seconds": 37.57467324996833,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "tsx-cancel",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-tsx-cancel-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/tsx-cancel"
+      ],
+      "exit_code": 0,
+      "seconds": 32.45639562502038,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "backpressure",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-node-backpressure-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/backpressure"
+      ],
+      "exit_code": 0,
+      "seconds": 8.252337250043638,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "oom",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-node-oom-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/oom"
+      ],
+      "exit_code": 0,
+      "seconds": 3.9385765839833766,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "cycles",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-node-cycles-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-shell-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-qualification-1/cycles"
+      ],
+      "exit_code": 0,
+      "seconds": 97.57128700008616,
+      "kernel_unchanged": true
+    }
+  ]
+}

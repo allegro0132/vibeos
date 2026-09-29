@@ -16,6 +16,8 @@ const char* vibeos_native_system_label(uint32_t field);
 int vibeos_native_checkpoint(void);
 // Read cancellation without yielding, for environment/event-loop boundaries.
 int vibeos_native_is_cancelled(void);
+// Poll admitted Rust external requests on the native stack, never invoking JS.
+int vibeos_native_external_ready(void);
 // Must run on the admitted native stack before V8/Node initialization.
 int vibeos_native_runtime_initialize(void);
 __attribute__((noreturn)) void vibeos_native_fatal_exit(int status);

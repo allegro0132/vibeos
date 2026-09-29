@@ -1,0 +1,129 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo original | write @home/secret
+@sleep 0.3
+echo '{"type":"module"}' | write @home/project/package.json
+@sleep 0.3
+echo 'const fs = require("fs");' | write @home/project/large.cjs
+@sleep 0.3
+echo 'const text = Array.from({length:4097}, (_,i) => String.fromCharCode(233+i%53)).join("");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'const expected = Buffer.from(text); fs.writeFileSync("large", text);' | write --append @home/project/large.cjs
+@sleep 0.3
+echo '(async () => {' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'if (!(await fs.promises.readFile("large")).equals(expected)) throw Error("binary read truncated");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'if (await fs.promises.readFile("large", "utf8") !== text) throw Error("UTF8 read truncated");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'const h = await fs.promises.open("large", "r"), buffer = Buffer.alloc(7000);' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'const part = await h.read(buffer, 0, buffer.length, 101);' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'if (part.bytesRead !== 7000 || !buffer.equals(expected.subarray(101,7101))) throw Error("positional read");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'const eof = await h.read(Buffer.alloc(10000), 0, 10000, 0); if (eof.bytesRead !== 8194) throw Error("EOF count");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'const current = await h.read(Buffer.alloc(512), 0, 512, null);' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'if (!current.buffer.equals(expected.subarray(0,512))) throw Error("position changed");' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'await h.close(); console.log("TOOLKIT_BOUNDARY_" + "LARGE_READ=8194"); })();' | write --append @home/project/large.cjs
+@sleep 0.3
+echo 'import fs from "node:fs";' | write @home/project/boundary.ts
+@sleep 0.3
+echo 'const tool = "/.vibeos-tools/node_modules/typescript/package.json";' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'const original = fs.readFileSync(tool, "utf8");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'let denied = 0;' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'function reject(action: () => void, codes = ["EACCES"]) { try { action(); } catch (e: any) {' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (codes.includes(e.code)) { denied++; return; } throw e; } throw Error("authority escaped"); }' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (fs.existsSync("/secret") || fs.existsSync("/secret.cjs")) throw Error("sibling visible");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.readFileSync("../secret"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.realpathSync("../secret"), ["EACCES", "ENOENT"]);' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync("../secret", "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync(tool, "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.openSync(tool, "r+"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.unlinkSync(tool));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.renameSync(tool, "stolen.json"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.mkdirSync("/.vibeos-tools/new-dir"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'process.chdir("/.vibeos-tools/node_modules/typescript");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (process.cwd() !== "/.vibeos-tools/node_modules/typescript") throw Error("tool cwd");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync("package.json", "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'process.chdir("/");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'try { await fs.promises.writeFile(tool, "changed"); throw Error("async write admitted"); } catch (e: any) {' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (e.code !== "EACCES") throw e; denied++; }' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'const after = await fs.promises.readFile(tool, "utf8"), syncAfter = fs.readFileSync(tool, "utf8");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'console.log("BOUNDARY_READ lengths="+original.length+"/"+after.length+"/"+syncAfter.length+" syncEqual="+(original===syncAfter));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (after !== original) throw Error("tool differs: " + after.slice(0,48));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'fs.writeFileSync("allowed.txt", "yes");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (fs.readFileSync("allowed.txt", "utf8") !== "yes" || denied !== 10) throw Error("boundary checks");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "PASS=10");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'const fs = require("fs");' | write @home/project/ungranted.cjs
+@sleep 0.3
+echo 'if (fs.existsSync("/.vibeos-tools/node_modules/typescript/package.json")) throw Error("ambient tool authority");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'fs.mkdirSync("subdir"); process.chdir("subdir");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'if (process.cwd() !== "/subdir") throw Error("project cwd"); fs.writeFileSync("inside", "yes"); process.chdir("/");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'if (fs.readFileSync("subdir/inside", "utf8") !== "yes") throw Error("relative cwd write");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'for (const [value, code] of [[7,"ERR_INVALID_ARG_TYPE"],["sub"+String.fromCharCode(0)+"dir","ERR_INVALID_ARG_VALUE"]]) {' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'let denied=false; try { process.chdir(value); } catch(e) { denied=e.code===code; } if(!denied) throw Error("cwd argument"); }' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'if (process.cwd() !== "/") throw Error("failed chdir changed cwd");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "UNGRANTED=ok");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'const fs = require("fs");' | write @home/project/check-secret.cjs
+@sleep 0.3
+echo 'if (fs.readFileSync("secret", "utf8").trim() !== "original") throw Error("secret modified");' | write --append @home/project/check-secret.cjs
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "SECRET=unchanged");' | write --append @home/project/check-secret.cjs
+@sleep 0.3
+@send node --root @home/project ungranted.cjs
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_UNGRANTED=ok
+@sleep 0.3
+@send node --root @home/project large.cjs
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_LARGE_READ=8194
+@sleep 0.3
+@send tsx --root @home/project boundary.ts
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_PASS=10
+@sleep 0.3
+@send node --root @home project/check-secret.cjs
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_SECRET=unchanged
+@sleep 1
+@quit

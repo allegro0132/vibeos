@@ -18,6 +18,8 @@ def main() -> int:
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument("--boot-timeout", type=float, default=30.0)
     parser.add_argument("--command-timeout", type=float, default=45.0)
+    parser.add_argument("--fail-marker", action="append", default=[],
+                        help="abort a custom @expect if this output arrives before its marker")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -50,6 +52,10 @@ def main() -> int:
                 log.write(chunk)
                 log.flush()
                 pending.extend(chunk)
+                if marker != b"vsh> " and marker not in pending:
+                    for failure in args.fail_marker:
+                        if failure.encode("utf-8") in pending:
+                            raise RuntimeError(f"guest failure before {label}: {failure}")
                 if len(pending) > 1 << 20:
                     del pending[: len(pending) - (1 << 20)]
             del pending[: pending.index(marker) + len(marker)]
@@ -64,6 +70,13 @@ def main() -> int:
                     continue
                 if raw == "@quit":
                     break
+                if raw == "@wait-exit":
+                    # Fatal-image tests expect firmware shutdown, not the
+                    # interactive QEMU escape sequence used by normal cases.
+                    remaining, _ = process.communicate(timeout=args.command_timeout)
+                    log.write(remaining)
+                    log.flush()
+                    return process.returncode
                 if raw.startswith("@send "):
                     process.stdin.write(raw.removeprefix("@send ").encode("utf-8") + b"\n")
                     process.stdin.flush()

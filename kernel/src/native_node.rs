@@ -18,7 +18,7 @@ impl Drop for Admission {
 /// Callers construct grants and streams in SYSTEM, as they can outlive the
 /// originating job. Arguments are copied into SYSTEM before publishing a task.
 pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
-                     io: Arc<CommandIo>) -> Result<(), vibeos_vsh::Status> {
+                     tools: Option<FileGrant>, io: Arc<CommandIo>) -> Result<(), vibeos_vsh::Status> {
     use vibeos_vsh::Status;
     if argv.is_empty() || argv.len() > 128 ||
        argv.iter().try_fold(0usize, |n, a| n.checked_add(a.len())).is_none_or(|n| n > 65536) ||
@@ -37,7 +37,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
     let domain = DOMAIN.lock().get_or_insert_with(NativeSyncDomain::new).clone();
     exec::spawn_pinned_on(exec::HartId::BOOT, "node-supervisor", async move {
         let _admission = admission;
-        if !files.live() {
+        if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) {
             drop(_admission);
             io.complete(WasiTerminal::Denied);
             return;
@@ -64,6 +64,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
             return;
         };
         run.tls().set_files(files.clone());
+        if let Some(tools) = tools.as_ref() { run.tls().set_tools(tools.clone()); }
         run.tls().set_entropy(entropy);
         run.tls().set_stdio(crate::native_stdio::StdioGrant::new(io.clone()));
         // No host environment is inherited; explicit empty initial environment.
@@ -71,7 +72,7 @@ pub(super) fn launch(argv: &[String], eval: Option<&str>, files: FileGrant,
         let monitor = async {
             loop {
                 exec::sleep_ms(10).await;
-                if !files.live() { io.deny(); }
+                if !files.live() || tools.as_ref().is_some_and(|grant| !grant.live()) { io.deny(); }
             }
         };
         let mut monitor = pin!(monitor);
@@ -104,7 +105,33 @@ use vibeos_core::cap::Rights;
 pub(super) fn install(session: &mut vibeos_vsh::Session) {
     session.install_capability_host_command("node", 3, 128,
         vibeos_vsh::StreamMode::Optional, planner, run_local);
+    #[cfg(feature = "node-toolkit")]
+    session.install_capability_host_command("tsc", 2, 128,
+        vibeos_vsh::StreamMode::Optional, tool_planner, run_tsc);
+    #[cfg(feature = "node-toolkit")]
+    session.install_capability_host_command("tsx", 3, 128,
+        vibeos_vsh::StreamMode::Optional, planner, run_tsx);
+    #[cfg(feature = "node-toolkit-probe")]
+    session.install_capability_host_command("node-tool-probe", 3, 128,
+        vibeos_vsh::StreamMode::Optional, planner, run_tool_probe);
 }
+#[derive(Clone, Copy, PartialEq)]
+enum CommandKind { Node, Compiler, #[cfg(feature = "node-toolkit")] Tsx, #[cfg(feature = "node-toolkit-probe")] ToolProbe }
+#[cfg(feature = "node-toolkit")]
+fn run_tsx(ctx: CapabilityCommandContext) -> CapabilityCommandFuture { run_command(ctx, CommandKind::Tsx) }
+#[cfg(feature = "node-toolkit-probe")]
+fn run_tool_probe(ctx: CapabilityCommandContext) -> CapabilityCommandFuture { run_command(ctx, CommandKind::ToolProbe) }
+#[cfg(feature = "node-toolkit")]
+fn tool_planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerError> {
+    if args.len() < 2 || args[0].value() != Some("--root") || args[1].path().is_none() ||
+       args[2..].iter().any(|a| a.value().is_none()) {
+        return Err(PlannerError { span: Span { start: 0, end: 0 },
+            message: "usage: tsc --root @ROOT/project [compiler options]" });
+    }
+    Ok(alloc::vec![PathRequirement { argument: 1, rights: Rights::READ.union(Rights::WRITE) }])
+}
+#[cfg(feature = "node-toolkit")]
+fn run_tsc(ctx: CapabilityCommandContext) -> CapabilityCommandFuture { run_command(ctx, CommandKind::Compiler) }
 fn planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerError> {
     if args.len() < 3 || args[0].value() != Some("--root") || args[1].path().is_none() ||
        args[2..].iter().any(|a| a.value().is_none()) ||
@@ -115,6 +142,9 @@ fn planner(args: &[ExpandedArgument]) -> Result<Vec<PathRequirement>, PlannerErr
     Ok(alloc::vec![PathRequirement { argument: 1, rights: Rights::READ.union(Rights::WRITE) }])
 }
 fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
+    run_command(ctx, CommandKind::Node)
+}
+fn run_command(ctx: CapabilityCommandContext, kind: CommandKind) -> CapabilityCommandFuture {
     Box::pin(async move {
         let Some(ResolvedArgument::CapabilityPath { root, tail, .. }) = ctx.args.get(1) else {
             return Err(Status::Usage);
@@ -127,7 +157,23 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             values.push(value.clone());
         }
         let mut argv = alloc::vec![String::from("node")];
-        let eval = if values.first().is_some_and(|s| s == "-e") {
+        #[cfg(feature = "node-toolkit")]
+        if kind == CommandKind::Tsx {
+            if values.first().is_none_or(|s| s.starts_with('-') || s == "watch") {
+                let _ = ctx.write_stderr(b"tsx: expected script; watch and subprocess modes are unavailable\n".to_vec()).await;
+                return Err(Status::Unavailable);
+            }
+            values.insert(0, String::from("/.vibeos-tools/vibeos/tsx-launcher.mjs"));
+        }
+        let eval = if kind == CommandKind::Compiler {
+            if values.iter().any(|arg| arg.eq_ignore_ascii_case("--watch") || arg.eq_ignore_ascii_case("-w")) {
+                let _ = ctx.write_stderr(b"tsc: watch is unavailable in the VibeOS port\n".to_vec()).await;
+                return Err(Status::Unavailable);
+            }
+            argv.push(String::from("/.vibeos-tools/node_modules/typescript/lib/tsc.js"));
+            argv.extend(values.iter().cloned());
+            None
+        } else if values.first().is_some_and(|s| s == "-e") {
             if values.len() < 2 { return Err(Status::Usage); }
             argv.extend(values[2..].iter().cloned());
             Some(values[1].as_str())
@@ -136,6 +182,10 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             argv.extend(values.iter().cloned());
             None
         };
+        #[cfg(feature = "node-toolkit")]
+        let tools = if kind != CommandKind::Node { Some(crate::native_toolkit::grant().await.map_err(|_| Status::Unavailable)?) } else { None };
+        #[cfg(not(feature = "node-toolkit"))]
+        let tools = None;
         let io = {
             let _system = unsafe { heap::enter_domain(AllocationDomain::SYSTEM) };
             let provider = ctx.resource_lease_provider::<vibeos_file_store::FileTreeRoot>(
@@ -143,7 +193,7 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             let grant = FileGrant::from_provider(move |rights| provider(rights).ok())
                 .and_then(|grant| grant.directory(path)).ok_or(Status::Denied)?;
             let io = Arc::new(CommandIo::new());
-            launch(&argv, eval, grant, io.clone())?;
+            launch(&argv, eval, grant, tools, io.clone())?;
             io
         };
         let _cancel = CancelOnDrop(io.clone());

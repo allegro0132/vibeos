@@ -1,0 +1,29 @@
+{
+  "stages": [
+    [
+      0,
+      6228238000
+    ],
+    [
+      1,
+      6316941000
+    ],
+    [
+      2,
+      6318023000
+    ],
+    [
+      3,
+      6653092000
+    ],
+    [
+      5,
+      6718602000
+    ]
+  ],
+  "meaning": {
+    "5": "large file first read",
+    "6": "large sequentially read file closed"
+  },
+  "result": "first large read started; close and LoadEnvironment return absent before SSH timeout"
+}

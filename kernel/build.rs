@@ -1,5 +1,6 @@
 fn main() {
     build_native_cxx_probe();
+    build_node_toolkit();
     println!("cargo:rerun-if-env-changed=VIBEOS_WASMTIME_COREMARK");
     println!("cargo:rerun-if-env-changed=VIBEOS_COREMARK_ITERATIONS");
     println!("cargo:rerun-if-env-changed=VIBEOS_COREMARK_VALIDATION");
@@ -23,6 +24,19 @@ fn main() {
     let iterations = std::env::var("VIBEOS_COREMARK_ITERATIONS").unwrap_or_else(|_| "60000".into());
     assert!((1..=1_000_000).contains(&iterations.parse::<u32>().expect("iterations")));
     println!("cargo:rustc-env=VIBEOS_COREMARK_ITERATIONS={iterations}");
+}
+
+fn build_node_toolkit() {
+    println!("cargo:rerun-if-env-changed=VIBEOS_NODE_TOOLKIT");
+    if std::env::var_os("CARGO_FEATURE_NODE_TOOLKIT").is_none() { return; }
+    let path = std::path::PathBuf::from(std::env::var_os("VIBEOS_NODE_TOOLKIT")
+        .expect("node-toolkit requires VIBEOS_NODE_TOOLKIT from prepare-node-toolkit.py"))
+        .canonicalize().expect("toolkit input");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let bytes = std::fs::read(path).expect("read toolkit");
+    assert!(bytes.len() <= 64 * 1024 * 1024 && bytes.starts_with(b"VIBETOOL1"));
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    std::fs::write(out.join("node-toolkit.pack"), bytes).expect("stage toolkit");
 }
 
 

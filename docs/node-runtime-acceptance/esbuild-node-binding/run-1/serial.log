@@ -1,0 +1,150 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 3
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 3
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x85596000..0xc0000000  (960936 KiB)
+  traps     stvec armed, PLIC ctx S/hart3, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x84e96000..0x85096000, MXR clear, RFENCE ready
+  read-only 50604 KiB .rodata 0x819b6000..0x84b21000; 4096 KiB COW capability-table pool
+  world     15 capability spaces, 1 typed channel, 6 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> quiet
+background component output muted
+[2Kvsh> mkdir @home/project
+[2Kvsh> echo 'const bridge = globalThis[Symbol.for("vibeos.esbuild")];' | write @home/project/common.cjs
+[2Kvsh> echo 'let encoded = "";' | write --append @home/project/common.cjs
+[2Kvsh> echo 'encoded += "0QAAAAAAAAAGBAAAAAcAAABjb21tYW5kAwkAAAB0cmFuc2Zvcm0HAAAAaW5wdXRGUwEABQAAAGlucHV0BBsAAABjb25zdCBh";' | write --append @home/project/common.cjs
+[2Kvsh> echo 'encoded += "bnN3ZXI6IG51bWJlciA9IDQyOwoFAAAAZmxhZ3MFBQAAAAMLAAAALS1sb2FkZXI9dHMDDAAAAC0tZm9ybWF0PWNqcwMPAAAA";' | write --append @home/project/common.cjs
+[2Kvsh> echo 'encoded += "LS1qc3gtZmFjdG9yeT1oAxQAAAAtLXNvdXJjZW1hcD1leHRlcm5hbAMYAAAALS1zb3VyY2VmaWxlPXNyYy9tYWluLnRz";' | write --append @home/project/common.cjs
+[2Kvsh> echo 'const packet = Buffer.from(encoded, "base64");' | write --append @home/project/common.cjs
+[2Kvsh> echo 'function check(data) { if (!Buffer.from(data).includes(Buffer.from("const answer = 42;"))) throw Error("bad transform"); }' | write --append @home/project/common.cjs
+[2Kvsh> echo 'module.exports = { bridge, packet, check };' | write --append @home/project/common.cjs
+[2Kvsh> echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/sync.cjs
+[2Kvsh> echo 'check(bridge.transformSync(packet));' | write --append @home/project/sync.cjs
+[2Kvsh> echo 'console.log("NODE_ESBUILD_" + "SYNC=ok");' | write --append @home/project/sync.cjs
+[2Kvsh> echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/async.cjs
+[2Kvsh> echo 'let ticks = 0; const clock = setInterval(() => ticks++, 10);' | write --append @home/project/async.cjs
+[2Kvsh> echo 'Promise.all([bridge.transform(packet), bridge.transform(packet)]).then(results => {' | write --append @home/project/async.cjs
+[2Kvsh> echo 'for (const result of results) check(result); clearInterval(clock);' | write --append @home/project/async.cjs
+[2Kvsh> echo 'if (ticks < 2) throw Error("timer starved"); console.log("NODE_ESBUILD_" + "ASYNC=ok ticks=" + ticks);' | write --append @home/project/async.cjs
+[2Kvsh> echo '}).catch(error => { clearInterval(clock); throw error; });' | write --append @home/project/async.cjs
+[2Kvsh> echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/mixed.cjs
+[2Kvsh> echo 'const pending = bridge.transform(packet); check(bridge.transformSync(packet));' | write --append @home/project/mixed.cjs
+[2Kvsh> echo 'pending.then(data => { check(data); console.log("NODE_ESBUILD_" + "MIXED=ok"); });' | write --append @home/project/mixed.cjs
+[2Kvsh> echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/exit.cjs
+[2Kvsh> echo 'bridge.transform(packet); setTimeout(() => process.exit(7), 20);' | write --append @home/project/exit.cjs
+[2Kvsh> echo 'const { bridge, packet, check } = require("./common.cjs");' | write @home/project/denied.cjs
+[2Kvsh> echo 'let rejected = false; try { bridge.transformSync(packet); } catch (e) { rejected = e.message.includes("status -3"); }' | write --append @home/project/denied.cjs
+[2Kvsh> echo 'if (!rejected) throw Error("unexpected authority"); console.log("NODE_ESBUILD_" + "DENIED=ok");' | write --append @home/project/denied.cjs
+[2Kvsh> node --root @home/project denied.cjs
+NODE_ESBUILD_DENIED=ok
+[2Kvsh> node-tool-probe --root @home/project sync.cjs
+WASI running
+WASI esbuild fuel=1600211145 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+NODE_ESBUILD_SYNC=ok
+[2Kvsh> node-tool-probe --root @home/project async.cjs
+WASI running
+WASI esbuild fuel=1600677492 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+WASI running
+WASI esbuild fuel=1600371022 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+NODE_ESBUILD_ASYNC=ok ticks=81
+[2Kvsh> node-tool-probe --root @home/project mixed.cjs
+WASI running
+WASI esbuild fuel=1602413225 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+WASI running
+WASI esbuild fuel=1598760194 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+NODE_ESBUILD_MIXED=ok
+[2Kvsh> node-tool-probe --root @home/project exit.cjs
+WASI running
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Cancelled reclaimed=true caps=0 waiters=0
+  vsh job %32: Returned(7)
+[2Kvsh> node-tool-probe --root @home/project sync.cjs
+WASI running
+WASI esbuild fuel=1602171829 max_required_fuel=131072
+WASI esbuild owner_peak_bytes=96523904
+WASI terminal=Exited(0) reclaimed=true caps=0 waiters=0
+NODE_ESBUILD_SYNC=ok
+[2Kvsh> 

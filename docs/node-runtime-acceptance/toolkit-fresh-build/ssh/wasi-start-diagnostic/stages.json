@@ -1,0 +1,28 @@
+{
+  "stages": [
+    [
+      7,
+      31643892000
+    ],
+    [
+      8,
+      31661247000
+    ],
+    [
+      9,
+      31662551000
+    ],
+    [
+      10,
+      31663229000
+    ]
+  ],
+  "meaning": {
+    "7": "esbuild module load start",
+    "8": "module load end",
+    "9": "WASI launch returned",
+    "10": "WasiInvocation::new entered",
+    "11": "WasiInvocation::new returned"
+  },
+  "result": "module load 17ms; timeout inside WASI constructor before running marker"
+}

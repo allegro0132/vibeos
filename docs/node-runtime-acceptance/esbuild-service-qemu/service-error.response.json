@@ -1,0 +1,25 @@
+{
+  "code": "",
+  "codeFS": false,
+  "errors": [
+    {
+      "detail": -1,
+      "id": "",
+      "location": {
+        "column": 13,
+        "file": "<stdin>",
+        "length": 1,
+        "line": 1,
+        "lineText": "const value: = ;",
+        "namespace": "",
+        "suggestion": ""
+      },
+      "notes": [],
+      "pluginName": "",
+      "text": "Unexpected \"=\""
+    }
+  ],
+  "map": "",
+  "mapFS": false,
+  "warnings": []
+}

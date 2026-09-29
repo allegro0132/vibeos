@@ -1,5 +1,6 @@
 #include "node-invocation.h"
 #include "node-process.h"
+#include "node-esbuild.h"
 #include "node.h"
 #include "env-inl.h"
 #include "uv.h"
@@ -8,10 +9,38 @@
 #include "libplatform/libplatform.h"
 #include "vibeos-process.h"
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace node { void SetIsolateCreateParamsForNode(v8::Isolate::CreateParams*); }
+namespace {
+// This environment owns a capability-rooted virtual cwd, not Node's global
+// process state. Keep kOwnsProcessState disabled (abort, credentials, etc.).
+// The non-owning bootstrap already binds cwd() to the uncached libuv getter.
+void VirtualChdir(const v8::FunctionCallbackInfo<v8::Value>& args) {
+  auto* isolate = args.GetIsolate();
+  auto invalid = [&](const char* message, const char* code) {
+    auto error = v8::Exception::TypeError(v8::String::NewFromUtf8(isolate, message).ToLocalChecked());
+    error.As<v8::Object>()->Set(isolate->GetCurrentContext(),
+        v8::String::NewFromUtf8Literal(isolate, "code"),
+        v8::String::NewFromUtf8(isolate, code).ToLocalChecked()).Check();
+    isolate->ThrowException(error);
+  };
+  if (args.Length() < 1 || !args[0]->IsString()) {
+    invalid("The directory argument must be a string", "ERR_INVALID_ARG_TYPE");
+    return;
+  }
+  v8::String::Utf8Value path(isolate, args[0]);
+  if (!*path) vibeos_native_fatal_exit(70);
+  if (std::memchr(*path, 0, path.length())) {
+    invalid("The directory argument must not contain null bytes", "ERR_INVALID_ARG_VALUE");
+    return;
+  }
+  const int status = uv_chdir(*path);
+  if (status) isolate->ThrowException(node::UVException(isolate, status, "chdir", nullptr, *path));
+}
+}
 extern "C" int vibeos_node_run(unsigned argc, const char* const* argv,
                                 const char* eval, size_t eval_length) {
   if (!argv || argc == 0 || argc > 128 || (!eval && eval_length) || eval_length > 1024 * 1024)
@@ -54,6 +83,12 @@ extern "C" int vibeos_node_run(unsigned argc, const char* const* argv,
     if (eval) exec_args = {"-e", std::string(eval, eval_length)};
     auto* env = node::CreateEnvironment(data, context, args, exec_args, flags);
     if (env) {
+      env->process_object()->Set(context,
+          v8::String::NewFromUtf8Literal(isolate, "chdir"),
+          v8::Function::New(context, VirtualChdir).ToLocalChecked()).Check();
+#ifdef VIBEOS_NODE_TOOLKIT
+      vibeos::EsbuildBridge esbuild(env, &loop);
+#endif
       // Node's normal startup dispatch reads invocation-owned options. No
       // mutation of the shared process CLI options is needed for -e.
       if (eval) {
@@ -96,6 +131,9 @@ extern "C" int vibeos_node_run(unsigned argc, const char* const* argv,
         caught.Reset();
       }
       node::Stop(env, node::StopFlags::kDoNotTerminateIsolate);
+#ifdef VIBEOS_NODE_TOOLKIT
+      esbuild.Close();
+#endif
       node::FreeEnvironment(env);
     }
     node::FreeIsolateData(data);

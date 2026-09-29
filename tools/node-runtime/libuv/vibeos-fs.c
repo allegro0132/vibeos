@@ -61,17 +61,37 @@ static void io_work(struct uv__work* work) {
   for (i = 0; i < req->nbufs; ++i) {
     if (req->bufs[i].len == 0) continue;
     if (req->file >= 3) {
+      const size_t done = req->fs_type == UV_FS_READ ? req->statbuf.st_ino : 0;
+      const size_t remaining = req->bufs[i].len - done;
+      int64_t offset = req->off;
+      if (offset >= 0) {
+        if (done > (uint64_t) INT64_MAX - (uint64_t) offset) {
+          req->result = UV_EOVERFLOW;
+          break;
+        }
+        offset += (int64_t) done;
+      }
       /* Keep the requested offset separate from the pending native ID. */
       if (req->statbuf.st_size == 0) {
         int64_t id = req->fs_type == UV_FS_READ
-            ? vibeos_native_file_read_begin_at(req->file, req->bufs[i].len, req->off)
+            ? vibeos_native_file_read_begin_at(req->file, remaining, offset)
             : vibeos_native_file_write_begin_at(req->file, req->bufs[i].base, req->bufs[i].len, req->off);
         if (id < 0) { req->result = result(id); break; }
         req->statbuf.st_size = (uint64_t) id;
       }
       req->result = result(req->fs_type == UV_FS_READ
-          ? vibeos_native_file_read_poll(req->statbuf.st_size, req->bufs[i].base, req->bufs[i].len)
+          ? vibeos_native_file_read_poll(req->statbuf.st_size, req->bufs[i].base + done, remaining)
           : vibeos_native_mutation_poll(req->statbuf.st_size));
+      if (req->fs_type == UV_FS_READ && req->result >= 0) {
+        const size_t received = req->result;
+        req->statbuf.st_size = 0; /* The completed native handle was consumed. */
+        req->statbuf.st_ino = done + received;
+        // The native bridge bounds each poll to one small filesystem chunk.
+        // A regular-file read must fill the requested buffer or reach EOF:
+        // Node's Promise readFile treats a short read as the final file data.
+        req->result = received && done + received < req->bufs[i].len
+            ? UV_EAGAIN : (ssize_t) (done + received);
+      }
     } else {
       req->result = result(req->fs_type == UV_FS_READ
           ? vibeos_native_try_read(req->file, req->bufs[i].base, req->bufs[i].len)
@@ -113,6 +133,7 @@ static int fs_io(uv_fs_type type, uv_loop_t* loop, uv_fs_t* req, uv_file fd,
   if (offset < -1) return UV_EINVAL;
   if (offset >= 0 && fd >= 0 && fd < 3) { req->result = UV_ESPIPE; return UV_ESPIPE; }
   req->statbuf.st_size = 0;
+  req->statbuf.st_ino = 0; /* Bytes accumulated for this asynchronous read. */
   for (i = 0; i < nbufs; ++i)
     if ((!bufs[i].base && bufs[i].len) || bufs[i].len > __PTRDIFF_MAX__)
       return UV_EINVAL;
@@ -671,6 +692,12 @@ int uv__vibeos_poll_requests(uv_loop_t* loop) {
      * run on the Rust executor stack, so only report these requests as ready. */
     if (req->result == UV_EAGAIN && needs_native_stack(req)) { completed = 1; continue; }
     if (req->result == UV_EAGAIN) work->work(work);
+    // More chunks are runnable, not blocked on an external event. Return to
+    // the event-loop phases before the next bounded poll instead of parking
+    // with no outstanding native read/waker. Pending native reads still park.
+    if (req->result == UV_EAGAIN && req->fs_type == UV_FS_READ &&
+        req->file >= 3 && req->statbuf.st_size == 0 && req->statbuf.st_ino != 0)
+      completed = 1;
     if (req->result != UV_EAGAIN) completed = 1;
   }
   return completed;

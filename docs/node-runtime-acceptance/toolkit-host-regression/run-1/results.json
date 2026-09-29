@@ -1,0 +1,40 @@
+[
+  {
+    "package": "vibeos-file-store",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "vibeos-file-store"
+    ],
+    "exit_code": 0,
+    "seconds": 28.48775170906447
+  },
+  {
+    "package": "vibeos-vsh",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "vibeos-vsh",
+      "--features",
+      "file-tree"
+    ],
+    "exit_code": 0,
+    "seconds": 38.06095229194034
+  },
+  {
+    "package": "vibeos-wasi-command",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "vibeos-wasi-command"
+    ],
+    "exit_code": 0,
+    "seconds": 14.698596749920398
+  }
+]

@@ -1,0 +1,6 @@
+{
+  "scripts/test-esbuild-qemu.py": "81779331d5de9a5fdcf84020e2ab8cfe8dc75c7e3fc15c30455b2681945a15f1",
+  "scripts/esbuild-protocol.py": "6c01983fe161185b1935b0264279699e7d3ad5efbd9453b08c015c9b2e188d31",
+  "scripts/test-native-esbuild-protocol.py": "294a3e8bcd71903d90fb537d224aef761a24072ce50ea418a72db4b69b073b85",
+  "kernel/src/native_esbuild_protocol.rs": "faadeabc228d03f02cf0fa3f46ce70c37c74b042d9f19217b425c62c7b64aeb0"
+}

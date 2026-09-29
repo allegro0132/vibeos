@@ -1,0 +1,52 @@
+[
+  {
+    "path": "configure/configure.stdout.gz",
+    "uncompressed_sha256": "d227db2fd41bd538b2c1ef17d06795c6c12a1638f6dbd621680c82017c4a0ffc",
+    "uncompressed_bytes": 39
+  },
+  {
+    "path": "configure/configure.stderr.gz",
+    "uncompressed_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "uncompressed_bytes": 0
+  },
+  {
+    "path": "engine/engine.stderr.gz",
+    "uncompressed_sha256": "dbbb8843b80df6866c03108da81f270328565323cb5f8c7deb53495df769503a",
+    "uncompressed_bytes": 54277725
+  },
+  {
+    "path": "engine/engine.stdout.gz",
+    "uncompressed_sha256": "37683f03d8f787eaa8009b1f5a5b90deee01271b883136fe1eed8bd352372bd0",
+    "uncompressed_bytes": 504716
+  },
+  {
+    "path": "uv/uv.stdout.gz",
+    "uncompressed_sha256": "188a07ac5a203b9ef81ba9df63655cf5f89ed16bb56b3ef3f941ac9f1a6c2cc1",
+    "uncompressed_bytes": 8368
+  },
+  {
+    "path": "uv/uv.stderr.gz",
+    "uncompressed_sha256": "125dffab7e617d915bc3f1670e48b6e1ff0ac79b8480fe3d08fb6045570c85d9",
+    "uncompressed_bytes": 564495
+  },
+  {
+    "path": "node-deps/node-deps.stdout.gz",
+    "uncompressed_sha256": "775dcc3a45df3ad462ab0d1a8491184081d371ea499aaa8ff142db78f23853eb",
+    "uncompressed_bytes": 19013
+  },
+  {
+    "path": "node-deps/node-deps.stderr.gz",
+    "uncompressed_sha256": "f5e76069d56bfba86e8ed2625c615d1a95364fafdb6b55b9bc84a6e426beba2e",
+    "uncompressed_bytes": 562872
+  },
+  {
+    "path": "node/node.stdout.gz",
+    "uncompressed_sha256": "6a126f357ae6ec0d0c205d79c0092eda380e3d20cc05f4edd6eca106391e758d",
+    "uncompressed_bytes": 19317
+  },
+  {
+    "path": "node/node.stderr.gz",
+    "uncompressed_sha256": "e61c35992dc8b06d8841121bf7db7cf2a3a65513a9457a6640c5286369690ddb",
+    "uncompressed_bytes": 563265
+  }
+]

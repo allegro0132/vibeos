@@ -148,6 +148,7 @@ static int ready(void* arg) {
   if (vibeos_native_is_cancelled() || loop->stop_flag || loop->closing_handles ||
       !uv__queue_empty(&loop->pending_queue)) return 1;
   if (!uv__queue_empty(cpu_queue(loop))) return 1;
+  if (vibeos_native_external_ready()) return 1;
   if (uv__vibeos_poll_requests(loop)) return 1;
   if (uv__vibeos_poll_streams(loop)) return 1;
   uv__queue_foreach(q, &loop->async_handles) {

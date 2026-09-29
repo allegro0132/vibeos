@@ -1,0 +1,29 @@
+quiet
+@sleep 0.3
+mkdir @home/ts-project
+@sleep 0.3
+echo '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true,"declaration":true,"outDir":"dist"},"include":["*.ts"]}' | write @home/ts-project/tsconfig.json
+@sleep 0.3
+echo 'export const answer: number = 42;' | write @home/ts-project/dep.ts
+@sleep 0.3
+echo "import { answer } from './dep'; export const result: number = answer + 1;" | write @home/ts-project/main.ts
+@sleep 0.3
+@send tsc --root @home/ts-project --version
+@sleep 0.3
+@expect Version 5.9.3
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json --noEmit; then node --root @home/ts-project -e "if(require('fs').existsSync('dist')) throw Error('unexpected output'); console.log('TSC_GUEST_' + 'CHECK=ok')"; else node --root @home/ts-project -e "console.log('TSC_GUEST_' + 'CHECK=failed')"; fi
+@sleep 0.3
+@expect TSC_GUEST_CHECK=
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json; then node --root @home/ts-project -e "const fs=require('fs'); if(!fs.readFileSync('dist/main.d.ts','utf8').includes('result: number')) throw Error('missing declaration'); console.log('TSC_GUEST_' + 'EMIT=' + require('./dist/main.js').result)"; else node --root @home/ts-project -e "console.log('TSC_GUEST_' + 'EMIT=failed')"; fi
+@sleep 0.3
+@expect TSC_GUEST_EMIT=
+@sleep 0.3
+echo 'export const bad: number = "wrong";' | write @home/ts-project/bad.ts
+@sleep 0.3
+@send if tsc --root @home/ts-project -p tsconfig.json --noEmit; then node --root @home/ts-project -e "console.log('TSC_GUEST_' + 'DIAGNOSTIC=missing')"; else node --root @home/ts-project -e "console.log('TSC_GUEST_' + 'DIAGNOSTIC=nonzero')"; fi
+@sleep 0.3
+@expect TSC_GUEST_DIAGNOSTIC=
+@sleep 1
+@quit

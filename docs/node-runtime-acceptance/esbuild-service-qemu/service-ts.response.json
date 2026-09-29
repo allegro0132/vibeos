@@ -1,0 +1,8 @@
+{
+  "code": "const answer = 42;\n",
+  "codeFS": false,
+  "errors": [],
+  "map": "{\n  \"version\": 3,\n  \"sources\": [\"src/main.ts\"],\n  \"sourcesContent\": [\"const answer: number = 42;\\n\"],\n  \"mappings\": \"AAAA,MAAM,SAAiB;\",\n  \"names\": []\n}\n",
+  "mapFS": false,
+  "warnings": []
+}

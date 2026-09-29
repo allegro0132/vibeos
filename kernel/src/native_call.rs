@@ -573,6 +573,7 @@ pub(super) async fn parking_probe() {
     native_async_wait_probe().await;
     native_stdio_probe().await;
     native_unlink_probe().await;
+    native_tool_mount_probe().await;
     native_open_probe().await;
     #[cfg(feature = "queued-entropy")]
     native_entropy_probe().await;
@@ -847,6 +848,69 @@ async fn native_stdio_probe() {
     assert_eq!(revoked.pending_waiters(), 0);
     crate::println!("NATIVE FD PASS pipe=1 close=1 stale=1 revoked_cleanup=1 drained=1");
     crate::println!("NATIVE STDIO PASS no_grant=1 backpressure=1 ordered=1 read=1 eof=1 revoked=1 waiters=0");
+}
+
+#[cfg(feature = "native-cxx-probe")]
+async fn native_tool_mount_probe() {
+    use alloc::{boxed::Box, sync::Arc};
+    use crate::{cap::Rights, native_files::*, native_tls::NativeSyncDomain};
+    use vibeos_file_store::{FileTreeRoot, RelPath};
+    let project = Arc::new(FileTreeRoot::new_empty(0x746f6f6c70726f6a).unwrap());
+    let tools = Arc::new(FileTreeRoot::new_empty(0x746f6f6c726f6f74).unwrap());
+    let mut tx = tools.begin().unwrap();
+    tx.mkdir(&RelPath::parse("tools").unwrap(), false).unwrap();
+    tx.write_chunks(&RelPath::parse("secret").unwrap(), [b"outside".as_slice()], false).unwrap();
+    tx.write_chunks(&RelPath::parse("tools/compiler.js").unwrap(), [b"official-tool".as_slice()], false).unwrap();
+    tx.symlink("compiler.js", &RelPath::parse("tools/alias.js").unwrap()).unwrap();
+    tx.symlink("../secret", &RelPath::parse("tools/escape").unwrap()).unwrap();
+    tx.commit_authoritative().await.unwrap();
+    let space = crate::world::Space::new("native-tools-authority");
+    let project_cap = space.0.lock().mint(project, Rights::ALL);
+    let tool_cap = space.0.lock().mint(tools.clone(), Rights::ALL);
+    let project_grant = FileGrant::new(space.clone(), project_cap).unwrap();
+    let tool_grant = FileGrant::new(space.clone(), tool_cap).unwrap()
+        .directory(RelPath::parse("tools").unwrap()).unwrap();
+    let run = NativeAsync::try_owned_entry(Box::new(move || {
+        let path = b"/.vibeos-tools/compiler.js";
+        let fd = unsafe { vibeos_native_open(path.as_ptr(), path.len(), 0) };
+        assert!(fd >= 3);
+        let mut bytes = [0u8; 64];
+        assert_eq!(unsafe { vibeos_native_file_read_at(fd, bytes.as_mut_ptr(), bytes.len(), 0) }, b"official-tool".len() as isize);
+        assert_eq!(&bytes[..b"official-tool".len()], b"official-tool");
+        for mode in [1, 2, 4, 5, 17, 33] {
+            assert_eq!(unsafe { vibeos_native_open(path.as_ptr(), path.len(), mode) }, -3);
+        }
+        assert_eq!(unsafe { vibeos_native_unlink(path.as_ptr(), path.len()) }, -3);
+        let alias = b"/.vibeos-tools/alias.js";
+        assert_eq!(unsafe { vibeos_native_realpath(alias.as_ptr(), alias.len(), bytes.as_mut_ptr(), bytes.len()) }, path.len() as isize);
+        assert_eq!(&bytes[..path.len()], path);
+        let escape = b"/.vibeos-tools/escape";
+        assert_eq!(unsafe { vibeos_native_open(escape.as_ptr(), escape.len(), 0) }, -3);
+        let dir = b"/.vibeos-tools";
+        assert_eq!(unsafe { vibeos_native_chdir(dir.as_ptr(), dir.len()) }, 0);
+        assert_eq!(unsafe { vibeos_native_getcwd(bytes.as_mut_ptr(), bytes.len()) }, dir.len() as isize);
+        assert_eq!(&bytes[..dir.len()], dir);
+        let relative = b"compiler.js";
+        let relative_fd = unsafe { vibeos_native_open(relative.as_ptr(), relative.len(), 0) };
+        assert!(relative_fd > fd);
+        assert_eq!(unsafe { vibeos_native_unlink(relative.as_ptr(), relative.len()) }, -3);
+        assert_eq!(unsafe { vibeos_native_chdir(b"/".as_ptr(), 1) }, 0);
+        // A read-only tool mount must not make the independent project read-only.
+        let writable = unsafe { vibeos_native_open(b"output.js".as_ptr(), 9, 5) };
+        assert!(writable > relative_fd);
+        assert_eq!(close(writable), 0);
+        space.0.lock().revoke(tool_cap).unwrap();
+        assert_eq!(unsafe { vibeos_native_file_read_at(fd, bytes.as_mut_ptr(), bytes.len(), 0) }, -3);
+        assert_eq!(unsafe { vibeos_native_open(path.as_ptr(), path.len(), 0) }, -3);
+        assert_eq!(close(fd), 0);
+        assert_eq!(close(relative_fd), 0);
+        42
+    }), 1024 * 1024, NativeSyncDomain::new()).unwrap();
+    run.tls().set_files(project_grant);
+    run.tls().set_tools(tool_grant);
+    assert_eq!(run.run().await.0, 42);
+    assert!(tools.snapshot().stat(&RelPath::parse("tools/compiler.js").unwrap(), true).is_ok());
+    crate::println!("NATIVE TOOL MOUNT read=1 readonly=1 cwd=1 realpath=1 escape=denied revoked_fd=denied project_write=1 PASS");
 }
 
 #[cfg(feature = "native-cxx-probe")]

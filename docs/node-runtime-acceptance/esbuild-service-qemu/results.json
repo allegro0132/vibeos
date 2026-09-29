@@ -1,0 +1,47 @@
+{
+  "backend": "VibeOS/QEMU/Wasmi",
+  "stage": "esbuild transforms (not Node/V8)",
+  "module_sha256": "5090d398c1b47b40fc708510d1a9bc11d5381c46de7ea2fac31ed008ef78ff78",
+  "kernel_sha256": "66d097b69321a6f03de28ae1e50b63d6235455394b2ca624d9c0a8cc661f20c5",
+  "repository_commit": "f7cb46d4e324202ddfee9a7116cdaf693d55d2f7",
+  "cases": [
+    {
+      "case": "service-ts",
+      "argv": [
+        "--service=0.25.0"
+      ],
+      "exit_code": 0,
+      "seconds": 13.903,
+      "stdin_sha256": "f4b084e51d7bfbe25a7b4adea96700ab6b15620953cfe1db4514557e2f9cdc87",
+      "owner_peak_bytes": 96523904,
+      "consumed_fuel": 1601427747,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "service-tsx",
+      "argv": [
+        "--service=0.25.0"
+      ],
+      "exit_code": 0,
+      "seconds": 13.881,
+      "stdin_sha256": "56c85a4f862aad748b04598d3b7e889c938488f32f1e97bc5c51ce2a29d22d98",
+      "owner_peak_bytes": 96523904,
+      "consumed_fuel": 1605189129,
+      "maximum_fuel_requirement": 131072
+    },
+    {
+      "case": "service-error",
+      "argv": [
+        "--service=0.25.0"
+      ],
+      "exit_code": 0,
+      "seconds": 14.198,
+      "stdin_sha256": "04f7ddf9598ed9504499aac17a1b76eaa05ba456f3b7cf1160a1c930936e6d02",
+      "owner_peak_bytes": 96523904,
+      "consumed_fuel": 1530307155,
+      "maximum_fuel_requirement": 131072
+    }
+  ],
+  "status": "PASS",
+  "reclaimed_invocations": 3
+}

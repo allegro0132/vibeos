@@ -1,0 +1,33 @@
+{
+  "kernel_sha256": "f2eadced3bb011e9f99674942c731a1f04262894ab1447c853de9555f377a8fa",
+  "results": [
+    {
+      "name": "binding",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-esbuild-node-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-js-probe-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-api-qualification-1/binding"
+      ],
+      "exit_code": 0,
+      "seconds": 129.13365962496027,
+      "kernel_unchanged": true
+    },
+    {
+      "name": "api",
+      "command": [
+        "python3",
+        "/Users/ziangwang/Sources/vibeos/scripts/test-esbuild-api-qemu.py",
+        "--kernel",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-js-probe-link-1/node-shell.elf",
+        "--work",
+        "/Users/ziangwang/Sources/vibeos/target/node-runtime/m3-final-api-qualification-1/api"
+      ],
+      "exit_code": 0,
+      "seconds": 67.27228887495585,
+      "kernel_unchanged": true
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "stages": [
+    [
+      0,
+      6102594000
+    ],
+    [
+      1,
+      6191020000
+    ],
+    [
+      2,
+      6192121000
+    ],
+    [
+      3,
+      6517358000
+    ]
+  ],
+  "meaning": {
+    "0": "toolkit initialization start",
+    "1": "toolkit initialization end",
+    "2": "Node process initialized",
+    "3": "before LoadEnvironment",
+    "4": "after LoadEnvironment"
+  },
+  "scope": "temporary stage diagnostics; SSH gate fails"
+}

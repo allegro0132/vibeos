@@ -61,6 +61,11 @@ def main():
         '-drive', f'if=none,id=project,format=raw,file={disk},cache=writeback',
         '-device', 'virtio-blk-device,drive=project,queue-size=8',
         '-global', 'virtio-mmio.force-legacy=false']
+    inputs = [ROOT / 'services/file-store/src/lib.rs'] + [Path(__file__), ROOT / 'scripts/qemu-vsh-driver.py',
+              ROOT / 'kernel/src/vsh_platform.rs', ROOT / 'kernel/Cargo.toml',
+              ROOT / 'services/wasi-command/src/lib.rs', ROOT / 'components/vsh/src/engine.rs']
+    inputs += sorted((ROOT / 'kernel/src').glob('native_*.rs'))
+    hashes = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}
     started = time.monotonic()
     result = subprocess.run(['python3', str(ROOT / 'scripts/qemu-vsh-driver.py'),
         '--case', str(case), '--log', str(work / 'serial.log'), '--', *command],
@@ -77,14 +82,11 @@ def main():
     checks['error_source_location'] = 'at [eval]:1:7' in serial
     checks['idle_interrupted'] = 'VSH_NODE_IDLE_MISSED' not in serial
     checks['qemu_exit'] = result.returncode == 0
-    inputs = [Path(__file__), ROOT / 'scripts/qemu-vsh-driver.py',
-              ROOT / 'kernel/src/vsh_platform.rs', ROOT / 'kernel/Cargo.toml',
-              ROOT / 'services/wasi-command/src/lib.rs', ROOT / 'components/vsh/src/engine.rs']
-    inputs += sorted((ROOT / 'kernel/src').glob('native_*.rs'))
+    checks['source_unchanged'] = all(hashlib.sha256((ROOT / p).read_bytes()).hexdigest() == h for p, h in hashes.items())
     report = dict(passed=all(checks.values()), checks=checks, command=command,
                   seconds=time.monotonic()-started,
                   kernel_sha256=hashlib.sha256(kernel.read_bytes()).hexdigest(),
-                  source_sha256={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs})
+                  source_sha256=hashes)
     (work / 'results.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps(report, indent=2))
     return 0 if report['passed'] else 1

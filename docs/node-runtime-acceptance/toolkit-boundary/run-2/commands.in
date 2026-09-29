@@ -1,0 +1,83 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo original | write @home/secret
+@sleep 0.3
+echo '{"type":"module"}' | write @home/project/package.json
+@sleep 0.3
+echo 'import fs from "node:fs";' | write @home/project/boundary.ts
+@sleep 0.3
+echo 'const tool = "/.vibeos-tools/node_modules/typescript/package.json";' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'const original = fs.readFileSync(tool, "utf8");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'let denied = 0;' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'function reject(action: () => void, codes = ["EACCES"]) { try { action(); } catch (e: any) {' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (codes.includes(e.code)) { denied++; return; } throw e; } throw Error("authority escaped"); }' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (fs.existsSync("/secret") || fs.existsSync("/secret.cjs")) throw Error("sibling visible");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.readFileSync("../secret"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.realpathSync("../secret"), ["EACCES", "ENOENT"]);' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync("../secret", "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync(tool, "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.openSync(tool, "r+"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.unlinkSync(tool));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.renameSync(tool, "stolen.json"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.mkdirSync("/.vibeos-tools/new-dir"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'process.chdir("/.vibeos-tools/node_modules/typescript");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (process.cwd() !== "/.vibeos-tools/node_modules/typescript") throw Error("tool cwd");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'reject(() => fs.writeFileSync("package.json", "changed"));' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'process.chdir("/");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'try { await fs.promises.writeFile(tool, "changed"); throw Error("async write admitted"); } catch (e: any) {' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (e.code !== "EACCES") throw e; denied++; }' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (await fs.promises.readFile(tool, "utf8") !== original) throw Error("tool altered");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'fs.writeFileSync("allowed.txt", "yes");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'if (fs.readFileSync("allowed.txt", "utf8") !== "yes" || denied !== 10) throw Error("boundary checks");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "PASS=10");' | write --append @home/project/boundary.ts
+@sleep 0.3
+echo 'const fs = require("fs");' | write @home/project/ungranted.cjs
+@sleep 0.3
+echo 'if (fs.existsSync("/.vibeos-tools/node_modules/typescript/package.json")) throw Error("ambient tool authority");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "UNGRANTED=ok");' | write --append @home/project/ungranted.cjs
+@sleep 0.3
+echo 'const fs = require("fs");' | write @home/project/check-secret.cjs
+@sleep 0.3
+echo 'if (fs.readFileSync("secret", "utf8").trim() !== "original") throw Error("secret modified");' | write --append @home/project/check-secret.cjs
+@sleep 0.3
+echo 'console.log("TOOLKIT_BOUNDARY_" + "SECRET=unchanged");' | write --append @home/project/check-secret.cjs
+@sleep 0.3
+@send node --root @home/project ungranted.cjs
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_UNGRANTED=ok
+@sleep 0.3
+@send tsx --root @home/project boundary.ts
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_PASS=10
+@sleep 0.3
+@send node --root @home project/check-secret.cjs
+@sleep 0.3
+@expect TOOLKIT_BOUNDARY_SECRET=unchanged
+@sleep 1
+@quit

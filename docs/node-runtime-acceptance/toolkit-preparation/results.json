@@ -1,0 +1,23 @@
+{
+  "passed": true,
+  "checks": {
+    "offline_reproducible": true,
+    "manifest_matches_files": true,
+    "fixed_metadata": true,
+    "archive_members": true,
+    "official_tsc_and_declarations": true,
+    "tsx_runtime_dependency_closure": true,
+    "refuse_existing_output": true,
+    "reject_corrupt_archive": true,
+    "failure_does_not_publish": true
+  },
+  "archive_sha256": "d3704c60112a59e0be70b3175863bf50fae0d7a66f17a513fd3302e83193a1a5",
+  "files": 200,
+  "target_execution": "NOT_RUN",
+  "source_sha256": {
+    "scripts/prepare-node-toolkit.py": "ebc930ee49459fab4f8c5da5e79b9cf4c7c57d0d0a8e646c6c63a4745057d7a0",
+    "scripts/node-runtime.py": "c7bb5f632ebd35f0f3e6dc7b57e99592f4d782aaa11ef919cb3c968d3d7b85f6",
+    "tools/node-runtime/toolkit.lock.json": "4e9c0d3aa709c4895e398557cfbfd13e3b1160783100084a323dcb52bbd21d06",
+    "tools/node-runtime/sources.lock.json": "9080453c5e877f8c1958446b00581b76e2a9fa6eac3844f311760c3dd5c06a34"
+  }
+}

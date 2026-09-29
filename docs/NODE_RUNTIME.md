@@ -3,8 +3,10 @@
 **Status: real V8 and official esbuild WASI execute on QEMU. Native Node now
 runs through capability-rooted local VSH and authorized OpenSSH PTY sessions.
 CJS/ESM, files, stdio/pipes, timers, exact exit status and cooperative cancellation
-pass target tests. Official tsc/tsx execution and final safety/regression
-qualification remain incomplete.**
+pass target tests. Official tsc now checks projects, emits JS/declarations,
+and reports type errors on target. Adapted upstream tsx also executes TS/TSX
+projects on target. Complete fresh-build M3 qualification passes; the full
+safety/lifecycle audit and final regression milestone remain incomplete.**
 
 [Current compatibility and limits](NODE_RUNTIME_COMPATIBILITY.md).
 
@@ -27,22 +29,44 @@ retains its original internal milestone labels.
   The SSH/VSH transport retains its existing buffered command-output semantics.
   [Launcher lifecycle evidence](node-runtime-acceptance/node-launcher-entry/README.md)
   records earlier 100-cycle execution and the subsequent ownership fixes.
-- **M3 — TypeScript tools:** pending official tsc and adapted upstream tsx
-  project execution, diagnostics, declarations, TSX and source locations.
-- **M4 — safety and lifecycle:** pending complete authority/revocation,
-  infinite-loop cancellation, output backpressure and 100-cycle reclamation.
-- **M5 — regression and evidence:** pending final affected host/QEMU suites,
-  reproducible complete build, timing/memory records and compatibility matrix.
+- **M3 — TypeScript tools:** complete. [Fresh build and final target evidence](node-runtime-acceptance/toolkit-fresh-build/README.md)
+  qualifies the full toolchain on QEMU, including authorized OpenSSH PTY use.
+  [Official tsc evidence](node-runtime-acceptance/tsc-qemu/README.md)
+  covers project checking, noEmit, JS/declaration emission, running emitted JS
+  and source-positioned type diagnostics. The adapted official esbuild JS API
+  passes TS/TSX, custom JSX factory, source-map and diagnostic checks on QEMU;
+  see [API evidence](node-runtime-acceptance/esbuild-api/README.md).
+  The [native transport](node-runtime-acceptance/esbuild-node-binding/README.md)
+  also passes Promise, mixed-call and exit-cleanup checks. [Adapted upstream
+  tsx](node-runtime-acceptance/tsx-qemu/README.md) now passes CJS/ESM, dynamic
+  import, offline modules, custom JSX factory and mapped exceptions on QEMU.
+  The final production image passes tsc, tsx, Node, directory boundaries,
+  transform cancellation, backpressure, OOM and 100 launches; a matching
+  probe profile passes the official esbuild API and Promise/exit-cleanup suite.
+- **M4 — safety and lifecycle:** partial. Existing Node tests cover root
+  boundaries, parent-capability revocation, and CPU/idle cancellation. Toolkit
+  tests cover read-only tools, cwd boundaries, [output backpressure](node-runtime-acceptance/node-backpressure/README.md),
+  [100 production launches](node-runtime-acceptance/node-cycles/README.md),
+  [transform cancellation](node-runtime-acceptance/tsx-cancel/README.md), and
+  [unrecoverable OOM](node-runtime-acceptance/node-oom/README.md).
+  The production cycle test's rounded heap samples do not prove precise
+  handle/capability reclamation. Complete final-image authority/revocation and
+  resource-inventory qualification remain outstanding.
+- **M5 — regression and evidence:** partial. Fresh complete build records,
+  toolkit timings, memory observations, host tests and default-image file-tree
+  regression are retained. Final WASI/MMU and affected-suite qualification
+  after the remaining M4 work is still outstanding.
 
 Completed milestones are committed and pushed to `implement_nodejs`. The full
 goal stays open until all agreed target execution and qualification requirements
-pass; M3, the full M4 audit and final M5 qualification remain outstanding.
+pass; the full M4 audit and final M5 qualification remain outstanding.
 
 The implementation uses real Node.js with its bundled V8/libuv, statically linked
 into an opt-in QEMU image. V8 starts JIT-less. Resource access remains rooted in
 explicit capabilities. The first release targets offline projects; npm online
 installation, network services, child processes, user workers, native addons and
-watch are excluded. The upstream tsx loading/transform adaptation remains pending.
+watch are excluded. The upstream tsx loading/transform adaptation is implemented
+and qualified through the complete fresh-build target suite.
 Optional node:sqlite and SQLite-backed Web Storage are excluded with upstream
 `--without-sqlite`; their exact runtime rejection remains unqualified.
 
@@ -58,9 +82,11 @@ Optional node:sqlite and SQLite-backed Web Storage are excluded with upstream
 | tsx | 4.19.3 | Official npm package SHA-512 integrity and source commit |
 | esbuild WASI Preview 1 | 0.25.0 | Official npm package integrity, archive SHA-256 and module SHA-256 |
 
-This is a lock for the feasibility inputs, **not** a complete transitive dependency
-lock. The tsx dependency tree still needs qualification. Node's V8/libuv sources
-are already included in the verified source archive. A separate
+This source lock is supplemented by `tools/node-runtime/toolkit.lock.json`,
+which pins the offline tool packages and transitive dependencies used by the
+adapted tsx launcher. Packaging manifests record every payload and adapter hash;
+the prepared toolkit has passed reproducibility and target execution checks.
+Node's V8/libuv sources are included in the verified source archive. A separate
 `tools/node-runtime/toolchain.lock.json` pins xPack RISC-V GCC 14.2.0-3, including
 newlib and static libstdc++, against its upstream release checksums.
 

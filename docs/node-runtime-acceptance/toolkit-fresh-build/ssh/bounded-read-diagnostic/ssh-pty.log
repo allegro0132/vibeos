@@ -1,0 +1,26 @@
+vsh> node --root @home -e "require('fs').mkdirSync('ssh-project'); console.log('SSH_NODE_' + 'SETUP=ok')"
+SSH_NODE_SETUP=ok
+vsh> node --root @home/ssh-project -e "console.log('SSH_NODE_' + 'EVAL=42')"
+SSH_NODE_EVAL=42
+vsh> echo wire-input | node --root @home/ssh-project -e "let s=''; process.stdin.on('data',x=>s+=x); process.stdin.on('end',()=>console.log('SSH_NODE_'+'STDIN='+s.trim()))"
+SSH_NODE_STDIN=wire-input
+vsh> node --root @home/ssh-project -e "process.exit(7)"
+  vsh job %4: Returned(7)
+vsh> node --root @home/ssh-project -e "require('fs').writeFileSync('cpu-entered','yes'); console.log('SSH_NODE_'+'CPU_READY'); for(;;){}"
+^C
+SSH_NODE_CPU_READY
+  vsh job %5: Cancelled
+vsh> node --root @home/ssh-project -e "if(require('fs').readFileSync('cpu-entered','utf8')!=='yes')throw Error('loop not reached'); console.log('SSH_NODE_'+'AFTER_CANCEL=ok')"
+SSH_NODE_AFTER_CANCEL=ok
+vsh> node --root @home/ssh-project -e 'require("fs").writeFileSync("main.ts","export const value: number = 42; console.log(\"SSH_TSX_\" + \"OK=\" + value);");console.log("SSH_TOOL_"+"SOURCE=ok")'
+SSH_TOOL_SOURCE=ok
+vsh> node --root @home/ssh-project -e 'require("fs").writeFileSync("tsconfig.json","{\"compilerOptions\":{\"target\":\"ES2020\",\"module\":\"commonjs\",\"outDir\":\"dist\",\"declaration\":true},\"include\":[\"main.ts\"]}");console.log("SSH_TOOL_"+"CONFIG=ok")'
+SSH_TOOL_CONFIG=ok
+vsh> tsc --root @home/ssh-project --version
+Version 5.9.3
+vsh> if tsc --root @home/ssh-project -p tsconfig.json; then node --root @home/ssh-project -e "if(!require('fs').readFileSync('dist/main.d.ts','utf8').includes('value: number'))throw Error('declaration'); console.log('SSH_TSC_'+'EMIT=ok')"; fi
+SSH_TSC_EMIT=ok
+vsh> node --root @home/ssh-project dist/main.js
+SSH_TSX_OK=42
+vsh> tsx --root @home/ssh-project main.ts
+Timeout, server 127.0.0.1 not responding.

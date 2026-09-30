@@ -1,12 +1,12 @@
-# Native JavaScript / TypeScript port: feasibility gate
+# Native JavaScript / TypeScript port
 
 **Status: real V8 and official esbuild WASI execute on QEMU. Native Node now
 runs through capability-rooted local VSH and authorized OpenSSH PTY sessions.
 CJS/ESM, files, stdio/pipes, timers, exact exit status and cooperative cancellation
 pass target tests. Official tsc now checks projects, emits JS/declarations,
 and reports type errors on target. Adapted upstream tsx also executes TS/TSX
-projects on target. Complete fresh-build M3 and M4 safety/lifecycle qualification pass;
-the final regression milestone remains incomplete.**
+projects on target. The agreed M1–M5 QEMU qualification is complete, including
+final production-image regressions. See the disclosed test limitations below.**
 
 [Current compatibility and limits](NODE_RUNTIME_COMPATIBILITY.md).
 
@@ -51,14 +51,15 @@ retains its original internal milestone labels.
   with exact stable non-cache allocator occupancy and synchronization counts;
   file/TLS/page owners, invocation grants, leases and I/O waiters are reclaimed.
   Intentional bounded process caches remain explicitly inventoried.
-- **M5 — regression and evidence:** partial. Fresh complete build records,
-  toolkit timings, memory observations, host tests and default-image file-tree
-  regression are retained. Final WASI/MMU and affected-suite qualification
-  after the remaining M4 work is still outstanding.
+- **M5 — regression and evidence:** complete. The [final qualification](node-runtime-acceptance/final-regression/README.md)
+  passes production Node/tsc/tsx, SSH with the original keepalive, esbuild APIs,
+  exclusions, 100 launches, and default file/VSH/WASI/MMU regressions. Affected
+  host suites pass; the expanded Python suite has one documented pre-existing
+  frontend-composition failure. Versions, logs, timings, memory observations
+  and the [requirement audit](node-runtime-acceptance/final-regression/requirements.md)
+  are retained. This is the agreed first-release scope, not full Node compatibility.
 
-Completed milestones are committed and pushed to `implement_nodejs`. The full
-goal stays open until all agreed target execution and qualification requirements
-pass; final M5 qualification remains outstanding.
+Milestones are committed and pushed to `implement_nodejs`.
 
 The implementation uses real Node.js with its bundled V8/libuv, statically linked
 into an opt-in QEMU image. V8 starts JIT-less. Resource access remains rooted in

@@ -1,0 +1,91 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+mkdir @home/project/node_modules
+@sleep 0.3
+mkdir @home/project/node_modules/offline
+@sleep 0.3
+echo '{"type":"module"}' | write @home/project/package.json
+@sleep 0.3
+echo '{"compilerOptions":{"jsx":"react","jsxFactory":"h","jsxFragmentFactory":"Fragment","target":"ES2022"}}' | write @home/project/tsconfig.json
+@sleep 0.3
+echo 'export const value: number = 42;' | write @home/project/lib.cts
+@sleep 0.3
+echo 'import { value } from "./lib.cts";' | write @home/project/main.cts
+@sleep 0.3
+echo 'if (value + 1 !== 43) throw Error("CJS import"); console.log("TSX_TARGET_" + "CJS=43");' | write --append @home/project/main.cts
+@sleep 0.3
+echo 'export const value: number = 17;' | write @home/project/esm-lib.ts
+@sleep 0.3
+echo 'import { value } from "./esm-lib.js";' | write @home/project/main.ts
+@sleep 0.3
+echo 'const module = await import("./dynamic.ts");' | write --append @home/project/main.ts
+@sleep 0.3
+echo 'if (value + module.value !== 42) throw Error("ESM import"); console.log("TSX_TARGET_" + "ESM=42");' | write --append @home/project/main.ts
+@sleep 0.3
+echo 'export const value: number = 25;' | write @home/project/dynamic.ts
+@sleep 0.3
+echo 'function h(tag: string, props: any, ...children: any[]) { return {tag, children}; }' | write @home/project/view.tsx
+@sleep 0.3
+echo 'const view = <box>{42}</box>;' | write --append @home/project/view.tsx
+@sleep 0.3
+echo 'if (view.tag !== "box" || view.children[0] !== 42) throw Error("custom JSX factory");' | write --append @home/project/view.tsx
+@sleep 0.3
+echo 'console.log("TSX_TARGET_" + "JSX=42");' | write --append @home/project/view.tsx
+@sleep 0.3
+echo 'function fail(): never {' | write @home/project/error.ts
+@sleep 0.3
+echo 'throw new Error("TSX_MAPPED_ERROR");' | write --append @home/project/error.ts
+@sleep 0.3
+echo '}' | write --append @home/project/error.ts
+@sleep 0.3
+echo 'fail();' | write --append @home/project/error.ts
+@sleep 0.3
+echo '{"name":"offline","main":"index.cjs"}' | write @home/project/node_modules/offline/package.json
+@sleep 0.3
+echo 'module.exports = { value: 9 };' | write @home/project/node_modules/offline/index.cjs
+@sleep 0.3
+echo 'import pkg from "offline";' | write @home/project/offline.ts
+@sleep 0.3
+echo 'if (pkg.value !== 9) throw Error("offline package"); console.log("TSX_TARGET_" + "OFFLINE=9");' | write --append @home/project/offline.ts
+@sleep 0.3
+@send tsx --root @home/project main.cts
+@sleep 0.3
+@expect TSX_TARGET_CJS=43
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project main.ts
+@sleep 0.3
+@expect TSX_TARGET_ESM=42
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project view.tsx
+@sleep 0.3
+@expect TSX_TARGET_JSX=42
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project offline.ts
+@sleep 0.3
+@expect TSX_TARGET_OFFLINE=9
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project error.ts
+@sleep 0.3
+@expect /error.ts:2:
+@sleep 0.3
+@expect Returned(1)
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project main.cts
+@sleep 0.3
+@expect TSX_TARGET_CJS=43
+@sleep 0.3
+@expect vsh> 
+@sleep 1
+@quit

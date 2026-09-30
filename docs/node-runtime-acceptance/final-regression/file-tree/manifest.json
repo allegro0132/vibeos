@@ -1,0 +1,6 @@
+{
+  "kernel_sha256": "751ee4884ad533ab1b2748c0a251e71b3f13652d82510214cab89c89ef4c40ec",
+  "source_revision": "c215b36a323d1254df947db57a7689feb1530152",
+  "command": "KEEP_FILE_TREE_EVIDENCE=1 scripts/qemu-file-tree-test.sh",
+  "passed": true
+}

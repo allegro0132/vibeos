@@ -1,0 +1,135 @@
+[
+  {
+    "revision": "1e5aca15d",
+    "path": "kernel/src/segment_store_platform.rs",
+    "sha256": "409fb5cf98c75c7797e5febad127ce054fd54346d1d0661bd4125cf5f26e8704",
+    "board_selection_matches": [
+      {
+        "line": 48,
+        "text": "#[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 64,
+        "text": "#[cfg(feature = \"qemu-virt\")]"
+      },
+      {
+        "line": 67,
+        "text": "#[cfg(feature = \"milkv-duo\")]"
+      },
+      {
+        "line": 1876,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1878,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1881,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1927,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2024,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2026,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2029,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2302,
+        "text": "                #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2322,
+        "text": "                #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      }
+    ]
+  },
+  {
+    "revision": "b70a8bb5",
+    "path": "kernel/src/segment_store_platform.rs",
+    "sha256": "61a7c7b51de131a09fb70602d4d9546b7249853ba94a8e9a798fa7ac5cf73827",
+    "board_selection_matches": [
+      {
+        "line": 48,
+        "text": "#[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1894,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1896,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1899,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1945,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2042,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2044,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2047,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      }
+    ]
+  },
+  {
+    "revision": "c215b36a",
+    "path": "kernel/src/segment_store_platform.rs",
+    "sha256": "1f371cab9e98b6dd78e01042a7dd702bf07d6ee3881bc85e01aa87dcf791f628",
+    "board_selection_matches": [
+      {
+        "line": 48,
+        "text": "#[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1894,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1896,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1899,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 1945,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2042,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2044,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      },
+      {
+        "line": 2047,
+        "text": "            #[cfg(all(feature = \"storage-bench\", feature = \"qemu-virt\"))]"
+      }
+    ]
+  }
+]

@@ -1,0 +1,756 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+   Compiling vibeos-core v0.1.0 (/Users/ziangwang/Sources/vibeos/core)
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+    --> component-runtime/src/async_state.rs:1140:14
+     |
+1140 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |              ^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+     |
+1140 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+1140 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+     |
+
+warning: use of deprecated method `core::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency
+   --> component-runtime/src/buffer_registry.rs:133:14
+    |
+133 |             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |              ^^^^^^^^^^^^
+    |
+help: replace the use of the deprecated method
+    |
+133 -             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+133 +             .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    |
+
+   Compiling vibeos-wasi-runtime v0.1.0 (/Users/ziangwang/Sources/vibeos/wasi-runtime)
+warning: `vibeos-component-runtime` (lib) generated 2 warnings (run `cargo fix --lib -p vibeos-component-runtime` to apply 2 suggestions)
+   Compiling vibeos-vsh v0.1.0 (/Users/ziangwang/Sources/vibeos/components/vsh)
+warning: unnecessary `unsafe` block
+    --> core/tests/heap.rs:1309:21
+     |
+1309 |     let mut scope = unsafe { enter_owner(owner) };
+     |                     ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling vibeos-netstack v0.1.0 (/Users/ziangwang/Sources/vibeos/components/netstack)
+warning: use of deprecated method `std::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib test) generated 1 warning (run `cargo fix --lib -p vibeos-core --tests` to apply 1 suggestion)
+warning: `vibeos-core` (test "heap") generated 1 warning
+    Finished `test` profile [optimized + debuginfo] target(s) in 5.91s
+     Running unittests src/lib.rs (target/debug/build/vibeos-core/67688d288c91fec8/out/vibeos_core-67688d288c91fec8)
+
+running 101 tests
+test boot_log::tests::unpublished_writer_never_blocks_reader_or_exposes_later_fragment ... ok
+test boot_log::tests::retains_prefix_and_reports_truncation_without_overwriting ... ok
+test cap::tests::persistent_witness_consumption_checks_delivery_then_scopes_the_lease ... ok
+test cap::supervised_transfer_tests::supervised_transfer_values_are_opaque_and_debug_redacted ... ok
+test cap::tests::persistent_witness_rechecks_rights_and_complete_ancestry ... ok
+test boot_log::tests::concurrent_fragments_are_complete_and_reads_are_repeatable ... ok
+test cap::supervised_transfer_tests::revocable_proxy_request_rejects_wrong_type_and_administrative_rights ... ok
+test cap::supervised_transfer_tests::internal_proxy_relocation_preserves_node_and_fails_atomically ... ok
+test cap::supervised_transfer_tests::internal_grant_move_is_strict_atomic_and_keeps_revocation_ancestry ... ok
+test exec::one_shot_wait_tests::allocation_identity_uses_running_domain_across_temporary_owner_scopes ... ok
+test exec::one_shot_wait_tests::bounded_continuation_yields_to_ready_work_and_cancellation ... ok
+test exec::one_shot_wait_tests::continuation_probe_tracks_ready_work_and_cancellation_without_locks ... ok
+test exec::one_shot_wait_tests::never_staged_exclusive_drop_drains_prepared_detach_as_cancelled ... ok
+test exec::one_shot_wait_tests::one_shot_wait_is_bounded_generation_safe_and_task_owned ... ok
+test exec::reclaimable_domain_tests::failed_staged_batch_admission_does_not_advance_the_live_table ... ok
+test exec::reclaimable_domain_tests::full_staged_domain_table_fails_without_touching_the_source_copy ... ok
+test exec::one_shot_wait_tests::one_shot_wake_and_replaced_waker_drop_reenter_outside_the_lock ... ok
+test exec::reclaimable_domain_tests::prepared_binding_rejects_a_same_number_counterfeit_status ... ok
+test exec::reclaimable_domain_tests::managed_reservation_installs_exact_inbound_join_capacity_before_publication ... ok
+test exec::reclaimable_domain_tests::releasing_a_hidden_managed_slot_does_not_burn_its_generation ... ok
+test exec::one_shot_wait_tests::prepared_six_edge_wait_uses_only_prepublication_registration_capacity ... ok
+test exec::one_shot_wait_tests::task_detach_is_exact_bounded_and_runs_after_ordinary_wait_cleanup ... ok
+test exec::reclaimable_domain_tests::stale_domain_generation_cannot_resolve_a_reused_slot ... ok
+test exec::one_shot_wait_tests::prepared_detach_and_wait_capacity_exist_before_publication ... ok
+test heap::fresh_domain_batch_tests::fresh_arena_identity_exhaustion_mutates_nothing ... ok
+test heap::fresh_domain_batch_tests::fresh_owner_identity_exhaustion_mutates_nothing ... ok
+test exec::reclaimable_domain_tests::managed_task_ledgers_move_into_exact_statuses_before_publication ... ok
+test exec::reclaimable_domain_tests::parallel_fault_teardown_accounts_for_completing_siblings ... ok
+test instance::tests::activation_failure_quarantines_the_whole_batch_without_publication ... ok
+test instance::tests::atomic_header_mismatch_is_sticky_quarantine ... ok
+test instance::tests::bind_batch_rejects_oversize_before_candidate_scan_or_mutation ... ok
+test instance::tests::bind_batch_preserves_order_and_is_compatible_with_atomic_activation ... ok
+test instance::tests::bind_batch_late_mismatch_never_leaves_a_bound_prefix ... ok
+test instance::tests::consumed_continuation_survives_payload_drop_fault_without_second_drop ... ok
+test instance::tests::continuation_fault_gate_rejects_every_frozen_projection_mismatch ... ok
+test instance::tests::cooperative_cancel_drops_a_parked_payload_without_quarantine ... ok
+test instance::tests::cooperative_cancel_after_payload_drop_is_inert_and_does_not_reset ... ok
+test instance::tests::cooperative_cancel_loses_to_payload_dropping_without_mutation ... ok
+test instance::tests::cooperative_cancel_mismatched_handle_quarantines_both_without_cspace_change ... ok
+test instance::tests::cooperative_cancel_tombstones_and_drops_on_next_exact_child_poll ... ok
+test instance::tests::corrupt_header_cannot_hide_a_retained_arena_from_duplicate_scan ... ok
+test instance::tests::exact_fault_abandons_payload_without_drop_and_retires_owner_before_reset ... ok
+test instance::tests::expected_payload_completion_mismatch_never_publishes_retires_or_resets ... ok
+test instance::tests::explicit_quarantine_never_vacates_or_resets_the_space ... ok
+test instance::tests::external_continuation_parks_without_spinning_and_resumes_on_exact_task_hart ... ok
+test instance::tests::failed_normal_retire_does_not_reset_after_child_drop ... ok
+test instance::tests::fault_reclaiming_is_an_unperturbed_cross_hart_lease ... ok
+test instance::tests::fault_after_real_pending_quantum_abandons_without_payload_drop ... ok
+test instance::tests::fault_detach_drains_a_parked_continuation_before_raw_reclaim_and_reset ... ok
+test instance::tests::fault_gate_rejects_every_mismatched_identity_projection_before_reclaim ... ok
+test instance::tests::fault_identity_mismatch_keeps_payload_and_never_polls_or_reclaims ... ok
+test instance::tests::fault_linearization_quarantines_a_retained_arena_alias_in_another_slot ... ok
+test instance::tests::named_batch_validation_capacity_and_generation_failures_mutate_nothing ... ok
+test instance::tests::failed_terminal_publication_quarantines_without_retire_or_cspace_reset ... ok
+test instance::tests::one_arena_cannot_be_registered_again_under_a_different_owner ... ok
+test instance::tests::fault_replay_after_reclaimed_never_invokes_raw_reclaim_or_reset_twice ... ok
+test instance::tests::missing_token_scan_checks_task_and_prepared_domain_projections ... ok
+test instance::tests::opaque_tokens_expose_only_stable_slot_alias_rejection ... ok
+test instance::tests::named_batch_reservation_is_ordered_distinct_and_atomically_abortable ... ok
+test instance::tests::named_batch_skips_an_early_exhausted_cspace_for_a_later_viable_slot ... ok
+test instance::tests::out_of_range_token_quarantines_the_exact_terminal_handle_slot ... ok
+test instance::tests::fault_reclaim_space_callback_runs_unlocked_before_reclaim_and_reset ... ok
+test instance::tests::only_non_system_tracked_domains_are_admitted ... ok
+test instance::tests::fixed_table_never_allocates_a_seventeenth_slot ... ok
+test instance::tests::prepared_binding_mismatch_is_sticky_quarantine ... ok
+test instance::tests::normal_finalize_rejects_projection_mismatches_before_close_or_reset ... ok
+test instance::tests::payload_normal_completion_drops_once_in_child_poll_and_detaches_word ... ok
+test instance::tests::payload_drop_fault_reaches_exact_dropping_gate_without_second_drop ... ok
+test instance::tests::quantum_continuation_self_wakes_once_and_uses_two_exact_polls ... ok
+test instance::tests::real_terminal_lifecycle_resets_once_then_invalidates_the_old_token ... ok
+test instance::tests::reserved_batch_abort_rejects_the_complete_set_before_mutation ... ok
+test instance::tests::refused_raw_reclaim_quarantines_without_close_or_cspace_reset ... ok
+test instance::tests::repeated_fault_generations_reuse_one_slot_without_registry_leaks ... ok
+test instance::tests::reserve_checks_bound_task_and_prepared_domains_when_record_domain_disagrees ... ok
+test instance::tests::refused_fault_space_cleanup_quarantines_before_any_reset ... ok
+test instance::tests::reserved_space_configuration_is_system_stable_and_resets_after_terminal_publication ... ok
+test instance::tests::running_finalize_is_inert_and_terminal_finalize_resets_exactly_once ... ok
+test instance::tests::reserved_space_pair_gate_rejects_an_exact_owner_alias ... ok
+test instance::tests::reserved_space_pair_gate_rejects_same_slot_and_stale_token_without_mutation ... ok
+test instance::tests::reserved_space_pair_gate_runs_in_caller_order_and_is_read_only ... ok
+test instance::tests::reserved_space_pair_transfer_capability_error_rolls_back_without_mutation ... ok
+test instance::tests::reserved_space_pair_transfer_executes_after_postflight_and_finalizes_once ... ok
+test instance::tests::reserved_space_pair_transfer_rolls_back_without_finalize_on_postflight_failure ... ok
+test instance::tests::structural_observation_checks_status_domain_and_space_without_touching_cspace ... ok
+test instance::tests::structural_observation_rejects_a_different_status_handle_without_reset ... ok
+test instance::tests::stale_continuation_cannot_wake_a_reused_instance_slot ... ok
+test instance::tests::stale_generation_quarantines_the_new_occupant_without_aliasing_it ... ok
+test instance::tests::stale_poll_witness_quarantines_without_poll_or_payload_tombstone ... ok
+test instance::tests::reserved_space_pair_gate_quarantines_both_on_exact_incarnation_fault ... ok
+test instance::tests::second_install_validation_mismatch_leaks_without_payload_drop ... ok
+test instance::tests::terminal_continuation_mismatch_never_retires_or_resets_cspace ... ok
+test net_segment_pool::tests::abandoned_slot_guard_is_recovered_before_buffer_reuse ... ok
+test instance::tests::terminal_publication_projection_mismatch_never_retires_or_resets ... ok
+test net_segment_pool::tests::exhausted_generation_never_reserves_or_wraps ... ok
+test poll_budget::tests::idle_has_no_grace_and_empty_polls_do_not_renew_it ... ok
+test poll_budget::tests::stopped_clock_is_bounded_and_progress_rearms ... ok
+test poll_budget::tests::wrapping_clock_preserves_bounded_elapsed_time ... ok
+test sync::tests::stale_recovery_snapshot_cannot_claim_a_reacquired_lock ... ok
+test instance::tests::terminal_retirement_phases_are_unperturbed_cross_hart_leases ... ok
+test instance::tests::token_loss_with_an_arena_owner_alias_quarantines_without_legacy_reclaim ... ok
+test instance::tests::wrong_in_range_token_quarantines_the_exact_terminal_handle_slot ... ok
+
+test result: ok. 101 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/arch.rs (target/debug/build/vibeos-core/7e0ed8dec4dad546/out/arch-7e0ed8dec4dad546)
+
+running 2 tests
+test local_fences_and_mxr_have_deterministic_host_state ... ok
+test rfence_probe_requests_and_errors_are_exact ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/bench.rs (target/debug/build/vibeos-core/2fdf8c9911b5a283/out/bench-2fdf8c9911b5a283)
+
+running 5 tests
+test empty_distributions_have_no_summary ... ok
+test exact_nearest_rank_boundaries_are_stable ... ok
+test mean_accumulation_does_not_overflow_u64 ... ok
+test percentiles_are_nearest_rank_and_input_is_sorted ... ok
+test singleton_distributions_use_the_only_sample_everywhere ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cap.rs (target/debug/build/vibeos-core/b969497906051f85/out/cap-b969497906051f85)
+
+running 53 tests
+test a_handle_is_meaningless_in_another_space ... ok
+test a_dead_cap_disappears_from_the_listing_after_collection ... ok
+test an_empty_or_out_of_range_handle_is_invalid ... ok
+test a_slot_freed_by_cascade_is_safely_reused ... ok
+test async_publication_requires_the_same_cspace_incarnation ... ok
+test a_reused_slot_does_not_honour_the_old_handle ... ok
+test cspace_identity_is_unique_redacted_and_stable_across_reset ... ok
+test cross_space_invocation_lease_survives_only_if_already_acquired ... ok
+test derive_cannot_amplify ... ok
+test committed_root_and_child_install_with_exact_identity_and_attenuation ... ok
+test derive_produces_a_strict_subset ... ok
+test derive_requires_grant ... ok
+test derived_caps_cannot_re_widen_through_a_chain ... ok
+test exact_admin_revoke_never_targets_a_reused_slot ... ok
+test exact_cspace_reset_rejects_identity_incarnation_and_aba_without_mutation ... ok
+test failed_recovery_install_never_publishes_a_partial_graph ... ok
+test grant_moves_authority_between_spaces_with_attenuation ... ok
+test grant_requires_grant_and_refuses_amplification ... ok
+test holding_a_handle_is_not_permission ... ok
+test invocation_lease_retains_actual_rights_for_service_side_enforcement ... ok
+test invocation_lease_survives_revoke_but_a_new_lease_does_not ... ok
+test legacy_tcb_typed_lookup_returns_an_owned_arc_lease ... ok
+test listing_reports_live_slots_only ... ok
+test lookup_requires_the_named_right ... ok
+test ordinary_space_cannot_enter_persistent_quarantine ... ok
+test persistent_fault_quarantine_hides_authority_and_blocks_lifecycle_operations ... ok
+test published_capability_tables_are_page_aligned_and_replaced_by_cow ... ok
+test recovered_dead_slot_is_reserved_at_strictly_next_generation ... ok
+test recovered_graph_restores_typed_root_and_child_in_one_publish ... ok
+test recovery_refuses_generation_rollback_and_ephemeral_identity ... ok
+test recovery_rejects_duplicate_and_out_of_range_metadata ... ok
+test resetting_a_space_never_revives_an_old_incarnation_handle ... ok
+test resolved_token_apis_preserve_invalid_rights_type_error_order ... ok
+test resolved_tokens_keep_the_resource_alive_only_until_their_drop ... ok
+test resolved_tokens_own_exactly_one_object_reference_and_release_it_on_drop ... ok
+test revocable_token_observes_ancestor_revoke_across_spaces ... ok
+test revocable_token_observes_ancestor_revoke_in_the_same_space ... ok
+test revocable_token_revalidates_after_local_revoke ... ok
+test revocation_cascades_through_a_chain_of_spaces ... ok
+test revoke_all_empties_a_space_and_reaches_its_grants ... ok
+test revoke_cascades_to_the_whole_derivation_subtree ... ok
+test revoke_invalidates_outstanding_handles ... ok
+test revoke_reaches_copies_in_other_spaces ... ok
+test revoke_requires_the_revoke_right ... ok
+test revoking_a_grant_does_not_touch_the_source ... ok
+test rights_algebra ... ok
+test rights_render_as_a_stable_string ... ok
+test scoped_child_keeps_cross_space_revocation_ancestry ... ok
+test scoped_derivation_allocates_the_published_resource_to_system ... ok
+test scoped_derivation_narrows_resource_and_rights_together ... ok
+test typed_lookup_checks_rights_before_type ... ok
+test typed_lookup_rejects_the_wrong_type ... ok
+test typed_resolve_ignores_a_dishonest_as_any_implementation ... ok
+
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cap_backend.rs (target/debug/build/vibeos-core/342bc445c309522b/out/cap_backend-342bc445c309522b)
+
+running 1 test
+test cow_backend_seals_before_publish_and_retires_only_after_replacement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chan.rs (target/debug/build/vibeos-core/1910c3f576f50183/out/chan-1910c3f576f50183)
+
+running 8 tests
+test an_endpoint_describes_itself_for_the_caps_listing ... ok
+test rights_pick_the_direction ... ok
+test full_transition_wakes_all_producers_and_loser_rearms ... ok
+test message_notification_covers_send_before_first_poll_without_consuming ... ok
+test messages_come_back_in_order ... ok
+test stats_count_both_directions ... ok
+test the_bound_is_enforced_and_the_message_is_handed_back ... ok
+test transition_notification_wakes_all_consumers_and_rearms_after_drain ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/execution_profile.rs (target/debug/build/vibeos-core/464708a8ce6460c8/out/execution_profile-464708a8ce6460c8)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/heap.rs (target/debug/build/vibeos-core/b5cb54aa1b9ca9d8/out/heap-b5cb54aa1b9ca9d8)
+
+running 47 tests
+test a_freed_block_is_reused_for_the_same_size_class ... ok
+test allocations_larger_than_the_old_64k_limit_are_recycled ... ok
+test arenas_isolate_incarnations_under_one_owner ... ok
+test arena_reclaim_never_touches_untracked_owner_allocations ... ok
+test allocations_are_aligned_and_distinct ... ok
+test coalescing_churn_preserves_alignment_and_live_payloads ... ok
+test a_successful_allocation_clears_a_stale_failure ... ok
+test busy_or_active_arenas_block_close_and_owner_unregister ... ok
+test a_request_larger_than_the_heap_is_refused ... ok
+test allocation_failure_diagnostics_are_isolated_by_hart ... ok
+test concurrent_frees_in_one_arena_leave_nothing_linked ... ok
+test deallocation_uses_header_owner_not_current_owner ... ok
+test disjoint_regions_preserve_holes_through_exhaustion_reclaim_and_coalescing ... ok
+test domain_scopes_restore_both_owner_and_arena ... ok
+test empty_domain_close_rejects_wrong_owner_without_consuming_arena ... ok
+test every_size_class_round_trips ... ok
+test exhausted_bump_reuses_a_larger_free_block_without_changing_live_accounts ... ok
+test exhaustion_returns_null_rather_than_wrapping ... ok
+test fault_reclaim_rejects_wrong_owner_without_touching_allocation ... ok
+test fault_reclaim_returns_every_block_to_its_size_class ... ok
+test fault_reclaim_scrubs_payload_before_same_address_reuse ... ok
+test free_blocks_are_reused_before_consuming_contiguous_bump_space ... ok
+test fresh_domain_batch_arena_capacity_failure_has_no_partial_registration ... ok
+test fresh_domain_batch_owner_capacity_failure_has_no_partial_registration ... ok
+test fresh_domain_batch_retire_preflight_is_read_only_and_matches_commit_validation ... ok
+test fresh_domain_batch_retire_busy_or_extra_arena_never_consumes_a_peer ... ok
+test fresh_domain_batch_retire_rejects_duplicate_and_mismatched_identity_without_mutation ... ok
+test fresh_domain_batch_success_is_ordered_distinct_and_reuses_slots ... ok
+test fresh_domain_batch_validation_preserves_the_fresh_sequences ... ok
+test one_owners_quota_denial_does_not_touch_another_account ... ok
+test over_aligned_requests_are_aligned_and_recycled ... ok
+test owner_and_arena_scopes_are_isolated_by_hart ... ok
+test owner_scopes_nest_and_support_explicit_restore ... ok
+test owner_scope_rejects_cross_hart_restore ... ok
+test physical_exhaustion_has_a_distinct_failure_reason ... ok
+test owner_slots_unregister_only_after_provenance_is_gone ... ok
+test region_validation_is_transactional_and_adjacent_ranges_merge ... ok
+test quotas_charge_physical_blocks_and_denial_changes_no_heap_state ... ok
+test stats_track_live_and_peak ... ok
+test recycled_memory_is_usable ... ok
+test pressure_coalesces_adjacent_classes_without_touching_live_blocks ... ok
+test same_class_realloc_grows_in_place_even_when_heap_is_full ... ok
+test size_classes_do_not_leak_into_each_other ... ok
+test realloc_in_another_owner_still_transfers_accounting ... ok
+test tracked_deallocation_unlinks_head_middle_and_tail ... ok
+test unknown_host_hart_fails_closed ... ok
+test unknown_owner_is_refused_without_falling_back_to_system ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/interrupt.rs (target/debug/build/vibeos-core/4e3ac66b2bfbc16e/out/interrupt-4e3ac66b2bfbc16e)
+
+running 9 tests
+test atomic_handler_slot_publishes_and_revokes_complete_records ... ok
+test enable_words_cross_the_31_32_boundary ... ok
+test highest_qemu_source_uses_the_last_word ... ok
+test irq_handoff_cells_keep_fixed_bounded_layouts ... ok
+test source_zero_is_reserved ... ok
+test sources_beyond_the_context_are_rejected ... ok
+test spsc_ring_wraps_and_counts_newest_byte_overflow ... ok
+test atomic_handler_slot_never_returns_a_torn_callback_context_pair ... ok
+test spsc_ring_release_acquire_handoff_preserves_byte_order ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ipi.rs (target/debug/build/vibeos-core/f0ffb1c124801996/out/ipi-f0ffb1c124801996)
+
+running 4 tests
+test concurrent_start_preparation_preserves_unique_physical_mapping ... ok
+test hsm_start_status_and_secondary_registration_are_explicit ... ok
+test mailbox_coalescing_offline_handoff_stale_and_failure_contract ... ok
+test online_physical_mask_tracks_sparse_permuted_harts_and_fails_closed ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/ipi_model.rs (target/debug/build/vibeos-core/ef074408a33c8aea/out/ipi_model-ef074408a33c8aea)
+
+running 5 tests
+test clear_fence_swap_coalesces_or_leaves_a_fresh_doorbell ... ok
+test every_enqueue_set_fence_send_and_idle_interleaving_is_safe ... ok
+test failed_first_kick_is_retried_without_consuming_the_reason ... ok
+test stale_ipi_has_no_reason_and_no_scheduler_side_effect ... ok
+test swap_before_clear_has_the_documented_lost_doorbell_counterexample ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mmu.rs (target/debug/build/vibeos-core/17eea3e28c391477/out/mmu-17eea3e28c391477)
+
+running 7 tests
+test canonical_virtual_addresses_match_sv39_sign_extension ... ok
+test invalid_leaf_encodings_fail_closed ... ok
+test leaf_entry_encodes_permissions_and_eager_ad_bits ... ok
+test satp_uses_sv39_mode_and_root_ppn ... ok
+test sv39_indices_select_all_three_levels ... ok
+test table_entry_round_trips_a_page_address ... ok
+test thead_leaf_attributes_do_not_corrupt_standard_sv39_fields ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net.rs (target/debug/build/vibeos-core/0b901b469889dd21/out/net-0b901b469889dd21)
+
+running 25 tests
+test construction_copies_instead_of_borrowing_the_source ... ok
+test capability_rights_select_direction_on_endpoint_packet ... ok
+test access_exposes_exactly_the_logical_frame ... ok
+test copy_to_short_buffer_is_atomic ... ok
+test bidirectional_packet_endpoint_preserves_frames_and_bound ... ok
+test copy_to_writes_the_frame_and_preserves_destination_tail ... ok
+test directional_async_methods_retain_the_same_message_type_and_direction ... ok
+test directional_views_share_one_queue_and_only_expose_their_operation ... ok
+test endpoint_message_type_is_part_of_capability_lookup ... ok
+test fresh_ingress_uses_direct_delivery_then_transitions_to_retained_retry ... ok
+test independently_narrowed_and_cloned_views_remain_typed ... ok
+test packet_accepts_every_representative_nonempty_boundary ... ok
+test packet_and_directional_handles_are_send_and_sync_without_payload_clone_bounds ... ok
+test packet_rejects_zero_and_every_representative_oversize ... ok
+test packet_session_fence_invalidates_stale_frames_across_every_rebind ... ok
+test packet_session_fence_overflow_is_terminal_for_the_attempted_binding ... ok
+test packet_stamp_requires_both_nonzero_coordinates_and_never_wraps ... ok
+test packet_storage_is_exactly_payload_plus_u16_length ... ok
+test packet_writer_constructs_directly_and_preserves_bounds ... ok
+test receive_builder_validates_lengths_and_clears_producer_tail ... ok
+test retained_ingress_cannot_cross_stack_rebind_device_reset_or_detach ... ok
+test retained_ingress_rechecks_revocation_before_retry_and_owner_can_discard ... ok
+test retained_ingress_survives_pressure_and_delivers_exactly_once ... ok
+test slice_conversion_and_clone_preserve_value_semantics ... ok
+test stamped_packet_releases_payload_only_to_the_exact_session ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_receive.rs (target/debug/build/vibeos-core/01674c1f9dd15798/out/net_receive-01674c1f9dd15798)
+
+running 6 tests
+test external_input_hint_closes_wait_races_without_publishing_a_ticket ... ok
+test queue_backpressure_preserves_ticket_and_acquisition_reads_original_storage ... ok
+test queue_retirement_preserves_loans_and_fault_cleanup_matches_incarnation ... ok
+test pending_batch_keeps_original_generation_through_queue_pressure_and_rebinding ... ok
+test revocation_blocks_new_access_but_existing_loan_survives_and_releases ... ok
+test stale_session_is_discarded_and_untracked_owner_does_not_dequeue ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_segment_pool.rs (target/debug/build/vibeos-core/211b5cf0dcd63209/out/net_segment_pool-211b5cf0dcd63209)
+
+running 8 tests
+test binding_retirement_releases_all_domains_and_invalidates_old_tickets ... ok
+test capacity_retry_and_reuse_are_bounded_and_generation_checked ... ok
+test invalid_serialization_releases_capacity_without_publishing ... ok
+test consumer_and_producer_can_access_different_slots_without_a_pool_lock ... ok
+test tickets_do_not_cross_pool_or_session_boundaries ... ok
+test restart_invalidates_only_exact_incarnation_including_queued_tickets ... ok
+test consumer_fault_retires_its_slot_even_when_producer_is_alive ... ok
+test serialization_fault_never_publishes_partial_bytes ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_segmentation.rs (target/debug/build/vibeos-core/545a08b42db689f3/out/net_segmentation-545a08b42db689f3)
+
+running 2 tests
+test builder_validates_before_exposing_owned_request ... ok
+test owns_bytes_and_rechecks_device_and_stack_session_on_retry ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_transmit.rs (target/debug/build/vibeos-core/bfc7ee375355182f/out/net_transmit-bfc7ee375355182f)
+
+running 2 tests
+test queued_old_ticket_cannot_read_reused_buffer_after_restart ... ok
+test raw_and_large_requests_share_one_fifo_and_full_preserves_ticket ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_tso_probe_completion.rs (target/debug/build/vibeos-core/5fda52cd91902e49/out/net_tso_probe_completion-5fda52cd91902e49)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_tso_probe_restart.rs (target/debug/build/vibeos-core/2c89352977b9ebc5/out/net_tso_probe_restart-2c89352977b9ebc5)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/net_tx_coalesce.rs (target/debug/build/vibeos-core/63bc3ed6452e58b7/out/net_tx_coalesce-63bc3ed6452e58b7)
+
+running 3 tests
+test incompatibility_and_session_changes_never_mutate_pending_batch ... ok
+test reconstructs_packet_boundaries_and_payload_across_sequence_wrap ... ok
+test bounds_psh_and_short_packet_flush ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/network_profile.rs (target/debug/build/vibeos-core/c318b2d6d83548f2/out/network_profile-c318b2d6d83548f2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runqueue.rs (target/debug/build/vibeos-core/0a7f6cfc0147836b/out/runqueue-0a7f6cfc0147836b)
+
+running 5 tests
+test enqueue_has_one_owner_and_never_grows_past_reserved_capacity ... ok
+test nonstealable_remote_work_is_idle_for_other_harts_but_local_for_its_owner ... ok
+test local_fifo_precedes_deterministic_remote_steal ... ok
+test every_valid_hart_has_independent_stats_and_capacity ... ok
+test ready_hint_mirrors_every_enqueue_remove_and_dispatch ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runqueue_model.rs (target/debug/build/vibeos-core/afd675d723b10359/out/runqueue_model-afd675d723b10359)
+
+running 2 tests
+test steal_wake_during_poll_cancel_and_fault_regressions ... ok
+test exhaustive_two_task_state_space_preserves_unique_ready_ownership ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runtime.rs (target/debug/build/vibeos-core/a9832ac787527046/out/runtime-a9832ac787527046)
+
+running 106 tests
+test a_fault_on_one_hart_does_not_detach_another_harts_running_task ... ok
+test a_live_joiner_observes_cancellation ... ok
+test a_full_channel_parks_the_sender_until_space_appears ... ok
+test a_managed_destructor_fault_uses_the_registry_gate ... ok
+test a_managed_fault_uses_the_exact_registry_witness_and_resets_only_after_terminal ... ok
+test a_fault_wins_over_a_mid_poll_cancellation_request ... ok
+test a_parallel_reclaimable_domain_admits_siblings_on_other_harts ... ok
+test a_parallel_domain_fault_collects_queued_siblings_on_other_harts ... ok
+test a_parked_task_stays_parked_until_woken ... ok
+test a_managed_fault_witness_replay_before_finalize_never_reclaims_or_resets_twice ... ok
+test a_pending_sleep_arms_the_timer_before_the_heartbeat ... ok
+test a_refused_exclusive_reclaim_is_sticky_and_never_reopens_the_domain ... ok
+test a_reclaimable_destructor_fault_cleans_registries_before_entering_drop ... ok
+test a_reclaimable_domain_rejects_cross_hart_and_exclusive_siblings ... ok
+test a_reclaimable_fault_detaches_every_sibling_in_the_same_arena ... ok
+test a_reclaimable_poll_fault_skips_drop_and_invokes_the_reclaimer ... ok
+test a_pending_tracked_task_remains_running_until_it_returns ... ok
+test a_remote_hart_can_cancel_the_task_running_in_another_slot ... ok
+test a_reused_exclusive_domain_ignores_the_previous_task_identity ... ok
+test a_running_task_cancels_only_at_its_poll_boundary ... ok
+test a_send_wakes_a_parked_receiver ... ok
+test a_sleep_already_past_completes_without_parking ... ok
+test a_sleeping_task_wakes_when_its_deadline_passes ... ok
+test a_sleep_repoll_replaces_its_waker_and_drop_unregisters_it ... ok
+test a_spawned_task_runs_to_completion ... ok
+test a_task_cannot_reenter_the_executor_and_overwrite_running_state ... ok
+test a_task_that_wakes_itself_mid_poll_is_rescheduled ... ok
+test a_timer_irq_probe_observes_the_target_tasks_next_poll ... ok
+test a_tracked_fault_retains_its_terminal_state_and_cannot_be_revived ... ok
+test a_tracked_task_preserves_its_identity_and_terminal_state ... ok
+test a_wait_listener_observes_a_wake_before_its_first_poll ... ok
+test a_wait_listener_repolls_pending_and_replaces_its_waker ... ok
+test a_wake_racing_registration_is_not_lost ... ok
+test an_exclusive_fault_closes_dispatch_before_reclaim_and_rejects_stale_events ... ok
+test an_irq_poll_probe_ignores_another_timer_owned_by_the_same_task ... ok
+test an_exclusive_reclaimable_domain_is_single_home_and_retires_after_publication ... ok
+test an_exclusive_fault_on_one_hart_preserves_another_harts_running_task ... ok
+test an_irq_poll_probe_requires_a_running_task ... ok
+test an_old_managed_fault_witness_cannot_reclaim_or_reset_a_reused_slot ... ok
+test an_owned_task_installs_its_owner_for_pending_and_ready_polls ... ok
+test an_untracked_fault_notifies_exact_task_cleanup_once ... ok
+test an_unknown_host_hart_cannot_alias_the_boot_scheduler_slot ... ok
+test an_untracked_fault_remains_conservative_and_never_raw_reclaims ... ok
+test cancel_before_first_poll_requires_excluding_remote_steals ... ok
+test cancellation_cannot_rewrite_an_exit_committed_before_future_drop ... ok
+test cancelling_a_channel_receiver_does_not_poison_the_next_receiver ... ok
+test cancelling_a_channel_sender_does_not_poison_the_next_sender ... ok
+test cancelling_a_parked_task_never_polls_it_again ... ok
+test cancelling_a_profiled_sleeper_clears_timer_and_probe_ledgers ... ok
+test cancelling_a_ready_task_reclaims_it_without_polling ... ok
+test cancelling_a_self_waking_task_removes_its_ready_entry ... ok
+test cancelling_a_sleeping_task_prevents_a_deadline_from_polling_it_again ... ok
+test cancelling_many_parked_tasks_leaves_no_wait_registrations ... ok
+test cancelling_many_sleepers_leaves_no_timer_registrations ... ok
+test dropped_joiners_unregister_and_repoll_replaces_the_waker ... ok
+test dropping_a_probe_releases_the_single_slot_immediately ... ok
+test dropping_a_wait_listener_unregisters_and_releases_its_waker ... ok
+test dropping_prepared_batch_rolls_back_every_future ... ok
+test exclusive_prepared_task_is_inert_until_exact_registry_activation ... ok
+test every_notify_observes_the_complete_multi_hart_batch_publication ... ok
+test faulting_prepared_rollback_leaks_conservatively_without_scheduler_visibility ... ok
+test exclusive_multi_hart_batch_is_complete_before_every_notification ... ok
+test exclusive_notification_panic_cannot_roll_back_registry_publication ... ok
+test exclusive_prepared_aliases_are_rejected_before_registry_callback ... ok
+test empty_prepared_batch_fails_without_scheduler_effect ... ok
+test exclusive_publication_merges_with_a_nonempty_scheduler_map ... ok
+test managed_publication_reservation_is_hidden_and_drop_restores_exact_admission ... ok
+test managed_publication_reservation_rejects_wrong_order_mixed_and_alias_inputs ... ok
+test hart0_steals_each_logical_remote_task_exactly_once ... ok
+test joiners_observe_the_same_exit_before_and_after_completion ... ok
+test managed_instances_on_two_harts_fault_independently ... ok
+test fault_and_destructor_paths_restore_the_system_owner ... ok
+test exclusive_admission_mismatch_stays_closed_after_the_conflict_retires ... ok
+
+running 1 test
+test managed_cancel_does_not_deadlock_abandoned_cspace_fault_recovery ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 105 filtered out; finished in 0.00s
+
+test managed_reservation_protects_ready_capacity_from_intervening_spawn ... ok
+test mixed_batch_publishes_safe_and_exclusive_members_together ... ok
+test nested_cancel_defers_a_same_arena_destructor_fault_to_the_outer_boundary ... ok
+test nested_cancel_keeps_a_different_domain_running_across_destructor_fault ... ok
+test nested_spawn_inherits_owner_and_explicit_spawn_restores_the_parent ... ok
+test notification_panic_cannot_roll_back_an_already_published_batch ... ok
+test prepared_handles_are_inert_until_the_whole_batch_is_published ... ok
+test pinned_remote_task_waits_for_its_exact_hart ... ok
+test reclaimable_fault_teardown_restores_wait_sleep_and_join_registries ... ok
+test polling_a_past_deadline_removes_the_timer_before_the_tick ... ok
+test rejected_exclusive_binding_is_sticky_and_leaks_conservatively ... ok
+test prepared_batch_reservation_failure_has_no_scheduler_effect ... ok
+test panicking_exclusive_activation_cannot_strand_a_scheduler_node_on_host ... ok
+test poll_once_reports_whether_anything_ran ... ok
+test prepared_batch_is_invisible_until_atomic_publication ... ok
+test removing_the_earliest_timer_rearms_the_next_deadline ... ok
+test rejected_managed_publication_releases_credits_without_burning_generation ... ok
+test rejected_mixed_batch_drops_only_the_safe_future ... ok
+test reserved_managed_members_and_system_supervisor_publish_atomically ... ok
+test remote_cancel_and_fault_leave_no_queue_owner_or_stale_wake ... ok
+test shared_fault_commits_every_sibling_before_the_cancel_window ... ok
+test sleep_releases_a_reentrant_waker_outside_the_timer_lock ... ok
+test stolen_wake_during_poll_migrates_one_ready_owner_to_hart0 ... ok
+test task_detach_observes_final_exit_cancel_and_destructor_fault_reasons_once ... ok
+test task_ids_disambiguate_reused_names ... ok
+test the_hardware_timer_is_armed_no_later_than_the_heartbeat ... ok
+test the_running_task_is_visible_while_it_is_polled ... ok
+test two_harts_keep_running_slots_current_tasks_and_domains_isolated ... ok
+test wait_listener_releases_a_reentrant_waker_outside_the_queue_lock ... ok
+test wait_queue_registration_stress_returns_to_zero ... ok
+test wait_queue_wakes_and_drops_wakers_outside_its_lock ... ok
+test managed_cancel_does_not_deadlock_abandoned_cspace_fault_recovery ... ok
+test waking_many_individually_parked_tasks_does_not_allocate_ready_capacity ... ok
+
+test result: ok. 106 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/scheduler_model.rs (target/debug/build/vibeos-core/d6928c2d78ba788d/out/scheduler_model-d6928c2d78ba788d)
+
+running 6 tests
+test cancel_during_drop_is_deferred_and_a_same_arena_drop_fault_still_wins ... ok
+test committed_exit_resists_late_cancel_but_destructor_fault_promotes_it ... ok
+test fault_teardown_is_confined_to_the_audited_arena ... ok
+test nested_cancel_is_deferred_until_the_outer_poll_boundary ... ok
+test wake_cancel_and_fault_boundary_regressions ... ok
+test fixed_point_covers_same_and_different_arena_interleavings ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sync.rs (target/debug/build/vibeos-core/730a375c53bc256e/out/sync-730a375c53bc256e)
+
+running 7 tests
+test concurrent_contender_is_serialized_and_counted_once ... ok
+test conditional_exact_task_recovery_validates_before_release ... ok
+test guard_drop_rejects_a_different_hart_before_unlocking ... ok
+test exact_task_recovery_separates_system_domain_tasks ... ok
+test fault_recovery_does_not_unlock_a_system_guard ... ok
+test fault_recovery_unlocks_only_a_matching_abandoned_guard ... ok
+test conditional_value_mismatch_fail_stops_the_lock_generation ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/vibeos-netstack/6cde86bad869b771/out/vibeos_netstack-6cde86bad869b771)
+
+running 2 tests
+test config::tests::dynamically_sized_interface_configuration_is_isolated ... ok
+test config::tests::physical_link_loss_clears_runtime_address_but_retains_intent ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/command.rs (target/debug/build/vibeos-netstack/6faaa41d474d61a0/out/command-6faaa41d474d61a0)
+
+running 4 tests
+test parses_link_and_dhcp_commands_with_eth0_alias ... ok
+test carries_nonzero_interface_identity_through_every_command ... ok
+test parses_linux_style_show_and_static_ipv4_commands ... ok
+test rejects_out_of_scope_devices_and_invalid_addresses ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/config_allocation.rs (target/debug/build/vibeos-netstack/6b3fa6239e4e5002/out/config_allocation-6b3fa6239e4e5002)
+
+running 1 test
+test persistent_tables_allocate_and_grow_outside_component_domain ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/build/vibeos-wasi-runtime/a4fdd6e665d3d804/out/vibeos_wasi_runtime-a4fdd6e665d3d804)
+
+running 7 tests
+test output_budget::tests::reservations_never_overdraw_or_wrap ... ok
+test validate_tests::threads_contract_requires_every_half ... ok
+test validate_tests::shared_memory_must_be_imported_and_bounded ... ok
+test validate_tests::atomics_need_the_threads_profile ... ok
+test validate_tests::threads_contract_is_gated ... ok
+test validate_tests::core_start_requires_the_complete_threads_contract ... ok
+test validate_tests::command_declaration_ceiling_is_enforced ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/runtime.rs (target/debug/build/vibeos-wasi-runtime/c9a0c3fac0189601/out/runtime-c9a0c3fac0189601)
+
+running 18 tests
+test genuine_standard_library ... ignored, run with WASI_EXAMPLE after building standard-library examples
+test embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta ... ok
+test cancellation_is_stable ... ok
+test invalid_read_result_does_not_consume_input ... ok
+test bad_result_pointer_has_no_output ... ok
+test clocks_are_not_ambient_in_standalone_embeddings ... ok
+test exit_is_non_returning_and_preserves_u32 ... ok
+test fuel_continuation_hint_excludes_host_calls_and_terminal_states ... ok
+test closed_import_and_start_contract ... ok
+test loop_and_growth_are_contained ... ok
+test malicious_later_iovec_has_no_output ... ok
+test pending_input_does_not_burn_fuel_and_can_be_denied ... ok
+test repeated_imports_share_a_definition_but_validate_each_signature ... ok
+test standard_descriptors_and_known_stubs ... ok
+test clocks_validate_pointers_and_preserve_full_nanoseconds ... ok
+test standard_streams_are_not_interactive_terminals ... ok
+test profile_declaration_ceilings_remain_enforced ... ok
+test scalar_memory_helpers_preserve_unaligned_access_and_traps ... ok
+
+test result: ok. 17 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests vibeos_core
+
+running 20 tests
+test core/src/cap.rs - cap::InvocationLease (line 758) - compile fail ... ok
+test core/src/cap.rs - cap::Revocable (line 685) - compile fail ... ok
+test core/src/cap.rs - cap::PersistentDerivationWitness (line 882) - compile fail ... ok
+test core/src/cap.rs - cap::Revocable (line 693) - compile fail ... ok
+test core/src/exec.rs - exec::IrqPollProbe (line 7350) ... ignored
+test core/src/cap.rs - cap::InvocationLease (line 766) - compile fail ... ok
+test core/src/cap.rs - cap::InvocationLease (line 774) - compile fail ... ok
+test core/src/cap.rs - cap::InvocationLease (line 791) - compile fail ... ok
+test core/src/cap.rs - cap::InvocationLease (line 782) - compile fail ... ok
+test core/src/cap.rs - cap::PersistentDerivationWitness (line 895) - compile fail ... ok
+test core/src/cap.rs - cap::Revocable (line 701) - compile fail ... ok
+test core/src/cap.rs - cap::SupervisedTransferRequest (line 2308) - compile fail ... ok
+test core/src/cap.rs - cap::SupervisedTransferRequest (line 2312) - compile fail ... ok
+test core/src/heap.rs - heap::OwnerScope (line 270) - compile fail ... ok
+test core/src/sync.rs - sync::SpinGuard (line 646) - compile fail ... ok
+test core/src/cap.rs - cap::Revocable (line 709) - compile fail ... ok
+test core/src/exec.rs - exec::PreparedTaskDetachSeal (line 307) - compile fail ... ok
+test core/src/exec.rs - exec::PreparedTaskDetachSeal (line 300) - compile fail ... ok
+test core/src/net.rs - net::SendEndpoint (line 549) - compile fail ... ok
+test core/src/net.rs - net::RecvEndpoint (line 588) - compile fail ... ok
+
+test result: ok. 19 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+   Doc-tests vibeos_netstack
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests vibeos_wasi_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

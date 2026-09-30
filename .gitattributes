@@ -13,3 +13,6 @@ docs/node-runtime-acceptance/**/*.log whitespace=-blank-at-eol,-blank-at-eof
 # A unified diff represents empty context lines with one significant space.
 docs/node-runtime-acceptance/esbuild-service-qemu/source.patch whitespace=-blank-at-eol,-blank-at-eof
 tools/node-runtime/patches/0058-node-cppgc-wrapper-list-release.patch whitespace=-blank-at-eol
+
+# Recorded @expect directives match the literal VSH prompt, including its space.
+docs/node-runtime-acceptance/final-regression/**/commands.in whitespace=-blank-at-eol

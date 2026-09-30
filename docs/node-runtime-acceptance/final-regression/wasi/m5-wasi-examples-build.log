@@ -1,0 +1,5 @@
+    Finished `release` profile [optimized] target(s) in 0.06s
+clang: warning: argument '--target=wasm32-wasi' is deprecated, use --target=wasm32-wasip1 instead [-Wdeprecated]
+2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303  target/wasi-examples/c-hello.wasm
+26aaaa101ebc195d9ebf090fd65388b42a9f0847e0f5101aedd74c28bf6321f6  target/wasi-examples/rust-hello.wasm
+bc604d893f948a8afe3725907f993eefee9d66e37c286927911d997eea94c92a  target/wasi-examples/c-threads.wasm

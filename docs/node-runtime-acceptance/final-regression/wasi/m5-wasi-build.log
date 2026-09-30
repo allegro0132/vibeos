@@ -1,0 +1,151 @@
+   Compiling typenum v1.20.1
+   Compiling rand_core v0.10.1
+   Compiling cmov v0.5.4
+   Compiling cfg-if v1.0.4
+   Compiling vibeos-hal v0.1.0 (/Users/ziangwang/Sources/vibeos/hal)
+   Compiling vibeos-durable-format v0.1.0 (/Users/ziangwang/Sources/vibeos/durable-format)
+   Compiling bitflags v2.13.1
+   Compiling semver v1.0.28
+   Compiling spin v0.9.9
+   Compiling zeroize v1.9.0
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `typenum` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name typenum --edition=2018 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/typenum-1.20.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --cfg 'feature="const-generics"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("const-generics", "i128", "scale-info", "scale_info", "strict"))' -C metadata=8191d3f5e9ca57a8 -C extra-filename=-55e0980aef2d40a4 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/typenum/55e0980aef2d40a4/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/typenum/55e0980aef2d40a4/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+warning: build failed, waiting for other jobs to finish...
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `vibeos-hal` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name vibeos_hal --edition=2021 hal/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("runtime-platform", "rx-admission-batch", "rx-batch-release"))' -C metadata=8ec76e6ce74a807f -C extra-filename=-d81f33ea4f65c962 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/vibeos-hal/d81f33ea4f65c962/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/vibeos-hal/d81f33ea4f65c962/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `rand_core` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name rand_core --edition=2024 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rand_core-0.10.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=d98b497c03ee0b8c -C extra-filename=-1fa24f2ac887d71d --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/rand_core/1fa24f2ac887d71d/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/rand_core/1fa24f2ac887d71d/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: could not compile `spin` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name spin --edition=2015 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/spin-0.9.9/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --cfg 'feature="mutex"' --cfg 'feature="rwlock"' --cfg 'feature="spin_mutex"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("barrier", "default", "fair_mutex", "lazy", "lock_api", "lock_api_crate", "mutex", "once", "portable-atomic", "portable_atomic", "rwlock", "spin_mutex", "std", "ticket_mutex", "use_ticket_mutex"))' -C metadata=a81190836800caf6 -C extra-filename=-b04e5aff86f673cf --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/spin/b04e5aff86f673cf/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/spin/b04e5aff86f673cf/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: could not compile `cmov` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name cmov --edition=2024 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cmov-0.5.4/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=ae49e7486966b17a -C extra-filename=-8790681e2cd5640a --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/cmov/8790681e2cd5640a/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/cmov/8790681e2cd5640a/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `semver` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name semver --edition=2021 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/semver-1.0.28/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("default", "serde", "std"))' -C metadata=edf0a0085fa61dac -C extra-filename=-0de33aa7c64f7ea1 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/semver/0de33aa7c64f7ea1/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/semver/0de33aa7c64f7ea1/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: could not compile `vibeos-durable-format` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name vibeos_durable_format --edition=2021 durable-format/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=3 -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values())' -C metadata=9525cd9d7b541917 -C extra-filename=-352cd131c7573d72 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/vibeos-durable-format/352cd131c7573d72/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/vibeos-durable-format/352cd131c7573d72/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `bitflags` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name bitflags --edition=2021 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitflags-2.13.1/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("arbitrary", "bytemuck", "example_generated", "serde", "serde_core", "std"))' -C metadata=e759a32c20511d24 -C extra-filename=-fd0a1444c74af852 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/bitflags/fd0a1444c74af852/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/bitflags/fd0a1444c74af852/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: the option `Z` is only accepted on the nightly compiler
+
+help: consider switching to a nightly toolchain: `rustup default nightly`
+
+note: selecting a toolchain with `+toolchain` arguments require a rustup proxy; see <https://rust-lang.github.io/rustup/concepts/index.html>
+
+note: for more information about Rust's stability policy, see <https://doc.rust-lang.org/book/appendix-07-nightly-rust.html#unstable-features>
+
+error: 1 nightly option were parsed
+
+error: could not compile `zeroize` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name zeroize --edition=2024 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --cfg 'feature="derive"' --cfg 'feature="zeroize_derive"' --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("aarch64", "alloc", "default", "derive", "serde", "simd", "std", "zeroize_derive"))' -C metadata=5082fc93dccb28bf -C extra-filename=-da78f2e91b44b185 --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/zeroize/da78f2e91b44b185/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/zeroize_derive/ba506a51a8948e95/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/zeroize/da78f2e91b44b185/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' --extern zeroize_derive=/Users/ziangwang/Sources/vibeos/target/release/build/zeroize_derive/ba506a51a8948e95/out/libzeroize_derive-ba506a51a8948e95.dylib -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)
+error: could not compile `cfg-if` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name cfg_if --edition=2018 /Users/ziangwang/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cfg-if-1.0.4/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata,link -C opt-level=z -C panic=abort -C linker-plugin-lto -C debuginfo=2 --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("core", "rustc-dep-of-std"))' -C metadata=ed18d971a68e8bd2 -C extra-filename=-d85d493fa5fbd91c --out-dir /Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/cfg-if/d85d493fa5fbd91c/out --target riscv64imac-unknown-none-elf -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out -L dependency=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out -L dependency=/Users/ziangwang/Sources/vibeos/target/release/build/cfg-if/d85d493fa5fbd91c/out --extern 'noprelude,nounused:alloc=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/alloc/682bba04873eb95f/out/liballoc-682bba04873eb95f.rmeta' --extern 'noprelude,nounused:compiler_builtins=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/compiler_builtins/c2c1a6c3dbae034e/out/libcompiler_builtins-c2c1a6c3dbae034e.rmeta' --extern 'noprelude,nounused:core=/Users/ziangwang/Sources/vibeos/target/riscv64imac-unknown-none-elf/release/build/core/e96b4e7926c82fd4/out/libcore-e96b4e7926c82fd4.rmeta' -Z unstable-options --cap-lints allow -C linker=ld.lld -C linker-flavor=ld -C target-feature=+zicsr,+zifencei -C link-arg=--gc-sections -C force-frame-pointers=yes` (exit status: 1)

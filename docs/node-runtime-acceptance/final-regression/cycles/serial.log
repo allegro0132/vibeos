@@ -1,0 +1,346 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 4
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 353 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 2
+Domain0 HARTs               : 0*,1*,2*,3*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x00000000bfe00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 2
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+
+   __   __ __  _           ____  ____
+   \ \ / /(_)| |__   ___  / __ \/ ___|
+    \ V / | || '_ \ / _ \| |  | \___ \
+     \_/  |_||_.__/ \___/ \____/|____/   v0.1
+
+  platform  QEMU virt (10 MHz timebase)
+  heap      0x8558e000..0xc0000000  (960968 KiB)
+  traps     stvec armed, PLIC ctx S/hart2, IRQ 10 enabled
+  smp       4 hart(s) online
+  mmu       Sv39 single address space, hart mask 0xf
+  pci       1 function(s), ECAM 0x30000000, MMIO 0x40000000..0x80000000
+  W^X       2048 KiB code pool 0x84e8e000..0x8508e000, MXR clear, RFENCE ready
+  read-only 50560 KiB .rodata 0x819b9000..0x84b19000; 4096 KiB COW capability-table pool
+  world     15 capability spaces, 1 typed channel, 6 components
+  sched     async executor, no threads, no preemption
+
+VibeOS vsh ready -- capability-native shell.
+
+[2Kvsh> quiet
+background component output muted
+[2Kvsh> mkdir @home/project
+[2Kvsh> echo 'export default value => value + 1;' | write @home/project/helper.mjs
+[2Kvsh> echo 'const fs = require("fs"), id = Number(process.argv[process.argv.length-1]); let input = "";' | write @home/project/cycle.cjs
+[2Kvsh> echo 'process.stdin.setEncoding("utf8"); process.stdin.on("data", data => input += data);' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'process.stdin.on("end", async () => {' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const previous = fs.existsSync("counter") ? Number(fs.readFileSync("counter","utf8")) : 0;' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'if (previous+1 !== id || input.trim() !== "payload") throw Error("cycle sequence/stdin");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'fs.writeFileSync("counter", String(id)); fs.openSync("counter", "r");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'if (await fs.promises.readFile("counter","utf8") !== String(id)) throw Error("async file");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const module = await import("./helper.mjs"); if(module.default(41)!==42) throw Error("module import");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'await new Promise(resolve => setTimeout(resolve,1));' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'const buffer = Buffer.alloc(65536, id); if(buffer[65535] !== id) throw Error("buffer");' | write --append @home/project/cycle.cjs
+[2Kvsh> echo 'console.log("NODE_CYCLE_" + "OK=" + id); });' | write --append @home/project/cycle.cjs
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 1
+NODE_CYCLE_OK=1
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:00:06 | 4 CPUs | 11 tasks
+CPU 0.1% | heap 143.0 MiB / 938.4 MiB | peak 400.8 MiB | untouched 537.2 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          4      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          4      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      256 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 2
+NODE_CYCLE_OK=2
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 3
+NODE_CYCLE_OK=3
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 4
+NODE_CYCLE_OK=4
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 5
+NODE_CYCLE_OK=5
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 6
+NODE_CYCLE_OK=6
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 7
+NODE_CYCLE_OK=7
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 8
+NODE_CYCLE_OK=8
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 9
+NODE_CYCLE_OK=9
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 10
+NODE_CYCLE_OK=10
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:00:14 | 4 CPUs | 11 tasks
+CPU 0.0% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 536.0 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 11
+NODE_CYCLE_OK=11
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 12
+NODE_CYCLE_OK=12
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 13
+NODE_CYCLE_OK=13
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 14
+NODE_CYCLE_OK=14
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 15
+NODE_CYCLE_OK=15
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 16
+NODE_CYCLE_OK=16
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 17
+NODE_CYCLE_OK=17
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 18
+NODE_CYCLE_OK=18
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 19
+NODE_CYCLE_OK=19
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 20
+NODE_CYCLE_OK=20
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 21
+NODE_CYCLE_OK=21
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 22
+  pgcache: 8126 of 8192 page reads served from cache
+NODE_CYCLE_OK=22
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 23
+NODE_CYCLE_OK=23
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 24
+NODE_CYCLE_OK=24
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 25
+NODE_CYCLE_OK=25
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 26
+NODE_CYCLE_OK=26
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 27
+NODE_CYCLE_OK=27
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 28
+NODE_CYCLE_OK=28
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 29
+NODE_CYCLE_OK=29
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 30
+NODE_CYCLE_OK=30
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 31
+NODE_CYCLE_OK=31
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 32
+NODE_CYCLE_OK=32
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 33
+NODE_CYCLE_OK=33
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 34
+NODE_CYCLE_OK=34
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 35
+NODE_CYCLE_OK=35
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 36
+NODE_CYCLE_OK=36
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 37
+NODE_CYCLE_OK=37
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 38
+NODE_CYCLE_OK=38
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 39
+NODE_CYCLE_OK=39
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 40
+NODE_CYCLE_OK=40
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 41
+NODE_CYCLE_OK=41
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 42
+NODE_CYCLE_OK=42
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 43
+NODE_CYCLE_OK=43
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 44
+NODE_CYCLE_OK=44
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 45
+NODE_CYCLE_OK=45
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 46
+NODE_CYCLE_OK=46
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 47
+  pgcache: 16310 of 16384 page reads served from cache
+NODE_CYCLE_OK=47
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 48
+NODE_CYCLE_OK=48
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 49
+NODE_CYCLE_OK=49
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 50
+NODE_CYCLE_OK=50
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:00:51 | 4 CPUs | 11 tasks
+CPU 0.0% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 535.7 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          4      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          4      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 51
+NODE_CYCLE_OK=51
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 52
+NODE_CYCLE_OK=52
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 53
+NODE_CYCLE_OK=53
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 54
+NODE_CYCLE_OK=54
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 55
+NODE_CYCLE_OK=55
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 56
+NODE_CYCLE_OK=56
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 57
+NODE_CYCLE_OK=57
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 58
+NODE_CYCLE_OK=58
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 59
+NODE_CYCLE_OK=59
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 60
+NODE_CYCLE_OK=60
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 61
+NODE_CYCLE_OK=61
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 62
+NODE_CYCLE_OK=62
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 63
+NODE_CYCLE_OK=63
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 64
+NODE_CYCLE_OK=64
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 65
+NODE_CYCLE_OK=65
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 66
+NODE_CYCLE_OK=66
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 67
+NODE_CYCLE_OK=67
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 68
+NODE_CYCLE_OK=68
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 69
+NODE_CYCLE_OK=69
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 70
+NODE_CYCLE_OK=70
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 71
+NODE_CYCLE_OK=71
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 72
+  pgcache: 24492 of 24576 page reads served from cache
+NODE_CYCLE_OK=72
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 73
+NODE_CYCLE_OK=73
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 74
+NODE_CYCLE_OK=74
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 75
+NODE_CYCLE_OK=75
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 76
+NODE_CYCLE_OK=76
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 77
+NODE_CYCLE_OK=77
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 78
+NODE_CYCLE_OK=78
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 79
+NODE_CYCLE_OK=79
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 80
+NODE_CYCLE_OK=80
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 81
+NODE_CYCLE_OK=81
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 82
+NODE_CYCLE_OK=82
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 83
+NODE_CYCLE_OK=83
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 84
+NODE_CYCLE_OK=84
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 85
+NODE_CYCLE_OK=85
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 86
+NODE_CYCLE_OK=86
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 87
+NODE_CYCLE_OK=87
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 88
+NODE_CYCLE_OK=88
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 89
+NODE_CYCLE_OK=89
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 90
+NODE_CYCLE_OK=90
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 91
+NODE_CYCLE_OK=91
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 92
+NODE_CYCLE_OK=92
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 93
+NODE_CYCLE_OK=93
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 94
+NODE_CYCLE_OK=94
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 95
+NODE_CYCLE_OK=95
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 96
+  pgcache: 32676 of 32768 page reads served from cache
+NODE_CYCLE_OK=96
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 97
+NODE_CYCLE_OK=97
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 98
+NODE_CYCLE_OK=98
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 99
+NODE_CYCLE_OK=99
+[2Kvsh> echo payload | node --root @home/project cycle.cjs 100
+NODE_CYCLE_OK=100
+[2Kvsh> vtop --once
+VTOP | QEMU virt | up 0d 00:01:36 | 4 CPUs | 11 tasks
+CPU 0.0% | heap 143.1 MiB / 938.4 MiB | peak 401.5 MiB | untouched 535.7 MiB
+SERVICE              STATE       CPU     POLL/s       LIVE       PEAK      LIMIT  ACCESS
+sensor               running      0.0%          0      256 B      256 B   64.0 KiB  manage
+logger               running      0.0%          0      512 B      640 B   64.0 KiB  manage
+guest                running      0.0%          0      256 B      384 B   64.0 KiB  manage
+virtio-blk           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+virtio-rng           running      0.0%          0    1.0 KiB    1.0 KiB   64.0 KiB  manage
+vsh                  running      0.0%          0   61.1 KiB  105.5 KiB    8.0 MiB  protected: active system console
+CPU: non-WFI residency; service CPU: poll time. --: awaiting interval sample.
+[2Kvsh> 

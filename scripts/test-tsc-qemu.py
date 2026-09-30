@@ -50,6 +50,11 @@ def main():
         'diag-fail.cjs': "console.log('TSC_GUEST_' + 'DIAGNOSTIC=missing')",
     }
     commands[2:2] = [f'echo "{source}" | write @home/ts-project/{name}' for name, source in helpers.items()]
+    # Output can arrive before native teardown and the command's stdin pump
+    # finish. Wait for the subsequent shell prompt before sending another
+    # command, otherwise its prefix may be consumed as the previous stdin.
+    commands = [item for line in commands for item in
+                ([line, '@expect vsh> '] if line.startswith('@expect ') else [line])]
     # The UART's bounded receive ring must not be overrun by a single burst.
     assert all(len(line.encode('utf-8')) < 240 for line in commands)
     case = work / 'commands.in'

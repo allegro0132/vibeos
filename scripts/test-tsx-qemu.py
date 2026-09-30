@@ -51,13 +51,12 @@ def main():
             assert "'" not in line
             commands.append(f"echo '{line}' | write {'--append ' if index else ''}@home/project/{name}")
     for name, marker in [('main.cts', 'CJS=43'), ('main.ts', 'ESM=42'), ('view.tsx', 'JSX=42'), ('offline.ts', 'OFFLINE=9')]:
-        commands += [f'@send tsx --root @home/project {name}', f'@expect TSX_TARGET_{marker}']
+        commands += [f'@send tsx --root @home/project {name}', f'@expect TSX_TARGET_{marker}', '@expect vsh> ']
     commands += ['@send tsx --root @home/project error.ts', '@expect /error.ts:2:', '@expect Returned(1)',
-                 '@send tsx --root @home/project main.cts', '@expect TSX_TARGET_CJS=43']
+                 '@expect vsh> ', '@send tsx --root @home/project main.cts', '@expect TSX_TARGET_CJS=43', '@expect vsh> ']
     assert all(len(line.encode()) < 240 for line in commands)
-    # The legacy console redraws prompts while delivering output. Pause after
-    # each command so redraws cannot cause the driver to quit a live command;
-    # success below is based on actual distinct output, not prompt matching.
+    # Require both the result and the subsequent prompt: output alone can
+    # precede native teardown while the old command still owns console input.
     case = work / 'commands.in'
     case.write_text('\n@sleep 0.3\n'.join(commands) + '\n@sleep 1\n@quit\n')
     command = ['qemu-system-riscv64', '-machine', 'virt', '-m', '1G', '-smp', '4',

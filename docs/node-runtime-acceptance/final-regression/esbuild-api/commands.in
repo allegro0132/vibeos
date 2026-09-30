@@ -1,0 +1,91 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'const es = require("/.vibeos-tools/node_modules/esbuild");' | write @home/project/sync.cjs
+@sleep 0.3
+echo 'const result = es.transformSync("const answer: number = 42", {loader:"ts", sourcemap:"external", sourcefile:"answer.ts"});' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'if (!result.code.includes("const answer = 42;")) throw Error("bad TS");' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'const map = JSON.parse(result.map); if (map.sources[0] !== "answer.ts" || !map.mappings) throw Error("bad map");' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'if (!map.sourcesContent[0].includes(": number")) throw Error("missing source");' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'console.log("ESBUILD_API_" + "SYNC=ok");' | write --append @home/project/sync.cjs
+@sleep 0.3
+echo 'const es = require("/.vibeos-tools/node_modules/esbuild");' | write @home/project/async.cjs
+@sleep 0.3
+echo 'const opts = {loader:"tsx", jsxFactory:"h", jsxFragment:"Fragment", sourcemap:"external", sourcefile:"view.tsx"};' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'es.transform("const view = <Box value={42} />", opts).then(result => {' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'if (!result.code.includes("h(Box, { value: 42 })")) throw Error("bad TSX");' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'if (JSON.parse(result.map).sources[0] !== "view.tsx") throw Error("bad TSX map");' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'console.log("ESBUILD_API_" + "ASYNC=ok"); });' | write --append @home/project/async.cjs
+@sleep 0.3
+echo 'const es = require("/.vibeos-tools/node_modules/esbuild");' | write @home/project/error.cjs
+@sleep 0.3
+echo 'let found = false; try { es.transformSync("const value: = 1", {loader:"ts", sourcefile:"broken.ts"}); } catch (e) {' | write --append @home/project/error.cjs
+@sleep 0.3
+echo 'found = e.errors.length === 1 && e.errors[0].location.file === "broken.ts" && e.errors[0].location.line === 1;' | write --append @home/project/error.cjs
+@sleep 0.3
+echo 'console.log(e.message); } if (!found) throw Error("missing syntax diagnostic");' | write --append @home/project/error.cjs
+@sleep 0.3
+echo 'console.log("ESBUILD_API_" + "ERROR=ok");' | write --append @home/project/error.cjs
+@sleep 0.3
+echo 'const es = require("/.vibeos-tools/node_modules/esbuild");' | write @home/project/options.cjs
+@sleep 0.3
+echo 'let found = false; try { es.transformSync("let n = 1", {notAnOption:true}); } catch (e) {' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'found = e.errors.length === 1 && e.errors[0].text.includes("notAnOption"); }' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'if (!found) throw Error("missing option diagnostic");' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'let limited = false; try { es.transformSync("x".repeat(1048577)); } catch(e) { limited = e.code === "EFBIG"; }' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'if (!limited) throw Error("missing input limit");' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'es.transform("let n = 1", {notAnOption:true}).then(() => { throw Error("accepted option"); }, e => {' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'if (!e.errors[0].text.includes("notAnOption")) throw Error("missing async diagnostic");' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'console.log("ESBUILD_API_" + "OPTIONS=ok"); });' | write --append @home/project/options.cjs
+@sleep 0.3
+echo 'const es = require("/.vibeos-tools/node_modules/esbuild");' | write @home/project/unsupported.cjs
+@sleep 0.3
+echo 'let denied = false; try { es.buildSync({}); } catch (e) { denied = e.code === "ENOTSUP"; }' | write --append @home/project/unsupported.cjs
+@sleep 0.3
+echo 'if (!denied) throw Error("build accepted");' | write --append @home/project/unsupported.cjs
+@sleep 0.3
+echo 'es.context({}).then(() => { throw Error("context accepted"); }, e => {' | write --append @home/project/unsupported.cjs
+@sleep 0.3
+echo 'if (e.code !== "ENOTSUP") throw e; console.log("ESBUILD_API_" + "UNSUPPORTED=ok"); });' | write --append @home/project/unsupported.cjs
+@sleep 0.3
+@send node-tool-probe --root @home/project sync.cjs
+@sleep 0.3
+@expect ESBUILD_API_SYNC=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project async.cjs
+@sleep 0.3
+@expect ESBUILD_API_ASYNC=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project error.cjs
+@sleep 0.3
+@expect ESBUILD_API_ERROR=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project options.cjs
+@sleep 0.3
+@expect ESBUILD_API_OPTIONS=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project unsupported.cjs
+@sleep 0.3
+@expect ESBUILD_API_UNSUPPORTED=ok
+@sleep 0.3
+@send node-tool-probe --root @home/project sync.cjs
+@sleep 0.3
+@expect ESBUILD_API_SYNC=ok
+@sleep 1
+@quit

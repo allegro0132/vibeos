@@ -1,0 +1,2 @@
+FAIL mmu: boot 1 produced no shell-ready marker
+FAIL mmu: no output captured (did the kernel boot?)

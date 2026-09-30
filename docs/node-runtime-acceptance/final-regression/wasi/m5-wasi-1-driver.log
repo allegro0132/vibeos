@@ -1,0 +1,33 @@
+warning: method `is_empty` is never used
+  --> durable-format/src/replay_ids.rs:54:19
+   |
+27 | impl<V, K: Ord + Copy> ReplayIndex<V, K> {
+   | ---------------------------------------- method in this implementation
+...
+54 |     pub(crate) fn is_empty(&self) -> bool { self.nodes.is_empty() }
+   |                   ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `vibeos-durable-format` (lib) generated 1 warning
+warning: use of deprecated method `core::sync::atomic::Atomic::<usize>::fetch_update`: renamed to `try_update` for consistency
+  --> core/src/boot_log.rs:18:41
+   |
+18 |         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+   |                                         ^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+help: replace the use of the deprecated method
+   |
+18 -         let start = match self.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+18 +         let start = match self.reserved.try_update(Ordering::Relaxed, Ordering::Relaxed,
+   |
+
+warning: `vibeos-core` (lib) generated 1 warning (run `cargo fix --lib -p vibeos-core` to apply 1 suggestion)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.22s
+     Running `target/debug/examples/fixtures /Users/ziangwang/Sources/vibeos/target/node-runtime/m5-wasi-1/fixtures`
+PASS standard Rust/C commands, arguments, binary stdin, stderr, exit
+wrote OpenSSH private key to /Users/ziangwang/Sources/vibeos/target/node-runtime/m5-wasi-1/rejected_key
+PASS upload failures, containment and disconnect recovery
+PASS local pipeline, post-boot compilation, 100 reclaimed invocations
+PASS WASI_QEMU: upload, execution, lifecycle, restart; evidence: /Users/ziangwang/Sources/vibeos/target/node-runtime/m5-wasi-1

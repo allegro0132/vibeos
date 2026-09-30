@@ -13,7 +13,8 @@ qualifies M2, including local VSH, authenticated SSH and 100 successful launcher
 cycles after the process-page ownership fix. The [fresh toolkit qualification](node-runtime-acceptance/toolkit-fresh-build/README.md)
 completes M3, including official tsc, adapted tsx, esbuild sync/Promise APIs and
 SSH use. The [M4 lifecycle/security audit](node-runtime-acceptance/lifecycle-audit/README.md)
-also passes; final M5 regression qualification remains incomplete.
+also passes. [Final M5 production and subsystem regressions](node-runtime-acceptance/final-regression/README.md)
+pass, with one disclosed pre-existing failure in the expanded Python suite.
 
 | Area | Verified behavior / current boundary | Evidence |
 |---|---|---|
@@ -41,7 +42,9 @@ also passes; final M5 regression qualification remains incomplete.
 
 Excluded first-release facilities include npm online installation, network
 services/DNS, general subprocesses, IPC, user workers, native addons, signals,
-watch mode and V8 WebAssembly. The platform uses explicit unavailable errors;
+watch mode and V8 WebAssembly. [Final rejection tests](node-runtime-acceptance/final-regression/exclusions/results.json)
+verify worker, sync/async subprocess, TCP/UDP, signal, addon and watch/poll
+errors, tsx watch refusal and unavailable V8 WebAssembly. The platform uses explicit unavailable errors;
 it does not substitute host execution. The existing WASI service used by
 esbuild is separate from V8 WebAssembly and Node's unavailable WASI binding.
 

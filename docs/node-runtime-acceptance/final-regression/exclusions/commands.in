@@ -1,0 +1,57 @@
+quiet
+@sleep 0.3
+mkdir @home/project
+@sleep 0.3
+echo 'const assert = require("assert/strict"), fs = require("fs");' | write @home/project/exclusions.cjs
+@sleep 0.3
+echo 'function denied(name, run, code) {' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'let caught; try { run(); } catch(e) { caught=e; }' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'assert.equal(caught?.code, code, name); console.log("NODE_EXCLUDED_"+name+"="+code); }' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("WORKER",()=>new (require("worker_threads").Worker)("1",{eval:true}),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("SPAWN",()=>require("child_process").spawn("node",["-e","1"]),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("SPAWN_SYNC",()=>{throw require("child_process").spawnSync("node",["-e","1"]).error},"ENOTSUP");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("TCP",()=>require("net").createServer().listen(0),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("UDP",()=>require("dgram").createSocket("udp4"),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("SIGNAL",()=>process.on("SIGUSR1",()=>{}),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'fs.writeFileSync("addon.node","not a native image");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("ADDON",()=>require("./addon.node"),"ERR_DLOPEN_DISABLED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("WATCH",()=>fs.watch("addon.node",()=>{}),"ENOTSUP");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'denied("WATCH_FILE",()=>fs.watchFile("addon.node",()=>{}),"ERR_VIBEOS_UNSUPPORTED");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'assert.equal(typeof WebAssembly,"undefined"); console.log("NODE_EXCLUDED_"+"WASM=unavailable");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+echo 'console.log("NODE_EXCLUDED_"+"DONE");' | write --append @home/project/exclusions.cjs
+@sleep 0.3
+@send node --root @home/project exclusions.cjs
+@sleep 0.3
+@expect NODE_EXCLUDED_DONE
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send tsx --root @home/project watch exclusions.cjs
+@sleep 0.3
+@expect watch and subprocess modes are unavailable
+@sleep 0.3
+@expect Unavailable
+@sleep 0.3
+@expect vsh> 
+@sleep 0.3
+@send node --root @home/project -e "console.log('NODE_EXCLUDED_'+'RESTART')"
+@sleep 0.3
+@expect NODE_EXCLUDED_RESTART
+@sleep 0.3
+@expect vsh> 
+@sleep 1
+@quit

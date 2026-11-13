@@ -131,3 +131,26 @@ fn ready_hint_mirrors_every_enqueue_remove_and_dispatch() {
     }
     assert!(queues.dispatch(hart(1)).is_none());
 }
+
+#[test]
+fn explicit_placement_keeps_default_children_local_and_remote_queues_live() {
+    use vibeos_core::runqueue::ReadyHint;
+    static HINT: ReadyHint = ReadyHint::new();
+    let mut queues = RunQueues::with_hint(&HINT);
+    queues.reserve_live_bound(2).unwrap();
+    queues.set_work_stealing(false);
+    queues.enqueue(hart(0), 1u8, true).unwrap();
+    assert!(queues.dispatch(hart(1)).is_none());
+    assert!(queues.hart_idle(hart(1)) && HINT.hart_idle(hart(1)));
+    assert!(!queues.hart_idle(hart(0)) && !HINT.hart_idle(hart(0)));
+    queues.enqueue(hart(1), 2u8, false).unwrap();
+    let remote = queues.dispatch(hart(1)).unwrap();
+    assert_eq!((remote.task, remote.stolen), (2, false));
+    assert_eq!(queues.dispatch(hart(0)).unwrap().task, 1);
+    assert!(HINT.hart_idle(hart(0)) && HINT.hart_idle(hart(1)));
+    // The policy is local to this queue instance, including unobserved queues.
+    let mut other = RunQueues::new();
+    other.reserve_live_bound(1).unwrap();
+    other.enqueue(hart(0), 3u8, true).unwrap();
+    assert!(other.dispatch(hart(1)).unwrap().stolen);
+}

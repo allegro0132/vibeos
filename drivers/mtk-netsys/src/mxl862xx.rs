@@ -1328,6 +1328,11 @@ impl<'a, I: Io> Mailbox<'a, I> {
         if self.bridge(physical)?.map != [0x200, 0, 0, 0, 0, 0, 0, 0] {
             return Err(Error::InvalidState);
         }
+        self.set_port_data(physical)
+    }
+    /// The two per-port DMA enable bits, without any forwarding-map
+    /// precondition. For owners that program the maps themselves.
+    pub(crate) fn set_port_data(&mut self, physical: u16) -> Result<(), Error> {
         for address in [0x0bc0 + physical * 6, 0x0a80 + physical * 6] {
             let [lo, hi] = address.to_le_bytes();
             let mut before = [lo, hi, 0, 0];

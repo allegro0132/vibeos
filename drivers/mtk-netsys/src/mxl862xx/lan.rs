@@ -277,6 +277,33 @@ impl<I: Io> Mailbox<'_, I> {
     pub fn restore_lan_bridge(&mut self, lease: &mut LanBridgeLease) -> Result<(), Error> {
         lease.restore(self)
     }
+    /// Turn a switch that is in its hardware-reset defaults into one plain
+    /// learning bridge of the four copper ports and the CPU port, with
+    /// untagged frames on the CPU port and no VLAN rules.
+    ///
+    /// For a product that resets the switch itself at start-up and therefore
+    /// needs neither a lease nor a restore: the next start resets again. The
+    /// state is verified first (default bridge 0, no VLAN bindings); anything
+    /// else is refused, not adopted. Forwarding is closed on every port
+    /// before the first new map opens, and each write is read back.
+    pub fn raw_lan_bridge(&mut self) -> Result<(), Error> {
+        const MEMBERS: [u16; 5] = [1, 2, 3, 4, 9];
+        for port in MEMBERS {
+            let bridge = self.bridge(port)?;
+            if bridge.id != 0 || bridge.destination != port as u8 || bridge.ingress_vlan.0 || bridge.egress_vlan.0 {
+                return Err(Error::InvalidState);
+            }
+        }
+        for port in MEMBERS {
+            Backend::map(self, port, map(0))?;
+        }
+        for port in 1..=4u16 {
+            self.set_port_data(port)?;
+            // The other copper ports and the CPU; never back out the ingress port.
+            Backend::map(self, port, map(0x21e & !(1 << port)))?;
+        }
+        Backend::map(self, 9, map(0x1e))
+    }
 }
 impl<I: Io> Backend for Mailbox<'_, I> {
     fn fdb_find(&mut self, id: u16, mac: [u8; 6]) -> Result<Option<FdbEntry>, Error> {

@@ -162,3 +162,48 @@ fn qemu_can_explicitly_disable_hardware_entropy_and_use_jitter() {
     assert!(r.boards["qemu-virt"].enabled.contains("jitter-entropy"));
     assert!(!r.features.contains("driver-virtio-rng"));
 }
+#[test]
+fn a_configuration_has_exactly_one_architecture() {
+    let c = catalog();
+    let mut config = c.preset("default").unwrap();
+    assert!(!config.boards.contains("bpi-r4pro-4e"));
+    let r = resolve(&c, &config).unwrap();
+    assert_eq!(
+        (r.arch.label(), r.target.as_str()),
+        ("riscv64", "riscv64imac-unknown-none-elf")
+    );
+    config.boards.insert("bpi-r4pro-4e".into());
+    let error = resolve(&c, &config).unwrap_err();
+    assert!(
+        error.contains("one kernel image has one architecture"),
+        "{error}"
+    );
+}
+#[test]
+fn an_external_board_resolves_alone_without_universal_features() {
+    let c = catalog();
+    let config = c.preset("bpi-r4pro-4e").unwrap();
+    assert_eq!(
+        config.components,
+        BTreeSet::from(["network".into(), "vsh".into()])
+    );
+    let r = resolve(&c, &config).unwrap();
+    r.require_valid().unwrap();
+    assert_eq!(r.target, "aarch64-unknown-none-softfloat");
+    assert!(r.features.is_empty());
+    let plan = &r.boards["bpi-r4pro-4e"];
+    for id in [
+        "aarch64-runtime",
+        "mtk-msdc",
+        "mtk-netsys",
+        "network",
+        "vsh",
+    ] {
+        assert!(plan.enabled.contains(id), "{id}");
+    }
+    // RISC-V-only parts never leak into an arm64 plan.
+    assert!(!plan.enabled.contains("uart16550") && !plan.enabled.contains("plic"));
+    let mut with_files = config.clone();
+    with_files.components.insert("file-tree".into());
+    assert!(!resolve(&c, &with_files).unwrap().valid());
+}

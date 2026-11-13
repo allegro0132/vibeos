@@ -42,7 +42,7 @@ fn run() -> Result<()> {
             "--dry-run" => dry_run = true,
             "--ascii" => ascii = true,
             "--help" | "-h" => {
-                println!("VibeOS configuration\n\n./configure.sh [--config FILE] [--preset NAME]\n./configure.sh --preset default --non-interactive\n./configure.sh resolve|check --config FILE\n./build.sh --config FILE [--dry-run]\n\nPresets: default, minimal, qemu-virt, milkv-duo, milkv-mars\nDriver choices: auto / on / off. Press ? inside the UI for keys.\n--ascii (or VIBECONFIG_ASCII=1) draws without Unicode; NO_COLOR disables colour.\n");
+                println!("VibeOS configuration\n\n./configure.sh [--config FILE] [--preset NAME]\n./configure.sh --preset default --non-interactive\n./configure.sh resolve|check --config FILE\n./build.sh --config FILE [--dry-run]\n\nPresets: default, minimal, or a board id (qemu-virt, milkv-duo, milkv-mars, bpi-r4pro-4e)\nA configuration has one architecture: RISC-V boards share one image; an arm64 board is configured alone.\nDriver choices: auto / on / off. Press ? inside the UI for keys.\n--ascii (or VIBECONFIG_ASCII=1) draws without Unicode; NO_COLOR disables colour.\n");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {arg}; use --help")),
@@ -133,6 +133,20 @@ pub fn save(root: &Path, path: &Path, config: &Config, r: &vibeos_config::Resolv
 }
 
 fn build(root: &Path, catalog: &Catalog, r: &vibeos_config::Resolved, dry: bool) -> Result<()> {
+    if r.image == vibeos_config::Image::External {
+        // Nothing to link here: the product repository owns the image.
+        let hints: Vec<String> = r
+            .boards
+            .keys()
+            .filter_map(|id| catalog.board(id))
+            .map(|b| format!("{}: {}", b.name, b.build_hint))
+            .collect();
+        return Err(format!(
+            "no {} image is built in this workspace\n{}",
+            r.arch.label(),
+            hints.join("\n")
+        ));
+    }
     let output = root.join("target/universal").join(&r.digest);
     let resolved_path = output.join("resolved.toml");
     let features = r.features.iter().cloned().collect::<Vec<_>>().join(",");

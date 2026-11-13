@@ -5,6 +5,7 @@ version = 1
 id = "qemu-virt"
 name = "QEMU virt"
 description = "RISC-V virt with 128 MiB RAM, VirtIO storage and networking."
+arch = "riscv64"
 required = ["uart16550", "plic"]
 defaults = ["virtio-blk", "virtio-net"]
 feature = "board-qemu-virt"
@@ -15,6 +16,7 @@ memory_bytes = 132120576
 id = "milkv-duo"
 name = "Milk-V Duo"
 description = "CV1800B / C906 with a 60 MiB kernel memory window."
+arch = "riscv64"
 required = ["uart16550", "plic", "cv1800b"]
 defaults = ["sdhci-blk", "dwmac-net"]
 feature = "board-milkv-duo"
@@ -25,11 +27,26 @@ memory_bytes = 62914560
 id = "milkv-mars"
 name = "Milk-V Mars"
 description = "JH7110 4 GiB with native SD and EQoS; jitterentropy supplies the entropy fallback."
+arch = "riscv64"
 required = ["uart16550", "plic", "jh7110", "dw-i2c"]
 defaults = ["dw-mshc", "eqos-net"]
 feature = "board-milkv-mars"
 load_address = 1075838976
 memory_bytes = 4292870144
+
+[[boards]]
+id = "bpi-r4pro-4e"
+name = "BPI-R4 Pro 4E"
+description = "MT7988A / Cortex-A73 router board. VibeOS provides the platform libraries; the router image is a separate product."
+arch = "aarch64"
+image = "external"
+build_hint = "Built by VibeWrt (github.com/allegro0132/vibewrt), which pins VibeOS as a submodule: ./scripts/build-bpi-r4pro-4e.sh"
+required = ["aarch64-runtime"]
+defaults = ["mtk-msdc", "mtk-netsys"]
+feature = ""
+# The bootstrap arena from boards/bpi-r4pro-4e; installed RAM comes from the FDT.
+load_address = 1074266112
+memory_bytes = 16252928
 
 [[nodes]]
 id = "uart16550"
@@ -37,7 +54,7 @@ name = "Serial console"
 description = "Required for boot; register layout follows the admitted board."
 kind = "driver"
 feature = "driver-uart16550"
-boards = []
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = []
 provides = ["console"]
 
@@ -47,7 +64,7 @@ name = "PLIC interrupt controller"
 description = "Required for boot; the BSP supplies hart and supervisor context mappings."
 kind = "driver"
 feature = "driver-plic"
-boards = []
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = []
 provides = ["interrupts"]
 
@@ -252,6 +269,36 @@ requires = ["jh7110"]
 provides = ["diagnostic-entropy"]
 
 [[nodes]]
+id = "aarch64-runtime"
+name = "AArch64 EL1 runtime"
+description = "Exception vectors, GICv3, MMU and PSCI for arm64 boards."
+kind = "driver"
+feature = ""
+boards = ["bpi-r4pro-4e"]
+requires = []
+provides = ["console", "interrupts"]
+
+[[nodes]]
+id = "mtk-msdc"
+name = "MediaTek MSDC storage"
+description = "MT7988 SD/eMMC host controller."
+kind = "driver"
+feature = ""
+boards = ["bpi-r4pro-4e"]
+requires = ["aarch64-runtime"]
+provides = ["block"]
+
+[[nodes]]
+id = "mtk-netsys"
+name = "MediaTek NETSYS network"
+description = "MT7988 frame engine with PDMA/QDMA, the PPE flow tables and the MxL862xx switch."
+kind = "driver"
+feature = ""
+boards = ["bpi-r4pro-4e"]
+requires = ["aarch64-runtime"]
+provides = ["network"]
+
+[[nodes]]
 id = "vsh"
 name = "VSH console"
 description = "The required capability shell."
@@ -266,6 +313,7 @@ name = "File services"
 description = "Managed storage, file trees and persistent programs."
 kind = "component"
 feature = "component-file-tree"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["cap:block"]
 conflicts = []
 
@@ -284,6 +332,7 @@ name = "SSH service"
 description = "Locally provisioned persistent identities; requires networking, storage and entropy."
 kind = "component"
 feature = "component-ssh"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["network", "file-tree", "cap:entropy"]
 conflicts = ["iperf3"]
 
@@ -293,6 +342,7 @@ name = "WASI command runtime"
 description = "Built-in WASI Preview 1 support; external programs are installed separately."
 kind = "component"
 feature = "component-wasi"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["file-tree"]
 conflicts = []
 
@@ -302,6 +352,7 @@ name = "Wasmtime native backend"
 description = "Requires RV64GC; runtime ISA, memory and command authority checks remain enforced."
 kind = "component"
 feature = "component-wasmtime"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["wasi"]
 conflicts = ["python"]
 
@@ -311,6 +362,7 @@ name = "Python/WASI support"
 description = "Bounded Wasmi interpreter with limits suitable for small boards; install the Python program separately."
 kind = "component"
 feature = "component-python"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["wasi"]
 conflicts = ["wasmtime"]
 
@@ -320,5 +372,6 @@ name = "iperf3 service"
 description = "DHCP TCP benchmark service; conflicts with the existing SSH service profile."
 kind = "component"
 feature = "component-iperf3"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["network"]
 conflicts = ["ssh"]

@@ -1,0 +1,11 @@
+# VibeOS build configuration. Edit this file or run ./configure.sh.
+version = 1
+boards = ["bpi-r4pro-4e"]
+components = [
+    "network",
+    "vsh",
+]
+
+[drivers]
+mtk-msdc = "on"
+mtk-netsys = "on"

@@ -20,7 +20,9 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{env, io, path::Path, time::Duration};
-use vibeos_config::{resolve, Catalog, Config, Kind, Node, Resolved, Result, Selection};
+use vibeos_config::{
+    resolve, Board, Catalog, Config, Image, Kind, Node, Resolved, Result, Selection,
+};
 
 const ASCII_BORDER: border::Set<'static> = border::Set {
     top_left: "+",
@@ -167,6 +169,8 @@ enum Modal {
     Help,
     Quit,
     Preset(String),
+    /// Selecting this board means leaving the current architecture or image.
+    Switch(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -225,6 +229,13 @@ impl App {
         self.query.clear();
         self.searching = false;
     }
+    fn boards<'a>(&self, c: &'a Catalog) -> Vec<&'a Board> {
+        self.config
+            .boards
+            .iter()
+            .filter_map(|id| c.board(id))
+            .collect()
+    }
     fn boot_required(&self, c: &Catalog, id: &str) -> bool {
         self.config
             .boards
@@ -247,7 +258,7 @@ impl App {
                             id: b.id.clone(),
                             mark: if on { Mark::On } else { Mark::Off },
                             name: b.name.clone(),
-                            note: memory(b.memory_bytes),
+                            note: b.arch.label().into(),
                             note_tone: Tone::Dim,
                             faded: false,
                         },
@@ -383,7 +394,20 @@ impl App {
         match self.tab {
             BOARDS => {
                 if !self.config.boards.contains(&id) {
-                    self.config.boards.insert(id);
+                    // One image has one architecture, and an external image
+                    // has one board: crossing either line replaces the set.
+                    let fits = c.board(&id).is_some_and(|new| {
+                        self.boards(c).iter().all(|b| {
+                            b.arch == new.arch
+                                && b.image == Image::Universal
+                                && new.image == Image::Universal
+                        })
+                    });
+                    if fits {
+                        self.config.boards.insert(id);
+                    } else {
+                        self.modal = Modal::Switch(id);
+                    }
                 } else if self.config.boards.len() == 1 {
                     self.say(Tone::Warn, "Keep at least one board.");
                 } else {
@@ -491,6 +515,23 @@ impl App {
                 }
                 return Action::None;
             }
+            Modal::Switch(id) => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Enter => {
+                        self.modal = Modal::None;
+                        if let (Ok(config), Some(b)) = (c.preset(&id), c.board(&id)) {
+                            self.config = config;
+                            self.say(
+                                Tone::Ok,
+                                format!("Now configuring {} ({}).", b.name, b.arch.label()),
+                            );
+                        }
+                    }
+                    KeyCode::Char('n') | KeyCode::Esc => self.modal = Modal::None,
+                    _ => {}
+                }
+                return Action::None;
+            }
             Modal::None => {}
         }
         if ctrl && key.code == KeyCode::Char('s') {
@@ -567,10 +608,12 @@ impl App {
             Ok(()) => {
                 self.saved = self.config.clone();
                 self.on_disk = true;
-                self.say(
-                    Tone::Ok,
-                    format!("Saved {}. Next: ./build.sh", path.display()),
-                );
+                let next = if self.boards(c).iter().any(|b| b.image == Image::External) {
+                    "See Review for how the image is built."
+                } else {
+                    "Next: ./build.sh"
+                };
+                self.say(Tone::Ok, format!("Saved {}. {next}", path.display()));
                 true
             }
             Err(e) => {
@@ -715,11 +758,11 @@ pub fn run(
     }
     // Back on the normal screen: leave the next step in the scrollback.
     if app.on_disk && !app.dirty() {
-        println!(
-            "Configuration: {}\nNext: ./build.sh --config {}",
-            path.display(),
-            path.display()
-        );
+        println!("Configuration: {}", path.display());
+        match app.boards(c).iter().find(|b| b.image == Image::External) {
+            Some(b) => println!("{}: {}", b.name, b.build_hint),
+            None => println!("Next: ./build.sh --config {}", path.display()),
+        }
     } else {
         println!("No changes saved.");
     }
@@ -732,6 +775,7 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
         let message = match app.modal {
             Modal::Quit => "VibeOS setup\nUnsaved changes: s save and quit / d discard / Esc return",
             Modal::Preset(_) => "VibeOS setup\nReplace selection with preset? y load / n return",
+            Modal::Switch(_) => "VibeOS setup\nSwitch architecture and replace boards? y switch / n return",
             _ => "VibeOS setup\nResize the terminal to at least 50 x 12.\nSelection preserved; Ctrl-S saves, q quits.",
         };
         f.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
@@ -827,6 +871,42 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
             ],
             th,
         ),
+        Modal::Switch(id) => {
+            let Some(new) = c.board(id) else { return };
+            let current = app.boards(c);
+            let why = match current.first() {
+                Some(old) if old.arch != new.arch => format!(
+                    "{} is {}; the current selection is {}.",
+                    new.name,
+                    new.arch.label(),
+                    old.arch.label()
+                ),
+                _ if new.image == Image::External => {
+                    format!(
+                        "{} has its own image, built outside this workspace.",
+                        new.name
+                    )
+                }
+                _ => "The current board has its own image and is configured alone.".into(),
+            };
+            dialog(
+                f,
+                area,
+                " Switch target ",
+                vec![
+                    Line::from(why),
+                    Line::from(th.span(Tone::Dim, "One kernel image has one architecture.")),
+                    Line::default(),
+                    Line::from(format!(
+                        "Replace the selection with {} and its defaults?",
+                        new.name
+                    )),
+                    Line::default(),
+                    keys(th, &[("Enter", "switch"), ("Esc", "cancel")]),
+                ],
+                th,
+            )
+        }
     }
 }
 
@@ -1119,6 +1199,10 @@ fn details(
         out.push(Line::default());
         out.push(Line::from(b.description.clone()));
         out.push(Line::default());
+        out.push(field(th, "Arch", b.arch.label()));
+        if b.image == Image::External {
+            out.push(field(th, "Image", "built outside this workspace"));
+        }
         out.push(field(th, "RAM window", memory(b.memory_bytes)));
         out.push(field(th, "Load at", format!("{:#x}", b.load_address)));
         out.push(field(th, "Boot needs", b.required.join(", ")));
@@ -1219,7 +1303,17 @@ fn review(
     };
     if r.valid() {
         out.push(Line::from(vec![
-            th.bold(Tone::Ok, format!("{} Ready to build", th.pick("✓", "+"))),
+            th.bold(
+                Tone::Ok,
+                format!(
+                    "{} {}",
+                    th.pick("✓", "+"),
+                    match r.image {
+                        Image::Universal => "Ready to build",
+                        Image::External => "Selection is consistent",
+                    }
+                ),
+            ),
             th.span(
                 Tone::Dim,
                 if app.dirty() || !app.on_disk {
@@ -1248,14 +1342,17 @@ fn review(
     }
     out.push(Line::default());
     out.push(field(th, "File", path.display().to_string()));
+    out.push(field(th, "Arch", r.arch.label()));
     out.push(field(th, "Target", r.target.clone()));
     out.push(field(th, "Digest", r.digest.clone()));
-    out.push(field(
-        th,
-        "Output",
-        format!("target/universal/{}/", clip(&r.digest, 13, th)),
-    ));
-    out.extend(wrapped_field(th, "Features", r.features.iter(), width));
+    if r.image == Image::Universal {
+        out.push(field(
+            th,
+            "Output",
+            format!("target/universal/{}/", clip(&r.digest, 13, th)),
+        ));
+        out.extend(wrapped_field(th, "Features", r.features.iter(), width));
+    }
     for (bid, plan) in &r.boards {
         out.push(Line::default());
         out.push(heading(
@@ -1272,10 +1369,22 @@ fn review(
     out.push(Line::default());
     out.push(heading(th, "Next"));
     let config = path.display();
-    for (command, what) in [
-        (format!("./build.sh --config {config}"), "build the image"),
-        (format!("./run.sh --config {config}"), "boot it in QEMU"),
-    ] {
+    let mut steps = Vec::new();
+    match r.image {
+        Image::Universal => {
+            steps.push((format!("./build.sh --config {config}"), "build the image"));
+            if r.boards.contains_key("qemu-virt") {
+                steps.push((format!("./run.sh --config {config}"), "boot it in QEMU"));
+            }
+        }
+        Image::External => {
+            // The image is linked by the product that pins this workspace.
+            for b in app.boards(c) {
+                out.push(Line::from(format!("  {}", b.build_hint)));
+            }
+        }
+    }
+    for (command, what) in steps {
         out.push(Line::from(vec![
             Span::raw(format!("  {command}")),
             th.span(Tone::Dim, format!("   {what}")),
@@ -1315,8 +1424,15 @@ fn draw_status(
         let parts: std::collections::BTreeSet<&String> =
             r.boards.values().flat_map(|p| &p.enabled).collect();
         let summary = format!(
-            "{} boards{}{} parts{}{}",
+            "{}{}{} {}{}{} parts{}{}",
+            r.arch.label(),
+            th.dot(),
             r.boards.len(),
+            if r.boards.len() == 1 {
+                "board"
+            } else {
+                "boards"
+            },
             th.dot(),
             parts.len(),
             th.dot(),
@@ -1554,6 +1670,43 @@ mod tests {
     }
 
     #[test]
+    fn another_architecture_replaces_the_selection_only_after_confirmation() {
+        let c = catalog();
+        let mut a = App::new(c.preset("default").unwrap(), true);
+        a.selected = c
+            .boards
+            .iter()
+            .position(|b| b.id == "bpi-r4pro-4e")
+            .unwrap();
+        press(&mut a, &c, KeyCode::Char(' '));
+        assert_eq!(a.modal, Modal::Switch("bpi-r4pro-4e".into()));
+        press(&mut a, &c, KeyCode::Esc);
+        assert_eq!(a.config, c.preset("default").unwrap());
+        press(&mut a, &c, KeyCode::Char(' '));
+        press(&mut a, &c, KeyCode::Enter);
+        assert_eq!(a.config, c.preset("bpi-r4pro-4e").unwrap());
+        let r = resolve(&c, &a.config).unwrap();
+        r.require_valid().unwrap();
+        assert_eq!(
+            (r.arch.label(), r.target.as_str()),
+            ("arm64", "aarch64-unknown-none-softfloat")
+        );
+        let text = screen(&c, &a, ASCII, 100, 30);
+        assert!(text.contains("arm64 - 1 board"), "{text}");
+        a.go(REVIEW);
+        assert!(screen(&c, &a, ASCII, 100, 40).contains("VibeWrt"));
+        // Going back to RISC-V asks again; RISC-V boards then combine freely.
+        a.go(BOARDS);
+        a.selected = 0;
+        press(&mut a, &c, KeyCode::Char(' '));
+        assert_eq!(a.modal, Modal::Switch("qemu-virt".into()));
+        press(&mut a, &c, KeyCode::Enter);
+        a.selected = 1;
+        press(&mut a, &c, KeyCode::Char(' '));
+        assert_eq!((a.modal.clone(), a.config.boards.len()), (Modal::None, 2));
+    }
+
+    #[test]
     fn rows_show_the_resolved_outcome() {
         let c = catalog();
         let mut a = App::new(c.preset("default").unwrap(), true);
@@ -1615,12 +1768,14 @@ mod tests {
                 Modal::Help,
                 Modal::Quit,
                 Modal::Preset("minimal".into()),
+                Modal::Switch("bpi-r4pro-4e".into()),
             ] {
                 a.modal = modal;
                 for (w, h) in [(40, 10), (50, 12), (60, 15), (80, 24), (140, 40)] {
                     let anchor = match (&a.modal, w >= 50 && h >= 12) {
                         (Modal::Help, true) => "Press any key to close.",
                         (Modal::Quit, true) => "keep editing",
+                        (Modal::Switch(_), true) => "cancel",
                         _ => "VibeOS",
                     };
                     assert!(screen(&c, &a, UNICODE, w, h).contains(anchor), "{w}x{h}");
@@ -1654,5 +1809,13 @@ mod tests {
         println!("{}\n", screen(&c, &a, UNICODE, 100, 16));
         a.go(BOARDS);
         println!("{}\n", screen(&c, &a, ASCII, 78, 24));
+        a.config = c.preset("default").unwrap();
+        a.selected = 3;
+        println!("{}\n", screen(&c, &a, UNICODE, 100, 24));
+        press(&mut a, &c, KeyCode::Char(' '));
+        println!("{}\n", screen(&c, &a, UNICODE, 100, 24));
+        press(&mut a, &c, KeyCode::Enter);
+        a.go(REVIEW);
+        println!("{}\n", screen(&c, &a, UNICODE, 100, 30));
     }
 }

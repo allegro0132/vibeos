@@ -39,12 +39,54 @@ pub struct Config {
     pub drivers: BTreeMap<String, Selection>,
 }
 
+/// Instruction set of a board. One kernel image has exactly one, so a
+/// configuration's architecture is derived from its boards, never stored.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Arch {
+    Riscv64,
+    Aarch64,
+}
+impl Arch {
+    /// The name people use; the Rust target keeps the formal one.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Riscv64 => "riscv64",
+            Self::Aarch64 => "arm64",
+        }
+    }
+    fn target(self) -> &'static str {
+        match self {
+            Self::Riscv64 => "riscv64imac-unknown-none-elf",
+            Self::Aarch64 => "aarch64-unknown-none-softfloat",
+        }
+    }
+}
+
+/// Who links the bootable image for a board.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Image {
+    /// `firmware/universal` in this workspace; boards can share one image.
+    #[default]
+    Universal,
+    /// A product repository that pins VibeOS. This workspace only provides
+    /// the platform libraries, so such a board is always configured alone.
+    External,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Board {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub arch: Arch,
+    #[serde(default)]
+    pub image: Image,
+    /// For an external image: where and how it is built.
+    #[serde(default)]
+    pub build_hint: String,
     pub required: Vec<String>,
     pub defaults: Vec<String>,
     pub feature: String,
@@ -122,6 +164,18 @@ impl Catalog {
             }
         }
         for b in &self.boards {
+            if (b.image == Image::External) == b.build_hint.is_empty() {
+                return Err(format!(
+                    "{}: build_hint is required for, and only for, an external image",
+                    b.id
+                ));
+            }
+            if b.image == Image::External && !b.feature.is_empty() {
+                return Err(format!(
+                    "{}: an external image has no firmware feature",
+                    b.id
+                ));
+            }
             for id in b.required.iter().chain(&b.defaults) {
                 if !self
                     .node(id)
@@ -220,8 +274,13 @@ impl Catalog {
         Ok(())
     }
     pub fn preset(&self, name: &str) -> Result<Config> {
-        let boards = if name == "default" || name == "minimal" {
-            self.boards.iter().map(|b| b.id.clone()).collect()
+        let boards: BTreeSet<String> = if name == "default" || name == "minimal" {
+            // Every board that can share the universal image.
+            self.boards
+                .iter()
+                .filter(|b| b.image == Image::Universal)
+                .map(|b| b.id.clone())
+                .collect()
         } else if self.board(name).is_some() {
             BTreeSet::from([name.into()])
         } else {
@@ -236,7 +295,16 @@ impl Catalog {
             drivers: BTreeMap::new(),
         };
         if name != "minimal" {
-            c.components.extend(["file-tree".into(), "network".into()]);
+            // Only what at least one of the boards can actually run.
+            c.components.extend(
+                ["file-tree", "network"]
+                    .into_iter()
+                    .filter(|id| {
+                        self.node(id)
+                            .is_some_and(|n| c.boards.iter().any(|b| n.supports(b)))
+                    })
+                    .map(str::to_owned),
+            );
             for b in c.boards.iter().filter_map(|id| self.board(id)) {
                 for d in &b.defaults {
                     c.drivers.insert(d.clone(), Selection::On);
@@ -263,6 +331,8 @@ pub struct Resolved {
     pub selection: Config,
     pub version: u32,
     pub digest: String,
+    pub arch: Arch,
+    pub image: Image,
     pub target: String,
     pub features: BTreeSet<String>,
     pub boards: BTreeMap<String, BoardPlan>,
@@ -281,7 +351,8 @@ impl Resolved {
     }
     pub fn report(&self) -> String {
         let mut text = format!(
-            "Target: {}\nConfig: {}\nFeatures: {}\n",
+            "Architecture: {}\nTarget: {}\nConfig: {}\nFeatures: {}\n",
+            self.arch.label(),
             self.target,
             self.digest,
             self.features.iter().cloned().collect::<Vec<_>>().join(",")
@@ -328,13 +399,38 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
             return Err(format!("unknown driver: {id}"));
         }
     }
+    let selected: Vec<&Board> = config.boards.iter().filter_map(|id| c.board(id)).collect();
+    let arch = selected[0].arch;
+    if let Some(other) = selected.iter().find(|b| b.arch != arch) {
+        return Err(format!(
+            "{} is {} but {} is {}; one kernel image has one architecture, so configure them separately",
+            selected[0].name,
+            arch.label(),
+            other.name,
+            other.arch.label()
+        ));
+    }
+    let image = selected[0].image;
+    if let Some(b) = selected.iter().find(|b| b.image == Image::External) {
+        if selected.len() > 1 {
+            return Err(format!(
+                "{} has its own image and cannot share a configuration with other boards",
+                b.name
+            ));
+        }
+    }
     let digest = hex_digest(&serde_json::to_vec(&(c, config)).map_err(|e| e.to_string())?);
     let mut r = Resolved {
         selection: config.clone(),
         version: SCHEMA,
         digest,
-        target: "riscv64imac-unknown-none-elf".into(),
-        features: BTreeSet::from(["image".into()]),
+        arch,
+        image,
+        target: arch.target().into(),
+        features: match image {
+            Image::Universal => BTreeSet::from(["image".into()]),
+            Image::External => BTreeSet::new(),
+        },
         boards: BTreeMap::new(),
         errors: Vec::new(),
     };
@@ -346,7 +442,9 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
         .collect::<BTreeSet<_>>();
     for board in config.boards.iter().filter_map(|id| c.board(id)) {
         let mut p = BoardPlan::default();
-        r.features.insert(board.feature.clone());
+        if !board.feature.is_empty() {
+            r.features.insert(board.feature.clone());
+        }
         for id in &board.required {
             if let Err(e) = enable(c, config, &board.id, id, "required for boot", &mut p) {
                 r.errors.push(format!("{}: {e}", board.id));
@@ -386,7 +484,8 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
         }
         for id in &p.enabled {
             let f = &c.node(id).unwrap().feature;
-            if !f.is_empty() {
+            // Feature names belong to the universal firmware manifest.
+            if !f.is_empty() && image == Image::Universal {
                 r.features.insert(f.clone());
             }
         }
@@ -422,13 +521,18 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
                 .push(format!("{id} does not support any selected board"));
         }
     }
-    if active.contains("network") && !active.contains("ssh") && !active.contains("iperf3") {
+    let universal = image == Image::Universal;
+    if universal
+        && active.contains("network")
+        && !active.contains("ssh")
+        && !active.contains("iperf3")
+    {
         r.features.insert("image-net-shell".into());
     }
-    if active.contains("ssh") && active.contains("wasi") {
+    if universal && active.contains("ssh") && active.contains("wasi") {
         r.features.insert("image-ssh-command".into());
     }
-    if active.contains("wasmtime") {
+    if arch == Arch::Riscv64 && active.contains("wasmtime") {
         r.target = "riscv64gc-unknown-none-elf".into();
     }
     r.errors.sort();

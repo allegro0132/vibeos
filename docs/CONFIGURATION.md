@@ -60,6 +60,32 @@ or `VIBECONFIG_ASCII=1`, which suits serial terminals. `NO_COLOR` disables
 colour; weight then carries the hierarchy. The minimum size is 50 x 12, and
 below 84 columns the detail pane moves under the list.
 
+## Architecture
+
+Every board in the catalog has an architecture, `riscv64` or `aarch64` (shown as
+arm64). A kernel image has exactly one, so a configuration does too: it is
+derived from the selected boards and never stored in `vibeos.toml`. The resolver
+rejects a selection that mixes architectures and picks the Rust target from it.
+
+| Architecture | Boards | Image |
+| --- | --- | --- |
+| riscv64 | QEMU virt, Milk-V Duo, Milk-V Mars | One shared universal image, built here |
+| arm64 | BPI-R4 Pro 4E | Built by [VibeWrt](https://github.com/allegro0132/vibewrt), configured alone |
+
+In the UI the Boards list shows each board's architecture. RISC-V boards combine
+freely. Selecting a board from the other architecture asks before replacing the
+selection with that board and its default drivers; cancelling changes nothing.
+Drivers and components that do not exist for the current architecture are shown
+as not applicable.
+
+This workspace holds the arm64 runtime, the BPI board definitions and the
+MediaTek drivers as libraries, but no arm64 firmware. For BPI-R4 Pro,
+`./configure.sh` records and validates the selection, Review shows where the
+image is built, and `./build.sh` stops with that pointer instead of compiling.
+A board with an external image always resolves to an empty feature set.
+
+## Drivers and presets
+
 Drivers have `auto`, `on` and `off` states. `auto` allows dependency resolution
 to select a provider. `on` requires the driver on compatible selected boards.
 `off` forbids it, including as a transitive dependency. Boot requirements cannot
@@ -79,7 +105,8 @@ partially selected drivers into the result.
 ```
 
 Checked-in presets are in `configs/presets/`: `default`, `minimal`, `qemu-virt`,
-`milkv-duo`, and `milkv-mars`. Default includes all three boards, their native
+`milkv-duo`, `milkv-mars` and `bpi-r4pro-4e`. Default and minimal cover the boards
+that share the universal image. Default includes all three RISC-V boards, their native
 storage/Ethernet drivers, VSH, file services and DHCP networking. Minimal includes
 all three boards and only their boot requirements plus VSH. Single-board presets
 include native storage and Ethernet. None installs external WASM programs.
@@ -99,7 +126,8 @@ jitter-entropy = "auto"
 xhci = "off"
 ```
 
-`configs/catalog.toml` defines supported boards, mandatory drivers, feature
+`configs/catalog.toml` defines supported boards, their architecture and who builds
+their image (`image = "external"` plus a `build_hint`), mandatory drivers, feature
 mappings, capability providers and conflicts. Extend the catalog and firmware
 implementation together. Unknown fields, unknown identifiers, cycles, missing
 providers and mismatched Cargo features are errors.

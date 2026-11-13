@@ -6,3 +6,5 @@ edition = "2021"
 [features]
 qdma-test = []
 ppe-capacity-test = []
+# Full 32K-entry FOE tables with one ownership record per hardware slot.
+ppe-32k = []

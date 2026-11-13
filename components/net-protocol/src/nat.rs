@@ -70,19 +70,58 @@ pub struct UdpForwardCache<const N: usize> {
     entries: [Option<(UdpPermit, Egress)>; N],
     next: usize,
 }
+/// Ways searched per key. Capacities up to eight are one fully associative
+/// set; larger caches are hashed into sets of eight so that every operation
+/// stays bounded by eight comparisons whatever the capacity.
+pub(crate) const CACHE_WAYS: usize = 8;
+pub(crate) fn cache_set<const N: usize>(direction: Direction, tuple: UdpTuple) -> core::ops::Range<usize> {
+    let ways = N.min(CACHE_WAYS);
+    if ways == 0 {
+        return 0..0;
+    }
+    let sets = N / ways;
+    if sets <= 1 {
+        return 0..ways;
+    }
+    let key = u64::from(u32::from_be_bytes(tuple.source))
+        ^ (u64::from(u32::from_be_bytes(tuple.destination)) << 32)
+        ^ (u64::from(tuple.source_port) << 16)
+        ^ (u64::from(tuple.destination_port) << 48)
+        ^ direction as u64;
+    let set = (mix(key) % sets as u64) as usize;
+    set * ways..(set + 1) * ways
+}
 impl<const N: usize> UdpForwardCache<N> {
     pub const fn new() -> Self { Self { entries: [None; N], next: 0 } }
+    /// Heap construction for capacities too large to build on a kernel stack.
+    pub fn new_boxed() -> alloc::boxed::Box<Self> {
+        let mut cache = alloc::boxed::Box::<Self>::new_uninit();
+        let raw = cache.as_mut_ptr();
+        // Safety: exclusively owned, aligned storage; every field and every
+        // array element is written exactly once before `assume_init`.
+        unsafe {
+            let entries = core::ptr::addr_of_mut!((*raw).entries).cast::<Option<(UdpPermit, Egress)>>();
+            for i in 0..N {
+                entries.add(i).write(None);
+            }
+            core::ptr::addr_of_mut!((*raw).next).write(0);
+            cache.assume_init()
+        }
+    }
+    pub const fn capacity(&self) -> usize { N }
     pub fn clear(&mut self) { self.entries.fill(None); self.next = 0; }
     pub fn forget(&mut self, direction: Direction, tuple: UdpTuple) {
-        for entry in &mut self.entries {
+        for entry in &mut self.entries[cache_set::<N>(direction, tuple)] {
             if entry.as_ref().is_some_and(|(permit, _)| permit.direction() == direction && permit.original() == tuple) {
                 *entry = None;
             }
         }
     }
     pub fn remember(&mut self, permit: UdpPermit, link: Egress) {
+        let set = cache_set::<N>(permit.direction(), permit.original());
+        let (base, ways) = (set.start, set.len());
         let mut vacant = None;
-        for (index, entry) in self.entries.iter_mut().enumerate() {
+        for (index, entry) in self.entries[set].iter_mut().enumerate() {
             if entry.as_ref().is_some_and(|(old, _)| old.direction() == permit.direction()
                 && old.original() == permit.original()) {
                 *entry = Some((permit, link));
@@ -92,14 +131,14 @@ impl<const N: usize> UdpForwardCache<N> {
             // finish looking for an update before consuming any capacity.
             if entry.is_none() && vacant.is_none() { vacant = Some(index); }
         }
-        if N != 0 {
-            let index = vacant.unwrap_or(self.next);
-            self.entries[index] = Some((permit, link));
-            self.next = (index + 1) % N;
+        if ways != 0 {
+            let index = vacant.unwrap_or(self.next % ways);
+            self.entries[base + index] = Some((permit, link));
+            self.next = (index + 1) % ways;
         }
     }
     pub fn lookup(&self, direction: Direction, tuple: UdpTuple) -> Option<(UdpPermit, Egress)> {
-        self.entries.iter().flatten().find(|(permit, _)|
+        self.entries[cache_set::<N>(direction, tuple)].iter().flatten().find(|(permit, _)|
             permit.direction() == direction && permit.original() == tuple).copied()
     }
 }

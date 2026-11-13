@@ -113,7 +113,7 @@ impl Pair {
                     && io.read(reg(GLOBAL)) & (if active { ENABLE } else { ENABLE | BUSY })
                         == ENABLE
                     && io.read(reg(0x2320)) == 0
-                    && io.read(reg(TABLE_CONFIG)) == 0x00104024
+                    && io.read(reg(TABLE_CONFIG)) == TABLE_CONFIG_VALUE
                     && io.read(reg(0x2204)) == 0x200e
             })
     }
@@ -311,14 +311,12 @@ impl PausedPair {
     /// Preserve the pair contract (exclusive tables, no cache), confirmed drain,
     /// and closed inputs throughout the edit.
     pub unsafe fn remove_connections(
-        self, io: &mut impl Registers, timeout: u64, tickets: &[[RuleTicket;2]],
+        mut self, io: &mut impl Registers, timeout: u64, tickets: &[[RuleTicket;2]],
     ) -> PairEditOutcome<()> {
         if tickets.len()>MAX_RULES {return PairEditOutcome::Rejected(self,EditError::Capacity);}
         if tickets.is_empty() {return PairEditOutcome::Updated(self,());}
-        let mut incoming=[tickets[0][0];MAX_RULES];let mut outgoing=[tickets[0][1];MAX_RULES];
-        for (i,pair) in tickets.iter().enumerate() {incoming[i]=pair[0];outgoing[i]=pair[1];}
-        let incoming=&incoming[..tickets.len()];let outgoing=&outgoing[..tickets.len()];
-        if let Err(error)=removal_records(&self.0.wan,incoming).and_then(|_|removal_records(&self.0.lan,outgoing)) {
+        let incoming=tickets.iter().map(|pair|pair[0]);let outgoing=tickets.iter().map(|pair|pair[1]);
+        if let Err(error)=removal_check(&mut self.0.wan,incoming.clone()).and_then(|_|removal_check(&mut self.0.lan,outgoing.clone())) {
             return PairEditOutcome::Rejected(self,error);
         }
         let paused=match self.edit(io,Direction::Inbound,|s,io|unsafe {s.remove_many(io,timeout,incoming)}) {
@@ -409,8 +407,7 @@ impl ActivePair {
     /// # Safety
     /// Retain the active pair's exclusive ownership and mapped DMA storage.
     pub unsafe fn retirement_words(&self, inbound: RuleTicket, outbound: RuleTicket) -> Option<[u32; 2]> {
-        if !self.0.wan.rules.iter().flatten().any(|r| r.ticket == inbound)
-            || !self.0.lan.rules.iter().flatten().any(|r| r.ticket == outbound) { return None; }
+        if self.0.wan.rules.get(inbound).is_none() || self.0.lan.rules.get(outbound).is_none() { return None; }
         Some([unsafe { self.0.wan.table.state_word(inbound.index)? },
               unsafe { self.0.lan.table.state_word(outbound.index)? }])
     }
@@ -432,14 +429,9 @@ impl ActivePair {
         inbound: RuleTicket,
         outbound: RuleTicket,
     ) -> PairRetireOutcome {
-        let Some(wan) = self.0.wan.rules.iter().position(|r| r.is_some_and(|r| r.ticket == inbound)) else {
+        let (Some(w), Some(l)) = (self.0.wan.rules.get(inbound).copied(), self.0.lan.rules.get(outbound).copied()) else {
             return PairRetireOutcome::Rejected(self, RetireError::Stale);
         };
-        let Some(lan) = self.0.lan.rules.iter().position(|r| r.is_some_and(|r| r.ticket == outbound)) else {
-            return PairRetireOutcome::Rejected(self, RetireError::Stale);
-        };
-        let w = self.0.wan.rules[wan].unwrap();
-        let l = self.0.lan.rules[lan].unwrap();
         if w.retiring || l.retiring {
             return PairRetireOutcome::Rejected(self, RetireError::AlreadyPending);
         }
@@ -454,8 +446,8 @@ impl ActivePair {
             || !self.0.valid(io, true) {
             return PairRetireOutcome::Failed(fail(io, self.0.tables(), Error::Preconditions));
         }
-        self.0.wan.rules[wan].as_mut().unwrap().retiring = true;
-        self.0.lan.rules[lan].as_mut().unwrap().retiring = true;
+        self.0.wan.rules.get_mut(inbound).expect("validated rule").retiring = true;
+        self.0.lan.rules.get_mut(outbound).expect("validated rule").retiring = true;
         PairRetireOutcome::Pending(self)
     }
 
@@ -474,14 +466,10 @@ impl ActivePair {
             Direction::Inbound => &self.0.wan,
             Direction::Outbound => &self.0.lan,
         };
-        let Some(index) = selected
-            .rules
-            .iter()
-            .position(|r| r.is_some_and(|r| r.ticket == ticket))
-        else {
+        let Some(record) = selected.rules.get(ticket).copied() else {
             return PairRetireOutcome::Rejected(self, RetireError::Stale);
         };
-        if selected.rules[index].unwrap().retiring {
+        if record.retiring {
             return PairRetireOutcome::Rejected(self, RetireError::AlreadyPending);
         }
         if !self.0.valid(io, true) {
@@ -491,7 +479,7 @@ impl ActivePair {
             Direction::Inbound => &mut self.0.wan,
             Direction::Outbound => &mut self.0.lan,
         };
-        if !unsafe { selected.table.retire_napt_state(ticket.index, selected.rules[index].unwrap().key.0) } {
+        if !unsafe { selected.table.retire_napt_state(ticket.index, record.key.0) } {
             return PairRetireOutcome::Failed(fail(io, self.0.tables(), Error::Preconditions));
         }
         io.barrier();
@@ -502,7 +490,7 @@ impl ActivePair {
             Direction::Inbound => &mut self.0.wan,
             Direction::Outbound => &mut self.0.lan,
         };
-        selected.rules[index].as_mut().unwrap().retiring = true;
+        selected.rules.get_mut(ticket).expect("validated rule").retiring = true;
         PairRetireOutcome::Pending(self)
     }
 }
@@ -1105,7 +1093,7 @@ mod tests {
         let PrepareOutcome::Paused(p) = (unsafe {
             prepare(
                 &mut io,
-                tables_with_second(0x40e00000),
+                tables_with_second(0x40c00000 + super::super::super::table::TABLE_BYTES as u64),
                 10,
                 &b[0],
                 &b[1],
@@ -1114,7 +1102,7 @@ mod tests {
         }) else {
             panic!("adjacent")
         };
-        assert_eq!(io.regs[&0x2620], 0x40e00000);
+        assert_eq!(io.regs[&0x2620], 0x40c00000 + super::super::super::table::TABLE_BYTES as u32);
         let PairOutcome::Restored(t) = (unsafe { p.stop(&mut io, 10) }) else {
             panic!("restore")
         };

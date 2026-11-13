@@ -375,3 +375,30 @@ fn known_arp_reply_rejects_unknown_changed_pending_or_invalid_requests() {
     assert_eq!(table.reply_known_request(&mut unsolicited, 2), None);
     assert_eq!(unsolicited, reply());
 }
+
+#[test]
+fn requested_refresh_probes_early_without_extending_the_binding() {
+    let mut t = Table::<8>::new(interface()).unwrap();
+    // Nothing to refresh before the binding exists or while it is pending.
+    assert_eq!(t.request_refresh(NEXT, 0), Ok(false));
+    t.resolve(NEXT, 0).unwrap();
+    assert_eq!(t.request_refresh(NEXT, 0), Ok(false));
+    transmit(&mut t, 0);
+    assert!(t.observe(&reply(), 1).unwrap());
+    assert_eq!(t.reachable_until(NEXT, 2), Ok(Some((PEER, 30001))));
+    // Well ahead of the traffic-driven window: a probe is scheduled at once,
+    // and only once; the lifetime itself is untouched.
+    assert_eq!(t.next_deadline(15000), Ok(None));
+    assert_eq!(t.request_refresh(NEXT, 15000), Ok(true));
+    assert_eq!(t.request_refresh(NEXT, 15000), Ok(false));
+    assert_eq!(t.next_deadline(15000), Ok(Some(15000)));
+    assert_eq!(t.reachable_until(NEXT, 15000), Ok(Some((PEER, 30001))));
+    transmit(&mut t, 15000);
+    assert!(t.observe(&reply(), 15002).unwrap());
+    assert_eq!(t.reachable_until(NEXT, 15003), Ok(Some((PEER, 45002))));
+    assert_eq!(t.next_deadline(15003), Ok(None));
+    // Unknown and local addresses, and an expired binding, schedule nothing.
+    assert_eq!(t.request_refresh(OTHER, 15003), Ok(false));
+    assert_eq!(t.request_refresh(IP, 15003), Err(Error::Address));
+    assert_eq!(t.request_refresh(NEXT, 45002), Ok(false));
+}

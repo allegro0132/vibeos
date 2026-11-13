@@ -129,15 +129,13 @@ impl DirectionalPausedPair {
             return DirectionalEditOutcome::Rejected(self, EditError::Mtu);
         }
         let key = binding.key();
-        if s.rules.iter().flatten().any(|r| r.key == key) {
+        if s.rules.contains_key(binding.index, &key) {
             return DirectionalEditOutcome::Rejected(self, EditError::Duplicate);
         }
-        let Some(record) = s.rules.iter().position(Option::is_none) else {
+        if s.rules.is_full() {
             return DirectionalEditOutcome::Rejected(self, EditError::Capacity);
-        };
-        let Some(index) = (binding.index..binding.index + 4)
-            .find(|i| !s.rules.iter().flatten().any(|r| r.ticket.index == *i))
-        else {
+        }
+        let Some(index) = s.rules.free_way(binding.index) else {
             return DirectionalEditOutcome::Rejected(self, EditError::BucketFull);
         };
         let Some(ticket) = ticket(index) else {
@@ -145,11 +143,7 @@ impl DirectionalPausedPair {
         };
         self.edit(io, timeout, |s, io| {
             s.table.bind_napt(index, &binding.entry, io.read(0x10) as u8);
-            s.rules[record] = Some(RuleRecord {
-                ticket,
-                key,
-                retiring: false,
-            });
+            s.rules.insert(RuleRecord::new(ticket, key));
             ticket
         })
     }
@@ -170,17 +164,12 @@ impl DirectionalPausedPair {
                 Error::Preconditions,
             ));
         }
-        let Some(record) = self
-            .selected()
-            .rules
-            .iter()
-            .position(|r| r.is_some_and(|r| r.ticket == ticket))
-        else {
+        if self.selected().rules.get(ticket).is_none() {
             return DirectionalEditOutcome::Rejected(self, EditError::Stale);
-        };
+        }
         self.edit(io, timeout, |s, _| {
             s.table.clear_entry(ticket.index);
-            s.rules[record] = None;
+            s.rules.remove(ticket);
         })
     }
     /// # Safety

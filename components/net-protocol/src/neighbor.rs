@@ -235,6 +235,28 @@ impl<const N: usize> Table<N> {
         self.last_now = now;
         Ok(result)
     }
+    /// Start refreshing a reachable binding ahead of the traffic-driven window.
+    /// For an owner whose packets no longer pass `resolve` (hardware
+    /// forwarding) and who must keep the binding valid beyond its own margin.
+    /// Only schedules probes: unknown, pending and already refreshing entries
+    /// are left alone, and nothing but a received reply extends a lifetime.
+    pub fn request_refresh(&mut self, ip: [u8; 4], now: u64) -> Result<bool, Error> {
+        self.clock(now)?;
+        if ip == self.interface.ip || !self.interface.host(ip) {
+            return Err(Error::Address);
+        }
+        let (slot, found) = self.locate(ip, now)?;
+        if found {
+            if let State::Reachable { until, refresh, .. } = &mut self.entries[slot].as_mut().unwrap().state {
+                if now < *until && refresh.is_none() {
+                    *refresh = Some(Refresh { attempts: 0, next_at: now });
+                    self.last_now = now;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
     /// Read-only, bounded next-hop authority for offload publication. Does not
     /// schedule probes or extend reachability. Caller must withdraw hardware
     /// before the returned absolute deadline or any neighbor/config change.

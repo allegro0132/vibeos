@@ -36,30 +36,46 @@ pub struct TcpForwardCache<const N: usize> {
 }
 impl<const N: usize> TcpForwardCache<N> {
     pub const fn new()->Self {Self {entries:[None;N],next:0}}
+    /// Heap construction for capacities too large to build on a kernel stack.
+    pub fn new_boxed()->alloc::boxed::Box<Self> {
+        let mut cache=alloc::boxed::Box::<Self>::new_uninit();
+        let raw=cache.as_mut_ptr();
+        // Safety: exclusively owned, aligned storage; every field and every
+        // array element is written exactly once before `assume_init`.
+        unsafe {
+            let entries=core::ptr::addr_of_mut!((*raw).entries).cast::<Option<(TcpPermit,Egress)>>();
+            for i in 0..N {entries.add(i).write(None);}
+            core::ptr::addr_of_mut!((*raw).next).write(0);
+            cache.assume_init()
+        }
+    }
+    pub const fn capacity(&self)->usize {N}
     pub fn clear(&mut self) {self.entries.fill(None);self.next=0;}
     pub fn forget(&mut self,direction:Direction,tuple:TcpTuple) {
-        for entry in &mut self.entries {
+        for entry in &mut self.entries[cache_set::<N>(direction,tuple)] {
             if entry.as_ref().is_some_and(|(p,_)|p.direction()==direction&&p.original()==tuple) {*entry=None;}
         }
     }
     pub fn remember(&mut self,permit:TcpPermit,link:Egress) {
+        let set=cache_set::<N>(permit.direction(),permit.original());
+        let (base,ways)=(set.start,set.len());
         let mut vacant=None;
-        for (index,entry) in self.entries.iter_mut().enumerate() {
+        for (index,entry) in self.entries[set].iter_mut().enumerate() {
             if entry.as_ref().is_some_and(|(p,_)|p.direction()==permit.direction()&&p.original()==permit.original()) {
                 *entry=Some((permit,link));return;
             }
             if entry.is_none()&&vacant.is_none() {vacant=Some(index);}
         }
-        if N!=0 {
-            let index=vacant.unwrap_or(self.next);
-            self.entries[index]=Some((permit,link));self.next=(index+1)%N;
+        if ways!=0 {
+            let index=vacant.unwrap_or(self.next%ways);
+            self.entries[base+index]=Some((permit,link));self.next=(index+1)%ways;
         }
     }
     /// Replace only an already-retained instance after a committed software
     /// forward. Never admit an evicted/new peer, reuse an old incarnation, or
     /// move the replacement cursor. This remains a hint, not new authority.
     pub fn refresh(&mut self,permit:TcpPermit,link:Egress)->bool {
-        for entry in &mut self.entries {
+        for entry in &mut self.entries[cache_set::<N>(permit.direction(),permit.original())] {
             if let Some((old,_))=entry {
                 if old.direction()==permit.direction() && old.original()==permit.original()
                     && old.receipt.identity==permit.receipt.identity
@@ -75,7 +91,7 @@ impl<const N: usize> TcpForwardCache<N> {
         false
     }
     pub fn lookup(&self,direction:Direction,tuple:TcpTuple)->Option<(TcpPermit,Egress)> {
-        self.entries.iter().flatten().find(|(p,_)|p.direction()==direction&&p.original()==tuple).copied()
+        self.entries[cache_set::<N>(direction,tuple)].iter().flatten().find(|(p,_)|p.direction()==direction&&p.original()==tuple).copied()
     }
 }
 

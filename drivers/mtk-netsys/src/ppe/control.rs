@@ -10,6 +10,9 @@ use core::{
 };
 
 pub mod duplex;
+mod rules;
+pub use rules::MAX_RULES;
+use rules::{BatchError, RuleRecord, Rules};
 
 const GLOBAL: usize = 0x2200;
 const TABLE_CONFIG: usize = 0x221c;
@@ -222,10 +225,11 @@ pub struct Session {
     ingress_cpu: u32,
     mtu: u16,
     path: FlowPath,
-    rules: [Option<RuleRecord>; MAX_RULES],
+    rules: Rules,
 }
-/// Fixed metadata budget; overflow takes the software path, never eviction.
-pub const MAX_RULES: usize = 16;
+/// Size field 4 selects 16K entries, 5 selects 32K; hash mode 1, v2/v3 entry
+/// format, search miss to CPU. No scan, keepalive, auto-build or age writers.
+pub(super) const TABLE_CONFIG_VALUE: u32 = 0x0010_4020 | if cfg!(feature = "ppe-32k") { 5 } else { 4 };
 static RULE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleTicket {
@@ -236,12 +240,6 @@ impl RuleTicket {
     pub fn index(self) -> usize {
         self.index
     }
-}
-#[derive(Clone, Copy)]
-struct RuleRecord {
-    ticket: RuleTicket,
-    key: (Protocol, [u8; 12]),
-    retiring: bool,
 }
 fn ticket(index: usize) -> Option<RuleTicket> {
     let id = RULE_SEQUENCE
@@ -335,13 +333,13 @@ impl FlowPath {
 fn napt_bucket(original: Tuple) -> usize {
     // Hash-mode 1 chooses destination/source bits using the port word,
     // rotates that choice by a byte, XOR-folds all tuple words, then
-    // selects a 4-way-aligned bucket in the 16K NETSYS-v3 table.
+    // selects a 4-way-aligned bucket in the 16K or 32K NETSYS-v3 table.
     let ports = (u32::from(original.source_port) << 16) | u32::from(original.destination_port);
     let dst = u32::from_be_bytes(original.destination);
     let src = u32::from_be_bytes(original.source);
     let choice = (ports & dst) | (!ports & src);
     let mixed = choice.rotate_left(8) ^ ports ^ dst ^ src;
-    let index = (((mixed ^ (mixed >> 16)) & 0xfff) << 2) as usize;
+    let index = (((mixed ^ (mixed >> 16)) as usize) & (super::table::ENTRIES / 4 - 1)) << 2;
     index
 }
 /// An exact direction-specific TCP/UDP translation. Constructors default to UDP;
@@ -546,16 +544,16 @@ unsafe fn start_table(
     {
         return StartOutcome::Failed(Outcome::Rejected(table, Error::Preconditions));
     }
-    let mut rules = [None; MAX_RULES];
+    // Reserve all ownership metadata before any register write.
+    let mut rules = Rules::new();
+    let mut initial = None;
     if let Some(binding) = binding {
-        let Some(ticket) = ticket(binding.index) else {
+        let slot = rules.free_way(binding.index);
+        let Some(ticket) = slot.and_then(ticket) else {
             return StartOutcome::Failed(Outcome::Rejected(table, Error::Preconditions));
         };
-        rules[0] = Some(RuleRecord {
-            ticket,
-            key: binding.key(),
-            retiring: false,
-        });
+        rules.insert(RuleRecord::new(ticket, binding.key()));
+        initial = Some(ticket);
     }
     let auxiliary = AUX.map(|o| io.read(ppe_reg(engine, o)));
     let result = (|| {
@@ -563,12 +561,10 @@ unsafe fn start_table(
         idle_on(io, engine, timeout)?;
         write_checked(io, ppe_reg(engine, GLOBAL), before.global & !ENABLE)?;
         idle_on(io, engine, timeout)?;
-        if let Some(binding) = binding {
-            table.bind_napt(binding.index, &binding.entry, io.read(0x10) as u8);
+        if let (Some(binding), Some(ticket)) = (binding, initial) {
+            table.bind_napt(ticket.index(), &binding.entry, io.read(0x10) as u8);
         }
-        // 16K * 128 bytes, hash mode 1, v2/v3 info, search miss FORWARD=2.
-        // No scan, keepalive, auto-build or age writers.
-        write_checked(io, ppe_reg(engine, TABLE_CONFIG), 0x00104024)?;
+        write_checked(io, ppe_reg(engine, TABLE_CONFIG), TABLE_CONFIG_VALUE)?;
         io.barrier();
         table.publish();
         write_checked(io, ppe_reg(engine, TABLE_BASE), table.region().base())?;
@@ -620,14 +616,13 @@ pub enum PauseOutcome {
     Paused(PausedSession),
     Failed(Outcome),
 }
-fn removal_records(session: &Session, tickets: &[RuleTicket]) -> Result<[usize; MAX_RULES], EditError> {
-    if tickets.len()>MAX_RULES {return Err(EditError::Capacity);}
-    let mut records=[0;MAX_RULES];
-    for (i,ticket) in tickets.iter().enumerate() {
-        if tickets[..i].contains(ticket) {return Err(EditError::Duplicate);}
-        records[i]=session.rules.iter().position(|r|r.is_some_and(|r|r.ticket==*ticket)).ok_or(EditError::Stale)?;
-    }
-    Ok(records)
+/// Every ticket must name a distinct live installation of this session.
+fn removal_check(session: &mut Session, tickets: impl Iterator<Item = RuleTicket> + Clone) -> Result<usize, EditError> {
+    session.rules.validate_batch(tickets).map_err(|error| match error {
+        BatchError::Stale => EditError::Stale,
+        BatchError::Duplicate => EditError::Duplicate,
+        BatchError::Capacity => EditError::Capacity,
+    })
 }
 
 impl PausedSession {
@@ -639,7 +634,7 @@ impl PausedSession {
             || io.read(ppe_reg(engine, TABLE_BASE)) != self.0.table.region().base()
             || io.read(ppe_reg(engine, GLOBAL)) & (ENABLE | BUSY) != ENABLE
             || io.read(ppe_reg(engine, 0x2320)) != 0
-            || io.read(ppe_reg(engine, TABLE_CONFIG)) != 0x00104024
+            || io.read(ppe_reg(engine, TABLE_CONFIG)) != TABLE_CONFIG_VALUE
             || io.read(ppe_reg(engine, 0x2204)) != 0x200e
         {
             return Err(Error::Preconditions);
@@ -679,15 +674,13 @@ impl PausedSession {
             return EditOutcome::Rejected(self, EditError::Mtu);
         }
         let key = binding.key();
-        if self.0.rules.iter().flatten().any(|r| r.key == key) {
+        if self.0.rules.contains_key(binding.index, &key) {
             return EditOutcome::Rejected(self, EditError::Duplicate);
         }
-        let Some(record) = self.0.rules.iter().position(Option::is_none) else {
+        if self.0.rules.is_full() {
             return EditOutcome::Rejected(self, EditError::Capacity);
-        };
-        let Some(index) = (binding.index..binding.index + 4)
-            .find(|i| !self.0.rules.iter().flatten().any(|r| r.ticket.index == *i))
-        else {
+        }
+        let Some(index) = self.0.rules.free_way(binding.index) else {
             return EditOutcome::Rejected(self, EditError::BucketFull);
         };
         let Some(ticket) = ticket(index) else {
@@ -702,7 +695,7 @@ impl PausedSession {
         })();
         match result {
             Ok(()) => {
-                self.0.rules[record] = Some(RuleRecord { ticket, key, retiring: false });
+                self.0.rules.insert(RuleRecord::new(ticket, key));
                 EditOutcome::Updated(self, ticket)
             }
             Err(error) => EditOutcome::Failed(Outcome::Quarantined(Quarantine {
@@ -716,20 +709,21 @@ impl PausedSession {
     /// # Safety
     /// Uphold the same exclusive, paused, no-cache contract as insert_napt.
     pub unsafe fn remove_many(
-        mut self, io: &mut impl Registers, timeout: u64, tickets: &[RuleTicket],
+        mut self, io: &mut impl Registers, timeout: u64,
+        tickets: impl Iterator<Item = RuleTicket> + Clone,
     ) -> EditOutcome<()> {
-        let records=match removal_records(&self.0,tickets) {
-            Ok(records)=>records,Err(error)=>return EditOutcome::Rejected(self,error),
+        let count=match removal_check(&mut self.0,tickets.clone()) {
+            Ok(count)=>count,Err(error)=>return EditOutcome::Rejected(self,error),
         };
-        if tickets.is_empty() {return EditOutcome::Updated(self,());}
+        if count==0 {return EditOutcome::Updated(self,());}
         let result=(|| {
             self.edit_begin(io,timeout)?;
-            for ticket in tickets {self.0.table.clear_entry(ticket.index);}
+            for ticket in tickets.clone() {self.0.table.clear_entry(ticket.index);}
             self.edit_end(io,timeout)
         })();
         match result {
             Ok(())=>{
-                for record in &records[..tickets.len()] {self.0.rules[*record]=None;}
+                for ticket in tickets {self.0.rules.remove(ticket);}
                 EditOutcome::Updated(self,())
             },
             Err(error)=>EditOutcome::Failed(Outcome::Quarantined(Quarantine {_table:self.0.table,error})),
@@ -741,7 +735,7 @@ impl PausedSession {
     pub unsafe fn remove_napt(
         self, io: &mut impl Registers, timeout: u64, ticket: RuleTicket,
     ) -> EditOutcome<()> {
-        unsafe {self.remove_many(io,timeout,&[ticket])}
+        unsafe {self.remove_many(io,timeout,core::iter::once(ticket))}
     }
     /// # Safety
     /// Revalidate the exact rule's authority, route, neighbor and deadline
@@ -778,7 +772,7 @@ impl PausedSession {
 impl Session {
     /// Whether this exact installation is awaiting drain and final removal.
     pub fn retirement_pending(&self, ticket: RuleTicket) -> bool {
-        self.rules.iter().flatten().any(|r| r.ticket == ticket && r.retiring)
+        self.rules.get(ticket).is_some_and(|r| r.retiring)
     }
     /// Experimental per-entry invalidation without changing ingress or PPE
     /// enable registers. No body clear, slot release or timer renewal occurs.
@@ -793,10 +787,10 @@ impl Session {
     /// close ingress or reset even if no MMIO write was performed here.
     pub unsafe fn retire_napt(mut self, io: &mut impl Registers, ticket: RuleTicket) -> RetireOutcome {
         let engine = self.engine;
-        let Some(record) = self.rules.iter().position(|r| r.is_some_and(|r| r.ticket == ticket)) else {
+        let Some(record) = self.rules.get(ticket).copied() else {
             return RetireOutcome::Rejected(self, RetireError::Stale);
         };
-        if self.rules[record].unwrap().retiring {
+        if record.retiring {
             return RetireOutcome::Rejected(self, RetireError::AlreadyPending);
         }
         let valid = self.path.ingress_matches(io)
@@ -804,9 +798,9 @@ impl Session {
             && io.read(ppe_reg(engine, TABLE_BASE)) == self.table.region().base()
             && io.read(ppe_reg(engine, GLOBAL)) & ENABLE != 0
             && io.read(ppe_reg(engine, 0x2320)) == 0
-            && io.read(ppe_reg(engine, TABLE_CONFIG)) == 0x00104024
+            && io.read(ppe_reg(engine, TABLE_CONFIG)) == TABLE_CONFIG_VALUE
             && io.read(ppe_reg(engine, 0x2204)) == 0x200e;
-        if !valid || !unsafe { self.table.retire_napt_state(ticket.index, self.rules[record].unwrap().key.0) } {
+        if !valid || !unsafe { self.table.retire_napt_state(ticket.index, record.key.0) } {
             return RetireOutcome::Failed(Outcome::Quarantined(Quarantine {
                 _table: self.table, error: Error::Preconditions,
             }));
@@ -817,11 +811,11 @@ impl Session {
                 _table: self.table, error: Error::Preconditions,
             }));
         }
-        self.rules[record].as_mut().unwrap().retiring = true;
+        self.rules.get_mut(ticket).expect("validated rule").retiring = true;
         RetireOutcome::Pending(self)
     }
     pub fn initial_ticket(&self) -> Option<RuleTicket> {
-        self.rules[0].map(|r| r.ticket)
+        self.rules.initial()
     }
     /// Close new admission and drain preceding lookups without detaching or
     /// rescanning the 2 MiB table. A failure retains the allocation.
@@ -1174,7 +1168,7 @@ mod tests {
                 .last(),
             Some((WAN, 0x20713333))
         );
-        assert_eq!(io.registers[&TABLE_CONFIG], 0x104024);
+        assert_eq!(io.registers[&TABLE_CONFIG], TABLE_CONFIG_VALUE);
         assert_eq!(io.registers[&0x2204], 0x200e);
         let first_stop = io.ops.len();
         let Outcome::Restored(table) = (unsafe { active.stop(&mut io, 10) }) else {
@@ -1272,7 +1266,8 @@ mod tests {
                 [2, 0, 0, 0, 0, 2],
             )
             .unwrap();
-            assert_eq!(binding.index(), index);
+            assert_eq!(binding.index() & 0x3ffc, index);
+            assert!(binding.index() < crate::ppe::table::ENTRIES && binding.index() % 4 == 0);
             let mut io = router_mock();
             io.registers.insert(0x10, 0x1234);
             let StartOutcome::Active(active) =
@@ -1282,7 +1277,7 @@ mod tests {
             };
             // Mock only: no DMA is running; physical code has no such accessor.
             assert_eq!(active.table.nonzero_entries(), 1);
-            let bytes = active.table.entry(index).unwrap();
+            let bytes = active.table.entry(binding.index()).unwrap();
             assert_eq!(&bytes[..4], &0x60400034u32.to_le_bytes());
             assert_eq!(&bytes[4..], &binding.entry.bytes()[4..]);
             assert!(!active.table.all_invalid());
@@ -1336,7 +1331,7 @@ mod tests {
     #[test]
     fn outbound_snat_format_preserves_remote_and_selects_untagged_wan() {
         let binding = outbound_binding();
-        assert_eq!(binding.index(), 0x374);
+        assert_eq!(binding.index() & 0x3ffc, 0x374);
         let bytes = binding.entry.bytes();
         assert_eq!(&bytes[0..4], &0x40500000u32.to_le_bytes()); // INVALID UDP, TTL/cache staging.
         assert_eq!(&bytes[4..16], &[0x64,0x4f,0xa8,0xc0, 0x64,0x4e,0xa8,0xc0, 0xa5,0x82,0xf7,0x5f]);
@@ -1814,6 +1809,9 @@ mod tests {
         };
         assert!(storage.is_zero());
     }
+    // The full-table geometry has no budget below its bucket ways; see
+    // full_table_fills_every_usable_slot_and_never_the_last.
+    #[cfg(not(feature = "ppe-32k"))]
     #[test]
     fn incremental_budget_mtu_and_foreign_ticket_reject_without_mutation() {
         let mut bindings = Vec::new();
@@ -2211,4 +2209,124 @@ mod tests {
         assert!(io.ops[begin..].iter().all(|op| !matches!(op, Op::Write(0x2620, _))));
     }
 
+    #[cfg(feature = "ppe-32k")]
+    fn spread_binding(n: u32) -> NaptBinding {
+        let mixed = n.wrapping_mul(0x9e37_79b1) ^ (n >> 7);
+        let original = Tuple {
+            source: [198, (mixed >> 16) as u8, (mixed >> 8) as u8, mixed as u8 | 1],
+            destination: [192, 168, 78, 1],
+            source_port: (n.wrapping_mul(40503) >> 3) as u16 | 1,
+            destination_port: 49152 + (mixed >> 18) as u16,
+        };
+        NaptBinding::wan_to_lan(
+            original,
+            Tuple { destination: [192, 168, 79, 100], destination_port: 24567, ..original },
+            [2, 0, 0, 0, 0, 1],
+            [2, 0, 0, 0, 0, 2],
+        )
+        .unwrap()
+    }
+    // The capacity fixture's bucket function forwarded on the board in every
+    // slot but the last; the session's hash must select the same buckets.
+    #[cfg(all(feature = "ppe-32k", feature = "ppe-capacity-test"))]
+    #[test]
+    fn full_table_hash_matches_the_hardware_qualified_fixture() {
+        use crate::ppe::capacity;
+        for port in capacity::FIRST_PORT..capacity::FIRST_PORT + capacity::ENTRIES as u16 {
+            for outbound in [false, true] {
+                let (tuple, _) = capacity::recipe(outbound, port);
+                assert_eq!(napt_bucket(tuple), capacity::bucket(tuple));
+            }
+        }
+        for n in 0..100_000 {
+            let binding = spread_binding(n);
+            let bytes = binding.entry.bytes();
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let tuple = Tuple {
+                source: word(4).to_be_bytes(),
+                destination: word(8).to_be_bytes(),
+                source_port: (word(12) >> 16) as u16,
+                destination_port: word(12) as u16,
+            };
+            assert_eq!(binding.index(), capacity::bucket(tuple));
+        }
+    }
+    #[cfg(feature = "ppe-32k")]
+    #[test]
+    fn full_table_fills_every_usable_slot_and_never_the_last() {
+        use crate::ppe::table::ENTRIES;
+        assert_eq!((ENTRIES, MAX_RULES, TABLE_CONFIG_VALUE), (32768, 32767, 0x0010_4025));
+        let mut io = router_mock();
+        let first = spread_binding(0);
+        let StartOutcome::Active(active) = (unsafe { start_single_napt(&mut io, table(), 10, &first) })
+        else { panic!("start") };
+        assert_eq!(io.registers[&TABLE_CONFIG], 0x0010_4025);
+        let PauseOutcome::Paused(mut paused) = (unsafe { active.pause(&mut io, 10) }) else { panic!("pause") };
+        let mut tickets = std::vec![paused.initial_ticket().unwrap()];
+        let mut full = 0usize;
+        for n in 1..2_000_000u32 {
+            io.ops.clear();
+            let binding = spread_binding(n);
+            paused = match unsafe { paused.insert_napt(&mut io, 10, &binding) } {
+                EditOutcome::Updated(p, ticket) => {
+                    assert!(ticket.index() >= binding.index() && ticket.index() < binding.index() + 4);
+                    assert_ne!(ticket.index(), ENTRIES - 1);
+                    tickets.push(ticket);
+                    p
+                }
+                EditOutcome::Rejected(p, EditError::BucketFull) => { full += 1; p }
+                EditOutcome::Rejected(p, EditError::Duplicate) => p,
+                EditOutcome::Rejected(_, error) => panic!("unexpected rejection {error:?}"),
+                EditOutcome::Failed(_) => panic!("edit"),
+            };
+            if tickets.len() == MAX_RULES { break; }
+        }
+        assert_eq!(tickets.len(), MAX_RULES);
+        assert!(full > 0);
+        assert_eq!(paused.0.rules.len(), MAX_RULES);
+        assert_eq!(paused.0.table.nonzero_entries(), MAX_RULES);
+        assert!(paused.0.table.entry(ENTRIES - 1).unwrap().iter().all(|b| *b == 0));
+        let mut slots: Vec<usize> = tickets.iter().map(|t| t.index()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), MAX_RULES);
+        // A full table rejects further rules without touching hardware.
+        io.ops.clear();
+        let writes = io.writes;
+        let mut rejected = false;
+        for n in 2_000_000..2_000_064u32 {
+            paused = match unsafe { paused.insert_napt(&mut io, 10, &spread_binding(n)) } {
+                EditOutcome::Rejected(p, EditError::Capacity | EditError::BucketFull | EditError::Duplicate) => { rejected = true; p }
+                _ => panic!("full table accepted a rule"),
+            };
+        }
+        assert!(rejected && io.writes == writes);
+        // Batch validation is all-or-nothing: duplicates and stale tickets
+        // leave every record and byte in place.
+        let mut bad = tickets[..1000].to_vec();
+        bad.push(tickets[3]);
+        paused = match unsafe { paused.remove_many(&mut io, 10, bad.iter().copied()) } {
+            EditOutcome::Rejected(p, EditError::Duplicate) => p,
+            _ => panic!("duplicate batch"),
+        };
+        assert_eq!((paused.0.rules.len(), io.writes), (MAX_RULES, writes));
+        paused = match unsafe { paused.remove_many(&mut io, 10, tickets[..20_000].iter().copied()) } {
+            EditOutcome::Updated(p, ()) => p,
+            _ => panic!("batch removal"),
+        };
+        assert_eq!(paused.0.rules.len(), MAX_RULES - 20_000);
+        assert_eq!(paused.0.table.nonzero_entries(), MAX_RULES - 20_000);
+        paused = match unsafe { paused.remove_many(&mut io, 10, tickets[19_999..20_001].iter().copied()) } {
+            EditOutcome::Rejected(p, EditError::Stale) => p,
+            _ => panic!("stale batch"),
+        };
+        assert_eq!(paused.0.rules.len(), MAX_RULES - 20_000);
+        // A freed slot is reusable under a fresh identity only.
+        let again = spread_binding(0);
+        paused = match unsafe { paused.insert_napt(&mut io, 10, &again) } {
+            EditOutcome::Updated(p, ticket) => { assert_ne!(ticket, tickets[0]); assert_eq!(ticket.index(), tickets[0].index()); p }
+            _ => panic!("reuse"),
+        };
+        assert!(matches!(unsafe { paused.stop(&mut io, 10) }, Outcome::Restored(t) if t.is_zero()));
+    }
 }

@@ -3,6 +3,8 @@
 //! bootloader's clocks and calibrated PHYs; the board owns switch isolation.
 //! Register/descriptor layout reference: U-Boot drivers/net/mtk_eth.
 
+#[cfg(feature = "ppe-32k")]
+extern crate alloc;
 #[cfg(any(test, feature = "qdma-test"))]
 pub mod qdma;
 pub mod mdio;

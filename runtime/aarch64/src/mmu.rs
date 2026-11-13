@@ -4,6 +4,7 @@
 //! path below changes only existing NX data leaves for CSpace publication.
 
 pub const PAGE_SIZE: usize = 4096;
+pub const BLOCK_SIZE: usize = 2 << 20;
 const ADDRESS_MASK: u64 = 0x0000_00ff_ffff_f000;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
@@ -84,6 +85,10 @@ impl<'a> Builder<'a> {
     }
     fn child(&mut self, parent: usize, slot: usize) -> Result<usize, Error> {
         let desc = self.storage.tables[parent].0[slot];
+        // A block already covers this slot; it cannot also hold a table.
+        if desc & 3 == 1 {
+            return Err(Error::Overlap);
+        }
         if desc != 0 {
             return Ok(((desc & ADDRESS_MASK) - (self.base() & ADDRESS_MASK)) as usize / PAGE_SIZE);
         }
@@ -115,6 +120,44 @@ impl<'a> Builder<'a> {
             *entry = (page as u64) | permission.bits();
         }
         Ok(())
+    }
+    /// Identity-map whole 2 MiB level-2 blocks. Large regions cost no level-3
+    /// tables; the range must not share a 2 MiB block with any page mapping.
+    /// Blocks carry the same permission bits as pages and are never changed
+    /// by the live data-permission update path.
+    pub fn map_blocks(&mut self, start: usize, end: usize, permission: Permission) -> Result<(), Error> {
+        if start % BLOCK_SIZE != 0 || end % BLOCK_SIZE != 0 {
+            return Err(Error::Alignment);
+        }
+        if start == 0 || start >= end || end > (1usize << 39) {
+            return Err(Error::Range);
+        }
+        if matches!(permission, Permission::Text | Permission::Device) {
+            return Err(Error::Range);
+        }
+        for block in (start..end).step_by(BLOCK_SIZE) {
+            let l2 = self.child(0, (block >> 30) & 511)?;
+            let entry = &mut self.storage.tables[l2].0[(block >> 21) & 511];
+            if *entry != 0 {
+                return Err(Error::Overlap);
+            }
+            // Level-2 block descriptor: type 0b01 instead of the page's 0b11.
+            *entry = (block as u64) | (permission.bits() & !3) | 1;
+        }
+        Ok(())
+    }
+    /// Descriptor of the 2 MiB block containing `address`, if block-mapped.
+    pub fn block_descriptor(&self, address: usize) -> Option<u64> {
+        if address >= (1usize << 39) {
+            return None;
+        }
+        let desc = self.storage.tables[0].0[(address >> 30) & 511];
+        if desc & 3 != 3 {
+            return None;
+        }
+        let table = ((desc & ADDRESS_MASK) - (self.base() & ADDRESS_MASK)) as usize / PAGE_SIZE;
+        let desc = self.storage.tables[table].0[(address >> 21) & 511];
+        (desc & 3 == 1).then_some(desc)
     }
     pub fn descriptor(&self, address: usize) -> Option<u64> {
         if address >= (1usize << 39) {
@@ -174,6 +217,31 @@ mod tests {
             map.map(0x40080000, 0x40081000, Permission::Data),
             Err(Error::Overlap)
         );
+    }
+    #[test]
+    fn blocks_use_no_leaf_tables_and_never_overlap_pages() {
+        let mut tables = Tables::new();
+        let mut map = Builder::new(&mut tables);
+        map.map(0x40080000, 0x40082000, Permission::Data).unwrap();
+        let before = map.table_count();
+        map.map_blocks(0x44000000, 0x50000000, Permission::Data).unwrap();
+        map.map_blocks(0x50000000, 0x50800000, Permission::Dma).unwrap();
+        assert_eq!(map.table_count(), before);
+        let data = map.block_descriptor(0x4fffffff).unwrap();
+        assert_eq!(data & 3, 1);
+        assert_eq!(data & (PXN | UXN | RO), PXN | UXN);
+        assert_eq!(data & ADDRESS_MASK, 0x4fe00000);
+        let dma = map.block_descriptor(0x50400000).unwrap();
+        assert_eq!(dma & 0x1c, 8);
+        assert!(map.block_descriptor(0x43e00000).is_none());
+        assert!(map.block_descriptor(0x50800000).is_none());
+        assert!(map.block_descriptor(0x40080000).is_none());
+        assert!(map.descriptor(0x44000000).is_none());
+        assert_eq!(map.map_blocks(0x40000000, 0x40200000, Permission::Data), Err(Error::Overlap));
+        assert_eq!(map.map(0x44001000, 0x44002000, Permission::Data), Err(Error::Overlap));
+        assert_eq!(map.map_blocks(0x44000000, 0x44200000, Permission::Data), Err(Error::Overlap));
+        assert_eq!(map.map_blocks(0x60001000, 0x60200000, Permission::Data), Err(Error::Alignment));
+        assert_eq!(map.map_blocks(0x60000000, 0x60200000, Permission::Text), Err(Error::Range));
     }
     #[test]
     fn invalid_ranges_and_table_exhaustion() {

@@ -2,7 +2,8 @@
 //! may prepare a TCP/UDP BIND entry while the device is disabled. The experimental
 //! retirement primitive touches only an aligned IB1 word while published.
 use super::{StagedEntry, ENTRY_BYTES};
-pub const ENTRIES: usize = 16384;
+/// 16K qualification geometry, or the full 32K table with `ppe-32k`.
+pub const ENTRIES: usize = if cfg!(feature = "ppe-32k") { 32768 } else { 16384 };
 pub const TABLE_BYTES: usize = ENTRIES * ENTRY_BYTES;
 /// Deliberately table-size aligned; this is our allocation contract, not a claim
 /// about the hardware's minimum alignment.
@@ -171,10 +172,10 @@ mod tests {
     fn region_rejects_wrong_size_alignment_and_dma_address_overflow() {
         assert_eq!(
             Region::new(0x40c00000, TABLE_BYTES).unwrap().end(),
-            0x40e00000
+            0x40c00000 + TABLE_BYTES as u64
         );
         assert_eq!(
-            Region::new(0xffe00000, TABLE_BYTES).unwrap().end(),
+            Region::new((1u64 << 32) - TABLE_BYTES as u64, TABLE_BYTES).unwrap().end(),
             1u64 << 32
         );
         assert_eq!(Region::new(0x40c01000, TABLE_BYTES), Err(Error::Alignment));

@@ -29,6 +29,7 @@ fn run() -> Result<()> {
     let mut preset = None;
     let mut non_interactive = false;
     let mut dry_run = false;
+    let mut ascii = false;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -39,14 +40,17 @@ fn run() -> Result<()> {
             "--preset" => preset = Some(args.next().ok_or("missing preset name")?),
             "--non-interactive" => non_interactive = true,
             "--dry-run" => dry_run = true,
+            "--ascii" => ascii = true,
             "--help" | "-h" => {
-                println!("VibeOS configuration\n\n./configure.sh [--config FILE] [--preset NAME]\n./configure.sh --preset default --non-interactive\n./configure.sh resolve|check --config FILE\n./build.sh --config FILE [--dry-run]\n\nPresets: default, minimal, qemu-virt, milkv-duo, milkv-mars\nDriver choices: auto / on / off. Escape closes dialogs; Ctrl-S saves.\n");
+                println!("VibeOS configuration\n\n./configure.sh [--config FILE] [--preset NAME]\n./configure.sh --preset default --non-interactive\n./configure.sh resolve|check --config FILE\n./build.sh --config FILE [--dry-run]\n\nPresets: default, minimal, qemu-virt, milkv-duo, milkv-mars\nDriver choices: auto / on / off. Press ? inside the UI for keys.\n--ascii (or VIBECONFIG_ASCII=1) draws without Unicode; NO_COLOR disables colour.\n");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {arg}; use --help")),
         }
     }
     let catalog = Catalog::load(&root)?;
+    // A first run (no file, no explicit preset) opens on the preset chooser.
+    let on_disk = config_path.exists() && preset.is_none();
     let config = match preset {
         Some(name) => catalog.preset(&name)?,
         None if config_path.exists() => read_config(&config_path)?,
@@ -63,10 +67,18 @@ fn run() -> Result<()> {
             return Err("interactive configuration needs a terminal; use --non-interactive --preset default".into());
         }
         #[cfg(feature = "tui")]
-        return ui::run(&root, &catalog, config, &config_path);
+        return ui::run(
+            &root,
+            &catalog,
+            config,
+            &config_path,
+            on_disk,
+            ui::Theme::detect(ascii),
+        );
         #[cfg(not(feature = "tui"))]
         return Err("use ./configure.sh to open the terminal UI".into());
     }
+    let _ = (ascii, on_disk);
     let resolved = resolve(&catalog, &config)?;
     print!("{}", resolved.report());
     resolved.require_valid()?;

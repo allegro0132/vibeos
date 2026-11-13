@@ -19,19 +19,46 @@ for image verification; QEMU is required only for running or smoke tests.
 ./run.sh --config vibeos.toml
 ```
 
-The UI has three columns: categories, selectable items, and dependencies plus
-availability on each selected board. It uses English ASCII text and borders.
+`./configure.sh` opens the setup UI. Five sections run across the top: Boards,
+Drivers, Components, Presets and Review. Each section is a list beside a detail
+pane; Review is one scrollable summary of the resolved build. A first run (no
+`vibeos.toml` yet) opens on Presets so you start from a working selection.
+
+Every row shows the *resolved* outcome rather than only the stored choice. A
+driver left on `auto` that a component pulled in is drawn as included and
+labelled `auto, in use`. The detail pane lists, per selected board, whether the
+item is included and why. The status line always shows the first unresolved
+problem, and Review lists them all.
+
+| Symbol | ASCII | Meaning |
+| --- | --- | --- |
+| `●` | `[x]` | Included in the build |
+| `○` | `[ ]` | Not included |
+| `◆` | `[#]` | Required; cannot be turned off |
+| `●` (yellow) | `[~]` | Selected, but missing on some boards |
+| `×` | `[-]` | Driver forced off, even as a dependency |
+| `!` | `[!]` | Selected, but cannot be satisfied (or conflicts) |
+| `·` | ` . ` | Applies to no selected board |
 
 | Key | Action |
 | --- | --- |
-| Tab / Left / Right | Change category |
-| Up / Down / j / k | Select an item |
-| Space / Enter | Toggle a board/component; cycle a driver; choose a preset |
-| / | Search names, identifiers and descriptions |
-| PageUp / PageDown | Scroll dependency details or preview |
-| Ctrl-S | Validate and save |
-| q / Escape | Exit, confirming if there are unsaved changes |
-| ? | Show key help |
+| Tab / Shift-Tab / Left / Right / 1-5 | Change section |
+| Up / Down / j / k / Home / End | Select an item |
+| Space / Enter | Toggle a board/component; cycle a driver; load a preset |
+| / | Filter by name, identifier or description; Escape clears it |
+| PageUp / PageDown | Scroll the detail pane or Review |
+| s / Ctrl-S | Validate and save (Enter also saves on Review) |
+| q / Escape | Quit; with unsaved changes, choose save, discard or keep editing |
+| ? | Keys and symbols |
+
+A failed save jumps to Review. Loading a preset asks first only when it would
+discard unsaved changes, and nothing is written until you save.
+
+The UI draws with Unicode and the terminal's own ANSI palette. It falls back to
+pure ASCII when the locale is not UTF-8, on the Linux console, or with `--ascii`
+or `VIBECONFIG_ASCII=1`, which suits serial terminals. `NO_COLOR` disables
+colour; weight then carries the hierarchy. The minimum size is 50 x 12, and
+below 84 columns the detail pane moves under the list.
 
 Drivers have `auto`, `on` and `off` states. `auto` allows dependency resolution
 to select a provider. `on` requires the driver on compatible selected boards.

@@ -22,3 +22,6 @@ vibeos-hal = { path = "../hal" }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 vibeos-runtime-riscv = { path = "../runtime/riscv" }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+vibeos-runtime-aarch64 = { path = "../runtime/aarch64" }

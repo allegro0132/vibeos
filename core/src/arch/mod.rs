@@ -1,9 +1,7 @@
 //! The thin seam between portable kernel logic and the machine.
 //!
-//! Everything below this line is riscv64 assembly; everything above it is
-//! ordinary Rust. The point is not portability to other ISAs — it is that the
-//! scheduler, the allocator, and the lock can be compiled and tested on the
-//! host, where iteration takes milliseconds instead of a QEMU boot.
+//! Bare-metal builds select an ISA runtime. Host-only deterministic models
+//! remain available for portable tests, never for unsupported firmware ISAs.
 
 pub use vibeos_hal::arch::{HartState, IpiError};
 
@@ -18,7 +16,18 @@ pub use vibeos_runtime_riscv::{
     RFENCE_EXTENSION_ID,
 };
 
-#[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
+#[cfg(not(target_os = "none"))]
 mod host;
-#[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
+#[cfg(not(target_os = "none"))]
 pub use host::*;
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(crate) use vibeos_runtime_aarch64::bare::cache_logical_hart_index;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub use vibeos_runtime_aarch64::bare::{
+    cached_logical_hart_index, clear_software_interrupt, counter as time,
+    current_hart_id, enable_interrupts, fence_ipi, irq_restore, irq_save,
+    reboot, send_ipi, set_timer, shutdown, wait_for_interrupt,
+};
+#[cfg(all(target_os = "none", not(any(target_arch = "riscv64", target_arch = "aarch64"))))]
+compile_error!("vibeos-core requires a real bare-metal architecture runtime");

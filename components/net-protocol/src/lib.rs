@@ -16,6 +16,15 @@
 extern crate alloc;
 
 pub mod command;
+pub mod arp;
+pub mod ipv4;
+pub mod icmp_error;
+pub mod icmp_nat;
+pub mod nat;
+mod tcp_window;
+pub mod neighbor;
+pub mod router_config;
+pub mod router_dhcp;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -1060,6 +1069,10 @@ impl SharedIpv4TcpStack {
                 break;
             }
         }
+        // DHCP expiry/retry exhaustion can emit Deconfigured during egress,
+        // even when no packet is transmitted. Publish it before returning a
+        // stale bound address or calculating the next wakeup.
+        self.apply_dhcp_event()?;
         let _ = self.device.flush_egress()?;
         self.ensure_listening(true);
 

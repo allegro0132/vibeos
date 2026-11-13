@@ -12,6 +12,8 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 
 ## Documents
 
+- **[BPI-R4PRO-4E platform libraries](docs/BPI_R4PRO_4E.md)** — reusable drivers/runtime; router firmware is maintained in [VibeWrt](https://github.com/allegro0132/vibewrt).
+
 - **[docs/BLUEPRINT.md](docs/BLUEPRINT.md)** — architecture, the four bets, the
   capability model's invariants, the compiler's confinement argument and where it
   leaks, and the trust model.

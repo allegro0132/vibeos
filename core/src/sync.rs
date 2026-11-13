@@ -70,13 +70,13 @@ fn recovery_context_hart_index() -> Option<usize> {
     // Host integration tests do not construct a complete SBI topology. The
     // target must never equate a dense-looking firmware hartid with a logical
     // slot: M5.2 explicitly supports non-contiguous and permuted mappings.
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(target_os = "none"))]
     {
         let physical = current_hart_id();
         return (physical < MAX_HARTS).then_some(physical);
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_os = "none")]
     None
 }
 

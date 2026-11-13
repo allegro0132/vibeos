@@ -154,10 +154,10 @@ pub fn current_logical_hart() -> Option<HartId> {
     // On target, a zero per-hart token means this CPU has not completed its
     // own registration. Never borrow a controller-published mapping for a
     // secondary that has not initialized its local stack/trap/runtime state.
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_os = "none")]
     return None;
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(target_os = "none"))]
     {
         let physical = arch::current_hart_id();
         (0..MAX_HARTS).find_map(|index| {
@@ -235,12 +235,12 @@ pub fn notify_ready(hart: HartId) {
         // An online physical hart with a valid mapping must be reachable. A
         // firmware failure here is kernel infrastructure state, not a
         // component fault; fail-stop without entering the task panic guard.
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(target_os = "none")]
         {
             let _ = error;
             arch::shutdown(true);
         }
-        #[cfg(not(target_arch = "riscv64"))]
+        #[cfg(not(target_os = "none"))]
         panic!("host IPI notification failed: {error:?}");
     }
 }
@@ -388,7 +388,7 @@ pub fn retry_pending(hart: HartId) -> DoorbellDisposition {
 }
 
 /// Reset global state for deterministic host integration tests.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 pub fn reset_test_state() {
     REGISTRATION_GATE.store(false, Ordering::Release);
     ONLINE_HARTS.store(0, Ordering::Release);

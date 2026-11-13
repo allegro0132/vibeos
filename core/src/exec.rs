@@ -901,12 +901,12 @@ fn current_scheduler_hart() -> Option<HartId> {
         return Some(hart);
     }
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(target_os = "none"))]
     {
         return HartId::new(arch::current_hart_id());
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_os = "none")]
     None
 }
 
@@ -1955,7 +1955,7 @@ static FAULT_GUARD: AtomicUsize = AtomicUsize::new(0);
 static FAULT_RECLAIMER: AtomicUsize = AtomicUsize::new(0);
 static FAULT_CLEANUP: AtomicUsize = AtomicUsize::new(0);
 static READY_NOTIFY_HOOK: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 static RECLAIMABLE_TEARDOWN_TEST_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 fn load_fault_guard() -> Option<FaultGuard> {
@@ -2010,24 +2010,24 @@ pub fn set_ready_notify_hook(hook: ReadyNotifyHook) {
 /// Remove the ready notification hook while the executor is quiescent.
 /// Host tests use this to isolate publication-order probes; kernels normally
 /// install their immutable IPI hook once during bootstrap.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 pub fn clear_ready_notify_hook() {
     READY_NOTIFY_HOOK.store(0, Ordering::Release);
 }
 
 /// Host-only deterministic interleaving hook after a tracked domain and all
 /// siblings have committed Faulted, but before sibling detachment begins.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 pub fn set_reclaimable_teardown_test_hook(hook: fn(AllocationDomain)) {
     RECLAIMABLE_TEARDOWN_TEST_HOOK.store(hook as usize, Ordering::Release);
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 pub fn clear_reclaimable_teardown_test_hook() {
     RECLAIMABLE_TEARDOWN_TEST_HOOK.store(0, Ordering::Release);
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 fn run_reclaimable_teardown_test_hook(domain: AllocationDomain) {
     let address = RECLAIMABLE_TEARDOWN_TEST_HOOK.swap(0, Ordering::AcqRel);
     if address != 0 {
@@ -2038,7 +2038,7 @@ fn run_reclaimable_teardown_test_hook(domain: AllocationDomain) {
     }
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(target_os = "none")]
 fn run_reclaimable_teardown_test_hook(_domain: AllocationDomain) {}
 
 fn notify_ready_hart(hart: HartId) {
@@ -3584,7 +3584,7 @@ pub fn spawn_sibling_on(
 /// first publications for the same arena. The future and its Drop path must
 /// not attempt to spawn a child in the same domain; that is a fail-stop
 /// contract violation.
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 pub unsafe fn spawn_exclusive_reclaimable_owned(
     domain: AllocationDomain,
     name: &str,

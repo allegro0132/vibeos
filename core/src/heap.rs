@@ -123,13 +123,13 @@ fn allocation_context_hart_index() -> Option<usize> {
     // Host integration tests do not all construct an SBI topology. A dense
     // physical id models the corresponding logical slot there. The target
     // must never make that assumption: SBI hart ids may be sparse or permuted.
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(target_os = "none"))]
     {
         let physical = arch::current_hart_id();
         return (physical < MAX_HARTS).then_some(physical);
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_os = "none")]
     None
 }
 

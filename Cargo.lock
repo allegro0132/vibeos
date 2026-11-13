@@ -240,8 +240,6 @@ dependencies = [
 [[package]]
 name = "cpufeatures"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
@@ -1229,8 +1227,6 @@ dependencies = [
 [[package]]
 name = "smoltcp"
 version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -1471,6 +1467,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-bsp-bpi-r4pro-4e"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-bsp-milkv-duo"
 version = "0.1.0"
 dependencies = [
@@ -1609,6 +1612,7 @@ version = "0.1.0"
 dependencies = [
  "vibeos-durable-format",
  "vibeos-hal",
+ "vibeos-runtime-aarch64",
  "vibeos-runtime-riscv",
 ]
 
@@ -1633,6 +1637,17 @@ version = "0.1.0"
 dependencies = [
  "vibeos-hal",
 ]
+
+[[package]]
+name = "vibeos-driver-mtk-msdc"
+version = "0.1.0"
+dependencies = [
+ "vibeos-storage-device",
+]
+
+[[package]]
+name = "vibeos-driver-mtk-netsys"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-pci"
@@ -1883,6 +1898,13 @@ dependencies = [
  "chacha20 0.10.1",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "vibeos-runtime-aarch64"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
 ]
 
 [[package]]

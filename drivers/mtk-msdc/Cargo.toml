@@ -1,0 +1,7 @@
+[package]
+name = "vibeos-driver-mtk-msdc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-storage-device = { path = "../../storage-device" }

@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 use alloc::alloc::{alloc, dealloc};
 use alloc::alloc::{handle_alloc_error, Layout};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -169,7 +169,7 @@ fn installed_capability_table_backend() -> Option<CapabilityTableBackend> {
     }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 fn host_allocate_capability_table_pages(page_count: usize) -> *mut u8 {
     let layout = capability_table_page_layout(page_count);
     // Safety: the layout is non-zero and has the exact page alignment promised
@@ -177,10 +177,10 @@ fn host_allocate_capability_table_pages(page_count: usize) -> *mut u8 {
     unsafe { alloc(layout) }
 }
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 fn host_protect_capability_table_pages(_start: usize, _page_count: usize, _read_only: bool) {}
 
-#[cfg(not(target_arch = "riscv64"))]
+#[cfg(not(target_os = "none"))]
 unsafe fn host_release_capability_table_pages(start: usize, page_count: usize) {
     let layout = capability_table_page_layout(page_count);
     // Safety: this exact pointer/layout pair came from the host fallback
@@ -193,7 +193,7 @@ fn capability_table_backend() -> CapabilityTableBackend {
         return backend;
     }
 
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(not(target_os = "none"))]
     {
         // Safety: the fallback allocator uses an exact 4 KiB-aligned Layout,
         // its logical protection hook is synchronous, and release reconstructs
@@ -207,9 +207,9 @@ fn capability_table_backend() -> CapabilityTableBackend {
         }
     }
 
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(target_os = "none")]
     {
-        panic!("riscv64 capability tables require an installed page backend")
+        panic!("bare-metal capability tables require an installed page backend")
     }
 }
 

@@ -3,6 +3,10 @@ name = "vibeos-net-protocol"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Explicit board/service policy; other images keep their current ICMP behavior.
+icmp-echo = ["smoltcp/auto-icmp-echo-reply"]
+
 [dependencies]
 smoltcp = { version = "=0.13.1", default-features = false, features = [
     "alloc",

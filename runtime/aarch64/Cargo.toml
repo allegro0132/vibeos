@@ -1,0 +1,10 @@
+[package]
+name = "vibeos-runtime-aarch64"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+crypto-simd-frame = []
+
+[dependencies]
+vibeos-hal = { path = "../../hal" }

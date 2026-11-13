@@ -1741,17 +1741,26 @@ mod tests {
         let mut a = App::new(c.preset("default").unwrap(), true);
         a.config
             .components
-            .extend(["ssh".to_owned(), "iperf3".to_owned()]);
+            .extend(["python".to_owned(), "wasmtime".to_owned()]);
         let text = screen(&c, &a, ASCII, 100, 30);
-        assert!(text.contains("iperf3 conflicts with ssh"), "{text}");
+        assert!(text.contains("python conflicts with wasmtime"), "{text}");
         a.go(COMPONENTS);
         let r = resolve(&c, &a.config).unwrap();
         let rows = a.rows(&c, Some(&r));
-        let ssh = rows.iter().find(|r| r.id == "ssh").unwrap();
+        let python = rows.iter().find(|r| r.id == "python").unwrap();
         assert_eq!(
-            (ssh.mark, ssh.note.as_str()),
-            (Mark::Failed, "conflicts with iperf3")
+            (python.mark, python.note.as_str()),
+            (Mark::Failed, "conflicts with wasmtime")
         );
+        // SSH and iperf3 each own their listeners and share an image.
+        a.config = c.preset("default").unwrap();
+        a.config
+            .components
+            .extend(["ssh".to_owned(), "iperf3".to_owned()]);
+        resolve(&c, &a.config).unwrap().require_valid().unwrap();
+        a.config
+            .components
+            .extend(["python".to_owned(), "wasmtime".to_owned()]);
         a.go(REVIEW);
         let text = screen(&c, &a, ASCII, 100, 30);
         assert!(text.contains("2 problems to fix before saving"), "{text}");

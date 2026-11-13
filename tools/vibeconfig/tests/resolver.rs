@@ -207,3 +207,15 @@ fn an_external_board_resolves_alone_without_universal_features() {
     with_files.components.insert("file-tree".into());
     assert!(!resolve(&c, &with_files).unwrap().valid());
 }
+#[test]
+fn ssh_and_iperf3_share_one_image() {
+    let c = catalog();
+    let mut config = c.preset("default").unwrap();
+    config.components.extend(["ssh".into(), "iperf3".into()]);
+    let r = resolve(&c, &config).unwrap();
+    r.require_valid().unwrap();
+    assert!(r.features.contains("component-ssh") && r.features.contains("component-iperf3"));
+    for plan in r.boards.values() {
+        assert!(plan.enabled.contains("ssh") && plan.enabled.contains("iperf3"));
+    }
+}

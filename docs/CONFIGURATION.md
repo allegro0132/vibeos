@@ -136,8 +136,8 @@ Resolution computes each board's dependency closure first, then the union of
 Cargo features. A requested component may be unavailable on some boards; its
 reason is displayed and it is not activated there. If it cannot run on any
 selected board, saving/building fails. Global library conflicts are errors even
-when components would run on different boards. Current conflicts are Python
-with Wasmtime, and SSH with the dedicated iperf3 service profile.
+when components would run on different boards. The current conflict is Python
+with Wasmtime. SSH and iperf3 can share an image: each has its own listeners.
 
 | Component | Dependencies / behavior |
 | --- | --- |
@@ -148,7 +148,7 @@ with Wasmtime, and SSH with the dedicated iperf3 service profile.
 | WASI | File services; built-in WASI Preview 1 command runtime |
 | Wasmtime | WASI and RV64GC; existing runtime ISA and memory admission |
 | Python support | WASI/Wasmi with the bounded small-board limits; install Python separately |
-| iperf3 | Networking; dedicated DHCP TCP server profile |
+| iperf3 | Networking; DHCP TCP benchmark server, alone or beside SSH |
 
 QEMU prefers virtio-rng. Boards without a dedicated approved source, including
 Duo and Mars, can use jitterentropy with OSR 3 and a 256 KiB collector. Explicitly

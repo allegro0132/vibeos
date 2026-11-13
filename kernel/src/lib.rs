@@ -643,11 +643,12 @@ compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 
     )
 ))]
 compile_error!("feature `iperf3-server` is an isolated QEMU network image");
+// Provisioned SSH is not in this list: it keeps its own listener beside the
+// iperf3 control/data pair, so one image can serve both.
 #[cfg(all(
     feature = "dhcp-iperf3-server",
     any(
         feature = "net-shell",
-        feature = "provisioned-ssh",
         feature = "milkv-ssh-acceptance",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe"

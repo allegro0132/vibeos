@@ -34,8 +34,22 @@ const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 const NETWORK_DRIVER_MEMORY_BUDGET: usize = 128 * 1024;
 #[cfg(not(feature = "network-tso-coalesce"))]
 const NETWORK_DRIVER_MEMORY_BUDGET: usize = BACKGROUND_MEMORY_BUDGET;
-#[cfg(not(feature = "tcp-large-window"))]
+#[cfg(all(
+    not(feature = "tcp-large-window"),
+    not(all(
+        feature = "provisioned-ssh",
+        any(feature = "iperf3-server", feature = "dhcp-iperf3-server")
+    ))
+))]
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
+// SSH's listener and iperf3's control/data pair live in one stack. Each
+// service alone fits the single-service budget, so together they get both.
+#[cfg(all(
+    not(feature = "tcp-large-window"),
+    feature = "provisioned-ssh",
+    any(feature = "iperf3-server", feature = "dhcp-iperf3-server")
+))]
+const NETWORK_STACK_MEMORY_BUDGET: usize = 2 * 384 * 1024;
 #[cfg(all(feature = "tcp-large-window", not(feature = "tcp-throughput-probe")))]
 // Four 256 KiB socket buffers are charged as four 512 KiB allocator
 // blocks. Keep room for metadata and old/new stacks during session rebinding.
@@ -602,6 +616,10 @@ pub struct World {
         feature = "dhcp-iperf3-server"
     ))]
     tcp_listener_root: Option<Cap>,
+    /// The same root as `tcp_listener_root` in an iperf3-only image; a
+    /// separate listener when provisioned SSH owns that slot.
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    iperf_control_listener_root: Option<Cap>,
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     iperf_data_listener_root: Option<Cap>,
     #[cfg(feature = "tcp-throughput-probe")]
@@ -1175,7 +1193,7 @@ impl World {
             return ComponentGrants::Iperf3Server {
                 control: cap::grant(
                     &policy,
-                    self.tcp_listener_root
+                    self.iperf_control_listener_root
                         .expect("iperf3 control listener root exists"),
                     rights,
                     &mut target,
@@ -2726,7 +2744,10 @@ pub fn build() {
         )))]
         let listen_port = 2222;
         let id = vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero");
-        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+        #[cfg(all(
+            any(feature = "iperf3-server", feature = "dhcp-iperf3-server"),
+            not(feature = "provisioned-ssh")
+        ))]
         let listener = new_shared_network_listener(
             listener_label,
             id,
@@ -2735,7 +2756,10 @@ pub fn build() {
             vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
             vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         );
-        #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        #[cfg(any(
+            feature = "provisioned-ssh",
+            not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))
+        ))]
         let listener = vibeos_net_api::TcpListener::new(
             listener_label,
             id,
@@ -2746,6 +2770,28 @@ pub fn build() {
         let listener = listener.expect("the image TCP listener policy is valid");
         #[cfg(feature = "network-profile")]
         crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
+        policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
+    });
+    #[cfg(all(
+        any(feature = "iperf3-server", feature = "dhcp-iperf3-server"),
+        not(feature = "provisioned-ssh")
+    ))]
+    let iperf_control_listener_root = tcp_listener_root;
+    // SSH keeps listener 1 on port 22, so iperf3 control gets its own frontend.
+    #[cfg(all(
+        any(feature = "iperf3-server", feature = "dhcp-iperf3-server"),
+        feature = "provisioned-ssh"
+    ))]
+    let iperf_control_listener_root = service_policy.as_ref().map(|policy_space| {
+        let listener = new_shared_network_listener(
+            "iperf3-control",
+            vibeos_net_api::TcpListenerId::new(3).expect("listener identity is non-zero"),
+            vibeos_iperf3_server::DEFAULT_PORT,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+            vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
+        )
+        .expect("the iperf3 control listener policy is valid");
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
@@ -3037,9 +3083,10 @@ pub fn build() {
         net_control_root,
     ) {
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
-        let listeners = vibeos_netstack::two_tcp_listeners(
-            tcp_listener_root.expect("iperf3 control listener root"),
+        let listeners = iperf_and_ssh_listeners(
+            iperf_control_listener_root.expect("iperf3 control listener root"),
             iperf_data_listener_root.expect("iperf3 data listener root"),
+            tcp_listener_root,
         );
         #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         let listeners = match tcp_listener_root {
@@ -3093,7 +3140,7 @@ pub fn build() {
             listeners: {
                 #[cfg(all(feature = "universal", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
                 { if net_policy.is_none() {
-                    vibeos_netstack::two_tcp_listeners(tcp_listener_root.expect("USB control listener"), iperf_data_listener_root.expect("USB data listener"))
+                    iperf_and_ssh_listeners(iperf_control_listener_root.expect("USB control listener"), iperf_data_listener_root.expect("USB data listener"), tcp_listener_root)
                 } else { vibeos_netstack::no_tcp_listeners() } }
                 #[cfg(all(feature = "universal", not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))))]
                 { if net_policy.is_none() { tcp_listener_root.map_or_else(vibeos_netstack::no_tcp_listeners, vibeos_netstack::one_tcp_listener) } else { vibeos_netstack::no_tcp_listeners() } }
@@ -3169,7 +3216,7 @@ pub fn build() {
     let iperf3_app_grants = match (
         service_policy.as_ref(),
         iperf3_app_space.as_ref(),
-        tcp_listener_root,
+        iperf_control_listener_root,
         iperf_data_listener_root,
     ) {
         (Some(policy_space), Some(app_space), Some(control), Some(data)) => {
@@ -3468,6 +3515,8 @@ pub fn build() {
             feature = "dhcp-iperf3-server"
         ))]
         tcp_listener_root,
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+        iperf_control_listener_root,
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         iperf_data_listener_root,
         #[cfg(feature = "tcp-throughput-probe")]
@@ -3913,6 +3962,22 @@ async fn store_fault_probe_task(space: SpaceRef, service: Cap) {
         panic!("injected store fault unexpectedly returned: {result:?}");
     }
     unreachable!("the bounded store-fault retry loop always returns or faults");
+}
+
+/// iperf3's control/data pair, plus the SSH listener when the image has one.
+/// SSH takes the last slot: slots 2..6 belong to the TCP throughput probe.
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+fn iperf_and_ssh_listeners(
+    control: Cap,
+    data: Cap,
+    listener: Option<Cap>,
+) -> vibeos_netstack::TcpListenerCapabilities {
+    let mut listeners = vibeos_netstack::two_tcp_listeners(control, data);
+    // Without provisioned SSH, `listener` is the control root already placed.
+    if cfg!(feature = "provisioned-ssh") {
+        listeners[vibeos_netstack::MAX_SERVICE_LISTENERS - 1] = listener;
+    }
+    listeners
 }
 
 #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]

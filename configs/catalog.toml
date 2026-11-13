@@ -334,7 +334,7 @@ kind = "component"
 feature = "component-ssh"
 boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["network", "file-tree", "cap:entropy"]
-conflicts = ["iperf3"]
+conflicts = []
 
 [[nodes]]
 id = "wasi"
@@ -369,9 +369,9 @@ conflicts = ["wasmtime"]
 [[nodes]]
 id = "iperf3"
 name = "iperf3 service"
-description = "DHCP TCP benchmark service; conflicts with the existing SSH service profile."
+description = "DHCP TCP throughput benchmark server on its own control and data listeners."
 kind = "component"
 feature = "component-iperf3"
 boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
 requires = ["network"]
-conflicts = ["ssh"]
+conflicts = []

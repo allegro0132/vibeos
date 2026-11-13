@@ -3,3 +3,5 @@ name = "vibeos-driver-virtio-core"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+vibeos-virtio-protocol = { path = "../../contracts/virtio" }

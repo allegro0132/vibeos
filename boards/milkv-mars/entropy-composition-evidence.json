@@ -1,0 +1,41 @@
+{
+  "status": "QEMU entropy composition verified; Mars incomplete",
+  "host_tests": 18,
+  "qemu_selftests": 390,
+  "entropy_acceptance": "two QEMU boots, bounded transport sample and distinct signed freshness markers, stable test identity",
+  "duo_build": "passed",
+  "mutation": "Ignoring the submission epoch fails stale-token test (isolated source copy; worktree unmodified)",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage4-host.log",
+      "sha256": "6d3a3972dc44a66f6273189817f3e6e6d8ff1bbf6e07633a55b87b065b4d8312"
+    },
+    {
+      "path": "target/mars-reference/stage4-token-mutation.log",
+      "sha256": "88d21fb0040a2fa500d3364fd073d1c3d084fc46625f0dc7e41a98c4622d90da"
+    },
+    {
+      "path": "target/mars-reference/stage4-qemu-selftest.log",
+      "sha256": "277ba5965c7bc9f86ae403f80a9875f9c60b920106f0767f719435b541e0e5b2"
+    },
+    {
+      "path": "target/mars-reference/stage4-ssh-security.log",
+      "sha256": "f43292c19bd4b8cdc49a0c4a1b0bdb9a920e7b5cbc3c134d4ac3be6abffb651d"
+    },
+    {
+      "path": "target/mars-reference/stage4-duo-build.log",
+      "sha256": "075ce195f94fefa4d4516c947854ebe9072206eb0a89e86b4b3fd9d1ea44a9dc"
+    },
+    {
+      "path": "target/mars-reference/stage4-kernel-dependencies.log",
+      "sha256": "e5a8ef99a9a3dd1ee6eace83411ad559f1e2f00f0a21a7e8f2aa0c832de833c1"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Shared VirtIO transport and other concrete driver migration",
+    "JH7110 platform and Mars firmware, DW-MSHC and GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

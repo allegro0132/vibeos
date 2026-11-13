@@ -1,0 +1,82 @@
+{
+  "status": "GMAC0 platform clock/reset/pad preparation implemented; production assembly and physical qualification pending",
+  "host_tests": 42,
+  "new_platform_tests": 8,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 1,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121950208,
+    "kernel_sha256": "2de8782896afbda8bc68cdb748d0570f0f338f333ad8b85baf099edc6bfbf8d8",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "JH7110_ETHERNET_MODEL PASS csr_hz=198000000 tx_parent=external reset=bounded",
+  "sdk_full_dtb_admission": "passed",
+  "mars_release_elf_contract": "passed",
+  "mutations": [
+    "reset assertion acknowledgment removed: detected",
+    "CSR clock substituted with GTX: detected",
+    "pin mask broadens into unrelated fields: detected",
+    "failure cleanup leaves TX clock enabled: detected"
+  ],
+  "source_reference": "boards/milkv-mars/ethernet-platform-reference.json",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage32-host-restored.log",
+      "sha256": "87e636234d3bc0a0f91f7a1ed95fd62b67dee30d0d0cb0a607b2073a87a96400"
+    },
+    {
+      "path": "target/mars-reference/stage32-sdk-network.log",
+      "sha256": "69cb5152fbf091c2507d3d5ca1b2ee61337b0afb3d1d8f8c77561c7ab6b0f039"
+    },
+    {
+      "path": "target/mars-reference/stage32-rv64-build.log",
+      "sha256": "ce63932cdb73a3b02e71b922e6ebc1496c72405f814579b6f4ab7402131898fa"
+    },
+    {
+      "path": "target/mars-reference/stage32-rv64-model/serial.log",
+      "sha256": "346c111ad590dc4a68e08f8ecd7ef8fc640551ed9a688ccec9846e9150c3a8c0"
+    },
+    {
+      "path": "target/mars-reference/stage32-rv64-model/summary.json",
+      "sha256": "e0db8d6299616eed5f40a6b5f599972c5f7a2e917188c11176d48dde282e27ca"
+    },
+    {
+      "path": "target/mars-reference/stage32-mars-build.log",
+      "sha256": "25d7d1fdf2dd32f3a9b032f0fd7edba2779c4d751cfba2246cefe6f1dd62b3e0"
+    },
+    {
+      "path": "target/mars-reference/stage32-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage32-mutation-assert-ack.log",
+      "sha256": "df13f78cbb5d63453734d999b5878e37ce10d1a2fd2a9aed98e2db29ca865f0e"
+    },
+    {
+      "path": "target/mars-reference/stage32-mutation-csr-rate.log",
+      "sha256": "2f95b6604fdb4ade9f7ac6da2b8cf9b3b099df6236bcdcd7424bc9d7b40ba0b2"
+    },
+    {
+      "path": "target/mars-reference/stage32-mutation-pin-mask.log",
+      "sha256": "08ad0e8ab0af5630398113057a962df5372820804c4eae1c1fe0a04026571872"
+    },
+    {
+      "path": "target/mars-reference/stage32-mutation-cleanup.log",
+      "sha256": "437cf176c8a470a55f8819a461540811a22c5c61c36614136d7d90788773f5a1"
+    }
+  ],
+  "physical_acceptance": false,
+  "blind_spots": [
+    "Register models do not prove real clock frequencies, reset completion or pad electrical behavior",
+    "Board requires external RGMII TX wiring and a stable 24 MHz oscillator",
+    "Shared AON pin controller must already be released by boot firmware",
+    "Failure cleanup is not DMA quiescence proof",
+    "No production Mars packet device is assembled yet"
+  ]
+}

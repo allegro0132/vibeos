@@ -48,7 +48,7 @@ impl Resource for ConsoleDev {
         format!(
             "{} @ {:#x} [{} bytes out]",
             uart::variant_name(),
-            uart::UART_BASE,
+            uart::base(),
             self.bytes.load(Ordering::Relaxed)
         )
     }

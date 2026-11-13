@@ -1,8 +1,8 @@
-//! Board-selected network-device frontend.
+//! Firmware-selected network-device frontend.
 //!
 //! Kernel components depend on this module rather than a concrete transport.
-//! The firmware's board selection remains a compile-time choice, so the
-//! re-export has no dynamic-dispatch or runtime probing cost.
+//! Firmware selects a HAL frontend at compile time; the hardware instance
+//! remains behind its static operation table.
 
 // This private binary-crate module intentionally exposes the complete stable
 // frontend even when a particular firmware image consumes only a subset.
@@ -15,6 +15,19 @@ use core::fmt::Write as _;
 /// clients. This frontend resource policy is intentionally unrelated to any
 /// backend's hardware descriptor-ring depth.
 pub const FRONTEND_QUEUE_DEPTH: usize = crate::platform::NETWORK_FRONTEND.queue_depth;
+
+/// Runtime control-plane observation, separate from controller diagnostics.
+#[cfg(feature = "network-status-snapshot")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeInfo {
+    pub online: bool,
+    pub quarantined: bool,
+    pub session_epoch: u64,
+    pub phy_link_up: bool,
+    pub ethernet_address: [u8; 6],
+    pub tx_checksum_offload: bool,
+    pub rx_checksum_offload: bool,
+}
 
 /// Stable physical attachment identity used only to order discovered NICs.
 /// Interface names are assigned after sorting these keys; no `netN` value is
@@ -89,7 +102,7 @@ impl NetworkLocation {
     }
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 #[allow(unused_imports)]
 pub use crate::dwmac_net::{
     ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
@@ -98,7 +111,10 @@ pub use crate::dwmac_net::{
     HANDSHAKE_FRAME_LEN, PEER_MAC,
 };
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(all(feature = "network-status-snapshot", feature = "packet-network", not(feature = "universal")))]
+pub(crate) use crate::dwmac_net::runtime_info_with;
+
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 #[allow(unused_imports)]
 pub use crate::virtio_net::{
     ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
@@ -119,13 +135,13 @@ pub(crate) use crate::virtio_net::{
 /// while DWMAC publishes the actual PHY state. Keeping that distinction here
 /// prevents service adapters from depending on a board-specific `NetInfo`
 /// layout.
-#[cfg(feature = "qemu-virt")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 #[allow(dead_code)]
 pub const fn carrier_up(_info: &NetInfo) -> bool {
     true
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 #[allow(dead_code)]
 pub const fn carrier_up(info: &NetInfo) -> bool {
     info.phy_link_up
@@ -133,22 +149,25 @@ pub const fn carrier_up(info: &NetInfo) -> bool {
 
 /// Report whether the selected physical backend completes IPv4/TCP/UDP
 /// checksums requested by its packet descriptors.
-#[cfg(feature = "qemu-virt")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 pub const fn tx_checksum_offload(_info: &NetInfo) -> bool {
     false
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 pub const fn tx_checksum_offload(info: &NetInfo) -> bool {
     info.tx_checksum_offload
 }
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 pub const fn rx_checksum_offload(_info: &NetInfo) -> bool {
     false
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 pub const fn rx_checksum_offload(info: &NetInfo) -> bool {
     info.rx_checksum_offload
 }
+
+#[cfg(feature = "universal")]
+pub use crate::universal_net::*;

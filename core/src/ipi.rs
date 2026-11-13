@@ -232,6 +232,8 @@ pub fn publish_runnable(hart: HartId) -> DoorbellDisposition {
 /// Executor ready-notification hook.
 pub fn notify_ready(hart: HartId) {
     if let DoorbellDisposition::Failed(error) = publish_runnable(hart) {
+        #[cfg(feature = "hang-failure-report")]
+        crate::hang_watch::ipi_failure(hart.index(), physical_hart_id(hart), error);
         // An online physical hart with a valid mapping must be reachable. A
         // firmware failure here is kernel infrastructure state, not a
         // component fault; fail-stop without entering the task panic guard.

@@ -1,0 +1,75 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "linux/drivers/mmc/host/dw_mmc-starfive.c",
+      "sha256": "89c7bd0dbda84a1c29892504342cbc8139e994042e8b576ca6c16b264c258d1a"
+    },
+    {
+      "path": "linux/drivers/pinctrl/starfive/pinctrl-starfive-jh7110.c",
+      "sha256": "331390418682add4ab9d94c0e95ae0d99c9e13b617532b9adff26cab65b6d908"
+    },
+    {
+      "path": "linux/drivers/pinctrl/starfive/pinctrl-starfive.c",
+      "sha256": "e8d516232ad7293227f4ac5e0574bd5100faddc3fa3e9a19f8a50b2e96439d8a"
+    },
+    {
+      "path": "linux/drivers/pinctrl/starfive/pinctrl-starfive.h",
+      "sha256": "f3ab69a1061e9133cb9186b6aa1da33e58f93ecec0aa852360a7d1b97f36f038"
+    },
+    {
+      "path": "linux/include/dt-bindings/pinctrl/starfive,jh7110-pinfunc.h",
+      "sha256": "db96360ba78329fe2dae6e812c7143c1a6e51c74b81459c3e51b64ceae808ced"
+    },
+    {
+      "path": "u-boot/arch/riscv/cpu/jh7110/pll.c",
+      "sha256": "02f73f494d2836f7a24b5340d9cc80d482862049514dc87768aa70b61f68f0b2"
+    },
+    {
+      "path": "u-boot/arch/riscv/include/asm/arch-jh7110/clk.h",
+      "sha256": "03b41cfb3bda023c33391241ce88b4dab29051998e7915fb183af70712368852"
+    },
+    {
+      "path": "u-boot/arch/riscv/include/asm/arch-jh7110/gpio.h",
+      "sha256": "7f6b0ac2f00665412f8ed47fc321f51518c7e5e072da821dfb8acea14d8f3f37"
+    },
+    {
+      "path": "u-boot/arch/riscv/include/asm/arch-jh7110/jh7110-regs.h",
+      "sha256": "d6d0d6457af593f48f89d890354f0a677782f467d383fd760bce8c437660fe86"
+    },
+    {
+      "path": "u-boot/board/starfive/evb/starfive_evb.c",
+      "sha256": "7638004cbc84fca5abcbdfdeea1331b1e9cb7a5cbeb9d6a59151d20ef419e103"
+    },
+    {
+      "path": "u-boot/board/starfive/visionfive2/starfive_visionfive2.c",
+      "sha256": "06778caeef13a8746e1215c857c6cf2361781a3bd3f4de63d4617dbbca5f0029"
+    },
+    {
+      "path": "u-boot/drivers/reset/reset-jh7110.c",
+      "sha256": "2ea19b32b6ef9dc03d31bf6d88a3a7ffec28efb1a2e6acb2c85ea6cdc67877a9"
+    },
+    {
+      "path": "u-boot/include/dt-bindings/clock/starfive-jh7110-clkgen.h",
+      "sha256": "5842350d24fa83cd7ae99559290bac73a043e6a0e5da53d0fee2a074ee628906"
+    },
+    {
+      "path": "u-boot/include/dt-bindings/reset/starfive-jh7110.h",
+      "sha256": "baf74b8e58e71f161e2353a9f0b53edbf6481bfcb34dfeeee395fbda259f158b"
+    },
+    {
+      "path": "u-boot/drivers/clk/starfive/clk-jh7110.c",
+      "sha256": "dd1a15472b1c19f7261009a396439d747f1d7af8a58336354806773c500372ee"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts",
+      "sha256": "be67b70444f960cb649317f8117b472c0878adfc0792484b363dbb791da829bf"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dtsi",
+      "sha256": "74ec33a74931aed76cc62a32a00382b5af18b6a30d8c10b50fc1b1985cbbd8fd"
+    }
+  ],
+  "scope": "SDIO1 clock, reset, GPIO routing and Mars board settling interval; no hardware qualification"
+}

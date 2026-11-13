@@ -1,0 +1,83 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/codecs/sf_hdmi.dtsi",
+      "sha256": "3ec2a2ee42d63106a54e32181ece895bad5cca8a0beab42c4d5c1e2b6bdef292"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/codecs/sf_pwmdac.dtsi",
+      "sha256": "19c1831af7b12c3d0801192ae51292f57523acfb490cc29034af806e349ee00d"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-clk.dtsi",
+      "sha256": "e3b4be49e1f972ece717eca63f4713c9b75b225033ac6849e323f1d48c53fdde"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts",
+      "sha256": "be67b70444f960cb649317f8117b472c0878adfc0792484b363dbb791da829bf"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dtsi",
+      "sha256": "74ec33a74931aed76cc62a32a00382b5af18b6a30d8c10b50fc1b1985cbbd8fd"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "sha256": "4834672066b8e4d7a2ae14169cc235de904966e8b8c3bc6b03cc5f670ece4a80"
+    },
+    {
+      "path": "linux/include/dt-bindings/clock/starfive-jh7110-clkgen.h",
+      "sha256": "7b9cae8485cf52fed31a33362339cff81b3db204b5d3aad236f0632b16df8271"
+    },
+    {
+      "path": "linux/include/dt-bindings/clock/starfive-jh7110-isp.h",
+      "sha256": "388f88dbe377bb15ebdc58c88ed5f431c15f88d743f9c9515495bdc9e2ea4a0b"
+    },
+    {
+      "path": "linux/include/dt-bindings/clock/starfive-jh7110-vout.h",
+      "sha256": "bdaeaf06eac740eff8e30b542d6d80b3e8b80445136ce8431a1066e8c6529e12"
+    },
+    {
+      "path": "linux/include/dt-bindings/gpio/gpio.h",
+      "sha256": "9459754421011352d52db59d3f5d51b8151043cae13bf430e177308ba89eb671"
+    },
+    {
+      "path": "linux/include/dt-bindings/interrupt-controller/irq.h",
+      "sha256": "392400a309a54ea5b1a2ac2e52773d3ab68e07323109b9aed88a69fedc74e082"
+    },
+    {
+      "path": "linux/include/dt-bindings/leds/common.h",
+      "sha256": "71e05e1cef6ebc77e058d38f86a5e7e531541c8492c7e9189fbf189da483aa12"
+    },
+    {
+      "path": "linux/include/dt-bindings/pinctrl/starfive,jh7110-pinfunc.h",
+      "sha256": "db96360ba78329fe2dae6e812c7143c1a6e51c74b81459c3e51b64ceae808ced"
+    },
+    {
+      "path": "linux/include/dt-bindings/power/jh7110-power.h",
+      "sha256": "42d2f8bbdfd21db2b31fe01694e035ef8a9ca97c25de098b4f5a04f4f6556f32"
+    },
+    {
+      "path": "linux/include/dt-bindings/reset/starfive-jh7110.h",
+      "sha256": "283388e54a663602b6840d3a5af6e1b5d90b1f093b077ee167d933db8e370505"
+    },
+    {
+      "path": "linux/include/dt-bindings/thermal/thermal.h",
+      "sha256": "d74d498871c3bf3d6aa985ad01c15dfa916614369dbcd832bdcb9d2d45b15e08"
+    }
+  ],
+  "dtb_sha256": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d",
+  "dtb_bytes": 52701,
+  "tools": {
+    "clang": "Homebrew clang version 20.1.8",
+    "dtc": "Version: DTC 1.8.1",
+    "rustc": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)",
+    "qemu-system-riscv64": "QEMU emulator version 11.0.3"
+  },
+  "opensbi_context_fixup_reference": {
+    "url": "https://github.com/riscv-software-src/opensbi/blob/v1.6/lib/utils/fdt/fdt_fixup.c",
+    "sha256": "c377056cfad1670ab3562a03abce4bab054d60b195f06971a835ecb820de70da",
+    "purpose": "M-mode PLIC context masking only; not selection of a paired Mars boot firmware version"
+  }
+}

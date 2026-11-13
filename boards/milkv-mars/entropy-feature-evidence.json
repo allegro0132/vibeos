@@ -1,0 +1,133 @@
+{
+  "status": "Kernel entropy feature independent of QEMU profile; native service composition pending",
+  "independent_kernel_features": [
+    "boot-dtb-probe",
+    "legacy-shell",
+    "qemu-default-image",
+    "queued-block",
+    "queued-entropy",
+    "queued-network"
+  ],
+  "independent_qemu_harts": 4,
+  "independent_selftests": 395,
+  "entropy_capability": "queue 8 epoch 1 online",
+  "native_kernel_check_features": [
+    "pio-block",
+    "packet-network",
+    "bounded-device-image",
+    "queued-entropy"
+  ],
+  "compatibility_qemu_statistics": [
+    {
+      "bytes": 64,
+      "interrupts": 1
+    },
+    {
+      "bytes": 64,
+      "interrupts": 1
+    }
+  ],
+  "mars_ethernet_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "48381e60d9b67987d23ca81812cd2ec8d56a1cc0f65dff304216d242a343bcd3",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 52056,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "regression_fixed": "selftest omitted discovered entropy component",
+  "mutation": "old QEMU module gate restored: independent compilation failed",
+  "negative_configuration": "queued plus jitter providers rejected",
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Independent composition still runs on QEMU hardware",
+    "PIO/native kernel check does not link a Mars entropy provider",
+    "Formal SSH qualification guards remain; no physical entropy qualification"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage50-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage50-compatible-test.log",
+      "sha256": "8a9d9630965752211492c411cffa433e5a0d92891801658434f0ad49ee0a5be9"
+    },
+    {
+      "path": "target/mars-reference/stage50-component-count-before.log",
+      "sha256": "0498aca66ca2b1e6f549dd874b1c7999e508f87f1ae2d7dcefbf170ddee5483b"
+    },
+    {
+      "path": "target/mars-reference/stage50-conflicting-providers.log",
+      "sha256": "992b5d6c13fba9de8610de5b8926828b895df041174c49e12aef10b2d679fe20"
+    },
+    {
+      "path": "target/mars-reference/stage50-feature-tree.log",
+      "sha256": "babd96d04462cce12272ef50862019e10907a3360b8f591ac8400ad9215a1b1f"
+    },
+    {
+      "path": "target/mars-reference/stage50-independent-build.log",
+      "sha256": "b6da95d95cdbc14efb775f2f625409fbea6d0503f93417e7181d72241cb7e78c"
+    },
+    {
+      "path": "target/mars-reference/stage50-independent-runtime.log",
+      "sha256": "28b6ccc712dd5574f007e54b7a8915cc3332a808dfcca76362b13d0e466d13ac"
+    },
+    {
+      "path": "target/mars-reference/stage50-lock-check.log",
+      "sha256": "7ac9ef388c8702b1f19e9048b5879e33c86391968e4436ccfa30893a7d81780f"
+    },
+    {
+      "path": "target/mars-reference/stage50-mars-build.log",
+      "sha256": "857818bb8d734429385a5aed4aaef14a0d590c7f6350b966079d6ac5d15bca2e"
+    },
+    {
+      "path": "target/mars-reference/stage50-mutation-board-gate.log",
+      "sha256": "33d8a7b7f84e808fb0ff0074898f5d9c10916c656b872c5b8c99cee679caeed6"
+    },
+    {
+      "path": "target/mars-reference/stage50-native-kernel-check.log",
+      "sha256": "1f227685e1e6d9811755afa38cf26c3cae747eb27ce856e5116288deb0b1fd4c"
+    },
+    {
+      "path": "target/mars-reference/stage50-resolved-features.log",
+      "sha256": "f879ac62c3c68b365f00198c498b31f175a91534df87bd8ca0bea2f91a281fa1"
+    },
+    {
+      "path": "target/mars-reference/stage50-compatible/boot-1.log",
+      "sha256": "6b22a6a53df293a395e89bc97787b0a498f9292a21321647ceddad942b66b84f"
+    },
+    {
+      "path": "target/mars-reference/stage50-compatible/boot-2.log",
+      "sha256": "1cb7bc45dfd4b5eb77512b4526c4f52602c9d9a02eaaf0706f13da2c787c374f"
+    }
+  ]
+}

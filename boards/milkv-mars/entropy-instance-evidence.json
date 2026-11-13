@@ -1,0 +1,112 @@
+{
+  "status": "Native PIO request owner integrated into boot diagnostic; source unqualified",
+  "request_bytes": {
+    "minimum": 1,
+    "maximum": 64
+  },
+  "host_tests": {
+    "mars_firmware": 12,
+    "trng_and_jh7110_platform": 42
+  },
+  "rv64": {
+    "harts": 4,
+    "kernel_selftests": 395,
+    "native_lifecycle_model_passed": true
+  },
+  "mutations_caught": [
+    "request serial recycled by reset",
+    "cross-reset repeated-output history erased",
+    "failed SEC stop ignored"
+  ],
+  "mars_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095565312,
+    "heap_end": 5368709120,
+    "elf_sha256": "2a4e88846ddccec2f90469639567c2447a2f0aabb2383454d2817a94bbd83e08",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3043328,
+        "memory_bytes": 3043328,
+        "flags": 5
+      },
+      {
+        "address": 1078882304,
+        "file_bytes": 438272,
+        "memory_bytes": 438272,
+        "flags": 4
+      },
+      {
+        "address": 1079320576,
+        "file_bytes": 52056,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088122880,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "native_hal_table_published": false,
+  "entropy_qualified": false,
+  "blind_spots": [
+    "CRG/TRNG registers and noise modeled for host and RV64 tests",
+    "Real boot firmware relinquishment of all SEC clients and stable parent clocks still require physical verification",
+    "No operation table publication or production SSH enabled",
+    "Existing SD image does not contain this stage"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage52-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage52-drivers.log",
+      "sha256": "e787b075467f08e34eff07539f96367c470b0d9231c8bea408eb22ffaa7d64cb"
+    },
+    {
+      "path": "target/mars-reference/stage52-host.log",
+      "sha256": "91dbfeab9a65f1b739cfbcc8d6d2aa7aa23e1014fafcbc48350d069e03f6f010"
+    },
+    {
+      "path": "target/mars-reference/stage52-mars-build.log",
+      "sha256": "6b5c02953f50536788b86e21bf4745d8dc1b993a7bf782defdd9646a089d8d8d"
+    },
+    {
+      "path": "target/mars-reference/stage52-mutation-history.log",
+      "sha256": "c2076ddeddeda3a63a290902f0061059c6bbe1d8e530aac8ce8a09b7f316b4ba"
+    },
+    {
+      "path": "target/mars-reference/stage52-mutation-serial.log",
+      "sha256": "7942c0f2c88c236b5d64228c6d3b9225573414fae5956c23656974602b99823a"
+    },
+    {
+      "path": "target/mars-reference/stage52-mutation-stop.log",
+      "sha256": "383a9fe3bbc6c67ad0a1b10ae9bcc3d2f811b43e4cd2a14da7f3e7711f8e56a7"
+    },
+    {
+      "path": "target/mars-reference/stage52-restored.log",
+      "sha256": "67c0f2b21116c7b6343e664f9c710bccbe3954fcaafcfcee2f734470872bab09"
+    },
+    {
+      "path": "target/mars-reference/stage52-rv64-build.log",
+      "sha256": "97403d63727429b546579a7d53fa5bf7a937f6ae9a14ff5a866ce7bd1bcaf715"
+    },
+    {
+      "path": "target/mars-reference/stage52-rv64-model/serial.log",
+      "sha256": "28ea99b79625394c108ce9d21374eda0845abf39d97e4c15b367e29649c05d8f"
+    },
+    {
+      "path": "target/mars-reference/stage52-rv64-model/summary.json",
+      "sha256": "7e21bde7fb010401a0ea5ab3e14288301fc695ea27ae58b169114de7bf22f45e"
+    }
+  ]
+}

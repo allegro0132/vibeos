@@ -1,8 +1,8 @@
-//! Persistent, fail-closed SSH provisioning for Milk-V Duo.
+//! Persistent SSH provisioning shared by firmware-selected platforms.
 
 extern crate alloc;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_core::cap::Rights;
@@ -385,7 +385,7 @@ pub fn onboarding_profile() -> Option<vibeos_sshd::AuthorizedProfile> {
 
 /// WASI is admitted only for a provisioned production session of the live
 /// policy generation. The password onboarding profile has no command authority.
-#[cfg(feature = "milkv-command")]
+#[cfg(feature = "provisioned-command")]
 pub fn command_profile_current(profile: vibeos_sshd::AuthorizedProfile) -> bool {
     !ONBOARDING_ACTIVE.load(Ordering::Acquire)
         && !POLICY_CHANGED.load(Ordering::Acquire)
@@ -405,7 +405,7 @@ pub async fn ensure_host_key() -> Result<Config, crate::block_device::BlockError
         }
     }
     let mut seed = [0u8; 32];
-    crate::jitterentropy_random::fill_seed(&mut seed)
+    crate::ssh_entropy::fill_seed(&mut seed).await
         .map_err(|_| crate::block_device::BlockError::DeviceIo)?;
     let mut config = load().await?.unwrap_or_else(Config::empty);
     config.generation = config
@@ -426,20 +426,23 @@ pub fn vsh_keygen(_args: &[String]) -> Result<String, Status> {
     if UPDATE_BUSY.swap(true, Ordering::AcqRel) {
         return Ok(String::from("SSH provisioning is busy\n"));
     }
-    let mut seed = [0u8; 32];
-    if let Err(error) = crate::jitterentropy_random::fill_seed(&mut seed) {
-        UPDATE_BUSY.store(false, Ordering::Release);
-        return Ok(format!("ssh-keygen failed: entropy {:?}\n", error));
-    }
-    let public = match derive_public_key(&seed) {
-        Ok(public) => public.to_bytes(),
-        Err(()) => {
+    crate::exec::spawn("ssh-keygen", async move {
+        let mut seed = [0u8; 32];
+        if let Err(error) = crate::ssh_entropy::fill_seed(&mut seed).await {
             erase(&mut seed);
             UPDATE_BUSY.store(false, Ordering::Release);
-            return Ok(String::from("ssh-keygen failed: invalid generated key\n"));
+            crate::uart::_print(format_args!("ssh-keygen failed: entropy {:?}\n", error));
+            return;
         }
-    };
-    crate::exec::spawn("ssh-keygen", async move {
+        let public = match derive_public_key(&seed) {
+            Ok(public) => public.to_bytes(),
+            Err(()) => {
+                erase(&mut seed);
+                UPDATE_BUSY.store(false, Ordering::Release);
+                crate::uart::_print(format_args!("ssh-keygen failed: invalid generated key\n"));
+                return;
+            }
+        };
         let result = async {
             let mut config = load().await?.unwrap_or_else(Config::empty);
             if config.flags & FLAG_CLIENT_KEYPAIR != 0 {

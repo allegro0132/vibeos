@@ -1,26 +1,37 @@
-//! Kernel composition adapter for the board-independent PCI driver crate.
-//!
-//! The driver owns ECAM enumeration and BAR assignment. The kernel supplies
-//! the selected BSP description and serializes the single host bridge.
-
+//! Kernel serialization and inventory view for the firmware PCI host.
 extern crate alloc;
-
 use crate::sync::SpinLock;
 use alloc::vec::Vec;
-
-pub use vibeos_driver_pci::{Bar, Function};
-
-static PCI: SpinLock<vibeos_driver_pci::Pci> =
-    SpinLock::new(vibeos_driver_pci::Pci::new(crate::platform::PCI));
-
-pub fn init() -> Result<usize, vibeos_driver_pci::Error> {
-    PCI.lock().init()
+use vibeos_hal::pci::{host, Error};
+pub use vibeos_hal::pci::{Bar, Function};
+static PCI: SpinLock<()> = SpinLock::new(());
+pub fn init() -> Result<usize, Error> {
+    let _lock = PCI.lock();
+    unsafe { (host().init)() }
 }
-
 pub fn functions() -> Vec<Function> {
-    PCI.lock().functions()
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().pci.is_none() { return Vec::new(); }
+    let _lock = PCI.lock();
+    let mut functions = Vec::new();
+    unsafe {
+        (host().functions)(&mut |function| functions.push(function));
+    }
+    functions
 }
-
 pub fn find_xhci() -> Option<Function> {
-    PCI.lock().find_xhci()
+    let _lock = PCI.lock();
+    let mut found = None;
+    unsafe {
+        (host().functions)(&mut |function| {
+            if found.is_none() && function.is_xhci() {
+                found = Some(function);
+            }
+        });
+    }
+    found
+}
+pub fn enable_bus_mastering(function: Function) -> Result<(), Error> {
+    let _lock = PCI.lock();
+    unsafe { (host().enable_bus_mastering)(function) }
 }

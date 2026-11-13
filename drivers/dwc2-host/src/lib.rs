@@ -1,29 +1,15 @@
-//! CV1800B platform bring-up for the integrated Synopsys DWC2 USB 2.0 OTG core.
+//! Polling Synopsys DWC2 host controller and USB class protocols.
 //!
-//! This first layer owns clocks, the SoC role override and the DWC2 host core.
-//! USB transactions and class drivers intentionally live above this crate.
+//! Firmware supplies platform clock/PHY setup, rollback and DMA synchronization.
+//! The controller receives only its own register resources.
 
 #![cfg_attr(not(test), no_std)]
 
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{compiler_fence, AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use vibeos_hal::Dwc2Description;
-
-const TOP_USB_ROLE: usize = 0x48;
-const CLKGEN_OFFSET: usize = 0x2000;
-const CLK_ENABLE_1: usize = CLKGEN_OFFSET + 0x04;
-const CLK_ENABLE_2: usize = CLKGEN_OFFSET + 0x08;
-const USB_CLOCKS_ENABLE_1: u32 = 0xf000_0000;
-const USB_CLOCKS_ENABLE_2: u32 = 1;
-const USB_ROLE_MASK: u32 = 0xc0;
-const USB_ROLE_HOST: u32 = 0x40;
-const USB_VBUS_POWER: u32 = 1 << 1;
-
-const PHY_UTMI_CONTROL: usize = 0x14;
-const PHY_UTMI_RESET: u32 = 0x18b;
-const PHY_UTMI_RESET_SETTLE_US: u64 = 100;
 
 const GAHBCFG: usize = 0x008;
 const GUSBCFG: usize = 0x00c;
@@ -93,12 +79,10 @@ const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
 const CDC_RX_POLL_TIMEOUT_MS: u64 = 2;
 const DMA_BYTES: usize = 2_048;
-pub const MAX_ETHERNET_FRAME_BYTES: usize = 1_536;
 const MAX_NAK_RETRIES: usize = 32;
 const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
 const APPLE_NKRO_REPORT_BYTES: usize = 15;
-const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
 const USB_CLASS_HUB: u8 = 9;
 const USB_CLASS_MASS_STORAGE: u8 = 8;
@@ -165,191 +149,15 @@ impl Default for InstanceState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    Busy,
-    InvalidDescription,
-    CoreNotFound(u32),
-    AhbIdleTimedOut,
-    CoreResetTimedOut,
-    HostModeTimedOut,
-    UnsupportedDma(u8),
-    DmaAddressTooWide,
-    NoDevice,
-    PortResetTimedOut,
-    BufferTooSmall,
-    InvalidDescriptor,
-    TransferTimedOut,
-    TransferFailed(u32),
-    Stalled,
-    Nak,
-    StorageProtocol,
-    StorageCommandFailed(u8),
-    StorageCswSignature(u32),
-    StorageCswTag(u32),
-    StorageCswResidue(u32),
-    StorageBlockSize(u32),
-    StorageCbwLength(usize),
-    TransferLength { expected: usize, actual: usize },
-    StorageDataLength { expected: usize, actual: usize },
-    StorageCswLength(usize),
-    StorageCapacityTooLarge,
-    StorageOutOfRange,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Speed {
-    High,
-    Full,
-    Low,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeviceInfo {
-    pub address: u8,
-    pub speed: Speed,
-    pub usb_version: u16,
-    pub device_class: u8,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub max_packet_size_0: u8,
-    pub configuration_count: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidKeyboardInfo {
-    pub interface: u8,
-    pub endpoint_in: u8,
-    pub max_packet_size: u16,
-    pub interval_ms: u16,
-    pub protocol: HidKeyboardProtocol,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HidKeyboardProtocol {
-    Boot,
-    Report,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MassStorageInfo {
-    pub configuration: u8,
-    pub interface: u8,
-    pub endpoint_in: u8,
-    pub endpoint_out: u8,
-    pub max_packet_size_in: u16,
-    pub max_packet_size_out: u16,
-    pub capacity_sectors: Option<u64>,
-    pub block_size: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CdcEcmInfo {
-    pub configuration: u8,
-    pub control_interface: u8,
-    pub data_interface: u8,
-    pub data_alternate: u8,
-    pub endpoint_in: u8,
-    pub endpoint_out: u8,
-    pub max_packet_size_in: u16,
-    pub max_packet_size_out: u16,
-    pub status_endpoint: Option<u8>,
-    pub status_max_packet_size: u16,
-    pub status_interval_ms: u16,
-    pub mac_string_index: u8,
-    pub mac_address: Option<[u8; 6]>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CdcCarrierStatus {
-    pub link_up: Option<bool>,
-    pub rtl815x_phystatus: Option<u16>,
-}
-
-pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
-pub const MAX_INTERFACE_ENDPOINTS: usize = 8;
-pub const MAX_DEVICE_CONFIGURATIONS: usize = 8;
-pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InterfaceInfo {
-    pub number: u8,
-    pub alternate: u8,
-    pub class: u8,
-    pub subclass: u8,
-    pub protocol: u8,
-    pub hid_report_length: u16,
-    pub interrupt_in: Option<u8>,
-    pub max_packet_size: u16,
-    pub interval: u8,
-    pub bulk_in: Option<u8>,
-    pub bulk_out: Option<u8>,
-    pub bulk_in_max_packet_size: u16,
-    pub bulk_out_max_packet_size: u16,
-    pub cdc_mac_string_index: Option<u8>,
-    pub endpoints: [Option<EndpointInfo>; MAX_INTERFACE_ENDPOINTS],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EndpointInfo {
-    pub address: u8,
-    pub attributes: u8,
-    pub max_packet_size: u16,
-    pub interval: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidReportDescriptor {
-    pub interface: u8,
-    pub declared_length: u16,
-    bytes: [u8; MAX_HID_REPORT_DESCRIPTOR_BYTES],
-    length: usize,
-}
-
-impl HidReportDescriptor {
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.length]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConfigurationInfo {
-    pub value: u8,
-    pub total_length: u16,
-    pub declared_interfaces: u8,
-    pub interfaces: [Option<InterfaceInfo>; MAX_CONFIGURATION_INTERFACES],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HubInfo {
-    pub address: u8,
-    pub ports: u8,
-    pub active_port: Option<u8>,
-    pub child_speed: Option<Speed>,
-    pub port_status: u16,
-}
-
-pub const MAX_HUB_CHILDREN: usize = MAX_HUB_PORTS as usize;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HubChildInfo {
-    pub device: DeviceInfo,
-    pub parent_hub_address: u8,
-    pub port: u8,
-    pub port_status: u16,
-    pub depth: u8,
-    pub tt_hub_address: Option<u8>,
-    pub tt_port: Option<u8>,
-}
-
+pub use vibeos_hal::usb_polling::{
+    CdcCarrierStatus, CdcEcmInfo, ConfigurationInfo, DeviceInfo, EndpointInfo, Error,
+    HidInputBatch, HidKeyboardInfo, HidKeyboardProtocol, HidReportDescriptor, HubChildInfo,
+    HubInfo, Info, InterfaceInfo, MassStorageInfo, Speed, Telemetry, UsbBusPath,
+    MAX_CONFIGURATION_INTERFACES, MAX_DEVICE_CONFIGURATIONS, MAX_ETHERNET_FRAME_BYTES,
+    MAX_HID_REPORT_DESCRIPTOR_BYTES, MAX_HUB_CHILDREN, MAX_INTERFACE_ENDPOINTS,
+    MAX_USB_BUS_PATH_DEPTH,
+};
 const MAX_HUB_DEPTH: u8 = 4;
-pub const MAX_USB_BUS_PATH_DEPTH: usize = MAX_HUB_DEPTH as usize + 1;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UsbBusPath {
-    pub ports: [u8; MAX_USB_BUS_PATH_DEPTH],
-    pub depth: u8,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SplitTarget {
@@ -369,32 +177,6 @@ struct TransferTarget {
 enum KeyboardLayout {
     Boot,
     AppleReport,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidInputBatch {
-    bytes: [u8; HID_INPUT_BYTES],
-    length: usize,
-}
-
-impl HidInputBatch {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; HID_INPUT_BYTES],
-            length: 0,
-        }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.length]
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.length < self.bytes.len() {
-            self.bytes[self.length] = byte;
-            self.length += 1;
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,31 +206,10 @@ impl SetupPacket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Info {
-    pub core_id: u32,
-    pub release: u16,
-    pub irq: u32,
-    pub host_channels: u8,
-    pub dynamic_fifo: bool,
-    pub dma_architecture: u8,
-    pub fifo_depth_words: u16,
-    pub dedicated_fifos: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Telemetry {
-    pub clock_enable_1: u32,
-    pub clock_enable_2: u32,
-    pub role_override: u32,
-    pub gusbcfg: u32,
-    pub hprt0: u32,
-    pub phy_utmi_control: u32,
-}
-
 /// Exclusive ownership of the fixed CV1800B DWC2 host instance.
 pub struct Controller {
     description: Dwc2Description,
+    platform: &'static vibeos_hal::usb_polling::Platform,
     dma: &'static DmaStorage,
     state: &'static InstanceState,
     info: Info,
@@ -484,8 +245,8 @@ pub struct Controller {
 }
 
 impl Controller {
-    /// Enable the CV1800B USB clocks, select host role, reset DWC2 and power
-    /// its root port. No interrupt or DMA is enabled at this stage.
+    /// Prepare the platform, reset DWC2 and power its root port. Interrupts
+    /// stay masked; DMA is configured but no transfer is submitted here.
     ///
     /// # Safety
     /// All ranges in `description` must be identity-mapped, strongly ordered
@@ -496,12 +257,18 @@ impl Controller {
     /// `timebase_hz` ticks.
     pub unsafe fn initialize(
         description: Dwc2Description,
+        platform: &'static vibeos_hal::usb_polling::Platform,
         dma: &'static DmaStorage,
         state: &'static InstanceState,
         timebase_hz: u64,
         time: fn() -> u64,
     ) -> Result<Self, Error> {
-        if !validate_description(description) || timebase_hz == 0 {
+        if !validate_description(description)
+            || timebase_hz == 0
+            || platform.dma.constraints.address_bits != description.dma_address_bits
+            || platform.dma.constraints.cache_line != 64
+            || platform.dma.constraints.alignment != 64
+        {
             return Err(Error::InvalidDescription);
         }
         if state
@@ -512,46 +279,20 @@ impl Controller {
             return Err(Error::Busy);
         }
 
-        let old_clocks_1 = unsafe { soc_read(description, CLK_ENABLE_1) };
-        let old_clocks_2 = unsafe { soc_read(description, CLK_ENABLE_2) };
-        let old_role = unsafe { soc_read(description, TOP_USB_ROLE) };
-        unsafe {
-            soc_write(
-                description,
-                CLK_ENABLE_1,
-                old_clocks_1 | USB_CLOCKS_ENABLE_1,
-            );
-            soc_write(
-                description,
-                CLK_ENABLE_2,
-                old_clocks_2 | USB_CLOCKS_ENABLE_2,
-            );
-            soc_write(
-                description,
-                TOP_USB_ROLE,
-                (old_role & !USB_ROLE_MASK) | USB_ROLE_HOST | USB_VBUS_POWER,
-            );
+        let saved = match (platform.prepare)(timebase_hz, time) {
+            Ok(saved) => saved,
+            Err(error) => {
+                state.claimed.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
 
-            // CV1800B's wrapper requires its UTMI state machine to be reset
-            // after the five USB clocks are enabled. This is the same pulse
-            // used by the vendor FSBL before it touches the DWC2 core.
-            let old_utmi = phy_read(description, PHY_UTMI_CONTROL);
-            phy_write(description, PHY_UTMI_CONTROL, PHY_UTMI_RESET);
-            compiler_fence(Ordering::SeqCst);
-            phy_write(description, PHY_UTMI_CONTROL, old_utmi);
-        }
-        compiler_fence(Ordering::SeqCst);
-        delay_us(timebase_hz, time, PHY_UTMI_RESET_SETTLE_US);
-
-        let result = unsafe { Self::initialize_core(description, dma, state, timebase_hz, time) };
+        let result =
+            unsafe { Self::initialize_core(description, platform, dma, state, timebase_hz, time) };
         match result {
             Ok(controller) => Ok(controller),
             Err(error) => {
-                unsafe {
-                    soc_write(description, TOP_USB_ROLE, old_role);
-                    soc_write(description, CLK_ENABLE_2, old_clocks_2);
-                    soc_write(description, CLK_ENABLE_1, old_clocks_1);
-                }
+                (platform.rollback)(saved);
                 state.claimed.store(false, Ordering::Release);
                 Err(error)
             }
@@ -560,6 +301,7 @@ impl Controller {
 
     unsafe fn initialize_core(
         description: Dwc2Description,
+        platform: &'static vibeos_hal::usb_polling::Platform,
         dma: &'static DmaStorage,
         state: &'static InstanceState,
         timebase_hz: u64,
@@ -674,9 +416,14 @@ impl Controller {
         if dma_architecture == 0 {
             return Err(Error::UnsupportedDma(dma_architecture));
         }
-        let dma_address = dma.base();
-        if dma_address > u32::MAX as usize
-            || dma_address.saturating_add(DMA_BYTES) > (1usize << description.dma_address_bits)
+        if platform
+            .dma
+            .constraints
+            .validate(vibeos_hal::memory::DmaRegion {
+                physical: dma.base() as u64,
+                bytes: DMA_BYTES,
+            })
+            .is_err()
         {
             return Err(Error::DmaAddressTooWide);
         }
@@ -696,6 +443,7 @@ impl Controller {
         }
         Ok(Self {
             description,
+            platform,
             dma,
             state,
             info: Info {
@@ -749,13 +497,14 @@ impl Controller {
     }
 
     pub fn telemetry(&self) -> Telemetry {
+        let wiring = unsafe { (self.platform.telemetry)() };
         Telemetry {
-            clock_enable_1: unsafe { soc_read(self.description, CLK_ENABLE_1) },
-            clock_enable_2: unsafe { soc_read(self.description, CLK_ENABLE_2) },
-            role_override: unsafe { soc_read(self.description, TOP_USB_ROLE) },
+            clock_enable_1: wiring.clock_enable_1,
+            clock_enable_2: wiring.clock_enable_2,
+            role_override: wiring.role_override,
             gusbcfg: unsafe { core_read(self.description, GUSBCFG) },
             hprt0: unsafe { core_read(self.description, HPRT0) },
-            phy_utmi_control: unsafe { phy_read(self.description, 0x14) },
+            phy_utmi_control: wiring.phy_utmi_control,
         }
     }
 
@@ -1366,12 +1115,12 @@ impl Controller {
                     },
                     &mut bytes[..requested],
                 )?;
-                self.report_descriptor = Some(HidReportDescriptor {
-                    interface: interface.number,
-                    declared_length: interface.hid_report_length,
+                self.report_descriptor = Some(HidReportDescriptor::new(
+                    interface.number,
+                    interface.hid_report_length,
                     bytes,
                     length,
-                });
+                )?);
                 if is_apple_report_keyboard_descriptor(&bytes[..length]) {
                     self.keyboard = Some(HidKeyboardInfo {
                         interface: interface.number,
@@ -2227,19 +1976,7 @@ impl Controller {
         let dma_address = self.dma.base();
 
         for _ in 0..nak_retries {
-            if direction_in {
-                invalidate_range(
-                    self.description.cache_line_bytes,
-                    dma_address,
-                    length.max(1),
-                );
-            } else {
-                clean_range(
-                    self.description.cache_line_bytes,
-                    dma_address,
-                    length.max(1),
-                );
-            }
+            sync_for_device(self.platform.dma, dma_address, length.max(1), direction_in);
 
             let channel = 0;
             unsafe {
@@ -2281,11 +2018,7 @@ impl Controller {
                                 as usize;
                         let actual = completed_length(direction_in, length, remaining);
                         if direction_in {
-                            invalidate_range(
-                                self.description.cache_line_bytes,
-                                dma_address,
-                                actual.max(1),
-                            );
+                            sync_for_cpu(self.platform.dma, dma_address, actual.max(1));
                         }
                         return Ok(actual);
                     }
@@ -2464,19 +2197,7 @@ impl Controller {
         dma_offset: usize,
     ) -> Result<(u32, usize), Error> {
         let dma_address = self.dma.base() + dma_offset;
-        if direction_in {
-            invalidate_range(
-                self.description.cache_line_bytes,
-                dma_address,
-                length.max(1),
-            );
-        } else {
-            clean_range(
-                self.description.cache_line_bytes,
-                dma_address,
-                length.max(1),
-            );
-        }
+        sync_for_device(self.platform.dma, dma_address, length.max(1), direction_in);
 
         let channel = 0;
         let split_control = split_control(split, complete);
@@ -2518,7 +2239,7 @@ impl Controller {
                     unsafe { channel_read(self.description, channel, HCTSIZ) & 0x7ffff } as usize;
                 let actual = completed_length(direction_in, length, remaining);
                 if direction_in && actual != 0 {
-                    invalidate_range(self.description.cache_line_bytes, dma_address, actual);
+                    sync_for_cpu(self.platform.dma, dma_address, actual);
                 }
                 return Ok((status, actual));
             }
@@ -3387,48 +3108,12 @@ fn delay_us(timebase_hz: u64, time: fn() -> u64, microseconds: u64) {
     }
 }
 
-fn clean_range(line: usize, start: usize, size: usize) {
-    cache_range(line, start, size, true)
-}
-
-fn invalidate_range(line: usize, start: usize, size: usize) {
-    cache_range(line, start, size, false)
-}
-
-#[cfg(target_arch = "riscv64")]
-fn cache_range(bytes: usize, start: usize, size: usize, clean: bool) {
-    let mut line = start & !(bytes - 1);
-    let end = start.saturating_add(size).saturating_add(bytes - 1) & !(bytes - 1);
-    while line < end {
-        unsafe {
-            if clean {
-                core::arch::asm!(".long 0x0295000b", in("a0") line, options(nostack));
-            } else {
-                core::arch::asm!(".long 0x02a5000b", in("a0") line, options(nostack));
-            }
-        }
-        line += bytes;
-    }
-    unsafe { core::arch::asm!(".long 0x0190000b", options(nostack)) };
-}
-
-#[cfg(not(target_arch = "riscv64"))]
-fn cache_range(_: usize, _: usize, _: usize, _: bool) {
-    compiler_fence(Ordering::SeqCst);
-}
-
 pub const fn validate_description(description: Dwc2Description) -> bool {
     range_contains(
         description.registers.start,
         description.registers.end,
         HC_BASE + 16 * HC_STRIDE,
-    ) && range_contains(description.phy.start, description.phy.end, 0x18)
-        && range_contains(
-            description.soc_control.start,
-            description.soc_control.end,
-            CLK_ENABLE_2 + 4,
-        )
-        && description.irq != 0
+    ) && description.irq != 0
         && description.dma_address_bits == 32
         && description.cache_line_bytes == 64
 }
@@ -3501,22 +3186,6 @@ unsafe fn core_write(description: Dwc2Description, offset: usize, value: u32) {
     unsafe { write32(description.registers.start + offset, value) }
 }
 
-unsafe fn phy_read(description: Dwc2Description, offset: usize) -> u32 {
-    unsafe { read32(description.phy.start + offset) }
-}
-
-unsafe fn phy_write(description: Dwc2Description, offset: usize, value: u32) {
-    unsafe { write32(description.phy.start + offset, value) }
-}
-
-unsafe fn soc_read(description: Dwc2Description, offset: usize) -> u32 {
-    unsafe { read32(description.soc_control.start + offset) }
-}
-
-unsafe fn soc_write(description: Dwc2Description, offset: usize, value: u32) {
-    unsafe { write32(description.soc_control.start + offset, value) }
-}
-
 unsafe fn read32(address: usize) -> u32 {
     unsafe { core::ptr::read_volatile(address as *const u32) }
 }
@@ -3532,9 +3201,7 @@ mod tests {
 
     const VALID: Dwc2Description = Dwc2Description {
         registers: AddressRange::new(0x0434_0000, 0x0435_0000),
-        phy: AddressRange::new(0x0300_6000, 0x0300_6058),
         irq: 30,
-        soc_control: AddressRange::new(0x0300_0000, 0x0300_a000),
         dma_address_bits: 32,
         cache_line_bytes: 64,
     };
@@ -3551,9 +3218,6 @@ mod tests {
             .is_ok());
         let mut short = VALID;
         short.registers.end = short.registers.start + HPRT0;
-        assert!(!validate_description(short));
-        short = VALID;
-        short.phy.end = short.phy.start + 0x14;
         assert!(!validate_description(short));
     }
 
@@ -3906,5 +3570,143 @@ mod tests {
         assert!(decode_apple_nkro_report(report, report)
             .as_slice()
             .is_empty());
+    }
+}
+
+fn sync_for_device(ops: &vibeos_hal::memory::DmaOps, start: usize, bytes: usize, input: bool) {
+    let direction = if input {
+        vibeos_hal::memory::DmaDirection::FromDevice
+    } else {
+        vibeos_hal::memory::DmaDirection::ToDevice
+    };
+    unsafe {
+        (ops.sync_for_device)(
+            vibeos_hal::memory::DmaRegion {
+                physical: start as u64,
+                bytes,
+            },
+            direction,
+        )
+    }
+}
+fn sync_for_cpu(ops: &vibeos_hal::memory::DmaOps, start: usize, bytes: usize) {
+    unsafe {
+        (ops.sync_for_cpu)(
+            vibeos_hal::memory::DmaRegion {
+                physical: start as u64,
+                bytes,
+            },
+            vibeos_hal::memory::DmaDirection::FromDevice,
+        )
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use vibeos_hal::{
+        memory::*,
+        usb_polling::{Platform, PlatformState, PlatformTelemetry},
+        AddressRange,
+    };
+    static STORAGE: DmaStorage = DmaStorage::new();
+    static STATE: InstanceState = InstanceState::new();
+    static PREPARES: AtomicUsize = AtomicUsize::new(0);
+    static ROLLBACKS: AtomicUsize = AtomicUsize::new(0);
+    static DMA: DmaOps = DmaOps {
+        constraints: DmaConstraints {
+            address_bits: 32,
+            alignment: 64,
+            cache_line: 64,
+        },
+        sync_for_device: |_, _| panic!("no DMA before core validation"),
+        sync_for_cpu: |_, _| panic!("no DMA before core validation"),
+    };
+    static PLATFORM: Platform = Platform {
+        prepare: |hz, time| {
+            assert_eq!((hz, time()), (1000, 123));
+            if PREPARES.fetch_add(1, SeqCst) < 2 {
+                Err(Error::InvalidDescription)
+            } else {
+                Ok(PlatformState([1, 2, 3, 4]))
+            }
+        },
+        rollback: |saved| {
+            assert_eq!(saved.0, [1, 2, 3, 4]);
+            ROLLBACKS.fetch_add(1, SeqCst);
+        },
+        telemetry: PlatformTelemetry::default,
+        dma: &DMA,
+    };
+    #[test]
+    fn failed_preparation_and_core_validation_have_distinct_rollback_paths() {
+        let mut registers = std::boxed::Box::new([0u32; 512]);
+        let base = registers.as_mut_ptr() as usize;
+        let d = Dwc2Description {
+            registers: AddressRange::new(base, base + 2048),
+            irq: 1,
+            dma_address_bits: 32,
+            cache_line_bytes: 64,
+        };
+        for attempt in 0usize..4 {
+            let error =
+                unsafe { Controller::initialize(d, &PLATFORM, &STORAGE, &STATE, 1000, || 123) }
+                    .err()
+                    .unwrap();
+            assert_eq!(
+                error,
+                if attempt < 2 {
+                    Error::InvalidDescription
+                } else {
+                    Error::CoreNotFound(0)
+                }
+            );
+            assert_eq!(ROLLBACKS.load(SeqCst), attempt.saturating_sub(1));
+            assert!(!STATE.claimed.load(SeqCst));
+        }
+        assert!(registers.iter().all(|r| *r == 0));
+    }
+    #[test]
+    fn dma_sync_selects_direction_and_ownership_transfer() {
+        static CALLS: std::sync::Mutex<std::vec::Vec<(bool, DmaRegion, DmaDirection)>> =
+            std::sync::Mutex::new(std::vec::Vec::new());
+        let ops = DmaOps {
+            constraints: DMA.constraints,
+            sync_for_device: |r, d| CALLS.lock().unwrap().push((true, r, d)),
+            sync_for_cpu: |r, d| CALLS.lock().unwrap().push((false, r, d)),
+        };
+        sync_for_device(&ops, 0x80000000, 64, true);
+        sync_for_cpu(&ops, 0x80000000, 32);
+        sync_for_device(&ops, 0x80000040, 8, false);
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            [
+                (
+                    true,
+                    DmaRegion {
+                        physical: 0x80000000,
+                        bytes: 64
+                    },
+                    DmaDirection::FromDevice
+                ),
+                (
+                    false,
+                    DmaRegion {
+                        physical: 0x80000000,
+                        bytes: 32
+                    },
+                    DmaDirection::FromDevice
+                ),
+                (
+                    true,
+                    DmaRegion {
+                        physical: 0x80000040,
+                        bytes: 8
+                    },
+                    DmaDirection::ToDevice
+                )
+            ]
+        );
     }
 }

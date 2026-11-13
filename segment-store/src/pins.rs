@@ -318,6 +318,13 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
         })
     }
 
+    /// Keep the production constructor heap-backed. `new` now allocates the
+    /// root and reader arrays separately, so moving the small registry into an
+    /// Arc does not put the slot arrays on the guarded kernel stack.
+    pub(crate) fn new_shared(reserved_roots: usize, reserved_readers: usize) -> Result<SharedPinRegistry<ROOT_SLOTS, READER_SLOTS>, PinError> {
+        Self::new(reserved_roots, reserved_readers).map(Self::into_shared)
+    }
+
     fn begin_root_write(&self) -> RootWriteGuard<'_> {
         loop {
             let revision = self.root_revision.load(Ordering::SeqCst);
@@ -1014,6 +1021,20 @@ mod tests {
     }
 
     extern crate std;
+
+    #[test]
+    fn production_registry_initializes_on_a_small_stack() {
+        std::thread::Builder::new().stack_size(64 * 1024).spawn(|| {
+            let pins = super::PinRegistry::<1024, 256>::new_shared(32, 8).unwrap();
+            assert_eq!(pins.reserved_roots, 32);
+            assert_eq!(pins.reserved_readers, 8);
+            assert!(pins.roots.iter().all(|slot| slot.read_stable().is_none()));
+            assert!(pins.readers.iter().all(|slot| slot.read_stable().is_none()));
+            assert!(pins.allocate_owner().is_ok());
+        }).unwrap().join().unwrap();
+        assert!(super::PinRegistry::<1, 1>::new_shared(2, 0).is_err());
+    }
+
 
     use super::*;
     use std::sync::Barrier;

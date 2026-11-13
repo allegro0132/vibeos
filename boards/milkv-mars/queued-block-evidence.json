@@ -1,0 +1,48 @@
+{
+  "status": "queued block composition verified; Mars incomplete",
+  "host_tests": 21,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "raw backing sector write verified",
+    "timeout, cancel, revoke and post-publication fault recovery",
+    "Duo release build"
+  ],
+  "mutation": "Truncating multi-sector operation to one sector fails actual kernel adapter test (isolated source copy)",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage6-host.log",
+      "sha256": "63e39a62bf0fc3cfe1f439611bae1fb41c8b5d83b7e109497e277f510697bd58"
+    },
+    {
+      "path": "target/mars-reference/stage6-transfer-mutation.log",
+      "sha256": "d30aad5827f128c9d394daf596c94553a1714af86be7b145e269f14e6fd1c0e2"
+    },
+    {
+      "path": "target/mars-reference/stage6-qemu-block.log",
+      "sha256": "d8f6930c2567615862b0ce3b723137c3b8bea15354f62a90db095323ca5c727d"
+    },
+    {
+      "path": "target/mars-reference/stage6-qemu-block-recovery.log",
+      "sha256": "8c8ee10387ea1e1752ec2131db46adb2458a0259e468375c46c5cc83bb8e368d"
+    },
+    {
+      "path": "target/mars-reference/stage6-qemu-selftest.log",
+      "sha256": "0d8856c3c99e5f7a54407169e0c94056eaaa28dae1e8f98a1458b31bb9068f10"
+    },
+    {
+      "path": "target/mars-reference/stage6-duo-build.log",
+      "sha256": "874e5b8bfd6a527d5b22755ac538a02eb7905d9f01d8d58b9fe8d9f18b07384f"
+    },
+    {
+      "path": "target/mars-reference/stage6-kernel-dependencies.log",
+      "sha256": "8c818538433d4dc6dbaffb4cff21e6087d7d18b101145e7e8edef19759899305"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Other concrete driver and SoC operations migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

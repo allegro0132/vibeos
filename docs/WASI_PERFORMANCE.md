@@ -1622,4 +1622,3 @@ acceptance image `scripts/test-wasi-threads-fixtures.py` passed all 57 cases
 with 61 clean lifecycles (the unmodified tree failed it at case 18 with an
 unclean reclamation). Neither script needs wasi-sdk; the pthreads fixture is
 the retained `target/coremark-threads/threads.wasm`.
-

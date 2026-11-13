@@ -109,6 +109,35 @@ pub struct MmioTransport {
 }
 
 impl MmioTransport {
+    /// Capture resource identity without exporting any register-access method.
+    pub fn descriptor(self) -> Option<vibeos_hal::device_transport::Descriptor> {
+        use vibeos_hal::device_transport::{Descriptor, Kind};
+        let kind = match self.device_id() {
+            DEVICE_ID_BLOCK => Kind::Block,
+            DEVICE_ID_NETWORK => Kind::Network,
+            DEVICE_ID_ENTROPY => Kind::Entropy,
+            _ => return None,
+        };
+        Some(Descriptor {
+            kind,
+            slot: self.slot(),
+            base: self.base(),
+            irq: self.irq(),
+            vendor_id: self.vendor_id(),
+        })
+    }
+
+    /// Resolve identity against trusted firmware resources, never a supplied base.
+    /// # Safety
+    /// The description must satisfy `probe_slot`'s MMIO mapping requirements.
+    pub unsafe fn from_descriptor(
+        description: VirtioMmioDescription,
+        descriptor: vibeos_hal::device_transport::Descriptor,
+    ) -> Option<Self> {
+        let transport = Self::probe_slot(description, descriptor.slot)?;
+        (transport.descriptor()? == descriptor).then_some(transport)
+    }
+
     /// Inspect one of the configured transport windows.
     ///
     /// # Safety
@@ -329,6 +358,58 @@ mod tests {
         slots: 8,
         first_irq: 1,
     };
+
+    // Ordinary RAM models volatile registers here. It cannot model device
+    // completion, reset latency, bus ordering or physical interrupt delivery.
+    #[test]
+    fn descriptor_resolution_rejects_forged_resources_before_access() {
+        use vibeos_hal::device_transport::Kind;
+        let mut registers = [0u32; REQUIRED_WINDOW_BYTES / 4];
+        registers[MMIO_MAGIC_VALUE_OFFSET / 4] = MMIO_MAGIC_VALUE;
+        registers[MMIO_VERSION_OFFSET / 4] = MMIO_VERSION_MODERN;
+        registers[MMIO_DEVICE_ID_OFFSET / 4] = DEVICE_ID_BLOCK;
+        registers[MMIO_VENDOR_ID_OFFSET / 4] = 0x1234;
+        registers[MMIO_STATUS_OFFSET / 4] = 15;
+        let base = registers.as_mut_ptr() as usize;
+        let description = VirtioMmioDescription {
+            registers: AddressRange::new(base, base + REQUIRED_WINDOW_BYTES),
+            stride: 0x1000,
+            slots: 1,
+            first_irq: 7,
+        };
+        let transport = unsafe { MmioTransport::scan_block(description) }.unwrap();
+        let d = transport.descriptor().unwrap();
+        assert_eq!(
+            (d.base, d.slot, d.irq, d.vendor_id, d.kind),
+            (base, 0, 7, 0x1234, Kind::Block)
+        );
+        assert_eq!(
+            unsafe { MmioTransport::from_descriptor(description, d) },
+            Some(transport)
+        );
+        for forged in [
+            vibeos_hal::device_transport::Descriptor { base: 1, ..d },
+            vibeos_hal::device_transport::Descriptor {
+                slot: usize::MAX,
+                ..d
+            },
+            vibeos_hal::device_transport::Descriptor { irq: 8, ..d },
+            vibeos_hal::device_transport::Descriptor { vendor_id: 0, ..d },
+            vibeos_hal::device_transport::Descriptor {
+                kind: Kind::Network,
+                ..d
+            },
+        ] {
+            assert_eq!(
+                unsafe { MmioTransport::from_descriptor(description, forged) },
+                None
+            );
+            assert_eq!(transport.status(), 15);
+        }
+        assert!(!transport.reset(0)); // no confirmation budget is not success
+        assert!(transport.reset(1));
+        assert_eq!(transport.status(), 0);
+    }
 
     #[test]
     fn resolves_first_and_last_slot() {

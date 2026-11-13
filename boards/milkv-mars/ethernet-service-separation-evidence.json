@@ -1,0 +1,165 @@
+{
+  "status": "Mars Ethernet device assembly independent of network service selection",
+  "device_feature": "ethernet-device",
+  "compatibility_feature": "ethernet = ethernet-device plus dhcp-iperf3-server",
+  "independent_command_kernel_features": [
+    "bounded-device-image",
+    "file-tree",
+    "legacy-shell",
+    "packet-network",
+    "pio-block",
+    "provisioned-command",
+    "provisioned-ssh",
+    "queued-entropy",
+    "ssh-commands",
+    "ssh-component-command",
+    "wasi-preview1"
+  ],
+  "native_command_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1096896512,
+    "heap_end": 5368709120,
+    "elf_sha256": "1c8a44dac4bf5a4ad36a5b80583a4a2ad962e977cfb1cd4c5648c1184bab341a",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 4222976,
+        "memory_bytes": 4222976,
+        "flags": 5
+      },
+      {
+        "address": 1080061952,
+        "file_bytes": 569344,
+        "memory_bytes": 569344,
+        "flags": 4
+      },
+      {
+        "address": 1080631296,
+        "file_bytes": 71360,
+        "memory_bytes": 15216640,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1089454080,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "compatible_payload_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095581696,
+    "heap_end": 5368709120,
+    "elf_sha256": "db70a23d34ad4feb445e2a63c18c4b3b7cc6014b5391f3c9f80a8ab5606be600",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3059712,
+        "memory_bytes": 3059712,
+        "flags": 5
+      },
+      {
+        "address": 1078898688,
+        "file_bytes": 438272,
+        "memory_bytes": 438272,
+        "flags": 4
+      },
+      {
+        "address": 1079336960,
+        "file_bytes": 52976,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088139264,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "host_tests": {
+    "device_and_trng": 12,
+    "legacy_alias_and_trng": 12,
+    "default_library": 3
+  },
+  "rv64": {
+    "harts": 4,
+    "selftests": 395,
+    "native_packet_and_admission_models": true
+  },
+  "mutations_caught": [
+    "benchmark service reattached to device feature",
+    "DTB admission gated on legacy benchmark feature"
+  ],
+  "physical_acceptance": false,
+  "mars_ssh_enabled": false,
+  "wasm_execution_tested": false,
+  "sd_images_rebuilt": false,
+  "limitations": [
+    "Native command firmware is linked only; diagnostic entropy remains unapproved and stopped",
+    "RV64 tests use modeled packet hardware and DTB fixtures",
+    "Physical ownership handoff, DMA coherency, production identity and entropy qualification remain pending"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage56-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage56-command-build.log",
+      "sha256": "99a803dcb414f8056515f183efa75edc95be97448fa9ff0e36223591e8fd07fa"
+    },
+    {
+      "path": "target/mars-reference/stage56-command-features.log",
+      "sha256": "e78596809697c55bc4bb2ea189116feb4ccc31a01355394c24ae66c0cb348d78"
+    },
+    {
+      "path": "target/mars-reference/stage56-compatible-build.log",
+      "sha256": "081820dda607ddafdb9461bd0ce50a6bf5e4e977d88bbf5599e1c25aeac0d115"
+    },
+    {
+      "path": "target/mars-reference/stage56-host-compatible.log",
+      "sha256": "55e529e1f83b3cfbbdd2ad0e6124e76a2af884d7c2f66eaf6432c628a9af60e0"
+    },
+    {
+      "path": "target/mars-reference/stage56-host-default.log",
+      "sha256": "f161d269b04b2ef5c7c3c59c2d81e2624f181fcde303c2064275438a1a7aac11"
+    },
+    {
+      "path": "target/mars-reference/stage56-host-device.log",
+      "sha256": "c967d227d250f8fe3c012061ee3fda3181564f30739487a3eb62ea9a2fa8fa89"
+    },
+    {
+      "path": "target/mars-reference/stage56-mutation-admission-gate.log",
+      "sha256": "d7266779fd7b19bbb3ca2dc67aefd255177a2b665e3f8df5bd3cf71ca0f5de39"
+    },
+    {
+      "path": "target/mars-reference/stage56-mutation-service-coupling.log",
+      "sha256": "c8646c6c377c49ff24071912c6cea8eb32d06572c42ae935aea7bf6e0e731a39"
+    },
+    {
+      "path": "target/mars-reference/stage56-native-command-check.log",
+      "sha256": "767508a92a13fb696430a28ddf2536a2a8229d8cdeae603a2af068dcefc70f0d"
+    },
+    {
+      "path": "target/mars-reference/stage56-rv64-build.log",
+      "sha256": "15cd3f971145d08efc487b785ab57458503ae745e4dcff2280f8498f8a4daed7"
+    },
+    {
+      "path": "target/mars-reference/stage56-rv64-final/serial.log",
+      "sha256": "78eeb51144c40b4596ab846e6e382c0b8327e674e53d5f0c4f3a0f35bac341fd"
+    },
+    {
+      "path": "target/mars-reference/stage56-rv64-final/summary.json",
+      "sha256": "906a3b9927037723eafba61314407801fb8cb3529d534f135b013ac09a8129ed"
+    }
+  ]
+}

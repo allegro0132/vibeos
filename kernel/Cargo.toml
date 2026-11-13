@@ -5,12 +5,71 @@ edition = "2021"
 autobins = false
 
 [features]
+hang-watchdog = ["vibeos-core/hang-watchdog"]
+hang-failure-report = ["vibeos-core/hang-failure-report"]
+hang-watchdog-selftest = ["hang-watchdog", "vibeos-core/hang-watchdog-selftest"]
+gro-prefix-views = ["gro-checked", "vibeos-netstack?/gro-prefix-views"]
+gro-full-batch = ["gro-wide", "vibeos-netstack?/gro-full-batch"]
+gro-wide = ["gro-checked", "vibeos-netstack?/gro-wide"]
+rx-align-empty = ["vibeos-netstack?/rx-align-empty"]
+application-rx-batch = ["vibeos-iperf3-server?/receive-batch", "vibeos-tcp-probe?/receive-batch"]
+tcp-read-profile = ["vibeos-net-api?/tcp-read-profile"]
+receive-exchange-profile = ["receive-buffer-exchange", "vibeos-netstack?/receive-exchange-profile"]
+rx-boundary-profile = ["network-inline-rx", "rx-publish-batch", "vibeos-core/rx-boundary-profile"]
+gro-checked = ["gro-scatter", "vibeos-netstack/gro-checked"]
+gro-scatter = ["pooled-rx", "bounded-gro", "vibeos-netstack/gro-scatter"]
+frontend-rx-batch = ["vibeos-netstack?/frontend-rx-batch"]
+network-service-peer = ["network-inline-rx"]
+network-inline-rx = ["packet-network", "pooled-rx", "rx-interrupt-poll", "vibeos-netstack/inline-device-service"]
+rx-admission-batch = ["pooled-rx", "vibeos-netstack/rx-admission-batch"]
+rx-queue-profile = ["vibeos-core/rx-queue-profile"]
+gro-batch-release = ["vibeos-netstack/gro-batch-release"]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = ["vibeos-core/lock-stall-probe"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro", "vibeos-netstack?/gro-atomic-id"]
+gro-end-profile = ["bounded-gro", "vibeos-netstack?/gro-end-profile"]
+rx-publish-batch = ["pooled-rx", "vibeos-core/rx-publish-batch"]
+tx-lease-profile = ["direct-tcp-segmentation", "vibeos-core/tx-lease-profile", "vibeos-netstack?/tx-lease-profile"]
+counter-probe = []
+skip-empty-service = ["vibeos-netstack?/skip-empty-service"]
+receive-buffer-exchange = ["vibeos-net-api?/receive-buffer-exchange", "vibeos-netstack?/receive-buffer-exchange"]
+copy-profile = ["vibeos-core/copy-profile"]
+pc-sample = ["vibeos-core/pc-sample"]
+driver-stage-profile = ["tx-wait-profile", "pooled-rx"]
+tx-wait-profile = ["packet-network"]
+idle-profile = ["vibeos-core/idle-profile"]
+application-event-poll = ["vibeos-iperf3-server?/event-driven", "vibeos-tcp-probe?/event-driven", "vibeos-net-api/activity-events"]
+network-event-poll = ["vibeos-netstack?/event-driven"]
+pooled-rx = ["vibeos-netstack?/pooled-rx"]
+rx-interrupt-poll = []
+direct-tcp-segmentation = ["native-tcp-segmentation"]
+native-tcp-segmentation = ["vibeos-netstack?/native-tcp-segmentation"]
+network-tso-coalesce = []
+network-tso-probe = ["vibeos-core/network-tso-probe"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = ["vibeos-netstack?/bounded-gro"]
+network-profile = ["vibeos-core/network-profile", "vibeos-net-api?/network-profile"]
+network-tx-audit = ["vibeos-core/network-tx-audit", "vibeos-netstack?/network-tx-audit"]
+network-status-snapshot = []
+universal-pci-usb = ["vibeos-vsh/pci-usb-help"]
+universal-dwc2 = []
+universal-python = ["python-command", "vibeos-wasi-runtime/python-duo"]
+universal = ["pio-block", "queued-block", "packet-network", "queued-network", "queued-entropy", "vibeos-hal/runtime-platform", "vibeos-image-policy/runtime-image"]
+# Experimental static network pipeline placement on admitted logical hart 1.
+network-pipeline = []
+# Diagnostic execution timing; excludes sleeping/WFI time.
+executor-profile = ["vibeos-core/executor-profile"]
+# Larger bounded socket storage for high-throughput network compositions.
+tcp-large-window = ["vibeos-netstack?/tcp-large-window"]
+mmu-large-memory-test = []
+boot-dtb-probe = []
+# Provisioned command service; never pulls in acceptance identities.
+provisioned-wasmtime = ["provisioned-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 # Research-only format admission; writes require runtime opt-in.
 experimental-authority-delta = ["vibeos-segment-store/experimental-authority-delta"]
-# Production Duo command image; never pulls in QEMU test identities.
-milkv-wasmtime = ["milkv-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
-python-wasi = ["wasi-ssh-upload", "python-command", "vibeos-bsp-qemu-virt?/python-wasi"]
+python-wasi = ["wasi-ssh-upload", "python-command"]
 milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without
@@ -38,21 +97,27 @@ wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]
 wasi-ssh = ["ssh-commands", "wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"]
-# Provisioned Duo command images admit WASI requests for the live production
-# SSH profile. Every milkv-* command image enables this; the request path
-# itself is shared with the QEMU test identity through `ssh-commands`.
-milkv-command = ["milkv-ssh", "ssh-commands"]
+# Provisioned command images admit WASI requests for the current SSH policy.
+# Explicit WASI dependencies make this entry usable without a board wrapper.
+provisioned-command = ["provisioned-ssh", "ssh-commands", "wasi-preview1", "vibeos-sshd/wasi-exec"]
 ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
-qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
-milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-dwc2-host", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]
+# Compatibility profiles; firmware may compose the same HAL frontends directly.
+pio-block = []
+queued-block = ["dep:vibeos-virtio-protocol"]
+queued-entropy = []
+packet-network = []
+queued-network = ["dep:vibeos-virtio-protocol"]
+qemu-virt = ["queued-block", "queued-network", "queued-entropy", "dep:vibeos-virtio-protocol", "vibeos-vsh/pci-usb-help"]
+milkv-duo = ["pio-block", "packet-network"]
+bounded-device-image = ["vibeos-image-policy/bounded-device"]
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
 # Dedicated raw-block benchmark authority. This is only enabled by the
 # benchmark image and is absent from production capability layouts.
-storage-bench = ["vibeos-image-policy/storage-bench", "vibeos-bsp-qemu-virt?/storage-bench"]
-storage-bench-128m = ["storage-bench", "vibeos-bsp-qemu-virt?/storage-bench-128m"]
+storage-bench = ["vibeos-image-policy/storage-bench"]
+storage-bench-128m = ["storage-bench"]
 storage-bench-small-store = ["storage-bench"]
 file-tree = [
     "dep:vibeos-file-store",
@@ -63,7 +128,7 @@ file-tree = [
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
 tcp-echo = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
-# Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
+# Reusable DHCP IPv4 control plane. It owns the raw packet endpoints,
 # starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
 net-shell = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
 # Test-only recovery hook used by the live stack-generation acceptance script.
@@ -77,8 +142,9 @@ iperf3-server = [
     "vibeos-netstack/static-service",
     "vibeos-vsh/network",
 ]
-# Physical Milk-V Duo iperf3 TCP server image with DHCP configuration.
-milkv-iperf3-server = [
+# Reusable iperf3 TCP server with DHCP configuration.
+tcp-throughput-probe = ["dhcp-iperf3-server", "tcp-large-window", "dep:vibeos-tcp-probe"]
+dhcp-iperf3-server = [
     "dep:vibeos-iperf3-server",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
@@ -118,16 +184,23 @@ milkv-ssh-acceptance = [
 ]
 # Production SSH image. Device and client identities are provisioned locally;
 # no acceptance fixture is linked into this feature.
-milkv-ssh = [
+provisioned-ssh = [
     "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
     "dep:vibeos-ssh-identity",
-    "dep:jitterentropy",
     "vibeos-netstack/dhcp-service",
     "vibeos-vsh/network",
 ]
+# Compatibility aliases retain Duo's existing entropy selection.
+milkv-ssh = ["provisioned-ssh", "jitter-entropy"]
+milkv-command = ["provisioned-command", "jitter-entropy"]
+milkv-wasmtime = ["provisioned-wasmtime", "jitter-entropy"]
+milkv-iperf3-server = ["dhcp-iperf3-server"]
+# Provider selection is explicit; new boards must supply/qualify their source.
+jitter-entropy = ["dep:jitterentropy"]
+
 # Narrow image/session-policy-managed WASM command path shared by the three
 # SSH images. Keeping these dependencies behind an explicit image feature
 # prevents merely linking the reusable kernel archive from exposing a command.
@@ -535,8 +608,6 @@ bench = false
 [dependencies]
 vibeos-wasi-runtime = { path = "../wasi-runtime", optional = true }
 vibeos-wasi-command = { path = "../services/wasi-command", optional = true }
-vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
-vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-component-admission = { path = "../services/component-admission", optional = true }
 vibeos-component-command = { path = "../services/component-command", optional = true }
 vibeos-component-format = { path = "../component-format", optional = true }
@@ -544,19 +615,10 @@ vibeos-component-host = { path = "../services/component-host", optional = true }
 vibeos-component-image-adapter = { path = "../services/component-image-adapter", optional = true }
 vibeos-component-loader = { path = "../services/component-loader", optional = true }
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
-vibeos-core = { path = "../core" }
+# vtop uses real WFI residency and per-task elapsed poll time on every image.
+vibeos-core = { path = "../core", features = ["idle-profile", "executor-profile"] }
 vibeos-durable-format = { path = "../durable-format" }
-vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
-vibeos-driver-dwc2-host = { path = "../drivers/dwc2-host", optional = true }
-vibeos-driver-milkv-duo-led = { path = "../drivers/milkv-duo-led", optional = true }
-vibeos-driver-pci = { path = "../drivers/pci", optional = true }
-vibeos-driver-sdhci-blk = { path = "../drivers/sdhci-blk", optional = true }
-vibeos-driver-virtio-blk = { path = "../drivers/virtio-blk", optional = true }
-vibeos-driver-virtio-core = { path = "../drivers/virtio-core", optional = true }
-vibeos-driver-virtio-mmio = { path = "../drivers/virtio-mmio", optional = true }
-vibeos-driver-virtio-net = { path = "../drivers/virtio-net", optional = true }
-vibeos-driver-virtio-rng = { path = "../drivers/virtio-rng", optional = true }
-vibeos-driver-xhci = { path = "../drivers/xhci", optional = true }
+vibeos-virtio-protocol = { path = "../contracts/virtio", optional = true }
 vibeos-hal = { path = "../hal" }
 vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }
@@ -566,6 +628,7 @@ vibeos-storage-device = { path = "../storage-device" }
 vibeos-authority-store = { path = "../services/authority-store" }
 vibeos-file-store = { path = "../services/file-store", optional = true }
 vibeos-kernel-acceptance = { path = "../acceptance/kernel-tests" }
+vibeos-tcp-probe = { path = "../components/tcp-probe", optional = true }
 vibeos-iperf3-server = { path = "../components/iperf3-server", optional = true }
 vibeos-net-api = { path = "../components/net-api", optional = true }
 vibeos-net-echo = { path = "../components/net-echo", optional = true }

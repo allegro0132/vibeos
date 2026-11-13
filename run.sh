@@ -4,6 +4,9 @@
 # Exit with Ctrl-A then X.
 set -eu
 cd "$(dirname "$0")"
+if [ "${1:-}" = "--config" ]; then
+  exec cargo run --quiet -p vibeos-config -- run "$@"
+fi
 # The bare-metal Cargo config lives under firmware/ so workspace-root host
 # tests remain host builds.
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)

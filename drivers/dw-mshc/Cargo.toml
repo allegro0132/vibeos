@@ -1,0 +1,8 @@
+[package]
+name = "vibeos-driver-dw-mshc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-hal = { path = "../../hal" }
+vibeos-sd-protocol = { path = "../sd-protocol" }

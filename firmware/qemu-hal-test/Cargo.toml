@@ -1,0 +1,48 @@
+[package]
+name = "vibeos-firmware-qemu-hal-test"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+wasmtime-composition-test = ["command-composition-test", "vibeos-kernel/provisioned-wasmtime"]
+command-composition-test = ["ssh-composition-test", "vibeos-kernel/provisioned-command"]
+ssh-composition-test = ["vibeos-kernel/provisioned-ssh"]
+mars-entropy-composition-test = ["trng-model-test", "vibeos-kernel/queued-entropy"]
+entropy-diagnostic-only = ["entropy-composition-test"]
+entropy-composition-test = ["vibeos-kernel/queued-entropy", "dep:vibeos-driver-virtio-rng"]
+entropy-polling = ["entropy-composition-test"]
+trng-model-test = ["dep:vibeos-starfive-trng", "dep:vibeos-platform-jh7110", "mars-composition-test", "vibeos-firmware-milkv-mars/entropy-device"]
+mars-ethernet-test = ["mars-ethernet-device-test", "vibeos-firmware-milkv-mars/ethernet"]
+mars-ethernet-device-test = ["mars-composition-test", "vibeos-firmware-milkv-mars/ethernet-device", "eqos-model-test"]
+eqos-model-test = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "dep:vibeos-platform-jh7110"]
+mars-composition-test = ["dep:vibeos-firmware-milkv-mars"]
+mars-resources-test = ["dep:vibeos-bsp-milkv-mars"]
+boot-admission-test = []
+jh7110-sd-model-test = ["dep:vibeos-platform-jh7110"]
+
+[[bin]]
+name = "vibeos-qemu-hal-test"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vibeos-driver-virtio-rng = { path = "../../drivers/virtio-rng", optional = true }
+vibeos-starfive-trng = { path = "../../drivers/starfive-trng", optional = true }
+vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
+vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["queued-block", "queued-network", "qemu-default-image", "boot-dtb-probe", "legacy-shell"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }
+vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio" }
+vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk" }
+vibeos-driver-virtio-core = { path = "../../drivers/virtio-core" }
+vibeos-driver-virtio-net = { path = "../../drivers/virtio-net" }
+vibeos-platform-jh7110 = { path = "../../platform/jh7110", optional = true }
+
+vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars", optional = true }
+
+vibeos-firmware-milkv-mars = { path = "../milkv-mars", default-features = false, optional = true }

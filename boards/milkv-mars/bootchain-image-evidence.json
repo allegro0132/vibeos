@@ -1,0 +1,105 @@
+{
+  "status": "Paired boot firmware and serial/SD test image built and statically checked; Mars port incomplete",
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "host_image_tests": 5,
+  "container_real_artifact_tests": 2,
+  "full_build_script": "sh scripts/build-mars-sd.sh",
+  "full_build_exit_status": 0,
+  "sd_check": {
+    "status": "sd-layout-passed",
+    "bytes": 672137216,
+    "sha256": "25f9e8bd58bdf899df600ecf2464d6ee77917f3ef753d1b43fa1ed13b68b82d5",
+    "physical_acceptance": false,
+    "ssh_enabled": false,
+    "partitions": [
+      {
+        "name": "spl",
+        "first_sector": 4096,
+        "sector_count": 4096
+      },
+      {
+        "name": "uboot",
+        "first_sector": 8192,
+        "sector_count": 8192
+      },
+      {
+        "name": "boot",
+        "first_sector": 16384,
+        "sector_count": 245760
+      },
+      {
+        "name": "vibeos-data",
+        "first_sector": 262144,
+        "sector_count": 1048576
+      }
+    ]
+  },
+  "bootchain_check": {
+    "status": "bootchain-contract-passed",
+    "opensbi": "1.2",
+    "uboot": "2021.10",
+    "sbi_extensions_built": [
+      "TIME",
+      "IPI",
+      "RFENCE",
+      "HSM"
+    ],
+    "spi_environment": false,
+    "physical_acceptance": false,
+    "checked_sha256": {
+      "u-boot-spl.bin.normal.out": "b05d699c43f1fa87303a5d675e98f2fb0a8d8ac3ae4e39a1a9b35f19be78c326",
+      "fw_payload.bin": "260c38e5212c8d81268e5ec79a902a07ba09ddc9a74a2a77c6bb25b0df439e0a",
+      "uboot.config": "b2e7f0d1a3ef9c8693c43b5731e1234ac0d3e9a4e78cdec7b1ea98fbdee472cb",
+      "opensbi.config": "d83376c0e8b3813285f0f83f827e419df79826bef22b0b9d3634c919b98ccef5",
+      "firmware.itb": "dde3fd4a7c2c0c2af9de9898e64bed5c98c9ed4268aac47a9ad4b5b794627afa",
+      "vibeos.itb": "71c7f7ba264f91e47dbc5704ab79aee984faa9293b183fbeb82cb75cc460b200",
+      "vibeos.bin": "9dae6a5b50d87cc42a9a20f0e88619160c32306422d76ebd048af3291eb9142e",
+      "mars.dtb": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d"
+    }
+  },
+  "independent_checks": [
+    "sgdisk --verify: no problems found",
+    "fsck.vfat -n: passed",
+    "SDK DTB exact hash match",
+    "kernel dependency boundary guard: passed"
+  ],
+  "mutations": [
+    "GPT CRC corruption",
+    "GPT boundary changed with both CRCs recomputed",
+    "payload corruption",
+    "data area nonzero",
+    "SPL CRC corruption",
+    "SBI HSM disabled",
+    "SPI environment enabled",
+    "FIT payload changed"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage25-complete-build.log",
+      "sha256": "82ff01b6ee3fe71e680123368faaad5e446a4284489624cb6abcc820fbe64a09"
+    },
+    {
+      "path": "target/mars-reference/stage25-image-tests.log",
+      "sha256": "985cd7ea9ae809a8d29a11ecab317590077e0ebc4ced976f468742970b4ce98c"
+    },
+    {
+      "path": "target/mars-reference/stage25-bootchain-tests.log",
+      "sha256": "9a101a2f78dbe8e4f4e8198b0cc9d839fc49b8fc8cc2a3a70959ff28632a6d98"
+    },
+    {
+      "path": "target/mars-reference/stage25-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    }
+  ],
+  "physical_acceptance": false,
+  "network_available": false,
+  "ssh_enabled": false,
+  "new_on_target_boot_tests": 0,
+  "limitations": [
+    "No Mars ROM/SPL/DDR/OpenSBI/U-Boot/kernel handoff has been run on physical hardware",
+    "Static SBI configuration and symbols do not qualify HSM/IPI/fence/timer execution",
+    "Card initialization/persistence/timeout/reset/boot-region protection require physical tests",
+    "EQoS, DMA/cache, entropy, SSH/WASM and full stability acceptance remain incomplete",
+    "Direct SD boot requires board revision/boot-selector confirmation"
+  ]
+}

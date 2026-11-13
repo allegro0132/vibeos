@@ -28,19 +28,35 @@ impl NetstackPlatform {
 }
 
 impl Platform for NetstackPlatform {
+    #[cfg(feature = "network-inline-rx")]
+    fn service_device(&self, control: Cap, receive: bool) -> Result<bool, NetworkBindError> {
+        let lease = self.space.0.lock()
+            .lookup_lease::<crate::net_device::NetDevice>(control, Rights::INVOKE)
+            .map_err(|_| NetworkBindError::Denied)?;
+        crate::dwmac_net::service_inline_with(&lease, receive).map_err(|_| NetworkBindError::Failed)
+    }
     fn packet_endpoints(
         &self,
         outbound: Cap,
         inbound: Cap,
     ) -> Option<vibeos_netstack::PacketEndpoints> {
         let cspace = self.space.0.lock();
-        let outbound = cspace
-            .lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND)
-            .ok()?;
-        let inbound = cspace
-            .lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV)
-            .ok()?;
-        Some((outbound, inbound))
+        #[cfg(feature = "pooled-rx")]
+        let receive = if let Ok(authority) = cspace.lookup_revocable::<vibeos_core::net_receive::ReceiveEndpoint>(inbound, Rights::RECV) {
+            vibeos_netstack::PacketReceive::Pooled { authority, domain: crate::heap::current_domain() }
+        } else {
+            cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV).ok()?.into()
+        };
+        #[cfg(not(feature = "pooled-rx"))]
+        let receive = cspace.lookup_revocable::<Endpoint<StampedPacket>>(inbound, Rights::RECV).ok()?.into();
+        #[cfg(feature = "native-tcp-segmentation")]
+        if let Ok(authority) = cspace.lookup_revocable::<vibeos_core::net_transmit::TransmitEndpoint>(outbound, Rights::SEND) {
+            return Some((vibeos_netstack::PacketTransmit::Pooled {
+                authority, domain: crate::heap::current_domain(),
+            }, receive));
+        }
+        let outbound = cspace.lookup_revocable::<Endpoint<StampedPacket>>(outbound, Rights::SEND).ok()?;
+        Some((outbound.into(), receive))
     }
 
     fn bind_stack(&self, control: Cap) -> Result<vibeos_core::net::PacketStamp, NetworkBindError> {
@@ -56,7 +72,7 @@ impl Platform for NetstackPlatform {
                 _ => NetworkBindError::Failed,
             });
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if let Ok(lease) =
             cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::INVOKE)
         {
@@ -76,18 +92,32 @@ impl Platform for NetstackPlatform {
         if let Ok(lease) =
             cspace.lookup_lease::<crate::net_device::NetDevice>(control, Rights::READ)
         {
-            let info = crate::net_device::info_with(&lease).ok()?;
-            return Some(NetworkInfo {
-                online: info.online,
-                quarantined: info.quarantined,
-                session_epoch: info.session_epoch,
-                phy_link_up: crate::net_device::carrier_up(&info),
-                ethernet_address: info.ethernet_address,
-                tx_checksum_offload: crate::net_device::tx_checksum_offload(&info),
-                rx_checksum_offload: crate::net_device::rx_checksum_offload(&info),
-            });
+            #[cfg(all(feature = "network-status-snapshot", feature = "packet-network", not(feature = "universal")))]
+            {
+                let info = crate::net_device::runtime_info_with(&lease).ok()?;
+                return Some(NetworkInfo {
+                    online: info.online, quarantined: info.quarantined,
+                    session_epoch: info.session_epoch, phy_link_up: info.phy_link_up,
+                    ethernet_address: info.ethernet_address,
+                    tx_checksum_offload: info.tx_checksum_offload,
+                    rx_checksum_offload: info.rx_checksum_offload,
+                });
+            }
+            #[cfg(not(all(feature = "network-status-snapshot", feature = "packet-network", not(feature = "universal"))))]
+            {
+                let info = crate::net_device::info_with(&lease).ok()?;
+                return Some(NetworkInfo {
+                    online: info.online,
+                    quarantined: info.quarantined,
+                    session_epoch: info.session_epoch,
+                    phy_link_up: crate::net_device::carrier_up(&info),
+                    ethernet_address: info.ethernet_address,
+                    tx_checksum_offload: crate::net_device::tx_checksum_offload(&info),
+                    rx_checksum_offload: crate::net_device::rx_checksum_offload(&info),
+                });
+            }
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if let Ok(lease) =
             cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::READ)
         {

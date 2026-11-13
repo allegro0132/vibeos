@@ -22,6 +22,11 @@ fn rfence_probe_requests_and_errors_are_exact() {
     assert_eq!(arch::test_probe_attempts(), 2);
     assert_eq!(arch::test_last_probed_extension(), Some(0x1234_5678));
 
+    assert_eq!(arch::probe_extension_raw(arch::RFENCE_EXTENSION_ID), (0, 1));
+    assert_eq!(arch::probe_extension_raw(0x504d55), (0, 0));
+    assert_eq!(arch::test_probe_attempts(), 4);
+    assert_eq!(arch::test_last_probed_extension(), Some(0x504d55));
+
     assert_eq!(arch::remote_fence_i(0b1010, 3), Ok(()));
     assert_eq!(arch::test_remote_fence_i_attempts(), 1);
     assert_eq!(

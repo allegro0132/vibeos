@@ -24,15 +24,30 @@ use crate::net_device;
 use crate::saved_program;
 use crate::store;
 use crate::sync::SpinLock;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 use crate::virtio_rng;
 use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
+// One reusable 32 KiB TSO staging buffer, including allocator size-class overhead.
+#[cfg(feature = "network-tso-coalesce")]
+const NETWORK_DRIVER_MEMORY_BUDGET: usize = 128 * 1024;
+#[cfg(not(feature = "network-tso-coalesce"))]
+const NETWORK_DRIVER_MEMORY_BUDGET: usize = BACKGROUND_MEMORY_BUDGET;
+#[cfg(not(feature = "tcp-large-window"))]
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
-#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+#[cfg(all(feature = "tcp-large-window", not(feature = "tcp-throughput-probe")))]
+// Four 256 KiB socket buffers are charged as four 512 KiB allocator
+// blocks. Keep room for metadata and old/new stacks during session rebinding.
+const NETWORK_STACK_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
+// Two shared-port sockets plus four exclusive listeners with pending sockets
+// allocate twenty large buffers; rebinding briefly retains both generations.
+// This diagnostic-only budget leaves default images unchanged.
+#[cfg(feature = "tcp-throughput-probe")]
+const NETWORK_STACK_MEMORY_BUDGET: usize = 24 * 1024 * 1024;
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
@@ -112,8 +127,10 @@ pub struct Component {
     space: Arc<Space>,
     template: Option<ComponentTemplate>,
     instance: SpinLock<ComponentInstance>,
+    lifecycle: SpinLock<()>,
     memory_owner: OwnerId,
     memory_budget: usize,
+    home_hart: exec::HartId,
 }
 
 struct ComponentInstance {
@@ -132,9 +149,9 @@ enum ComponentTemplate {
     Guest,
     BlockDriver,
     NetDriver,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     UsbEcmNetDriver,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
     SshSecurityTest,
@@ -145,15 +162,17 @@ enum ComponentTemplate {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     Ipv4Stack,
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho,
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     Iperf3Server,
+    #[cfg(feature = "tcp-throughput-probe")]
+    TcpProbe,
     StoreFaultProbe,
     FaultProbe,
 }
@@ -177,14 +196,14 @@ enum ComponentGrants {
         inbound: Cap,
         control: Cap,
     },
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     UsbEcmNetDriver {
         transport: Cap,
         outbound: Cap,
         inbound: Cap,
         control: Cap,
     },
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     VirtioRng {
         mmio: Cap,
         dma: Cap,
@@ -210,20 +229,22 @@ enum ComponentGrants {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     Ipv4Stack(Vec<vibeos_netstack::NetworkInterfaceCapabilities>),
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho {
         listener: Cap,
     },
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     Iperf3Server {
         control: Cap,
         data: Cap,
     },
+    #[cfg(feature = "tcp-throughput-probe")]
+    TcpProbe([Cap; 4]),
     StoreFaultProbe(Cap),
     FaultProbe,
 }
@@ -233,9 +254,9 @@ enum ComponentGrants {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 #[derive(Clone)]
 struct NetworkStackRoot {
@@ -253,9 +274,9 @@ struct NetworkStackRoot {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 fn grant_network_stack(
     roots: &[NetworkStackRoot],
@@ -304,6 +325,8 @@ pub enum RestartError {
     NotRestartable,
     StillRunning,
     GenerationExhausted,
+    GenerationChanged,
+    DispatchFailed,
 }
 
 impl fmt::Display for RestartError {
@@ -313,6 +336,8 @@ impl fmt::Display for RestartError {
             Self::NotRestartable => "component has no audited restart template",
             Self::StillRunning => "component is still running; cancel it first",
             Self::GenerationExhausted => "component generation space exhausted",
+            Self::GenerationChanged => "component generation changed before restart",
+            Self::DispatchFailed => "restart worker exited without a result",
         })
     }
 }
@@ -358,13 +383,20 @@ pub struct ComponentSnapshot {
     pub state: exec::TaskState,
     pub terminal_reason: Option<&'static str>,
     pub polls: u64,
+    pub poll_ticks: u64,
     pub memory: MemoryAccount,
 }
 
 impl Component {
     pub fn snapshot(&self) -> ComponentSnapshot {
+        self.try_snapshot().expect("a component allocation owner must remain registered")
+    }
+
+    /// A monitor may retain a record while a test/supervisor removes it.
+    /// Missing retired accounts are omitted rather than faulting the monitor.
+    pub fn try_snapshot(&self) -> Option<ComponentSnapshot> {
         let mut system_owner = heap::enter_owner(OwnerId::SYSTEM);
-        let (generation, arena, task_id, state, polls) = {
+        let (generation, arena, task_id, state, polls, poll_ticks) = {
             let instance = self.instance.lock();
             (
                 instance.generation,
@@ -372,11 +404,10 @@ impl Component {
                 instance.task.id(),
                 instance.task.state(),
                 instance.task.polls(),
+                instance.task.poll_ticks(),
             )
         };
-        let account = HEAP
-            .account_stats(self.memory_owner)
-            .expect("a component allocation owner must remain registered");
+        let account = HEAP.account_stats(self.memory_owner)?;
         debug_assert_eq!(account.owner, self.memory_owner);
         let snapshot = ComponentSnapshot {
             id: self.id,
@@ -388,6 +419,7 @@ impl Component {
             state,
             terminal_reason: state.terminal_reason(),
             polls,
+            poll_ticks,
             memory: MemoryAccount {
                 owner: self.id,
                 budget_bytes: account.quota_bytes,
@@ -397,8 +429,10 @@ impl Component {
             },
         };
         system_owner.restore();
-        snapshot
+        Some(snapshot)
     }
+
+    pub fn is_restartable(&self) -> bool { self.template.is_some() }
 
     pub fn memory_owner(&self) -> OwnerId {
         self.memory_owner
@@ -486,6 +520,8 @@ pub(crate) fn fault_probe_drop_count() -> u64 {
 pub struct World {
     pub spaces: BTreeMap<&'static str, Arc<Space>>,
     components: SpinLock<BTreeMap<ComponentId, Arc<Component>>>,
+    /// Image-policy expectation captured before any component is registered.
+    pub(crate) expected_boot_components: usize,
     /// init's handles onto everything it created.
     pub console: Cap,
     #[cfg(not(feature = "legacy-shell"))]
@@ -541,47 +577,49 @@ pub struct World {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     network_stack_roots: Vec<NetworkStackRoot>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_policy: Option<Arc<Space>>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_transport: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_outbound_root: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_inbound_root: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_control_root: Option<Cap>,
     #[cfg(any(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     tcp_listener_root: Option<Cap>,
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     iperf_data_listener_root: Option<Cap>,
+    #[cfg(feature = "tcp-throughput-probe")]
+    tcp_probe_roots: Option<[Cap; 4]>,
     #[cfg(any(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     ))]
     rng_policy: Option<Arc<Space>>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     rng_mmio: Option<Cap>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     rng_dma: Option<Cap>,
     #[cfg(any(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     ))]
     rng_source_root: Option<Cap>,
     #[cfg(any(
@@ -621,6 +659,13 @@ struct StoreBlockGrants {
 }
 
 impl World {
+    fn listener_policy(&self) -> Option<&Arc<Space>> {
+        #[cfg(all(feature = "universal", feature = "universal-dwc2"))]
+        { self.net_policy.as_ref().or(self.usb_net_policy.as_ref()) }
+        #[cfg(not(all(feature = "universal", feature = "universal-dwc2")))]
+        { self.net_policy.as_ref() }
+    }
+
     /// Hand the C7.4 supervisor its already-provisioned journal endpoint
     /// through init's explicit store authority. The acceptance task receives
     /// no `Cap`, CSpace, object name, or durable identity; it can only request
@@ -772,6 +817,7 @@ impl World {
             None => exec::spawn_pinned_owned(memory_owner, name, fut),
         };
         let component = Arc::new(Component {
+            lifecycle: SpinLock::new_recoverable(()),
             id,
             name: String::from(name),
             cspace,
@@ -783,6 +829,7 @@ impl World {
             }),
             memory_owner,
             memory_budget,
+            home_hart: vibeos_core::ipi::current_logical_hart().expect("component creation hart"),
         });
         let mut components = self.components.lock();
         // There is no yield between the two checks on the single-hart executor,
@@ -800,8 +847,7 @@ impl World {
             let mut target = space.0.lock();
             let listener = {
                 let policy = self
-                    .net_policy
-                    .as_ref()
+                    .listener_policy()
                     .expect("network policy CSpace exists")
                     .0
                     .lock();
@@ -919,7 +965,7 @@ impl World {
             };
         }
 
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         if template == ComponentTemplate::VirtioRng {
             let policy = self
                 .rng_policy
@@ -1033,7 +1079,7 @@ impl World {
             };
         }
 
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if template == ComponentTemplate::UsbEcmNetDriver {
             let policy = self
                 .usb_net_policy
@@ -1082,9 +1128,9 @@ impl World {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         if template == ComponentTemplate::Ipv4Stack {
             return ComponentGrants::Ipv4Stack(grant_network_stack(
@@ -1096,8 +1142,7 @@ impl World {
         #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
         if template == ComponentTemplate::TcpEcho {
             let policy = self
-                .net_policy
-                .as_ref()
+                .listener_policy()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
@@ -1116,11 +1161,10 @@ impl World {
             };
         }
 
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         if template == ComponentTemplate::Iperf3Server {
             let policy = self
-                .net_policy
-                .as_ref()
+                .listener_policy()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
@@ -1148,6 +1192,16 @@ impl World {
             };
         }
 
+        #[cfg(feature = "tcp-throughput-probe")]
+        if template == ComponentTemplate::TcpProbe {
+            let policy = self.listener_policy().expect("probe policy exists");
+            let policy = policy.0.lock();
+            let mut target = space.0.lock();
+            let rights = Rights::READ.union(Rights::WRITE).union(Rights::RECV).union(Rights::INVOKE);
+            return ComponentGrants::TcpProbe(self.tcp_probe_roots.expect("probe roots exist")
+                .map(|root| cap::grant(&policy, root, rights, &mut target).unwrap()));
+        }
+
         let init = self.spaces["init"].clone();
         let init = init.0.lock();
         let mut target = space.0.lock();
@@ -1172,11 +1226,11 @@ impl World {
             ComponentTemplate::NetDriver => {
                 unreachable!("network grants come from the private policy CSpace")
             }
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
             ComponentTemplate::UsbEcmNetDriver => {
                 unreachable!("USB network grants come from the private policy CSpace")
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-entropy")]
             ComponentTemplate::VirtioRng => {
                 unreachable!("entropy grants come from the private policy CSpace")
             }
@@ -1193,9 +1247,9 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             ComponentTemplate::Ipv4Stack => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
@@ -1204,10 +1258,12 @@ impl World {
             ComponentTemplate::TcpEcho => {
                 unreachable!("TCP echo app grants come from the private policy CSpace")
             }
-            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
             ComponentTemplate::Iperf3Server => {
                 unreachable!("iperf3 grants come from the private policy CSpace")
             }
+            #[cfg(feature = "tcp-throughput-probe")]
+            ComponentTemplate::TcpProbe => unreachable!("probe grants come from private policy"),
             ComponentTemplate::StoreFaultProbe => ComponentGrants::StoreFaultProbe(
                 cap::grant(
                     &init,
@@ -1268,7 +1324,7 @@ impl World {
                     net_device::driver_task(space.get(), mmio, dma, outbound, inbound, control),
                 )
             },
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
             ComponentGrants::UsbEcmNetDriver {
                 transport,
                 outbound,
@@ -1287,7 +1343,7 @@ impl World {
                     ),
                 )
             },
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-entropy")]
             ComponentGrants::VirtioRng { mmio, dma, source } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
@@ -1340,9 +1396,9 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             ComponentGrants::Ipv4Stack(interfaces) => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -1359,13 +1415,18 @@ impl World {
                     crate::net_echo_platform::task(space.get(), listener),
                 )
             },
-            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
             ComponentGrants::Iperf3Server { control, data } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
                     &component.name,
                     crate::iperf3_platform::task(space.get(), control, data),
                 )
+            },
+            #[cfg(feature = "tcp-throughput-probe")]
+            ComponentGrants::TcpProbe(listeners) => unsafe {
+                exec::spawn_reclaimable_owned(domain, &component.name,
+                    crate::tcp_probe_platform::task(space.get(), listeners))
             },
             ComponentGrants::StoreFaultProbe(service) => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -1426,9 +1487,48 @@ impl World {
     }
 
     /// Replace a terminal task incarnation while retaining stable component,
-    /// memory-owner, Space, and supervisor-route identities.
+    /// memory-owner, Space, and supervisor-route identities. This synchronous
+    /// factory uses the caller hart; cross-hart operator callers should await
+    /// `restart_component_on_home` to preserve the initial placement.
     pub fn restart_component(&self, name: &str) -> Result<RestartReport, RestartError> {
         let component = self.component_named(name).ok_or(RestartError::NotFound)?;
+        let _lifecycle = component.lifecycle.lock();
+        if !self.components.lock().contains_key(&component.id) { return Err(RestartError::NotFound); }
+        self.restart_component_locked(&component)
+    }
+
+    /// Operator restart: construct the fresh arena on the original hart.
+    /// No lifecycle guard or allocation-owner override crosses an await.
+    pub async fn restart_component_on_home(self: &Arc<Self>, name: &str) -> Result<RestartReport, RestartError> {
+        let component = self.component_named(name).ok_or(RestartError::NotFound)?;
+        let generation = component.snapshot().generation;
+        let (result, worker) = {
+            let mut system = heap::enter_owner(OwnerId::SYSTEM);
+            let result = Arc::new(SpinLock::new(None));
+            let output = result.clone();
+            let world = self.clone();
+            let worker = exec::spawn_pinned_on(component.home_hart, "component-restart", async move {
+                let reply = {
+                    let _lifecycle = component.lifecycle.lock();
+                    if !world.components.lock().contains_key(&component.id) {
+                        Err(RestartError::NotFound)
+                    } else if component.snapshot().generation != generation {
+                        Err(RestartError::GenerationChanged)
+                    } else {
+                        world.restart_component_locked(&component)
+                    }
+                };
+                *output.lock() = Some(reply);
+            });
+            system.restore();
+            (result, worker)
+        };
+        worker.join().await;
+        let reply = result.lock().take().unwrap_or(Err(RestartError::DispatchFailed));
+        reply
+    }
+
+    fn restart_component_locked(&self, component: &Arc<Component>) -> Result<RestartReport, RestartError> {
         let template = component.template.ok_or(RestartError::NotRestartable)?;
         let before = component.snapshot();
         if before.state == exec::TaskState::Running {
@@ -1477,6 +1577,44 @@ impl World {
         })
     }
 
+    /// Serialize an operator action with automatic supervision. Retrying a
+    /// pending stop/restart never retargets a newer incarnation.
+    pub(crate) fn control_component(
+        &self,
+        request: &vibeos_vsh::vtop::Request,
+    ) -> Result<vibeos_vsh::vtop::Control, &'static str> {
+        use vibeos_vsh::vtop::{Action, Control};
+        let component = self.component_named(&request.name).ok_or("service no longer exists")?;
+        let _lifecycle = component.lifecycle.lock();
+        if !self.components.lock().contains_key(&component.id) { return Err("service no longer exists"); }
+        if !component.is_restartable() { return Err("read-only: no audited restart template"); }
+        let instance = component.instance.lock();
+        if instance.generation != request.generation || instance.task.id() != request.task {
+            return Err("service generation changed; select it again");
+        }
+        let task = instance.task.clone();
+        drop(instance);
+        let running = task.state() == exec::TaskState::Running;
+        match request.action {
+            Action::Start if running => return Err("service is already running"),
+            Action::Stop if !running => return Ok(Control::Done),
+            Action::Stop | Action::Restart if running => {
+                task.cancel();
+                return Ok(Control::Pending);
+            }
+            _ => {}
+        }
+        self.restart_component_locked(&component).map_err(|error| match error {
+            RestartError::NotFound => "service no longer exists",
+            RestartError::NotRestartable => "read-only: no audited restart template",
+            RestartError::StillRunning => "service is still running",
+            RestartError::GenerationExhausted => "service generation exhausted",
+            RestartError::GenerationChanged => "service generation changed",
+            RestartError::DispatchFailed => "restart worker failed",
+        })?;
+        Ok(Control::Done)
+    }
+
     /// Remove a terminal test/supervisor record once its allocation domain is
     /// empty (normal Drop) or has been raw-reclaimed (audited fault arena).
     pub(crate) fn remove_terminal_component(&self, id: ComponentId) -> bool {
@@ -1484,7 +1622,8 @@ impl World {
         let Some(component) = component else {
             return false;
         };
-        let snapshot = component.snapshot();
+        let _lifecycle = component.lifecycle.lock();
+        let Some(snapshot) = component.try_snapshot() else { return false; };
         if snapshot.state == exec::TaskState::Running {
             return false;
         }
@@ -1772,7 +1911,7 @@ pub fn start_net_supervisor() {
 /// Restart the USB ECM frontend independently from both DWC2 host service and
 /// the native DWMAC component. Synchronous class transactions leave no DMA
 /// ownership behind when this component faults.
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 pub fn start_usb_net_supervisor() {
     let world = world();
     let Some(component) = world.component_named("usb-ecm-net") else {
@@ -1806,7 +1945,7 @@ pub fn start_usb_net_supervisor() {
 /// Restart only faulted entropy-driver incarnations. A failed or unconfirmed
 /// device reset remains quarantined inside the driver and cannot be converted
 /// into synthetic output by the supervisor.
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 pub fn start_rng_supervisor() {
     let world = world();
     let Some(component) = world.component_named("virtio-rng") else {
@@ -1845,16 +1984,16 @@ pub fn start_rng_supervisor() {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 pub fn start_ipv4_stack_supervisor() {
     let world = world();
     let Some(component) = world.component_named(crate::netstack_platform::COMPONENT_NAME) else {
         return;
     };
-    exec::spawn("supervisor:ipv4-stack", async move {
+    let supervise = async move {
         let mut attempts = 0u32;
         loop {
             let (generation, join) = component.join_current();
@@ -1879,7 +2018,13 @@ pub fn start_ipv4_stack_supervisor() {
                 exec::TaskState::Faulted | exec::TaskState::Running => return,
             }
         }
-    });
+    };
+    #[cfg(feature = "network-pipeline")]
+    if crate::online_hart_mask() & 2 != 0 {
+        exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "supervisor:ipv4-stack", supervise);
+        return;
+    }
+    exec::spawn("supervisor:ipv4-stack", supervise);
 }
 
 /// Restart only faulted SSH acceptance-server incarnations. A fresh template
@@ -1945,60 +2090,69 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let net_location = net_resources.as_ref().map(|resources| resources.location);
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
     let net_policy = net_resources
         .as_ref()
         .map(|_| Space::new("virtio-net-policy"));
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_resources = crate::usb_ecm_net::discover();
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     let usb_net_location = usb_net_resources
         .as_ref()
         .map(|resources| resources.location);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_space = usb_net_resources
         .as_ref()
         .map(|_| Space::new("usb-ecm-net"));
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_policy = usb_net_resources
         .as_ref()
         .map(|_| Space::new("usb-ecm-net-policy"));
-    #[cfg(feature = "qemu-virt")]
+    let service_policy = net_policy.clone();
+    #[cfg(all(feature = "universal", feature = "universal-dwc2"))]
+    let service_policy = service_policy.or_else(|| usb_net_policy.clone());
+    #[cfg(feature = "queued-entropy")]
     let rng_resources = virtio_rng::discover();
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_resources = crate::jitterentropy_random::provision().ok();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("virtio-rng-policy"));
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-acceptance-random-policy"));
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-random-policy"));
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let jitter_resources = if vibeos_hal::runtime_platform::get().entropy_backend == vibeos_hal::runtime_platform::EntropyBackend::Jitter {
+        crate::jitterentropy_random::provision().ok()
+    } else { None };
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let rng_policy = if jitter_resources.is_some() { Some(Space::new("ssh-random-policy")) } else { rng_policy };
     #[cfg(feature = "ssh-security-test")]
     let ssh_security_test_space = rng_resources
         .as_ref()
@@ -2008,7 +2162,11 @@ pub fn build() {
         .as_ref()
         .zip(rng_resources.as_ref())
         .map(|_| Space::new("ssh-test"));
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(all(feature = "universal", feature = "provisioned-ssh"))]
+    let ssh_production_space = if service_policy.is_some() && rng_policy.is_some() && vibeos_hal::runtime_platform::component_enabled("ssh") {
+        Some(Space::new("sshd"))
+    } else { None };
+    #[cfg(all(feature = "provisioned-ssh", not(feature = "universal")))]
     let ssh_production_space = net_resources
         .as_ref()
         .zip(rng_resources.as_ref())
@@ -2026,34 +2184,36 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
-    #[cfg(not(feature = "milkv-duo"))]
+    #[cfg(not(any(feature = "milkv-duo", feature = "universal-dwc2")))]
     let ipv4_stack_space = net_resources
         .as_ref()
         .map(|_| Space::new(crate::netstack_platform::COMPONENT_NAME));
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     let ipv4_stack_space = (net_resources.is_some() || usb_net_resources.is_some())
         .then(|| Space::new(crate::netstack_platform::COMPONENT_NAME));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    let tcp_echo_app_space = net_resources
+    let tcp_echo_app_space = service_policy
         .as_ref()
         .map(|_| Space::new("tcp-echo-service"));
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
-    let iperf3_app_space = net_resources.as_ref().map(|_| Space::new("iperf3-server"));
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let iperf3_app_space = service_policy.as_ref().map(|_| Space::new("iperf3-server"));
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_space = service_policy.as_ref().map(|_| Space::new("tcp-probe"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -2387,8 +2547,14 @@ pub fn build() {
         net_grants,
     ) = match (net_resources, net_space.as_ref(), net_policy.as_ref()) {
         (Some(resources), Some(driver_space), Some(policy_space)) => {
+            #[cfg(feature = "direct-tcp-segmentation")]
+            let outbound = crate::segmented_tx::create(crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(not(feature = "direct-tcp-segmentation"))]
             let outbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-outbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(feature = "pooled-rx")]
+            let inbound = crate::detached_rx::create(crate::net_device::FRONTEND_QUEUE_DEPTH);
+            #[cfg(not(feature = "pooled-rx"))]
             let inbound: Arc<NetEndpoint<StampedPacket>> =
                 NetEndpoint::new("net-inbound", crate::net_device::FRONTEND_QUEUE_DEPTH);
             let mut policy = policy_space.0.lock();
@@ -2407,9 +2573,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             )))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
@@ -2429,9 +2595,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
@@ -2472,7 +2638,7 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let (
         usb_net_transport_root,
         usb_net_outbound_root,
@@ -2527,41 +2693,41 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
-    let tcp_listener_root = net_policy.as_ref().map(|policy_space| {
+    let tcp_listener_root = service_policy.as_ref().filter(|_| !cfg!(feature = "provisioned-ssh") || crate::platform::component_enabled("ssh")).map(|policy_space| {
         let listener_label = if cfg!(any(
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         )) {
             "sshd"
         } else if cfg!(any(
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )) {
             "iperf3-control"
         } else {
             "tcp-echo"
         };
-        #[cfg(feature = "milkv-ssh")]
+        #[cfg(feature = "provisioned-ssh")]
         let listen_port = 22;
         #[cfg(all(
-            not(feature = "milkv-ssh"),
-            any(feature = "iperf3-server", feature = "milkv-iperf3-server")
+            not(feature = "provisioned-ssh"),
+            any(feature = "iperf3-server", feature = "dhcp-iperf3-server")
         ))]
         let listen_port = vibeos_iperf3_server::DEFAULT_PORT;
         #[cfg(not(any(
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )))]
         let listen_port = 2222;
         let id = vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero");
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
-        let listener = vibeos_net_api::TcpListener::new_shared(
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+        let listener = new_shared_network_listener(
             listener_label,
             id,
             listen_port,
@@ -2569,7 +2735,7 @@ pub fn build() {
             vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
             vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         );
-        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
+        #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         let listener = vibeos_net_api::TcpListener::new(
             listener_label,
             id,
@@ -2578,11 +2744,13 @@ pub fn build() {
             vibeos_net_api::DEFAULT_TCP_FRONTEND_BUFFER_BYTES,
         );
         let listener = listener.expect("the image TCP listener policy is valid");
+        #[cfg(feature = "network-profile")]
+        crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
-    let iperf_data_listener_root = net_policy.as_ref().map(|policy_space| {
-        let listener = vibeos_net_api::TcpListener::new_shared(
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let iperf_data_listener_root = service_policy.as_ref().map(|policy_space| {
+        let listener = new_shared_network_listener(
             "iperf3-data",
             vibeos_net_api::TcpListenerId::new(2).expect("listener identity is non-zero"),
             vibeos_iperf3_server::DEFAULT_PORT,
@@ -2591,15 +2759,50 @@ pub fn build() {
             vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         )
         .expect("the iperf3 data listener policy is valid");
+        #[cfg(feature = "network-profile")]
+        crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_roots = service_policy.as_ref().map(|policy_space| {
+        let mut policy = policy_space.0.lock();
+        core::array::from_fn(|index| {
+            #[cfg(not(feature = "receive-buffer-exchange"))]
+            let listener = vibeos_net_api::TcpListener::new("tcp-probe",
+                vibeos_net_api::TcpListenerId::new(3 + index as u64).unwrap(),
+                vibeos_tcp_probe::FIRST_PORT + index as u16,
+                vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
+                vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES).unwrap();
+            // The independent pattern verifier must exercise the same storage
+            // handoff as iperf when this experiment is selected. Pools outlive
+            // both the protocol and probe task arenas; try_recv derives the
+            // current tracked consumer identity before granting a read lease.
+            #[cfg(feature = "receive-buffer-exchange")]
+            let listener = {
+                #[cfg(feature = "tcp-large-window")]
+                let socket_bytes = 256 * 1024;
+                #[cfg(not(feature = "tcp-large-window"))]
+                let socket_bytes = 32 * 1024;
+                let capacity = vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES;
+                let pool = vibeos_net_api::receive_storage::Storage::new_static(socket_bytes, capacity).unwrap();
+                crate::println!("RXEX_POOL listener={} port={} bytes={} slots=3", 3 + index,
+                    vibeos_tcp_probe::FIRST_PORT + index as u16, socket_bytes);
+                vibeos_net_api::TcpListener::new_with_receive_storage("tcp-probe",
+                    vibeos_net_api::TcpListenerId::new(3 + index as u64).unwrap(),
+                    vibeos_tcp_probe::FIRST_PORT + index as u16, capacity, capacity, pool).unwrap()
+            };
+            #[cfg(feature = "network-profile")]
+            crate::println!("NPROF_LOCK_NAME address={:#x} name=tcp-listener-{}-port-{}", listener.profile_lock_address(), listener.id().get(), listener.port());
+            policy.mint(listener, Rights::ALL_VOLATILE)
+        })
+    });
+    #[cfg(feature = "queued-entropy")]
     let (rng_mmio_root, rng_dma_root, rng_source_root, rng_grants) =
         match (rng_resources, rng_space.as_ref(), rng_policy.as_ref()) {
             (Some(resources), Some(driver_space), Some(policy_space)) => {
                 let mut policy = policy_space.0.lock();
                 let mmio_root = policy.mint(resources.mmio, Rights::ALL);
-                let dma_root = policy.mint(resources.dma, Rights::ALL);
+                let dma_root = policy.mint(resources.state, Rights::ALL);
                 let source_root = policy.mint(resources.source, Rights::ALL);
                 let mut target = driver_space.0.lock();
                 let grants = (
@@ -2629,9 +2832,16 @@ pub fn build() {
                 )
             }
             (None, None, None) => (None, None, None, None),
+            #[cfg(feature = "universal")]
+            (None, None, Some(_)) => (None, None, None, None),
             _ => unreachable!("entropy resources and CSpaces are constructed together"),
         };
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let rng_source_root = match jitter_resources {
+        Some(resources) => Some(rng_policy.as_ref().expect("jitter policy").0.lock().mint(resources.source, Rights::ALL)),
+        None => rng_source_root,
+    };
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
         (Some(resources), Some(policy_space)) => {
             let mut policy = policy_space.0.lock();
@@ -2640,7 +2850,7 @@ pub fn build() {
         (None, None) => None,
         _ => unreachable!("acceptance entropy resource and policy are constructed together"),
     };
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
         (Some(resources), Some(policy_space)) => {
             Some(policy_space.0.lock().mint(resources.source, Rights::ALL))
@@ -2710,7 +2920,7 @@ pub fn build() {
     });
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     let ssh_test_grants = ssh_test_space.as_ref().map(|test_space| {
-        let network = net_policy
+        let network = service_policy
             .as_ref()
             .expect("SSH test requires the network policy")
             .0
@@ -2767,9 +2977,9 @@ pub fn build() {
             .unwrap(),
         )
     });
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     let ssh_production_grants = ssh_production_space.as_ref().map(|target_space| {
-        let network = net_policy
+        let network = service_policy
             .as_ref()
             .expect("SSH requires network policy")
             .0
@@ -2805,9 +3015,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let mut network_stack_roots = Vec::new();
     #[cfg(any(
@@ -2815,9 +3025,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
         net_location,
@@ -2826,23 +3036,27 @@ pub fn build() {
         net_inbound_root,
         net_control_root,
     ) {
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         let listeners = vibeos_netstack::two_tcp_listeners(
             tcp_listener_root.expect("iperf3 control listener root"),
             iperf_data_listener_root.expect("iperf3 data listener root"),
         );
-        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
+        #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         let listeners = match tcp_listener_root {
             Some(listener) => vibeos_netstack::one_tcp_listener(listener),
             None => vibeos_netstack::no_tcp_listeners(),
         };
+        #[cfg(feature = "tcp-throughput-probe")]
+        let listeners = {
+            let mut listeners = listeners;
+            for (slot, root) in listeners[2..6].iter_mut().zip(tcp_probe_roots.expect("probe roots")) {
+                *slot = Some(root);
+            }
+            listeners
+        };
         network_stack_roots.push(NetworkStackRoot {
             location,
-            driver: if cfg!(feature = "milkv-duo") {
-                "dwmac"
-            } else {
-                "virtio-mmio"
-            },
+            driver: vibeos_hal::boot::platform().network_driver_name,
             policy: policy.clone(),
             outbound,
             inbound,
@@ -2851,15 +3065,15 @@ pub fn build() {
         });
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
@@ -2876,7 +3090,16 @@ pub fn build() {
             outbound,
             inbound,
             control,
-            listeners: vibeos_netstack::no_tcp_listeners(),
+            listeners: {
+                #[cfg(all(feature = "universal", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+                { if net_policy.is_none() {
+                    vibeos_netstack::two_tcp_listeners(tcp_listener_root.expect("USB control listener"), iperf_data_listener_root.expect("USB data listener"))
+                } else { vibeos_netstack::no_tcp_listeners() } }
+                #[cfg(all(feature = "universal", not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))))]
+                { if net_policy.is_none() { tcp_listener_root.map_or_else(vibeos_netstack::no_tcp_listeners, vibeos_netstack::one_tcp_listener) } else { vibeos_netstack::no_tcp_listeners() } }
+                #[cfg(not(feature = "universal"))]
+                { vibeos_netstack::no_tcp_listeners() }
+            },
         });
     }
     #[cfg(any(
@@ -2884,9 +3107,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     {
         network_stack_roots.sort_by_key(|root| root.location);
@@ -2910,16 +3133,16 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let ipv4_stack_grants = ipv4_stack_space
         .as_ref()
         .map(|space| grant_network_stack(&network_stack_roots, space));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_app_grant = match (
-        net_policy.as_ref(),
+        service_policy.as_ref(),
         tcp_echo_app_space.as_ref(),
         tcp_listener_root,
     ) {
@@ -2942,9 +3165,9 @@ pub fn build() {
         (None, None, None) => None,
         _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf3_app_grants = match (
-        net_policy.as_ref(),
+        service_policy.as_ref(),
         iperf3_app_space.as_ref(),
         tcp_listener_root,
         iperf_data_listener_root,
@@ -2964,6 +3187,13 @@ pub fn build() {
         (None, None, None, None) => None,
         _ => unreachable!("iperf3 app grants exist exactly with both listeners"),
     };
+    #[cfg(feature = "tcp-throughput-probe")]
+    let tcp_probe_grants = tcp_probe_space.as_ref().map(|space| {
+        let policy = service_policy.as_ref().unwrap().0.lock();
+        let mut target = space.0.lock();
+        let rights = Rights::READ.union(Rights::WRITE).union(Rights::RECV).union(Rights::INVOKE);
+        tcp_probe_roots.unwrap().map(|root| cap::grant(&policy, root, rights, &mut target).unwrap())
+    });
     let (
         store_root,
         durable_cspace_root,
@@ -3065,27 +3295,27 @@ pub fn build() {
     if let Some(space) = net_policy.as_ref() {
         spaces.insert("virtio-net-policy", space.clone());
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let Some(space) = usb_net_space.as_ref() {
         spaces.insert("usb-ecm-net", space.clone());
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let Some(space) = usb_net_policy.as_ref() {
         spaces.insert("usb-ecm-net-policy", space.clone());
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let Some(space) = rng_space.as_ref() {
         spaces.insert("virtio-rng", space.clone());
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("virtio-rng-policy", space.clone());
     }
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-acceptance-random-policy", space.clone());
     }
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-random-policy", space.clone());
     }
@@ -3097,7 +3327,7 @@ pub fn build() {
     if let Some(space) = ssh_test_space.as_ref() {
         spaces.insert("ssh-test", space.clone());
     }
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let Some(space) = ssh_production_space.as_ref() {
         spaces.insert("sshd", space.clone());
     }
@@ -3114,9 +3344,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     if let Some(space) = ipv4_stack_space.as_ref() {
         spaces.insert(crate::netstack_platform::COMPONENT_NAME, space.clone());
@@ -3125,9 +3355,13 @@ pub fn build() {
     if let Some(space) = tcp_echo_app_space.as_ref() {
         spaces.insert("tcp-echo-service", space.clone());
     }
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     if let Some(space) = iperf3_app_space.as_ref() {
         spaces.insert("iperf3-server", space.clone());
+    }
+    #[cfg(feature = "tcp-throughput-probe")]
+    if let Some(space) = tcp_probe_space.as_ref() {
+        spaces.insert("tcp-probe", space.clone());
     }
     if let Some(space) = store_backend.as_ref() {
         spaces.insert("store-backend", space.clone());
@@ -3142,7 +3376,33 @@ pub fn build() {
         spaces.insert("saved-program", space.clone());
     }
 
+    // Count planned component spaces before registration. Client grants (such
+    // as init's net_control) may be withheld by a service image and cannot be
+    // used to infer whether its driver or IPv4/SSH service was discovered.
+    let expected_boot_components = 4 + usize::from(block_space.is_some())
+        + usize::from(net_space.is_some());
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
+    let expected_boot_components = expected_boot_components + usize::from(usb_net_space.is_some());
+    #[cfg(feature = "queued-entropy")]
+    let expected_boot_components = expected_boot_components + usize::from(rng_space.is_some());
+    #[cfg(feature = "ssh-security-test")]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_security_test_space.is_some());
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_test_space.is_some());
+    #[cfg(feature = "provisioned-ssh")]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_production_space.is_some());
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test",
+        feature = "milkv-ssh-acceptance", feature = "provisioned-ssh",
+        feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let expected_boot_components = expected_boot_components + usize::from(ipv4_stack_space.is_some());
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    let expected_boot_components = expected_boot_components + usize::from(tcp_echo_app_space.is_some());
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let expected_boot_components = expected_boot_components + usize::from(iperf3_app_space.is_some());
+    #[cfg(feature = "tcp-throughput-probe")]
+    let expected_boot_components = expected_boot_components + usize::from(tcp_probe_space.is_some());
     let world = Arc::new(World {
+        expected_boot_components,
         spaces,
         components: SpinLock::new(BTreeMap::new()),
         console: c_console,
@@ -3183,47 +3443,49 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         network_stack_roots,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_policy,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_transport: usb_net_transport_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_outbound_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_inbound_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_control_root,
         #[cfg(any(
             feature = "tcp-echo",
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         tcp_listener_root,
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         iperf_data_listener_root,
+        #[cfg(feature = "tcp-throughput-probe")]
+        tcp_probe_roots,
         #[cfg(any(
-            feature = "qemu-virt",
+            feature = "queued-entropy",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         ))]
         rng_policy,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         rng_mmio: rng_mmio_root,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         rng_dma: rng_dma_root,
         #[cfg(any(
-            feature = "qemu-virt",
+            feature = "queued-entropy",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         ))]
         rng_source_root,
         #[cfg(any(
@@ -3284,7 +3546,7 @@ pub fn build() {
         world.spawn_component_inner(
             "virtio-net",
             space.clone(),
-            BACKGROUND_MEMORY_BUDGET,
+            NETWORK_DRIVER_MEMORY_BUDGET,
             Some(ComponentTemplate::NetDriver),
             net_device::driver_task(
                 SpaceRef::new(&space).get(),
@@ -3297,7 +3559,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let (Some(space), Some((transport, outbound, inbound, control))) =
         (usb_net_space, usb_net_grants)
     {
@@ -3316,7 +3578,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let (Some(space), Some((mmio, dma, source))) = (rng_space, rng_grants) {
         world.spawn_component_inner(
             "virtio-rng",
@@ -3366,7 +3628,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let (Some(space), Some((listener, random))) = (ssh_production_space, ssh_production_grants) {
         world.spawn_component_inner(
             "sshd",
@@ -3382,19 +3644,11 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
-    #[cfg(any(
-        feature = "tcp-echo",
-        feature = "net-shell",
-        feature = "ssh-test",
-        feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
-        feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
-    ))]
+    #[cfg(not(feature = "network-pipeline"))]
     if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
         world.spawn_component_inner(
             crate::netstack_platform::COMPONENT_NAME,
@@ -3416,18 +3670,101 @@ pub fn build() {
         );
     }
 
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    // Remote test-service initialization may execute before boot continues.
+    // Publish the complete world before allowing that hart to run its tasks.
+    #[cfg(feature = "network-service-peer")]
+    { *WORLD.lock() = Some(world.clone()); }
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     if let (Some(space), Some((control, data))) = (iperf3_app_space, iperf3_app_grants) {
-        world.spawn_component_inner(
-            "iperf3-server",
-            space.clone(),
-            IPERF3_SERVER_MEMORY_BUDGET,
-            Some(ComponentTemplate::Iperf3Server),
-            crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
-        );
+        let service_world = world.clone();
+        start_network_test_service(move || {
+            service_world.spawn_component_inner(
+                "iperf3-server",
+                space.clone(),
+                IPERF3_SERVER_MEMORY_BUDGET,
+                Some(ComponentTemplate::Iperf3Server),
+                crate::iperf3_platform::task(SpaceRef::new(&space).get(), control, data),
+            );
+        });
     }
 
-    *WORLD.lock() = Some(world);
+    #[cfg(feature = "tcp-throughput-probe")]
+    if let (Some(space), Some(listeners)) = (tcp_probe_space, tcp_probe_grants) {
+        let service_world = world.clone();
+        start_network_test_service(move || {
+            service_world.spawn_component_inner("tcp-probe", space.clone(), 512 * 1024,
+                Some(ComponentTemplate::TcpProbe),
+                crate::tcp_probe_platform::task(SpaceRef::new(&space).get(), listeners));
+        });
+    }
+
+    *WORLD.lock() = Some(world.clone());
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "provisioned-ssh",
+        feature = "iperf3-server",
+        feature = "dhcp-iperf3-server"
+    ))]
+    #[cfg(feature = "network-pipeline")]
+    if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
+        let start = move || {
+            world.spawn_component_inner(
+                crate::netstack_platform::COMPONENT_NAME,
+                space.clone(),
+                NETWORK_STACK_MEMORY_BUDGET,
+                Some(ComponentTemplate::Ipv4Stack),
+                crate::netstack_platform::task_with_discovered(SpaceRef::new(&space).get(), interfaces),
+            );
+        };
+        #[cfg(feature = "network-pipeline")]
+        if !cfg!(feature = "network-inline-rx") && crate::online_hart_mask() & 2 != 0 {
+            // Construct a fresh arena on its eventual home hart. No existing
+            // reclaimable task or arena is migrated. Publish the component
+            // before allowing boot to install its supervisor.
+            static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            READY.store(false, Ordering::Release);
+            exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "net-stack-init", async move {
+                start();
+                READY.store(true, Ordering::Release);
+            });
+            let began = crate::sbi::time();
+            while !READY.load(Ordering::Acquire) {
+                assert!(crate::sbi::time().wrapping_sub(began) < exec::timebase_hz() * 5,
+                    "network pipeline initial publication timed out");
+                core::hint::spin_loop();
+            }
+        } else {
+            start();
+        }
+    }
+}
+
+/// Construct each test component and its arena on its eventual home hart.
+/// Existing tasks/arenas are never migrated; ordinary restart uses that home.
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server", feature = "tcp-throughput-probe"))]
+fn start_network_test_service(start: impl FnOnce() + Send + 'static) {
+    #[cfg(feature = "network-service-peer")]
+    if crate::online_hart_mask() & 2 != 0 {
+        // Boot calls this serially, waiting for publication before the next
+        // service. The initializer itself has only SYSTEM lifetime storage.
+        static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+        READY.store(false, Ordering::Release);
+        exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "net-test-init", async move {
+            start();
+            READY.store(true, Ordering::Release);
+        });
+        let began = crate::sbi::time();
+        while !READY.load(Ordering::Acquire) {
+            assert!(crate::sbi::time().wrapping_sub(began) < exec::timebase_hz() * 5,
+                "network test-service publication timed out");
+            core::hint::spin_loop();
+        }
+        return;
+    }
+    start();
 }
 
 /// Samples a (fake) thermometer and publishes it. Holds SEND and nothing else —
@@ -3576,4 +3913,23 @@ async fn store_fault_probe_task(space: SpaceRef, service: Cap) {
         panic!("injected store fault unexpectedly returned: {result:?}");
     }
     unreachable!("the bounded store-fault retry loop always returns or faults");
+}
+
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+fn new_shared_network_listener(name: &str, id: vibeos_net_api::TcpListenerId, port: u16,
+    receive: usize, transmit: usize, group: vibeos_net_api::TcpPortGroupId,
+) -> Result<Arc<vibeos_net_api::TcpListener>, vibeos_net_api::TcpFrontendError> {
+    #[cfg(feature = "receive-buffer-exchange")]
+    {
+        #[cfg(feature = "tcp-large-window")]
+        let socket_bytes = 256 * 1024;
+        #[cfg(not(feature = "tcp-large-window"))]
+        let socket_bytes = 32 * 1024;
+        let pool = vibeos_net_api::receive_storage::Storage::new_static(socket_bytes, receive)
+            .map_err(|_| vibeos_net_api::TcpFrontendError::InvalidBufferSize)?;
+        crate::println!("RXEX_POOL listener={} port={} bytes={} slots=3", id.get(), port, socket_bytes);
+        vibeos_net_api::TcpListener::new_shared_with_receive_storage(name, id, port, receive, transmit, group, pool)
+    }
+    #[cfg(not(feature = "receive-buffer-exchange"))]
+    vibeos_net_api::TcpListener::new_shared(name, id, port, receive, transmit, group)
 }

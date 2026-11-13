@@ -1,0 +1,139 @@
+{
+  "status": "Independent block/network frontend composition verified; Mars incomplete",
+  "host_hal_tests": 12,
+  "python_tests": 14,
+  "no_board_profile_firmware": {
+    "package": "vibeos-firmware-qemu-hal-test",
+    "kernel_features": [
+      "boot-dtb-probe",
+      "legacy-shell",
+      "qemu-default-image",
+      "queued-block",
+      "queued-network"
+    ],
+    "live_boot": {
+      "status": "passed",
+      "boot_hart": 0,
+      "harts": 4,
+      "timebase_hz": 10000000,
+      "selftests": 390,
+      "kernel_sha256": "ea30a8c089244192ca79f454fb698cc63217c6de7817266054f7d1e2bda8b3c7",
+      "physical_acceptance": false
+    },
+    "block_read_write": "passed, raw sector 8 verified",
+    "network": "passed, raw L2 handshake",
+    "block_recovery": "passed",
+    "network_recovery": "passed, abandoned faulted HELLO and fresh-epoch handshake"
+  },
+  "compile_matrix": {
+    "combinations": [
+      "pio-block,packet-network",
+      "pio-block,queued-network",
+      "queued-block,packet-network",
+      "queued-block,queued-network"
+    ],
+    "kernel_board_profile": "none",
+    "services": [
+      "net-shell",
+      "wasi-preview1",
+      "legacy-shell"
+    ],
+    "image_policy": "qemu-default-image",
+    "status": "passed; mixed combinations have not run on hardware"
+  },
+  "legacy_qemu_selftests": 390,
+  "duo_release_build": "passed",
+  "negative_checks": [
+    "Conflicting block and network selections reject compilation",
+    "Changing preserved Duo storage identity fails isolated compatibility test"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage18-hal-firmware-build.log",
+      "sha256": "46ab2557749f681263cc3c710e0325d446650c97730864ab90d8d50ba8a080a6"
+    },
+    {
+      "path": "target/mars-reference/stage18-hal-dependencies.log",
+      "sha256": "28fbe3b53d00a044b6b88b3d9711aea553bfec0fcf09da0e3b51a0025a85fcc5"
+    },
+    {
+      "path": "target/mars-reference/stage18-hal-tests.log",
+      "sha256": "2bb01e72e09b3819fc915e380ae72658e00e24a72e51d3b3ecdca53bd83b6cd7"
+    },
+    {
+      "path": "target/mars-reference/stage18-python-tests.log",
+      "sha256": "c9811dcd7d51683ba5e61910b5aa26e91e8766a287b6a6f52a04bac8ac9f3a3d"
+    },
+    {
+      "path": "target/mars-reference/stage18-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage18-identity-mutation.log",
+      "sha256": "add51fa307e253eec831ab922d387954a8eae562a4fb3c12ba176126ff290227"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-boot/serial.log",
+      "sha256": "cdf9149531c941238956274b9348ce6b3f14fdc8f51fe1a6db508e0b4bd611aa"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-boot/summary.json",
+      "sha256": "010c83115e2dfd547ceac0305443df1304c4f0ba64a1dc55c560227ed3c660ec"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-block.log",
+      "sha256": "d3b096b691b10ba3e115be6b93eb002a3c57e2b9b53a4c0b488f36e3fdbd5da4"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-net.log",
+      "sha256": "a7780ff6b3a9c1583f3d4d937de4748f865bbdd4ef95eebac7ae553a0413c69b"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-block-recovery.log",
+      "sha256": "fc5af6cc144f8c719ea47e6169ffc7f0579f272c1b1a8430589c675a984f8b33"
+    },
+    {
+      "path": "target/mars-reference/stage18-unbundled-net-recovery.log",
+      "sha256": "cad0b1f55a8153ab2a87e856e190f00dd632bd8aa5cd8b878343c52cc2ebe5f9"
+    },
+    {
+      "path": "target/mars-reference/stage18-qemu-regression.log",
+      "sha256": "eb8b8dadc5c327535d7966232fdce628af8c5602d1f3a861df6b85ab1ef9d13f"
+    },
+    {
+      "path": "target/mars-reference/stage18-duo-build.log",
+      "sha256": "cd94d0406c26117e5c6a866cfa58e4fa681ae35edf122aafb4be68255a9174a4"
+    },
+    {
+      "path": "target/mars-reference/stage18-reject-pio-block,queued-block,packet-network.log",
+      "sha256": "e373ece665141402666afb9ac31dd16b98521a617a394c8dc19c256128944290"
+    },
+    {
+      "path": "target/mars-reference/stage18-reject-pio-block,packet-network,queued-network.log",
+      "sha256": "b81553699b5b55a100eee2c29bda939365bb84c15a7a32fe3871d4cce5a64c85"
+    },
+    {
+      "path": "target/mars-reference/stage18-pio-block,packet-network-check.log",
+      "sha256": "4a414124bd9253a4b2f43a5e28917405a9b91dc2ecf3a6864eca49b7982b356b"
+    },
+    {
+      "path": "target/mars-reference/stage18-pio-block,queued-network-check.log",
+      "sha256": "a4828dbb4229141e476d1846e2ce6fa8670c9816195ae76525d12c92b9ac00a7"
+    },
+    {
+      "path": "target/mars-reference/stage18-queued-block,packet-network-check.log",
+      "sha256": "48d928f9c47fae09687dc8ca7f4200173525afa7feaa4fc0b2485ebbaa1070fc"
+    },
+    {
+      "path": "target/mars-reference/stage18-queued-block,queued-network-check.log",
+      "sha256": "7c43bd9c77600a9851e00a6aecf614b2c5dd86c1dcb1bd7bbe6fbe41cb2a0a58"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Mars firmware entry and DTB admission/resource publication",
+    "JH7110 platform, DW-MSHC SD and EQoS Ethernet integration",
+    "Remaining kernel USB/entropy board-selection branches",
+    "Boot firmware, flashable SD image and physical acceptance"
+  ]
+}

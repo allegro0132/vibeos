@@ -10,6 +10,14 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
      \_/  |_||_.__/ \___/ \____/|____/   v0.1
 ```
 
+## Configure a universal image
+
+Run `./configure.sh` to choose boards, drivers and built-in components, then
+`./build.sh` to resolve dependencies and build one kernel for the selected boards.
+Use `./run.sh --config vibeos.toml` to run that image under QEMU.
+See [the configuration guide](docs/CONFIGURATION.md) for presets, artifact checks
+and Duo/Mars packaging.
+
 ## Documents
 
 - **[BPI-R4PRO-4E platform libraries](docs/BPI_R4PRO_4E.md)** — reusable drivers/runtime; router firmware is maintained in [VibeWrt](https://github.com/allegro0132/vibewrt).
@@ -30,6 +38,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   Blob layout, CAS catalog ABI, complete-Blob deduplication, and authority rules.
 - **[docs/STORAGE_V2_GC.md](docs/STORAGE_V2_GC.md)** — persistent/runtime roots,
   typed edges, generation pins, and the crash-safe G/G+1/G+2 reuse barrier.
+- **[docs/VTOP.md](docs/VTOP.md)** — live CPU/heap monitoring and audited service management in UART and SSH terminals.
 - **[docs/CAPABILITY_SHELL.md](docs/CAPABILITY_SHELL.md)** — the S0 contract for
   Bash-inspired syntax with capability-native commands, streams, Jobs, limits,
   cancellation, and fail-closed admission.

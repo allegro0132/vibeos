@@ -1,0 +1,59 @@
+{
+  "status": "boot contract and QEMU large RAM verified; Mars port incomplete",
+  "checks": [
+    {
+      "name": "host",
+      "local_log": "target/mars-reference/stage2-host.log",
+      "sha256": "93b7ff8f561364196b7ffc619b10c85e9b6a8f2b199e8fb4738f49c315ccf621"
+    },
+    {
+      "name": "qemu-mmu",
+      "local_log": "target/mars-reference/stage2-qemu-mmu.log",
+      "sha256": "561687d9cb3714ef295aca079a82a917e5a6516ec1c5ef64f2f6db27de8f7404"
+    },
+    {
+      "name": "qemu-selftest-390",
+      "local_log": "target/mars-reference/stage2-qemu-selftest.log",
+      "sha256": "c7dbbe0e1b4347b17016177d29458d7d55c9ddb61edeb07eec62c30a3ac90574"
+    },
+    {
+      "name": "qemu-large-ram-393",
+      "local_log": "target/mars-reference/stage2-large-ram.log",
+      "sha256": "c9d142923cd7d6f4dd70873d29adea8b64f9f6310eb3b53550accd37f3b33f16"
+    },
+    {
+      "name": "large-ram-serial",
+      "local_log": "target/mars-reference/../mars-large-ram/serial.log",
+      "sha256": "204bf22a37202921cd381fb14ca961087b3b0690149b36466f7b694f39db1d7d"
+    },
+    {
+      "name": "duo-build",
+      "local_log": "target/mars-reference/stage2-duo-build.log",
+      "sha256": "24b31b50791cb842c47f3a643e6888fd70d085ae63d1f03f3ddc8cf84fdc1c50"
+    },
+    {
+      "name": "pin-stack-regression",
+      "local_log": "target/mars-reference/stage2-pin-regression.log",
+      "sha256": "3d62af7eaaf49d5ecadbcc21a0f45ee85f49df5533fc7d05c676cc32fad0a0f0"
+    },
+    {
+      "name": "arena-mutation-caught",
+      "local_log": "target/mars-reference/stage2-arena-mutation.log",
+      "sha256": "03665689911db93ce286920c709619789ecf13791d87529852f0326b0dbb5135"
+    },
+    {
+      "name": "kernel-dependencies",
+      "local_log": "target/mars-reference/stage2-kernel-dependencies.log",
+      "sha256": "a78516dd3a9b7ecd5022cf2b5e30bafbeec8703b0f07b148e3da8454c99c6858"
+    }
+  ],
+  "mutation": "Replacing crossed root window count with 1 fails host test; restored and rerun successfully",
+  "hardware_acceptance": "not run",
+  "pending": [
+    "Remaining concrete driver dependencies in kernel",
+    "Live DTB topology and reserved-memory admission",
+    "Mars firmware, JH7110 platform, SD and GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH and entropy qualification, three cold boots and one hour stress"
+  ]
+}

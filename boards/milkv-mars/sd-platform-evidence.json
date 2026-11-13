@@ -1,0 +1,32 @@
+{
+  "status": "CV1800B SD platform extraction verified; Mars incomplete",
+  "host_tests": 36,
+  "qemu_selftests": 390,
+  "duo_build": "passed",
+  "mutation": "Power-off using the power-on supply nibble fails the sequence test in an isolated source copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage5-host.log",
+      "sha256": "2aeea80ee626fc9577e22e8db593c8e09f973da220c219ee0a1276021c437001"
+    },
+    {
+      "path": "target/mars-reference/stage5-power-mutation.log",
+      "sha256": "01de296eab611296e82687dfa8ceb58262b076b1959d72f45ad5359e2f5432e0"
+    },
+    {
+      "path": "target/mars-reference/stage5-duo-build.log",
+      "sha256": "dc2adb180b3ed5836efffae1f63bd079198e97997bab3605873e4957572650cc"
+    },
+    {
+      "path": "target/mars-reference/stage5-qemu-selftest.log",
+      "sha256": "4f3867e9b9d5536c35fabf4473d29b2a4eeff6564b26c59998bb622eca303135"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Other concrete driver and SoC operations migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

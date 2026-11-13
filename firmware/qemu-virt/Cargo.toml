@@ -5,9 +5,21 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
+entropy-diagnostic-only = []
+entropy-polling = []
+boot-dtb-probe = ["vibeos-kernel/boot-dtb-probe"]
+# Reusable services; this firmware selects the appropriate entropy provider.
+provisioned-ssh = ["vibeos-kernel/provisioned-ssh"]
+provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]
+provisioned-wasmtime = ["provisioned-command", "vibeos-kernel/provisioned-wasmtime"]
+dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
+
+mmu-large-memory = ["legacy-shell", "vibeos-bsp-qemu-virt/mmu-large-memory", "vibeos-kernel/mmu-large-memory-test"]
+python-wasi = ["vibeos-kernel/python-wasi", "vibeos-bsp-qemu-virt/python-wasi"]
 # Research-only format admission; writes require runtime opt-in.
 experimental-authority-delta = ["vibeos-kernel/experimental-authority-delta"]
-python-wasi = ["vibeos-kernel/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
 wasmtime-threads = ["vibeos-kernel/wasmtime-threads"]
@@ -28,8 +40,8 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 # Dedicated guest-path storage qualification image. Keeping this as one named
 # feature prevents benchmark builds from silently omitting the V2 file-tree
 # policy while preserving the production storage and capability paths.
-storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
-storage-bench-128m = ["storage-bench", "vibeos-kernel/storage-bench-128m"]
+storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench", "vibeos-bsp-qemu-virt/storage-bench"]
+storage-bench-128m = ["storage-bench", "vibeos-kernel/storage-bench-128m", "vibeos-bsp-qemu-virt/storage-bench-128m"]
 storage-bench-small-store = ["storage-bench", "vibeos-kernel/storage-bench-small-store"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
@@ -187,3 +199,15 @@ bench = false
 
 [dependencies]
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["qemu-virt", "qemu-default-image"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }
+
+vibeos-driver-virtio-rng = { path = "../../drivers/virtio-rng" }
+vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio" }
+vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk" }
+vibeos-driver-virtio-core = { path = "../../drivers/virtio-core" }
+vibeos-driver-virtio-net = { path = "../../drivers/virtio-net" }
+vibeos-driver-pci = { path = "../../drivers/pci" }
+vibeos-driver-xhci = { path = "../../drivers/xhci" }

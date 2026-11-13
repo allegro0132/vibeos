@@ -1,0 +1,109 @@
+{
+  "status": "Shared clock decoder and Ethernet integration verified in models; physical clock presence unverified",
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "source": {
+    "url": "https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/u-boot/drivers/clk/starfive/clk-jh7110.c",
+    "sha256": "dd1a15472b1c19f7261009a396439d747f1d7af8a58336354806773c500372ee"
+  },
+  "host_platform_tests": 29,
+  "new_clock_tests": 3,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121921536,
+    "kernel_sha256": "8b71bd712fa80a4d2fbf54939a6661e18216f1dbccf5da4484ba15a81da9e43a",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "ethernet_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "1e5d1a4170f5fc0270a9f33d949200e929df6e5780ffc9590c8553546e68249a",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 51984,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "mutations": [
+    "divider limit removed: detected",
+    "post divider ignored: detected",
+    "root mux ignored: detected"
+  ],
+  "physical_acceptance": false,
+  "entropy_driver_registered": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Read-only snapshot does not prove physical parent clock presence or stable lifetime",
+    "Firmware shared-domain/TRNG composition remains pending",
+    "No entropy quality or SSH qualification"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage42-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage42-host.log",
+      "sha256": "49ae28b9cc509abbcf568fc86a138ec7117172b6a90b06240fb3d080aeb452f0"
+    },
+    {
+      "path": "target/mars-reference/stage42-mutation-divider-limit.log",
+      "sha256": "c02308e145ea9b4301359813c5a8d162b0be404311812ad21dd60e071b288c83"
+    },
+    {
+      "path": "target/mars-reference/stage42-mutation-post-divider.log",
+      "sha256": "20f27d38783b51b01ae59c47e4baf9df65e16459d9db6007e5e616379ae9b422"
+    },
+    {
+      "path": "target/mars-reference/stage42-mutation-root-mux.log",
+      "sha256": "759df570a242c4442005174f3e4b7d8ede8eb2a8d4490986de9cabcde31116c9"
+    },
+    {
+      "path": "target/mars-reference/stage42-network-build.log",
+      "sha256": "d2541d248791a328f1bec4789986f3ed5ddb09487ca208c5df53732aeeeaa9c4"
+    },
+    {
+      "path": "target/mars-reference/stage42-rv64-build.log",
+      "sha256": "2aa9945cb7770f99057ee66d263a75b166a1355585a0d14a367f6fa3c60198b6"
+    },
+    {
+      "path": "target/mars-reference/stage42-rv64-model/serial.log",
+      "sha256": "6ea53722d925bbd0cb3df8c1488e4edec667452fd4f51e1f728e29f2238ce4af"
+    },
+    {
+      "path": "target/mars-reference/stage42-rv64-model/summary.json",
+      "sha256": "b20c5538e24529b42c3aaa4372c4a5ca44321057f62bc4b181ae817a12b2d3bd"
+    }
+  ]
+}

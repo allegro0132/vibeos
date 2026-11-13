@@ -55,8 +55,6 @@ pub const TIMEBASE_HZ: u64 = 25_000_000;
 pub const DWMAC: DwmacDescription = DwmacDescription {
     registers: AddressRange::new(ETHERNET_BASE, ETHERNET_MMIO_END),
     irq: ETHERNET_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
-    efuse: AddressRange::new(EFUSE_BASE, EFUSE_MMIO_END),
     phy_address: 0,
     dma_address_bits: 32,
     cache_line_bytes: 64,
@@ -64,7 +62,6 @@ pub const DWMAC: DwmacDescription = DwmacDescription {
 pub const SDHCI: SdhciDescription = SdhciDescription {
     registers: AddressRange::new(SDHCI_BASE, SDHCI_MMIO_END),
     irq: SDHCI_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     source_clock_hz: 375_000_000,
     bus_width: 1,
     init_clock_hz: 400_000,
@@ -72,9 +69,7 @@ pub const SDHCI: SdhciDescription = SdhciDescription {
 };
 pub const DWC2: Dwc2Description = Dwc2Description {
     registers: AddressRange::new(USB_BASE, USB_MMIO_END),
-    phy: AddressRange::new(USB_PHY_BASE, USB_PHY_END),
     irq: USB_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     dma_address_bits: 32,
     cache_line_bytes: 64,
 };
@@ -118,6 +113,7 @@ pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
 ];
 
 pub const MMU: MmuDescription = MmuDescription {
+    ram_granularity: vibeos_hal::MappingGranularity::Page4K,
     ram: AddressRange::new(RAM_START, RAM_END),
     ram_attributes: MemoryAttributes::THeadNormal,
     mmio_attributes: MemoryAttributes::THeadDevice,
@@ -187,6 +183,7 @@ impl BoardContract for Board {
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;
+    const RESET: Option<fn() -> !> = Some(cold_reset);
     const HART_IDS: &'static [usize] = HART_IDS;
 
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

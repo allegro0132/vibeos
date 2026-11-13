@@ -1,0 +1,58 @@
+{
+  "status": "foundation-only; full port incomplete",
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "target": "Milk-V Mars, 4 GiB, microSD",
+  "rustc": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)",
+  "qemu": "QEMU emulator version 11.0.3",
+  "checks": [
+    {
+      "name": "host",
+      "passed": 49,
+      "log_sha256": "fe45be8d97d01240d6e3e9dc27bd4578afb5a8ca90f3745a9f2140f13b92baf1",
+      "local_log": "target/mars-reference/all-host-tests.log"
+    },
+    {
+      "name": "qemu-mmu",
+      "passed": true,
+      "log_sha256": "932a933b4e019ff980db04246fd2b8c2b96c9086a7eb23b79af27afb2fb603f6",
+      "local_log": "target/mars-reference/qemu-mmu.log"
+    },
+    {
+      "name": "qemu-selftest",
+      "passed": 390,
+      "log_sha256": "20c646900bab77d16c560ac57c10f9350ad0ecc1fbbdef575128d80e3bdb624f",
+      "local_log": "target/mars-reference/qemu-selftest.log"
+    },
+    {
+      "name": "duo-build",
+      "passed": true,
+      "log_sha256": "f5fc5747a2590e8a62ee0f5d951f369887f98b3c03d6cedf41361ee00c5f7fa0",
+      "local_log": "target/mars-reference/duo-build.log"
+    }
+  ],
+  "mutations": [
+    {
+      "package": "vibeos-driver-plic",
+      "mutation": "context * 0x80 -> context * 0x40",
+      "test": "duo_context_only_clears_implemented_enable_words",
+      "caught": true
+    },
+    {
+      "package": "vibeos-driver-uart16550",
+      "mutation": "let _ = r.read(0x1f); -> let _ = r.read(0x1e);",
+      "test": "busy_irq_acknowledges_usr_even_with_no_interrupt_bit",
+      "caught": true
+    }
+  ],
+  "hardware_acceptance": "not run; no Mars firmware or physical qualification",
+  "pending": [
+    "remaining kernel/BSP/driver separation",
+    "JH7110 clocks/reset/pinmux and DMA implementation",
+    "live MMU and allocator integration",
+    "DW-MSHC kernel service integration",
+    "GMAC5/PHY driver",
+    "Mars firmware and bootloader/SD image packaging",
+    "SSH entropy qualification and runtime integration",
+    "three cold boots and one-hour stress acceptance"
+  ]
+}

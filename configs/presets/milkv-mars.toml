@@ -1,0 +1,12 @@
+# VibeOS build configuration. Edit this file or run ./configure.sh.
+version = 1
+boards = ["milkv-mars"]
+components = [
+    "file-tree",
+    "network",
+    "vsh",
+]
+
+[drivers]
+dw-mshc = "on"
+eqos-net = "on"

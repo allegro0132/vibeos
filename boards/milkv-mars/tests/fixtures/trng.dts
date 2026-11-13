@@ -1,0 +1,10 @@
+// Pinned vendor TRNG with enabled status from the final Mars board include.
+/include/ "network.dts"
+&{/soc} {
+ trng@1600C000 {
+  compatible = "starfive,jh7110-trng"; status = "okay";
+  reg = <0 0x1600c000 0 0x4000>;
+  clocks = <200 205 200 206>; clock-names = "hclk", "ahb";
+  resets = <201 131>; interrupts = <30>;
+ };
+};

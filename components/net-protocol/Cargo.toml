@@ -6,12 +6,37 @@ edition = "2021"
 [features]
 # Explicit board/service policy; other images keep their current ICMP behavior.
 icmp-echo = ["smoltcp/auto-icmp-echo-reply"]
+gro-prefix-views = ["gro-checked"]
+gro-full-batch = ["gro-wide", "smoltcp/tcp-gro-full-batch"]
+gro-wide = ["gro-checked", "smoltcp/tcp-gro-wide"]
+rx-align-empty = ["smoltcp/tcp-align-empty-rx"]
+receive-exchange-profile = ["receive-buffer-exchange"]
+gro-checked = ["gro-scatter", "gro-atomic-id"]
+gro-scatter = ["gro-batch-release", "smoltcp/tcp-gro-receive"]
+frontend-rx-batch = []
+rx-admission-batch = ["pooled-rx", "bounded-gro", "vibeos-core/rx-admission-batch"]
+gro-batch-release = ["bounded-gro", "pooled-rx", "vibeos-core/rx-batch-release"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro"]
+gro-end-profile = ["bounded-gro"]
+tx-lease-profile = ["native-tcp-segmentation", "vibeos-core/tx-lease-profile"]
+skip-empty-service = []
+activity-events = ["vibeos-net-api/activity-events"]
+receive-buffer-exchange = ["smoltcp/tcp-buffer-exchange", "vibeos-net-api/receive-buffer-exchange"]
+# DMA loans through the capability-addressed detached receive transport.
+pooled-rx = []
+network-tx-audit = ["vibeos-core/network-tx-audit"]
+native-tcp-segmentation = ["smoltcp/tcp-segmentation"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = []
+tcp-large-window = []
 
 [dependencies]
-smoltcp = { version = "=0.13.1", default-features = false, features = [
+smoltcp = { version = "=0.14.0", default-features = false, features = [
     "alloc",
     "medium-ethernet",
     "proto-ipv4",
+    "auto-icmp-echo-reply",
     "socket-dhcpv4",
     "socket-tcp",
     "socket-tcp-reno",

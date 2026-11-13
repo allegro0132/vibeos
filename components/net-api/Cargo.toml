@@ -3,5 +3,11 @@ name = "vibeos-net-api"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+tcp-read-profile = []
+receive-buffer-exchange = []
+network-profile = ["vibeos-core/network-profile"]
+activity-events = []
+
 [dependencies]
 vibeos-core = { path = "../../core" }

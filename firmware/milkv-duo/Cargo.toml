@@ -5,6 +5,14 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
+# Reusable services; this firmware selects the appropriate entropy provider.
+provisioned-ssh = ["vibeos-kernel/provisioned-ssh", "vibeos-kernel/jitter-entropy"]
+provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]
+provisioned-wasmtime = ["provisioned-command", "vibeos-kernel/provisioned-wasmtime"]
+dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
+
 python = ["vibeos-kernel/milkv-python"]
 wasmtime = ["vibeos-kernel/milkv-wasmtime"]
 wasmtime-benchmark = ["wasmtime", "vibeos-kernel/wasi-long-fuel"]
@@ -47,3 +55,12 @@ bench = false
 
 [dependencies]
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["milkv-duo", "milkv-duo-sd-image"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-milkv-duo = { path = "../../boards/milkv-duo" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }
+vibeos-driver-sdhci-blk = { path = "../../drivers/sdhci-blk" }
+vibeos-platform-cv1800b = { path = "../../platform/cv1800b" }
+vibeos-driver-dwmac-net = { path = "../../drivers/dwmac-net" }
+vibeos-driver-milkv-duo-led = { path = "../../drivers/milkv-duo-led" }
+vibeos-driver-dwc2-host = { path = "../../drivers/dwc2-host" }

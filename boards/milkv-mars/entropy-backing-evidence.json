@@ -1,0 +1,49 @@
+{
+  "status": "Explicit DMA/private backing contract and instance capability verified",
+  "host_hal_driver_tests": 41,
+  "qemu_dma_provider_statistics": [
+    {
+      "bytes": 64,
+      "interrupts": 1
+    },
+    {
+      "bytes": 64,
+      "interrupts": 1
+    }
+  ],
+  "qemu_harts_per_boot": 1,
+  "native_provider": "actual kernel adapter fixture uses DriverOwned without DMA callbacks",
+  "mutation": "fabricated zero-length DMA backing detected",
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Private backing adapter test does not instantiate native Mars hardware in the complete kernel",
+    "Native service publication and entropy qualification remain pending"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage49-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage49-host.log",
+      "sha256": "fbb9fe0f6d5faddadf9071b9cd42816cc23bf77c76285621e4da6f27980b78f1"
+    },
+    {
+      "path": "target/mars-reference/stage49-interrupt-test.log",
+      "sha256": "620099cbb523d788c70fe731e21d7723570aa6490d404601c8776d449d34b630"
+    },
+    {
+      "path": "target/mars-reference/stage49-mutation-fabricated-dma.log",
+      "sha256": "661d741c85184cc3bc3d4220ab2a82141e283d748bf17f32d1ed60dd4c1332f5"
+    },
+    {
+      "path": "target/mars-reference/stage49-interrupt/boot-1.log",
+      "sha256": "92bd27870fa7d733ee53a2a6dd869f97d0dbf3b6b40771f68f4b9a7f17d4540e"
+    },
+    {
+      "path": "target/mars-reference/stage49-interrupt/boot-2.log",
+      "sha256": "4f52f4ef38d8efa9f20edf616a572398694bbe148cede9814cf9c245a2f4637f"
+    }
+  ]
+}

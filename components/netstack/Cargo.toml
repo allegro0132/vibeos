@@ -4,6 +4,31 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+gro-prefix-views = ["gro-checked", "vibeos-net-protocol/gro-prefix-views"]
+gro-full-batch = ["gro-wide", "vibeos-net-protocol/gro-full-batch"]
+gro-wide = ["gro-checked", "vibeos-net-protocol/gro-wide"]
+rx-align-empty = ["vibeos-net-protocol/rx-align-empty"]
+receive-exchange-profile = ["receive-buffer-exchange", "vibeos-net-protocol/receive-exchange-profile"]
+gro-checked = ["vibeos-net-protocol/gro-checked"]
+gro-scatter = ["vibeos-net-protocol/gro-scatter"]
+frontend-rx-batch = ["vibeos-net-protocol/frontend-rx-batch"]
+inline-device-service = []
+rx-admission-batch = ["vibeos-net-protocol/rx-admission-batch"]
+gro-batch-release = ["vibeos-net-protocol/gro-batch-release"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro", "vibeos-net-protocol/gro-atomic-id"]
+gro-end-profile = ["bounded-gro", "vibeos-net-protocol/gro-end-profile"]
+tx-lease-profile = ["vibeos-net-protocol/tx-lease-profile"]
+skip-empty-service = ["vibeos-net-protocol/skip-empty-service"]
+# Experimental protocol binding; firmware assembly remains disabled.
+receive-buffer-exchange = ["vibeos-net-protocol/receive-buffer-exchange"]
+event-driven = ["vibeos-net-api/activity-events"]
+pooled-rx = ["vibeos-net-protocol/pooled-rx"]
+network-tx-audit = ["vibeos-net-protocol/network-tx-audit"]
+native-tcp-segmentation = ["vibeos-net-protocol/native-tcp-segmentation"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = ["vibeos-net-protocol/bounded-gro"]
+tcp-large-window = ["vibeos-net-protocol/tcp-large-window"]
 default = ["tcp-echo"]
 static-service = []
 dhcp-service = []

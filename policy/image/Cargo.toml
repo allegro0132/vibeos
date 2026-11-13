@@ -8,9 +8,12 @@ vibeos-component-admission = { path = "../../services/component-admission", opti
 vibeos-component-format = { path = "../../component-format" }
 
 [features]
+runtime-image = []
 default = ["qemu-default"]
 qemu-default = []
 milkv-duo-sd = []
+# A firmware-bounded device exports a zero-based 512 MiB data partition.
+bounded-device = []
 c53-native-async-qemu-acceptance = []
 c53-native-async-command-projection = []
 c88-f4-float-candidate = []

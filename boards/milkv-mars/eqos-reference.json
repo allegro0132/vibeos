@@ -1,0 +1,31 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "u-boot/drivers/net/dwc_eth_qos.c",
+      "sha256": "93ca2f0b3bdbaeac24cd2659ded46453ca0447e72415d2ef86c4cb99f887b669"
+    },
+    {
+      "path": "u-boot/drivers/net/phy/phy.c",
+      "sha256": "cfd7c63283e383fcd8fcef2f8c4af6c57bfa826a0fdff70a7b7d821c3be0d4f6"
+    },
+    {
+      "path": "linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.h",
+      "sha256": "51cf590173358ee6e0e89e6958086236fe8f639b26e8d216ffcd18e3f221dd27"
+    },
+    {
+      "path": "linux/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c",
+      "sha256": "42f4f85951190fd880ffce84a33e76a49e1066f4605d0a21577366e4dffd182c"
+    },
+    {
+      "path": "linux/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c",
+      "sha256": "3d27d0d81e3315beb4c319abbbbbfc4855f7f21702710b2f5a2a0f945af1341b"
+    },
+    {
+      "path": "linux/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c",
+      "sha256": "07c0f7deee72c77ed39828d6d356e7987c4f4e220c60d62f1bb6039d35116d12"
+    }
+  ],
+  "scope": "EQoS Clause 22 register commands, CSR clock selection, basic descriptor fields and AXI descriptor stride; not platform/DMA qualification"
+}

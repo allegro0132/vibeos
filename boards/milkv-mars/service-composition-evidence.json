@@ -1,0 +1,94 @@
+{
+  "status": "Reusable provisioned services verified in software; Mars incomplete",
+  "host_entropy_contract_tests": 1,
+  "python_tests": 9,
+  "qemu_selftests": 390,
+  "provisioning": {
+    "status": "passed",
+    "boots": 2,
+    "host_identity_persisted": true,
+    "client_public_key_persisted": true,
+    "client_key_not_automatically_authorized": true,
+    "kernel_sha256": "6c277c8be547ebeb2b894368f5c0651f46bd4352f9005c47c02e72e95f2f6b54",
+    "physical_entropy_qualified": false
+  },
+  "duo_release_builds": {
+    "generic_ssh": "passed",
+    "legacy_default": "passed",
+    "generic_wasmtime_lp64d": "passed"
+  },
+  "wasmtime_artifact": {
+    "path": "target/riscv64gc-unknown-none-elf/release/vibeos-milkv-duo",
+    "sha256": "77c1ee3cf888aa4fdcda7e09b98ab0a7fb7da6bc645623847b3483e905f8a0b4",
+    "elf_flags": "0x5",
+    "float_abi": "LP64D",
+    "features": "provisioned-wasmtime"
+  },
+  "negative_checks": [
+    "Missing entropy provider rejects provisioned SSH configuration",
+    "LP64 target rejects Wasmtime; LP64D build passes",
+    "Removing partial-seed erasure fails isolated mutation test"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage16-seed-tests.log",
+      "sha256": "b9b6d45694aed87faa97bf11002ff93b7a813dc310e9a8450226c45b17612c90"
+    },
+    {
+      "path": "target/mars-reference/stage16-seed-mutation.log",
+      "sha256": "3707cf2da5e6a0cf9cab60f13dcea5e6306e7553555baea13ad61b6b0613c358"
+    },
+    {
+      "path": "target/mars-reference/stage16-python-tests.log",
+      "sha256": "5684d13977a1f6829bcd5f644c72b35ab6f8d42951d571a5f230c4cc35a359f3"
+    },
+    {
+      "path": "target/mars-reference/stage16-boundary-audit.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage16-qemu-selftest.log",
+      "sha256": "859b2dcc3b52daae2ac5dddc8c7b9fdb845a5a028acf3c50b91dc3e9df2d2e93"
+    },
+    {
+      "path": "target/mars-reference/stage16-duo-generic-build.log",
+      "sha256": "e55e1ad4aae9548e95f0b43e41550211f99219b2c920860e7734f76680ae5693"
+    },
+    {
+      "path": "target/mars-reference/stage16-duo-legacy-final-build.log",
+      "sha256": "bcce1ddf5c0ff8f7c6a47d32f4338bffa7203e5e799ceef67767de8a54f3eac2"
+    },
+    {
+      "path": "target/mars-reference/stage16-duo-wasmtime-lp64d-build.log",
+      "sha256": "5a7b4d8fd16264dd2a8171bcba39e8cce812b572b678daa4359e7f4aaf9b5a8b"
+    },
+    {
+      "path": "target/mars-reference/stage16-wasmtime-artifact.json",
+      "sha256": "57adee54d88fd28fb00231c20e7308aa711aba63847cd637515368792dc43ebe"
+    },
+    {
+      "path": "target/mars-reference/stage16-missing-provider.log",
+      "sha256": "666af133b85e866d231771101b6f42d6560a59174297ac3170174850b4d13fcc"
+    },
+    {
+      "path": "target/mars-reference/stage16-provisioned-recheck/boot-1.log",
+      "sha256": "8d01c2a9bf8a1d579c81ed69c32128a25179978a5add5c33b9cb6ac822a9d312"
+    },
+    {
+      "path": "target/mars-reference/stage16-provisioned-recheck/boot-2.log",
+      "sha256": "d8945c4303d8291ee2e005097ebc0a70f3ac5088ff2106b8a7d9bf1826475e65"
+    },
+    {
+      "path": "target/mars-reference/stage16-provisioned-recheck/summary.json",
+      "sha256": "1c5155f0371c6147b8fb8e74e92718ecd248ef27e3b6a4ab08a5fcaf8d18bfc4"
+    }
+  ],
+  "hardware_acceptance": "not run; no physical entropy or SSH/WASM transport claim",
+  "remaining": [
+    "Remove remaining kernel board-selection branches",
+    "Shared MDIO/PHY support, JH7110 platform and Mars firmware integration",
+    "DW-MSHC SD and GMAC5/EQoS Ethernet integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification, three cold boots and stability acceptance"
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "status": "Shared SEC domain lifecycle implemented; production entropy composition pending",
+  "host_tests": 56,
+  "new_platform_tests": 7,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 3,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121921536,
+    "kernel_sha256": "0f7c73c3b1311fcbfe9f0270d00a4a9c1ba49b131831adcedde6b34e50e3cc9f",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "mutations": [
+    "reset acknowledgement omitted: detected",
+    "clock gating before reset proof: detected",
+    "reset mask broadened: detected",
+    "deadline omitted: detected"
+  ],
+  "physical_acceptance": false,
+  "production_domain_instantiated": false,
+  "blind_spots": [
+    "Model does not access actual STG MMIO or verify reset synchronizers",
+    "Parent STG clock lifetime and exclusive ownership of all SEC clients are constructor/caller obligations",
+    "No entropy-quality, IRQ, SSH or board stability evidence"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage39-host.log",
+      "sha256": "47f1469785f41e961b74d1c42900e4f24848f0feebecc56dc9c8a2cdb8ee7560"
+    },
+    {
+      "path": "target/mars-reference/stage39-rv64-build.log",
+      "sha256": "2b22762e969dceeb131ce23d7657d2162c147dcb10d7d74aef65eb4618fcf99c"
+    },
+    {
+      "path": "target/mars-reference/stage39-rv64-model/serial.log",
+      "sha256": "7eb2e9ddb4b3deff6f8eb13118f51cc0d52a42a1ef63e33a450d1155e6e4ffd7"
+    },
+    {
+      "path": "target/mars-reference/stage39-rv64-model/summary.json",
+      "sha256": "4d62a784bf58830df68968a90b3163f070b541b35b05b9b06eec911cf085a126"
+    },
+    {
+      "path": "target/mars-reference/stage39-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage39-mutation-deadline.log",
+      "sha256": "70f16e77b579f19306bacfbc2aa706a0ece768a65e949bef76cf940b579c88f8"
+    },
+    {
+      "path": "target/mars-reference/stage39-mutation-gate-order.log",
+      "sha256": "a0d2a9816967d2b3fbbabf794cfccdef1ae80c5f3c28f1a8f4b2ed3383ec350b"
+    },
+    {
+      "path": "target/mars-reference/stage39-mutation-reset-ack.log",
+      "sha256": "32ba80328647884ca9cd9ac5c5e3d83d42026db6b82735ee70425e44a14abcea"
+    },
+    {
+      "path": "target/mars-reference/stage39-mutation-reset-mask.log",
+      "sha256": "aac4016bf17c2f4e88178dc37c55254de3e5032482f43b61301bbca996645012"
+    },
+    {
+      "path": "target/mars-reference/stage39-official-dtb.log",
+      "sha256": "8c08aedfdfd00245f4889d705f513ae027dfffa6a473a240123206dd5da0fd98"
+    },
+    {
+      "path": "target/mars-reference/stage39-mars-build.log",
+      "sha256": "564f81473037ca7cdb63dae2c0c50eca4f37edc0737d356a01b34a2c0438672d"
+    }
+  ],
+  "mars_network_payload_elf_contract": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "1f53d89bc3001836e7eb3bd42fb02a10bfd94a84ce6eecd26f82745566688860",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 51984,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  }
+}

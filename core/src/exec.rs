@@ -702,6 +702,8 @@ enum CancelRequest {
 struct TaskStatus {
     published: Arc<AtomicBool>,
     polls: AtomicU64,
+    #[cfg(feature = "executor-profile")]
+    poll_ticks: AtomicU64,
     state: AtomicU8,
     next_joiner: AtomicU64,
     joiners: SpinLock<Vec<JoinWaiter>>,
@@ -724,6 +726,8 @@ impl TaskStatus {
         Self {
             published,
             polls: AtomicU64::new(0),
+            #[cfg(feature = "executor-profile")]
+            poll_ticks: AtomicU64::new(0),
             state: AtomicU8::new(TaskState::Running as u8),
             next_joiner: AtomicU64::new(1),
             joiners: SpinLock::new(joiners),
@@ -1151,6 +1155,14 @@ fn current_task_exact_wake() -> Option<ExactTaskWake> {
     })
 }
 
+/// Current poll's task and registered allocation domain from one scheduler
+/// observation. Temporary heap-owner scopes do not change this identity.
+/// This is provenance, not authority or proof that the task has stopped.
+pub fn current_task_allocation_identity() -> Option<(TaskId, AllocationDomain)> {
+    let current = current_task_exact_wake()?;
+    Some((current.task, current.domain))
+}
+
 /// Exact identity of the executor scope currently polling or destroying a task.
 /// Unlike `current_task_id`, this remains available during guarded destruction
 /// after the running slot is detached. This is cleanup provenance only, not
@@ -1465,6 +1477,13 @@ impl TaskHandle {
             })
     }
 
+    /// Elapsed timebase ticks in completed polls, including interrupt time.
+    /// Retained after exit so monitors can compute deltas across teardown.
+    #[cfg(feature = "executor-profile")]
+    pub fn poll_ticks(&self) -> u64 {
+        self.status.poll_ticks.load(Ordering::Relaxed)
+    }
+
     /// Number of tasks currently registered to join this task.
     ///
     /// This is exposed for runtime diagnostics and reclamation invariants.
@@ -1671,6 +1690,8 @@ pub struct TaskReport {
     pub name: String,
     pub state: TaskState,
     pub polls: u64,
+    #[cfg(feature = "executor-profile")]
+    pub poll_ticks: u64,
 }
 
 struct Task {
@@ -6154,6 +6175,8 @@ pub fn task_report() -> Vec<TaskReport> {
                     name,
                     state: task.status.state(),
                     polls: task.status.polls.load(Ordering::Acquire),
+                    #[cfg(feature = "executor-profile")]
+                    poll_ticks: task.status.poll_ticks.load(Ordering::Relaxed),
                 });
             }
             if !allocation_failed {
@@ -6171,6 +6194,8 @@ pub fn task_report() -> Vec<TaskReport> {
                         name,
                         state: running.status.state(),
                         polls: running.status.polls.load(Ordering::Acquire),
+                    #[cfg(feature = "executor-profile")]
+                    poll_ticks: running.status.poll_ticks.load(Ordering::Relaxed),
                     });
                 }
             }
@@ -6318,6 +6343,8 @@ fn waker_for(id: TaskId) -> Waker {
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {
     let hart = require_current_scheduler_hart("executor run loop");
+    #[cfg(feature = "idle-profile")]
+    IDLE_PROFILE[hart.index()].activate(arch::time());
     loop {
         if poll_once_on(hart) {
             continue;
@@ -6340,10 +6367,26 @@ pub fn run() -> ! {
         let queue_idle = SCHED.lock().ready.hart_idle(hart);
         let reasons = ipi::take_idle_reasons(hart);
         if queue_idle && reasons == 0 {
+            #[cfg(feature = "idle-profile")]
+            IDLE_PROFILE[hart.index()].enter(arch::time());
             arch::wait_for_interrupt();
+            #[cfg(feature = "idle-profile")]
+            IDLE_PROFILE[hart.index()].leave(arch::time());
         }
         arch::irq_restore(irq);
     }
+}
+
+#[cfg(feature = "idle-profile")]
+static IDLE_PROFILE: [crate::idle_profile::Counter; MAX_HARTS] =
+    [const { crate::idle_profile::Counter::new() }; MAX_HARTS];
+#[cfg(feature = "idle-profile")]
+pub use crate::idle_profile::Snapshot as IdleSnapshot;
+/// WFI interval residency, sampled without per-packet/per-lock instrumentation.
+/// Includes an ongoing idle interval. Unavailable snapshots are never zero load.
+#[cfg(feature = "idle-profile")]
+pub fn idle_profile() -> [Option<IdleSnapshot>; MAX_HARTS] {
+    core::array::from_fn(|i| IDLE_PROFILE[i].snapshot(arch::time))
 }
 
 /// Poll at most one ready task. Returns false when nothing was runnable.
@@ -6354,7 +6397,30 @@ pub fn poll_once() -> bool {
     poll_once_on(hart)
 }
 
+#[cfg(feature = "executor-profile")]
+static PROFILE_TICKS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+#[cfg(feature = "executor-profile")]
+static PROFILE_CALLS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+/// Cumulative elapsed time inside executor turns (including task polls and
+/// interrupts), not CPU cycles or WFI residency. Snapshots are approximate.
+#[cfg(feature = "executor-profile")]
+pub fn execution_profile() -> (u64, [u64; MAX_HARTS], [u64; MAX_HARTS]) {
+    (arch::time(), core::array::from_fn(|i| PROFILE_TICKS[i].load(Ordering::Relaxed)),
+     core::array::from_fn(|i| PROFILE_CALLS[i].load(Ordering::Relaxed)))
+}
+#[cfg(feature = "executor-profile")]
+struct ProfileTurn { hart: HartId, start: u64 }
+#[cfg(feature = "executor-profile")]
+impl Drop for ProfileTurn {
+    fn drop(&mut self) {
+        PROFILE_TICKS[self.hart.index()].fetch_add(arch::time().wrapping_sub(self.start), Ordering::Relaxed);
+        PROFILE_CALLS[self.hart.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
 fn poll_once_on(hart: HartId) -> bool {
+    let _network_executor = crate::net_profile::Scope::enter(crate::net_profile::Stage::Executor);
+    #[cfg(feature = "executor-profile")]
+    let _profile = ProfileTurn { hart, start: arch::time() };
     debug_assert_eq!(
         current_scheduler_hart(),
         Some(hart),
@@ -6517,6 +6583,9 @@ fn poll_once_on(hart: HartId) -> bool {
     // boundary; ordinary safe tasks carry an untracked domain.
     let mut owner_scope = unsafe { heap::enter_domain_on_hart(task.domain, hart) };
     check_active_poll!(id, task.domain, &status);
+    #[cfg(feature = "executor-profile")]
+    let profile_start = arch::time();
+    let network_task = crate::net_profile::Scope::task(&task.name);
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -6536,6 +6605,9 @@ fn poll_once_on(hart: HartId) -> bool {
             false
         }
     };
+    drop(network_task);
+    #[cfg(feature = "executor-profile")]
+    status.poll_ticks.fetch_add(arch::time().wrapping_sub(profile_start), Ordering::Relaxed);
     // `run_guarded` may have returned through a longjmp, which bypasses Drop
     // for scopes created inside the guarded call. Restore at the executor
     // boundary before touching scheduler infrastructure or another task.
@@ -7461,7 +7533,12 @@ fn next_timer_id() -> u64 {
 fn arm_locked(timers: &[TimerEntry]) {
     let heartbeat = arch::time().saturating_add(HEARTBEAT_SECS.saturating_mul(timebase_hz()));
     let next = timers.last().map(|timer| timer.deadline);
-    arch::set_timer(next.map_or(heartbeat, |deadline| deadline.min(heartbeat)));
+    let deadline = next.map_or(heartbeat, |deadline| deadline.min(heartbeat));
+    #[cfg(feature = "pc-sample")]
+    let deadline = current_scheduler_hart().map_or(deadline, |hart| {
+        crate::pc_sample::RECORDER.deadline(hart.index(), arch::time(), deadline)
+    });
+    arch::set_timer(deadline);
 }
 
 fn unregister_timer(id: u64) -> Option<Waker> {
@@ -7799,6 +7876,33 @@ mod one_shot_wait_tests {
     }
 
     #[test]
+    fn allocation_identity_uses_running_domain_across_temporary_owner_scopes() {
+        let _serial = EXECUTOR_TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        assert!(current_task_allocation_identity().is_none());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let inside = observed.clone();
+        let owner = OwnerId::new(133);
+        spawn_tracked_owned(owner, "allocation-identity", async move {
+            let (task, domain) = current_task_allocation_identity().unwrap();
+            assert_eq!(Some(task), current_task_id());
+            assert_eq!(domain, AllocationDomain::untracked(owner));
+            {
+                let _system = heap::enter_owner(OwnerId::SYSTEM);
+                assert_ne!(heap::current_domain(), domain);
+                assert_eq!(current_task_allocation_identity(), Some((task, domain)));
+            }
+            yield_now().await;
+            assert_eq!(current_task_allocation_identity(), Some((task, domain)));
+            inside.store(1, Ordering::SeqCst);
+        });
+        run_until_idle(10_000);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(current_task_allocation_identity().is_none());
+    }
+
+    #[test]
     fn bounded_continuation_yields_to_ready_work_and_cancellation() {
         let _serial = EXECUTOR_TEST_SERIAL
             .lock()
@@ -8133,6 +8237,7 @@ mod one_shot_wait_tests {
         let _task = unsafe { enter_current_task_on_hart(HartId::BOOT, task, status.clone()) };
         assert_eq!(current_task_scope_id(), Some(task));
         assert_eq!(current_task_id(), None); // Detached scope, like guarded Drop.
+        assert!(current_task_allocation_identity().is_none());
 
         assert!(!try_reserve_current_task_registrations(0));
         assert!(!try_reserve_current_task_registrations(5));

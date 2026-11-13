@@ -4,6 +4,25 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+hang-failure-report = []
+hang-watchdog = ["hang-failure-report"]
+hang-watchdog-selftest = ["hang-watchdog"]
+rx-boundary-profile = ["rx-admission-batch"]
+rx-admission-batch = ["vibeos-hal/rx-admission-batch"]
+rx-queue-profile = []
+rx-batch-release = ["vibeos-hal/rx-batch-release"]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = []
+rx-publish-batch = []
+tx-lease-profile = []
+copy-profile = []
+pc-sample = []
+idle-profile = []
+network-tso-probe = []
+network-profile = []
+network-tx-audit = []
+# Diagnostic execution timing; excludes sleeping/WFI time.
+executor-profile = []
 # Target-only fault-gate corruption/probe hooks used by the C4.8 QEMU
 # acceptance image. Production profiles must not enable this feature.
 wasm-c48-target-acceptance = []

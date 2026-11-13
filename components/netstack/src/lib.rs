@@ -21,17 +21,43 @@ compile_error!("select a netstack address policy");
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use vibeos_core::cap::{Cap, Revocable};
-use vibeos_core::chan::Endpoint;
-use vibeos_core::net::{PacketStamp, StampedPacket};
+use vibeos_core::net::PacketStamp;
 use vibeos_net_api::TcpListener;
 use vibeos_net_protocol::{
     Ipv4StackConfig, SharedIpv4TcpStack, TcpListenerHandle, MAX_TCP_LISTENERS,
 };
 
 pub use vibeos_net_protocol::command::NetworkInterfaceId;
+pub use vibeos_net_protocol::{PacketTransmit, PacketReceive};
+#[cfg(feature = "gro-end-profile")]
+pub use vibeos_net_protocol::{GRO_PROFILE_LEN, GRO_PROFILE_NONE_OFFSET};
 
 pub mod command;
 pub mod config;
+
+#[cfg(feature = "rx-admission-batch")]
+static RX_ADMISSION_SIZES: [core::sync::atomic::AtomicU64; 9] = [const { core::sync::atomic::AtomicU64::new(0) }; 9];
+#[cfg(feature = "rx-admission-batch")]
+pub fn rx_admission_sizes() -> [u64; 9] {
+    core::array::from_fn(|i| RX_ADMISSION_SIZES[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// Approximate once-per-second totals for live stack instances; no hot-path
+/// atomic increments. Diagnostic only, not a lifetime delivery guarantee.
+#[cfg(feature = "gro-end-profile")]
+static GRO_END_STATS: [core::sync::atomic::AtomicU64; GRO_PROFILE_LEN] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; GRO_PROFILE_LEN];
+#[cfg(feature = "gro-end-profile")]
+pub fn gro_end_stats() -> [u64; GRO_PROFILE_LEN] {
+    core::array::from_fn(|i| GRO_END_STATS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+#[cfg(feature = "bounded-gro")]
+static GRO_STATS: [core::sync::atomic::AtomicU64; 3] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 3];
+#[cfg(feature = "bounded-gro")]
+pub fn gro_stats() -> [u64; 3] {
+    core::array::from_fn(|i| GRO_STATS[i].load(core::sync::atomic::Ordering::Relaxed))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkInfo {
@@ -53,12 +79,18 @@ pub enum NetworkBindError {
 }
 
 pub type PacketEndpoints = (
-    Revocable<Endpoint<StampedPacket>>,
-    Revocable<Endpoint<StampedPacket>>,
+    PacketTransmit,
+    PacketReceive,
 );
 
 /// Privileged packet and network-control operations consumed by this component.
 pub trait Platform: Sync {
+    /// One bounded synchronous device turn. No device reference escapes this
+    /// call. Implementations retain device authority and exclusive ownership.
+    /// `receive` is true before protocol processing; the final false turn
+    /// services generated TX/completions and idle notification arming only.
+    #[cfg(feature = "inline-device-service")]
+    fn service_device(&self, _control: Cap, _receive: bool) -> Result<bool, NetworkBindError> { Ok(false) }
     fn packet_endpoints(&self, outbound: Cap, inbound: Cap) -> Option<PacketEndpoints>;
     fn bind_stack(&self, control: Cap) -> Result<PacketStamp, NetworkBindError>;
     fn network_info(&self, control: Cap) -> Option<NetworkInfo>;
@@ -75,6 +107,18 @@ const TCP_TEST_SEED: u64 = 0x5649_4245_4f53_4e31;
 // Keep the timer fallback short enough that ingress and TCP ACK work does not
 // acquire an additional 10 ms of latency on polling-only hardware backends.
 const IDLE_POLL_CEILING_MS: u64 = 1;
+
+#[cfg(feature = "receive-buffer-exchange")]
+static EXCHANGE_BYTES: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+#[cfg(feature = "receive-buffer-exchange")]
+pub fn receive_exchange_bytes() -> [u64; 2] {
+    core::array::from_fn(|i| EXCHANGE_BYTES[i].load(core::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "receive-exchange-profile")]
+pub fn receive_exchange_attempts() -> [u64; 16] {
+    vibeos_net_protocol::receive_exchange::attempt_stats()
+}
 
 pub const COMPONENT_NAME: &str = "net-stack";
 pub const MAX_SERVICE_LISTENERS: usize = MAX_TCP_LISTENERS;
@@ -236,13 +280,46 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
     if interfaces.is_empty() {
         return;
     }
+    #[cfg(not(feature = "event-driven"))]
+    let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
+    #[cfg(feature = "event-driven")]
+    let notifications = {
+        let mut events = Vec::new();
+        if events.try_reserve_exact(interfaces.len() * (MAX_SERVICE_LISTENERS + 1)).is_err() { return; }
+        for interface in &interfaces {
+            let Ok(input) = interface.inbound.message_event() else { return; };
+            events.push(input);
+            for listener in &interface.listeners {
+                let Ok(event) = listener.try_with(TcpListener::application_event) else { return; };
+                events.push(event);
+            }
+        }
+        events
+    };
+    #[cfg(feature = "event-driven")]
+    let mut event_armed = false;
+    #[cfg(feature = "event-driven")]
+    let mut wake_futures = {
+        let mut waits = Vec::new();
+        if waits.try_reserve_exact(notifications.len()).is_err() { return; }
+        waits
+    };
 
+    #[cfg(feature = "bounded-gro")]
+    let mut gro_last_ms = 0;
     loop {
         #[cfg(feature = "tcp-echo-recovery-test")]
         if FAULT_REQUESTED.swap(false, Ordering::AcqRel) {
             panic!("injected TCP stack fault");
         }
 
+        // Only an idle candidate pays for listener preparation. After arming,
+        // repeat the full work check before parking to close the wakeup race.
+        #[cfg(feature = "event-driven")]
+        if event_armed {
+            debug_assert!(wake_futures.is_empty());
+            for notification in &notifications { wake_futures.push(notification.wait()); }
+        }
         let now_ms = monotonic_ms();
         let mut live_interfaces = 0usize;
         let mut more_work = false;
@@ -286,10 +363,72 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
                 .store(rejected_stack_generation_ingress, Ordering::Release);
         }
 
+        #[cfg(feature = "bounded-gro")]
+        if now_ms.saturating_sub(gro_last_ms) >= 1000 {
+            let mut totals = [0u64; 3];
+            #[cfg(feature = "rx-admission-batch")]
+            let mut admission_sizes = [0u64; 9];
+            #[cfg(feature = "gro-end-profile")]
+            let mut end_totals = [0u64; GRO_PROFILE_LEN];
+            for interface in &interfaces {
+                if let Some(active) = interface.stack.as_ref() {
+                    let stats = active.core.device_stats();
+                    totals[0] += stats.rx_frames;
+                    totals[1] += stats.gro_merged_segments;
+                    totals[2] += stats.gro_aggregates;
+                    #[cfg(feature = "rx-admission-batch")]
+                    for (total, value) in admission_sizes.iter_mut().zip(stats.rx_admission_sizes) { *total += value; }
+                    #[cfg(feature = "gro-end-profile")]
+                    for (total, value) in end_totals.iter_mut().zip(stats.gro_end_profile) {
+                        *total += value;
+                    }
+                }
+            }
+            for (slot, value) in GRO_STATS.iter().zip(totals) {
+                slot.store(value, core::sync::atomic::Ordering::Relaxed);
+            }
+            #[cfg(feature = "gro-end-profile")]
+            for (slot, value) in GRO_END_STATS.iter().zip(end_totals) {
+                slot.store(value, core::sync::atomic::Ordering::Relaxed);
+            }
+            gro_last_ms = now_ms;
+            #[cfg(feature = "rx-admission-batch")]
+            for (slot, value) in RX_ADMISSION_SIZES.iter().zip(admission_sizes) { slot.store(value, core::sync::atomic::Ordering::Relaxed); }
+        }
+
         if live_interfaces == 0 {
             return;
         }
-        if more_work {
+        #[cfg(feature = "event-driven")]
+        {
+            vibeos_core::net_profile::poll_decision(more_work, more_work || !event_armed);
+            if more_work {
+                wake_futures.clear();
+                event_armed = false;
+                vibeos_core::exec::yield_now().await;
+            } else {
+                if !event_armed {
+                    event_armed = true;
+                    continue;
+                }
+                use core::{future::{poll_fn, Future}, pin::{pin, Pin}, task::Poll};
+                // Timer retains bounded observation of carrier/config changes
+                // and capability revocation, which are not packet notifications.
+                let mut timer = pin!(vibeos_core::exec::sleep_ms(
+                    next_poll_delay_ms.clamp(1, IDLE_POLL_CEILING_MS)));
+                poll_fn(|cx| {
+                    if timer.as_mut().poll(cx).is_ready() { return Poll::Ready(()); }
+                    for waiter in &mut wake_futures {
+                        if Pin::new(waiter).poll(cx).is_ready() { return Poll::Ready(()); }
+                    }
+                    Poll::Pending
+                }).await;
+                wake_futures.clear();
+                event_armed = false;
+            }
+        }
+        #[cfg(not(feature = "event-driven"))]
+        if poll_budget.runnable(now_ms, more_work) {
             vibeos_core::exec::yield_now().await;
         } else {
             let delay = next_poll_delay_ms.clamp(1, IDLE_POLL_CEILING_MS);
@@ -300,8 +439,8 @@ pub async fn task_with_interfaces(space: &Space, interface_caps: &[NetworkInterf
 
 struct InterfaceTask {
     interface: NetworkInterfaceId,
-    outbound: Revocable<Endpoint<StampedPacket>>,
-    inbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: PacketTransmit,
+    inbound: PacketReceive,
     control: Cap,
     listeners: Vec<Revocable<TcpListener>>,
     observed_epoch: Option<u64>,
@@ -313,6 +452,8 @@ struct InterfaceTask {
 
 impl InterfaceTask {
     fn poll(&mut self, space: &Space, now_ms: u64) -> Result<InterfacePollReport, InterfaceError> {
+        #[cfg(feature = "inline-device-service")]
+        let device_work = space.service_device(self.control, true).map_err(|_| InterfaceError::Retired)?;
         let Some(info) = device_info(space, self.control) else {
             return Err(InterfaceError::Retired);
         };
@@ -336,6 +477,10 @@ impl InterfaceTask {
                 }
                 Err(_) => return Err(InterfaceError::Retired),
             };
+            // Binding a new packet session invalidates the old one. End its
+            // socket references before allocating replacement RX writers from
+            // persistent pools. On construction failure no stale stack remains.
+            self.clear_stack();
             let stack_config = Ipv4StackConfig::new(
                 info.ethernet_address,
                 GUEST_IPV4,
@@ -371,6 +516,19 @@ impl InterfaceTask {
                     None => next.add_tcp_listener(port),
                 }
                 .map_err(|_| InterfaceError::Retired)?;
+                #[cfg(feature = "receive-buffer-exchange")]
+                if listener.try_with(|frontend| frontend.receive_storage().is_some())
+                    .map_err(|_| InterfaceError::Retired)? {
+                    listener.try_with(|frontend| frontend.network_update_state(vibeos_net_api::TcpStreamState::Listening))
+                        .map_err(|_| InterfaceError::Retired)?
+                        .map_err(|_| InterfaceError::Retired)?;
+                    // This stack remains inside the current InterfaceTask poll
+                    // future until normal destruction; pools outlive its arena.
+                    // Hard-fault cleanup is still experimental and may require
+                    // restarting the board rather than reusing abandoned state.
+                    unsafe { next.enable_receive_exchange_current_task(socket, listener.clone()) }
+                        .map_err(|_| InterfaceError::Retired)?;
+                }
                 bound_listeners.push(BoundListener {
                     frontend: listener.clone(),
                     socket,
@@ -402,13 +560,24 @@ impl InterfaceTask {
             .poll_network(now_ms)
             .map_err(|_| InterfaceError::Retired)?;
         frontend_work |= drive_frontends(active_stack).map_err(|_| InterfaceError::Retired)?;
+        #[cfg(feature = "inline-device-service")]
+        // Drain generated ACK/TX work without admitting a second RX budget.
+        // The next protocol turn owns the next receive batch.
+        let device_work = device_work | space.service_device(self.control, false).map_err(|_| InterfaceError::Retired)?;
+        vibeos_core::net_profile::stack_activity(report.ingress_frames, frontend_work);
         config::publish_stack_status(
             self.interface,
             self.observed_config_revision,
             active_stack.core.ipv4_status(),
         );
         Ok(InterfacePollReport {
-            more_work: report.more_work || frontend_work,
+            more_work: report.more_work || report.ingress_frames != 0 || frontend_work
+                || {
+                    #[cfg(feature = "inline-device-service")]
+                    { device_work }
+                    #[cfg(not(feature = "inline-device-service"))]
+                    { false }
+                },
             next_poll_delay_ms: report
                 .next_poll_delay_ms
                 .unwrap_or(IDLE_POLL_CEILING_MS)
@@ -418,6 +587,10 @@ impl InterfaceTask {
 
     fn drop_carrier(&mut self) {
         config::publish_link_down(self.interface);
+        self.clear_stack();
+    }
+
+    fn clear_stack(&mut self) {
         self.stack = None;
         self.observed_epoch = None;
         self.observed_ethernet_address = None;
@@ -469,6 +642,11 @@ fn drive_frontends(stack: &mut BoundStack) -> Result<bool, DriveError> {
             .try_with(|frontend| stack.core.drive_tcp_frontend(listener.socket, frontend))
         {
             Ok(Ok(report)) => {
+                #[cfg(feature = "receive-buffer-exchange")]
+                if report.received_bytes != 0 {
+                    EXCHANGE_BYTES[0].fetch_add(report.exchanged_bytes as u64, core::sync::atomic::Ordering::Relaxed);
+                    EXCHANGE_BYTES[1].fetch_add((report.received_bytes - report.exchanged_bytes) as u64, core::sync::atomic::Ordering::Relaxed);
+                }
                 worked |= report.received_bytes != 0
                     || report.transmitted_bytes != 0
                     || report.close_applied.is_some();
@@ -492,3 +670,6 @@ fn monotonic_ms() -> u64 {
     let hz = vibeos_core::exec::timebase_hz();
     vibeos_core::arch::time().saturating_mul(1_000) / hz
 }
+
+#[cfg(all(test, feature = "receive-buffer-exchange"))]
+mod lifecycle_tests;

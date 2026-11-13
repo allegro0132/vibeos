@@ -7,7 +7,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
+KERNEL=${QEMU_TEST_KERNEL:-target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt}
 UPDATE=0
 FILTER=""
 QEMU_SMP=${QEMU_SMP:-4}
@@ -29,8 +29,15 @@ if [ -z "$toolchain" ] || ! command -v rustup >/dev/null 2>&1; then
 fi
 pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
+if [ -n "${QEMU_TEST_KERNEL:-}" ]; then
+  if [ ! -f "$KERNEL" ]; then
+    echo "qemu-test.sh: supplied QEMU_TEST_KERNEL does not exist: $KERNEL" >&2
+    exit 1
+  fi
+else
 (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features legacy-shell) >&2
+fi
 
 # Strip everything that legitimately varies between runs: timings, addresses,
 # heap sizes, and the terminal control codes the line discipline emits.
@@ -629,7 +636,8 @@ for case_file in tests/cases/*.in; do
     boot=$((boot + 1))
   done
 
-  if [ "$name" = "guard_page" ]; then
+  if [ "$name" = "guard_page" ] || [ "$name" = "guard_page_tty" ]; then
+    cp "$qemu_log" "target/qemu-$name.log"
     guard_probe=$(sed -n 's/.*guard probe: hart0 store into \(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
     guard_stval=$(sed -n 's/.*fatal trap: cause=15 stval=\(0x[0-9a-f][0-9a-f]*\).*/\1/p' "$qemu_log" | tail -1)
     if [ -z "$guard_probe" ] || [ "$guard_probe" != "$guard_stval" ] \

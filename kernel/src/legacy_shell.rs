@@ -77,7 +77,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let first = trimmed.split_whitespace().next().unwrap_or("");
     let vsh_command = matches!(
         first,
-        "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
+        "vtop" | "echo" | "wc" | "false" | "deny" | "fault" | "spin" | "let" | "jobs" | "wait"
     ) || (first == "cancel"
         && trimmed
             .split_whitespace()
@@ -92,7 +92,400 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
     let rest: Vec<&str> = parts.collect();
 
     match cmd {
+        "bootlog" => crate::boot_log::dump(),
+        #[cfg(feature = "rx-boundary-profile")]
+        "nrboundary" => {
+            println!("RX_BOUNDARY_BEGIN hz={} sample_every=127 rows=budget,poll_zero,queue_full bins=published_0..32", crate::exec::timebase_hz());
+            for hart in 0..exec::MAX_HARTS {
+                if let Some((driver, empty, post, totals)) = vibeos_core::net_rx_boundary::snapshot(hart) {
+                    if driver.iter().flatten().any(|n| *n != 0) {
+                        println!("RX_BOUNDARY hart={} driver={:?} empty={:?} post_not_ready_ready={:?} totals_admitted_ticks={:?}", hart, driver, empty, post, totals);
+                    }
+                }
+            }
+            println!("RX_BOUNDARY_END");
+        },
+        #[cfg(feature = "driver-stage-profile")]
+        "ndrvstage" => println!("DRIVER_STAGE hz={} sample_every=64 fields=[turns,tx_ticks,rx_ticks,rx_hw_ticks,rx_acquired,rx_published,rx_full,rx_empty] values={:?}",
+            crate::exec::timebase_hz(), crate::dwmac_net::driver_stage_stats()),
+        #[cfg(all(feature = "receive-buffer-exchange", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "nrxexchange" => println!("RXEX_BYTES fields=[exchanged,copied] values={:?}", vibeos_netstack::receive_exchange_bytes()),
+        #[cfg(all(feature = "receive-exchange-profile", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "nrxexwhy" => println!("RXEX_ATTEMPTS version=1 pairs=[calls,pending_bytes] reasons=[empty,drive_budget,transfer_limit,pool_budget,no_spare,transport_refused,success,reserve_error] values={:?}", vibeos_netstack::receive_exchange_attempts()),
+        #[cfg(all(feature = "tcp-read-profile", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+        "ntcpread" => {
+            for exchanged in [false, true] {
+                println!("TCP_READ version=1 exchange={} hz={} sample_every=127 fields=[calls,progress,bytes,short,zero,blocked,closed,error,sampled,ticks,max_ticks] values={:?}",
+                    exchanged, crate::exec::timebase_hz(), vibeos_net_api::receive_profile::RECORDER.snapshot(exchanged));
+            }
+            println!("TCP_READ_END");
+        },
+        #[cfg(feature = "tx-wait-profile")]
+        "ntxwait" => println!("TX_WAIT hz={} fields=[other_turns,other_ticks,tx_only_turns,tx_only_ticks,idle_turns,idle_ticks] values={:?}",
+            crate::exec::timebase_hz(), crate::dwmac_net::tx_wait_stats()),
+        #[cfg(feature = "pooled-rx")]
+        "nrpool" => if let Some(ops) = &vibeos_hal::network::device().receive_buffers {
+            println!("RX_POOL {:?}", (ops.stats)());
+            #[cfg(feature = "rx-queue-profile")]
+            for hart in 0..exec::MAX_HARTS {
+                if let Some((calls, rows)) = vibeos_core::net_receive::queue_profile::snapshot(hart) {
+                    println!("RX_QUEUE_SAMPLE hart={} calls={} interval=127 rows=success,empty,rejected fields=samples,queue_ticks,total_ticks values={:?}", hart, calls, rows);
+                }
+            }
+        },
+        #[cfg(feature = "rx-interrupt-poll")]
+        "nrxirq" => println!("RX_IRQ fields=[interrupts,arms,busy_rechecks,timers,tx_wakes] values={:?}",
+            crate::dwmac_net::rx_irq_stats()),
+        #[cfg(any(feature = "network-tso-coalesce", feature = "direct-tcp-segmentation"))]
+        "ntsoq" => {
+            let (groups, frames) = crate::dwmac_net::tso_counts();
+            println!("TSO_QUEUE groups={} wire_frames={}", groups, frames);
+        }
+        #[cfg(feature = "network-tso-probe")]
+        "ntso" => {
+            fn mac(s:&str)->Option<[u8;6]>{
+                let v:Vec<_>=s.split(':').map(|n|u8::from_str_radix(n,16).ok()).collect();
+                if v.len()!=6{return None;}Some([v[0]?,v[1]?,v[2]?,v[3]?,v[4]?,v[5]?])
+            }
+            let parsed=(||{
+                if rest.len()!=6{return None;}
+                Some(vibeos_core::net_tso_probe::Request {
+                    src_mac:mac(rest[0])?,dst_mac:mac(rest[1])?,
+                    src_ip:rest[2].parse::<core::net::Ipv4Addr>().ok()?.octets(),
+                    dst_ip:rest[3].parse::<core::net::Ipv4Addr>().ok()?.octets(),
+                    payload:rest[4].parse().ok()?,mss:rest[5].parse().ok()?,
+                })
+            })();
+            let Some(request)=parsed else {println!("usage: ntso SRC_MAC DST_MAC SRC_IP DST_IP PAYLOAD MSS");return;};
+            let accepted=vibeos_core::net_tso_probe::start(request);
+            println!("NTSO_START accepted={}",accepted);
+            if accepted {
+                for _ in 0..2000 {
+                    if matches!(vibeos_core::net_tso_probe::state(),3|4){break;}
+                    exec::sleep_ms(1).await;
+                }
+            }
+            println!("NTSO_END state={} (3=DMA-complete,4=failed)",vibeos_core::net_tso_probe::state());
+        }
+
+        #[cfg(feature = "network-tx-audit")]
+        "ntxaudit" => {
+            use vibeos_core::net_tx_audit as a;
+            if rest.first() == Some(&"start") {
+                if !tx_audit_hardware("start").await { return; }
+                println!("NTXAUDIT_START accepted={}", a::start());
+            } else if rest.first() == Some(&"stop") {
+                match a::seal() {
+                    Some(rows) => {
+                        if !tx_audit_hardware("stop").await { return; }
+                        println!("NTXAUDIT fields=[frames,payload_bytes,hash_sum,hash_xor,syn,fin] stages=[protocol_generated,driver_accepted]");
+                        for (stage, row) in rows.iter().enumerate() {
+                            println!("NTXAUDIT stage={} values={:?}", stage, row);
+                        }
+                        println!("NTXAUDIT_END");
+                    }
+                    None => println!("NTXAUDIT not ready; if a writer is finishing, retry stop"),
+                }
+            } else {
+                println!("  usage: ntxaudit start|stop (one capture per boot, TCP source 192.168.77.10:5300 -> 192.168.77.1)");
+            }
+        }
+        #[cfg(all(feature = "bounded-gro", feature = "dhcp-iperf3-server"))]
+        "ngro" => {
+            println!("NGRO fields=[rx_frames,merged_segments,aggregates] values={:?} approximate=true",
+                vibeos_netstack::gro_stats());
+        }
+        #[cfg(all(feature = "gro-end-profile", feature = "dhcp-iperf3-server"))]
+        "ngrodetail" => {
+            let counts = vibeos_netstack::gro_end_stats();
+            let none = vibeos_netstack::GRO_PROFILE_NONE_OFFSET;
+            println!("GRO_DETAIL version=3");
+            println!("GRO_END fields=[first_rejected,psh,short,receive_none,next_ineligible,headers,ipid,budget,original_invalid] values={:?} approximate=true", &counts[..9]);
+            println!("GRO_SIZE sizes=0..{} values={:?} attempted=true", none - 10, &counts[9..none]);
+            println!("GRO_NONE fields=[ingress_budget,empty_endpoint,authority,rejected,unsupported] values={:?}", &counts[none..]);
+        }
+        #[cfg(feature = "tx-lease-profile")]
+        "ntxlease" => {
+            use vibeos_core::tx_lease_profile as p;
+            println!("TXLEASE hz={} interval={} units=timer_ticks", exec::timebase_hz(), p::INTERVAL);
+            for h in 0..exec::MAX_HARTS {
+                for (kind, name) in p::NAMES.iter().enumerate() {
+                    let [calls, samples, ticks, max] = p::snapshot(h, kind);
+                    println!("TXLEASE_ROW h={} kind={} calls={} samples={} ticks={} max={}", h, name, calls, samples, ticks, max);
+                }
+            }
+            println!("TXLEASE_END");
+        }
+        #[cfg(feature = "rx-admission-batch")]
+        "nrxbat" => {
+            println!("RX_ADMISSION sizes=0..8 values={:?} approximate=true", vibeos_netstack::rx_admission_sizes());
+        }
+        #[cfg(feature = "counter-probe")]
+        "npmuevents" => {
+            // Diagnostic shell is the sole PMU owner. Never auto-start, and do
+            // not probe fixed counters: older SBI implementations can select
+            // them regardless of a requested mask for cycle/instret events.
+            const EVENTS: [(usize, &str); 10] = [(3, "cache_references"), (4, "cache_misses"),
+                (5, "branches"), (6, "branch_misses"), (8, "frontend_stalls"), (9, "backend_stalls"),
+                (0x10001, "l1d_read_miss"), (0x10009, "l1i_read_miss"),
+                (0x10019, "dtlb_read_miss"), (0x10021, "itlb_read_miss")];
+            println!("PMU_EVENTS started=false counters=3,4");
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { continue; }
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(u64::MAX) }; 1 + 2 * EVENTS.len() * 5]);
+                    for slot in 0..2 * EVENTS.len() { result[5 + slot * 5].store(0, Ordering::Relaxed); }
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "pmu-event-probe", async move {
+                        output[0].store(ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64), Ordering::Release);
+                        for counter in 3..=4 {
+                            let (error, info) = sbi::pmu_counter_info_raw(counter);
+                            // Restrict this experiment to the verified Mars CSR layout.
+                            if error != 0 || info != (0x27c00 | counter) { return; }
+                            for (event_index, (event, _)) in EVENTS.iter().enumerate() {
+                                let offset = 1 + ((counter - 3) * EVENTS.len() + event_index) * 5;
+                                output[offset + 4].store(1, Ordering::Release);
+                                let (error, selected) = unsafe { sbi::pmu_counter_config_raw(counter, 1, 0, *event, 0) };
+                                output[offset].store(error as u64, Ordering::Release);
+                                output[offset + 1].store(selected as u64, Ordering::Release);
+                                if error != 0 { continue; }
+                                if selected != counter { return; }
+                                output[offset + 4].store(3, Ordering::Release);
+                                let (error, value) = unsafe { sbi::pmu_counter_stop_raw(counter, 1, 1) };
+                                output[offset + 2].store(error as u64, Ordering::Release);
+                                output[offset + 3].store(value as u64, Ordering::Release);
+                                // OpenSBI v1.2 resets the mapping even when the
+                                // counter was already stopped (-8). Preserve it.
+                                if error != 0 && error != -8 { return; }
+                            }
+                        }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                if exit.state() != exec::TaskState::Exited || result[0].load(Ordering::Acquire) != index as u64 {
+                    println!("PMU_EVENTS_FAILED h={}", index); continue;
+                }
+                for counter in 3..=4 {
+                    for (event_index, (event, name)) in EVENTS.iter().enumerate() {
+                        let offset = 1 + ((counter - 3) * EVENTS.len() + event_index) * 5;
+                        let row = core::array::from_fn::<_, 4, _>(|i| result[offset + i].load(Ordering::Acquire));
+                        println!("PMU_EVENT h={} counter={} event={:#x} name={} config_error={} selected={} cleanup_error={} cleanup_value={} attempted_mask={}",
+                            index, counter, event, name, row[0] as i64, row[1], row[2] as i64, row[3], result[offset + 4].load(Ordering::Acquire));
+                    }
+                }
+            }
+            println!("PMU_EVENTS_END");
+        }
+        #[cfg(feature = "counter-probe")]
+        "npmu" => {
+            const LIMIT: usize = 64;
+            println!("PMU_INVENTORY limit={} readonly=true", LIMIT);
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { println!("PMU_OFFLINE h={}", index); continue; }
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(0) }; 5 + LIMIT * 2]);
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "pmu-inventory", async move {
+                        let observed = ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64);
+                        let (probe_error, probe_value) = sbi::probe_extension_raw(0x504d55);
+                        let (error, count) = if probe_error == 0 && probe_value != 0 {
+                            sbi::pmu_num_counters_raw()
+                        } else { (-2, 0) };
+                        for (cell, value) in output.iter().zip([observed, probe_error as u64,
+                            probe_value as u64, error as u64, count as u64]) {
+                            cell.store(value, Ordering::Release);
+                        }
+                        if error == 0 {
+                            for counter in 0..count.min(LIMIT) {
+                                let (error, info) = sbi::pmu_counter_info_raw(counter);
+                                output[5 + counter * 2].store(error as u64, Ordering::Release);
+                                output[6 + counter * 2].store(info as u64, Ordering::Release);
+                            }
+                        }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                if exit.state() != exec::TaskState::Exited || result[0].load(Ordering::Acquire) != index as u64 {
+                    println!("PMU_FAILED h={}", index); continue;
+                }
+                let error = result[3].load(Ordering::Acquire) as i64;
+                let count = result[4].load(Ordering::Acquire) as usize;
+                println!("PMU_HART h={} probe_error={} probe_value={} count_error={} count={} truncated={}",
+                    index, result[1].load(Ordering::Acquire) as i64, result[2].load(Ordering::Acquire),
+                    error, count, count > LIMIT);
+                if error != 0 { continue; }
+                for counter in 0..count.min(LIMIT) {
+                    let error = result[5 + counter * 2].load(Ordering::Acquire) as i64;
+                    let info = result[6 + counter * 2].load(Ordering::Acquire);
+                    if error != 0 {
+                        println!("PMU_COUNTER h={} index={} error={} raw={:#x}", index, counter, error, info);
+                    } else if info >> 63 != 0 {
+                        println!("PMU_COUNTER h={} index={} error=0 raw={:#x} type=firmware", index, counter, info);
+                    } else {
+                        println!("PMU_COUNTER h={} index={} error=0 raw={:#x} type=hardware csr={:#x} width={}",
+                            index, counter, info, info & 0xfff, ((info >> 12) & 0x3f) + 1);
+                    }
+                }
+            }
+            println!("PMU_END");
+        }
+        #[cfg(feature = "counter-probe")]
+        "ncounters" => {
+            println!("NCOUNTERS hz={} units=hardware_counters", exec::timebase_hz());
+            // Base-extension query only: no PMU event or counter is configured.
+            let (error, value) = sbi::probe_extension_raw(0x504d55);
+            println!("NCOUNTERS_SBI pmu_probe_error={} pmu_probe_value={} pmu_probe_supported={}",
+                error, value, error == 0 && value != 0);
+            for index in 0..exec::MAX_HARTS {
+                let hart = exec::HartId::new(index).unwrap();
+                if !ipi::is_online(hart) { println!("NCOUNTERS_OFFLINE h={}", index); continue; }
+                // Allocate both the result and pinned task in SYSTEM scope,
+                // then restore the ambient domain before awaiting the join.
+                let (result, handle) = {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    let result = Arc::new([const { AtomicU64::new(0) }; 6]);
+                    let output = result.clone();
+                    let handle = exec::spawn_pinned_on(hart, "counter-probe", async move {
+                        let before = sbi::time();
+                        let (cycle, instret) = unsafe { crate::counter_probe::read() };
+                        let after = sbi::time();
+                        let observed = ipi::current_logical_hart().map_or(u64::MAX, |h| h.index() as u64);
+                        let values = [observed, before, after, cycle.value, instret.value,
+                            (cycle.available as u64) | ((instret.available as u64) << 1)];
+                        for (cell, value) in output.iter().zip(values) { cell.store(value, Ordering::Release); }
+                    });
+                    (result, handle)
+                };
+                let exit = handle.join().await;
+                let row = result.each_ref().map(|v| v.load(Ordering::Acquire));
+                if exit.state() == exec::TaskState::Exited && row[0] == index as u64 {
+                    println!("NCOUNTERS_HART h={} before={} after={} cycle={} instret={} available={}",
+                        index, row[1], row[2], row[3], row[4], row[5]);
+                } else { println!("NCOUNTERS_FAILED h={}", index); }
+            }
+            println!("NCOUNTERS_END");
+        }
+        #[cfg(feature = "idle-profile")]
+        "nidle" => {
+            println!("NIDLE hz={} harts={} units=timer_ticks source=wfi_interval", exec::timebase_hz(), exec::MAX_HARTS);
+            for (hart, sample) in exec::idle_profile().iter().enumerate() {
+                match sample {
+                    Some(s) => println!("NIDLE_HART h={} active={} since={} now={} idle={} sleeps={}",
+                        hart, s.active, s.since, s.now, s.idle, s.sleeps),
+                    None => println!("NIDLE_UNAVAILABLE h={}", hart),
+                }
+            }
+            println!("NIDLE_END");
+        }
+        #[cfg(feature = "pc-sample")]
+        "npc" => {
+            use vibeos_core::pc_sample::RECORDER as p;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                let accepted = p.start(sbi::time(), exec::timebase_hz(), seconds);
+                if accepted {
+                    let _owner = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
+                    // Re-arm on each actual hart through pinned tasks. The SSIP
+                    // handler remains lock-free; existing earlier timers win.
+                    for h in 0..exec::MAX_HARTS {
+                        let hart = vibeos_core::runqueue::HartId::new(h).unwrap();
+                        if vibeos_core::ipi::is_online(hart) {
+                            exec::spawn_pinned_on(hart, "pc-sample-arm", async { exec::init_timer(); });
+                        }
+                    }
+                }
+                println!("NPC_START accepted={} window={:?} hz={}", accepted, p.window(), exec::timebase_hz());
+            } else {
+                if !p.freeze(sbi::time()) {
+                    println!("NPC not ready; arm once with `npc 5`, wait for expiry, then retry");
+                    return;
+                }
+                println!("NPC window={:?} hz={} irq_mask_bias=true ra_is_stack=false", p.window(), exec::timebase_hz());
+                for h in 0..exec::MAX_HARTS {
+                    let (count, dropped) = p.count(h);
+                    println!("NPC_HART h={} count={} dropped={}", h, count, dropped);
+                    for i in 0..count {
+                        let (time, due, pc, ra) = p.sample(h, i);
+                        println!("NPC_SAMPLE h={} i={} time={} due={} pc={:#x} ra={:#x}", h, i, time, due, pc, ra);
+                    }
+                }
+                println!("NPC_END");
+            }
+        }
+        #[cfg(feature = "copy-profile")]
+        "ncopy" => {
+            use vibeos_core::copy_profile as p;
+            let recorder = &p::RECORDER;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                println!("NCOPY_START accepted={} window={:?} hz={}",
+                    recorder.start(sbi::time(), exec::timebase_hz(), seconds), recorder.window(), exec::timebase_hz());
+            } else if recorder.freeze(sbi::time()) {
+                println!("NCOPY window={:?} hz={} interval={} min_bytes={} capacity={} units=timer_ticks",
+                    recorder.window(), exec::timebase_hz(), p::INTERVAL, p::MIN_BYTES, p::CAPACITY);
+                for h in 0..exec::MAX_HARTS {
+                    let (eligible,dropped) = recorder.counts(h);
+                    println!("NCOPY_HART h={} eligible={} dropped={}", h,eligible,dropped);
+                    for i in 0..p::CAPACITY {
+                        let (caller,key,calls,bytes,ticks,max) = recorder.entry(h,i);
+                        if calls != 0 { println!("NCOPY_ENTRY h={} caller={:#x} key={} calls={} bytes={} ticks={} max={}",
+                            h,caller,key,calls,bytes,ticks,max); }
+                    }
+                }
+                println!("NCOPY_END");
+            } else { println!("NCOPY not ready; arm once with `ncopy 1..5`, then dump after expiry"); }
+        }
+        #[cfg(feature = "network-profile")]
+        "nprof" => {
+            use vibeos_core::net_profile as p;
+            if let Some(seconds) = rest.first().and_then(|s| s.parse::<u64>().ok()) {
+                println!("NPROF_START accepted={} window={:?} hz={}",
+                    p::start(seconds, exec::timebase_hz()), p::window(), exec::timebase_hz());
+            } else {
+                let (start, end, width) = p::window();
+                if start == 0 || sbi::time() <= end {
+                    println!("NPROF not ready; arm once with `nprof 60`, then wait until the window ends");
+                    return;
+                }
+                println!("NPROF window={:?} stages={:?} units=timer_ticks queues=[inbound,outbound]", (start,end,width), p::NAMES);
+                println!("NPROF_SAMPLING stages={:?} interval={}", p::SAMPLED_NAMES, p::SAMPLE_INTERVAL);
+                for h in 0..exec::MAX_HARTS {
+                    for stage in 0..p::STAGE_COUNT {
+                        let counts = p::poll_snapshot(h, stage);
+                        if counts.iter().any(|n| *n != 0) {
+                            println!("NPROF_POLL h={} stage={} counts={:?}", h, p::NAMES[stage], counts);
+                        }
+                    }
+                    let b = p::snapshot_hart(h);
+                    println!("NPROF_HART h={} ticks={:?} wait={:?} calls={:?}", h,b.ticks,b.wait,b.calls);
+                }
+                #[cfg(all(feature = "packet-network", not(feature = "universal")))]
+                println!("NPROF_LOCK_NAME address={:#x} name=packet-driver-control", crate::dwmac_net::profile_control_address());
+                #[cfg(all(feature = "packet-network", feature = "network-status-snapshot", not(feature = "universal")))]
+                println!("NPROF_LOCK_NAME address={:#x} name=packet-runtime-info", crate::dwmac_net::profile_runtime_info_address());
+                for h in 0..exec::MAX_HARTS {
+                    for slot in 0..=p::LOCK_SLOTS {
+                        let (address, wait, calls) = p::lock_snapshot(h, slot);
+                        if calls.iter().any(|n| *n != 0) {
+                            println!("NPROF_LOCK h={} address={:#x} wait={:?} calls={:?}", h,address,wait,calls);
+                        }
+                    }
+                }
+                for i in 0..p::BUCKETS {
+                    if start + i as u64 * width >= end { break; }
+                    let b = p::snapshot(i);
+                    println!("NPROF i={} ticks={:?} wait={:?} calls={:?} high={:?} full={:?} dma={:?}",
+                        i,b.ticks,b.wait,b.calls,b.high,b.full,b.dma);
+                }
+                println!("NPROF_END");
+            }
+        }
         "help" => {
+            println!("  bootlog         retained current-boot RAM output and uptime ticks");
             println!("  ps              component identities, lifecycle, and poll counts");
             println!("  spaces          capability spaces in the system");
             println!("  caps <space>    component owner and capability table");
@@ -180,6 +573,14 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 exec::cancelled_count()
             );
             println!("  component allocation quotas are enforced; `mem` shows live and peak use");
+            #[cfg(feature = "executor-profile")]
+            {
+                let (now, ticks, calls) = exec::execution_profile();
+                println!("EXEC_PROFILE now={} hz={} ticks={:?} calls={:?}", now, exec::timebase_hz(), ticks, calls);
+                for task in exec::task_report() {
+                    println!("TASK_PROFILE name={} polls={} ticks={}", task.name, task.polls, task.poll_ticks);
+                }
+            }
             if tty::is_quiet() {
                 println!("  background output is muted; poll counts still rising");
             }
@@ -338,7 +739,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 println!("  usage: restart <component>");
                 return;
             };
-            match world().restart_component(name) {
+            match world().restart_component_on_home(name).await {
                 Ok(report) => {
                     println!(
                         "  restarted {}  generation {} -> {}",
@@ -455,7 +856,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "mmu" => match rest.as_slice() {
             [] => mmu_status(),
-            ["guard", "fault"] => mmu_guard_fault(),
+            ["guard", "fault"] => mmu_guard_fault(false),
+            ["guard", "fault-tty"] => mmu_guard_fault(true),
             ["wx"] => mmu_wx_demo().await,
             ["wx", "fault", "execute"] => crate::code_pool::execute_writable_probe(),
             ["wx", "fault", "read"] => crate::rustc::sealed_access_probe(false),
@@ -561,8 +963,7 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 
         "reboot" => {
             println!("  rebooting.");
-            sbi::request_system_reset(sbi::RESET_TYPE_COLD_REBOOT, sbi::RESET_REASON_NONE);
-            crate::platform::cold_reset();
+            crate::platform::reboot();
         }
 
         "halt" => {
@@ -577,8 +978,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 fn mmu_status() {
     let text = mmu::mapping(mmu_status as *const () as usize)
         .expect("the running shell text must be mapped");
-    let plic = mmu::mapping(mmu::PLIC_START).expect("the PLIC must be mapped");
-    let uart = mmu::mapping(mmu::UART_VIRTIO_START).expect("UART/virtio must be mapped");
+    let plic = mmu::mapping(mmu::plic_start()).expect("the PLIC must be mapped");
+    let uart = mmu::mapping(mmu::uart_virtio_start()).expect("UART/virtio must be mapped");
     let online = crate::online_hart_mask();
     let enabled = mmu::enabled_hart_mask();
     println!(
@@ -594,8 +995,8 @@ fn mmu_status() {
     );
     println!(
         "  kernel RAM: {:#x}..{:#x}, identity, {} KiB leaves, strict W^X",
-        mmu::KERNEL_RAM_START,
-        mmu::KERNEL_RAM_END,
+        mmu::kernel_ram_start(),
+        mmu::kernel_ram_end(),
         text.page_size / 1024,
     );
     println!(
@@ -943,7 +1344,7 @@ fn mmu_capability_table_write_probe() -> ! {
     panic!("read-only capability table accepted a store")
 }
 
-fn mmu_guard_fault() {
+fn mmu_guard_fault(hold_tty: bool) {
     let hart = ipi::current_logical_hart().expect("guard probe requires a registered hart");
     let guard = mmu::stack_guard_page(hart.index()).expect("current hart guard must exist");
     println!(
@@ -951,6 +1352,18 @@ fn mmu_guard_fault() {
         hart.index(),
         guard
     );
+    if hold_tty {
+        struct FaultWhileFormatting(usize);
+        impl core::fmt::Display for FaultWhileFormatting {
+            fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                // Formatting executes inside tty::emit's lock. The same known
+                // guard page as the ordinary fatal probe must reject this store.
+                unsafe { (self.0 as *mut u8).write_volatile(0x5a) };
+                panic!("stack guard accepted a store while formatting")
+            }
+        }
+        println!("{}", FaultWhileFormatting(guard));
+    }
     // Safety: this command is an explicit fatal acceptance probe. The address
     // is the current hart's statically reserved guard page, never heap or
     // device memory. A successful return is itself an integrity failure.
@@ -1619,6 +2032,21 @@ fn durable_demo() {
     println!("  authority result: stable IDs only; no path or object pointer was persisted");
 }
 
+#[cfg(feature = "network-tx-audit")]
+async fn tx_audit_hardware(phase: &str) -> bool {
+    use vibeos_core::net_tx_audit as a;
+    let request = a::request_hardware();
+    for _ in 0..1_000 {
+        if let Some(values) = a::hardware_snapshot(request) {
+            println!("NTXAUDIT_HW phase={} values={:?}", phase, values);
+            return true;
+        }
+        exec::sleep_ms(1).await;
+    }
+    println!("NTXAUDIT_HW timeout phase={}", phase);
+    false
+}
+
 const NET_COMMAND_TIMEOUT_MS: usize = 2_000;
 
 async fn net_command(args: &[&str]) {
@@ -1626,7 +2054,7 @@ async fn net_command(args: &[&str]) {
     let (Some(outbound), Some(inbound), Some(control)) =
         (w.net_outbound, w.net_inbound, w.net_control)
     else {
-        println!("  virtio-net: offline (no modern network transport discovered)");
+        println!("  raw network diagnostics unavailable: this session has no endpoint/control grants (not a link-status result)");
         return;
     };
     let init = w.spaces["init"].clone();
@@ -1636,7 +2064,7 @@ async fn net_command(args: &[&str]) {
             Ok(info) if info.quarantined => {
                 println!("  virtio-net: quarantined (reset was not confirmed)")
             }
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(feature = "packet-network")]
             Ok(info) if info.online => {
                 println!(
                     "  dwmac: ready, polling descriptors {}, raw Ethernet header {}, RMII, PHY link {}",
@@ -1653,7 +2081,7 @@ async fn net_command(args: &[&str]) {
                     info.clock_bypass, info.clock_divider, info.ephy_control
                 );
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-network")]
             Ok(info) if info.online => println!(
                 "  virtio-net: ready, queues rx=0/tx=1 size {}, header {}, features VERSION_1",
                 info.queue_size, info.header_size
@@ -1664,13 +2092,13 @@ async fn net_command(args: &[&str]) {
         "test" => match net_handshake(&init, outbound, inbound, control).await {
             Ok((before, after)) => {
                 println!("  raw L2 HELLO -> CHALLENGE -> ACK: ok");
-                #[cfg(feature = "milkv-duo")]
+                #[cfg(feature = "packet-network")]
                 println!(
                     "  DWMAC polling completion: ok (rx +{}, tx +{})",
                     after.rx_packets.saturating_sub(before.rx_packets),
                     after.tx_packets.saturating_sub(before.tx_packets)
                 );
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-network")]
                 println!(
                     "  dual-queue completion: ok (IRQ observed; rx +{}, tx +{})",
                     after.rx_packets.saturating_sub(before.rx_packets),
@@ -1848,9 +2276,9 @@ async fn net_handshake(
     let tx_target = before.tx_packets.saturating_add(2);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let after = net_info(init, control)?;
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "packet-network")]
         let completed = after.tx_packets >= tx_target && after.rx_packets > before.rx_packets;
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-network")]
         let completed = after.tx_packets >= tx_target
             && after.rx_packets > before.rx_packets
             && after.used_interrupts > before.used_interrupts;
@@ -1892,18 +2320,18 @@ async fn block_command(args: &[&str]) {
                     if info.quarantined {
                         println!("  virtio-blk: quarantined (reset was not confirmed)");
                     } else if info.online {
-                        #[cfg(feature = "milkv-duo")]
+                        #[cfg(feature = "pio-block")]
                         println!(
                             "  microSD: ready, data partition {} sectors, PIO depth {}",
                             info.capacity_sectors, info.queue_size
                         );
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         println!(
                             "  virtio-blk: ready, capacity {} sectors, queue size {}",
                             info.capacity_sectors, info.queue_size
                         );
                     } else {
-                        #[cfg(feature = "milkv-duo")]
+                        #[cfg(feature = "pio-block")]
                         match info.last_error {
                             Some(error) => {
                                 println!("  microSD: offline ({})", error);
@@ -1914,7 +2342,7 @@ async fn block_command(args: &[&str]) {
                             }
                             None => println!("  microSD: offline (driver component not attached)"),
                         }
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         println!("  virtio-blk: offline (driver component not attached)");
                     }
                 }
@@ -1996,7 +2424,7 @@ async fn block_command(args: &[&str]) {
             }
         }
         "test" => {
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             let irq_before = {
                 let lease = init
                     .0
@@ -2067,7 +2495,7 @@ async fn block_command(args: &[&str]) {
                 Ok(lease) => crate::block_device::read_with(lease, 8).await,
                 Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             let irq_after = {
                 let lease = init
                     .0
@@ -2082,13 +2510,13 @@ async fn block_command(args: &[&str]) {
             match verified {
                 Ok(observed) if observed == data => {
                     println!("  sector 8 write + flush: ok");
-                    #[cfg(feature = "qemu-virt")]
+                    #[cfg(feature = "queued-block")]
                     if irq_after > irq_before {
                         println!("  used-buffer IRQ delivery: ok");
                     } else {
                         println!("  used-buffer IRQ delivery: not observed");
                     }
-                    #[cfg(feature = "milkv-duo")]
+                    #[cfg(feature = "pio-block")]
                     println!("  SDHCI PIO polling completion: ok");
                 }
                 Ok(_) => println!("  sector 8 write + flush: readback mismatch"),
@@ -2284,7 +2712,7 @@ async fn block_command(args: &[&str]) {
                 println!("  authority revocation: explicit restart failed");
             }
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         "multiblock-probe" => {
             let poll_budget: usize = args
                 .get(1)
@@ -2324,7 +2752,7 @@ async fn block_command(args: &[&str]) {
         }
         other => println!(
             "  usage: blk [info|scope|test|fault|recover|timeout|cancel|revoke{}] (got `{}`)",
-            if cfg!(feature = "milkv-duo") {
+            if cfg!(feature = "pio-block") {
                 "|multiblock-probe"
             } else {
                 ""
@@ -2369,7 +2797,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
         return;
     }
 
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let before = crate::virtio_blk::telemetry();
     let started = crate::sbi::time();
     let result = match workload {
@@ -2506,7 +2934,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
         _ => unreachable!(),
     };
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = {
         let delta = crate::virtio_blk::telemetry().saturating_sub(before);
         (
@@ -2519,7 +2947,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
             delta.used_interrupts,
         )
     };
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     if let Err(error) = &result {
         println!("  block benchmark failed: {:?}", error);
@@ -2978,7 +3406,7 @@ async fn storage_object_bench(
             .ok()
             .and_then(|lease| crate::store::info_with(&lease).ok())
             .is_some_and(|info| info.ready && !info.busy);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let quiet = if ready {
             let before = crate::virtio_blk::telemetry();
             exec::sleep_ms(250).await;
@@ -2986,7 +3414,7 @@ async fn storage_object_bench(
         } else {
             false
         };
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         let quiet = ready;
         if quiet || crate::sbi::time() >= ready_deadline {
             break;
@@ -2997,7 +3425,7 @@ async fn storage_object_bench(
         .expect("storage benchmark kind is non-zero");
     if workload == "v2-dedup-gc" {
         const OBJECT_COUNT: u64 = 8;
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io_started = crate::virtio_blk::telemetry();
         let started = crate::sbi::time();
         let mut ok = true;
@@ -3052,11 +3480,11 @@ async fn storage_object_bench(
             ok &= verified;
         }
         let elapsed = crate::sbi::time().saturating_sub(started).max(1);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
             io.read_bytes, io.write_bytes, io.used_interrupts);
         let (
@@ -3093,7 +3521,7 @@ async fn storage_object_bench(
         .benchmark_authority_shape()
         .await
         .unwrap_or((0, 0, false, 0, 0, 0));
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io_started = crate::virtio_blk::telemetry();
     let put_started = crate::sbi::time();
     // The Merkle-blob profile wraps content in its own verified envelope;
@@ -3122,11 +3550,11 @@ async fn storage_object_bench(
         )),
     };
     let put_ticks = crate::sbi::time().saturating_sub(put_started).max(1);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let put_io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let put_io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let put_io = (
         put_io.requests,
         put_io.read_requests,
@@ -3217,11 +3645,11 @@ async fn storage_object_bench(
             .is_err();
         status = if revoked && denied { "ok" } else { "failed-closed" };
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = (
         io.requests,
         io.read_requests,
@@ -3323,15 +3751,15 @@ async fn storage_file_tree_bench(
                 .wrapping_add(0x5a) as u8
         }));
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io_started = crate::virtio_blk::telemetry();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let mut file_phase_boundaries = [io_started; 4];
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let mut file_phase_elapsed = [0_u64; 3];
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let mut stage_detail_ticks = [0_u64; 3];
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let mut verify_detail_ticks = [0_u64; 2];
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
@@ -3383,28 +3811,28 @@ async fn storage_file_tree_bench(
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
                 if unique {
-                    #[cfg(feature = "qemu-virt")]
+                    #[cfg(feature = "queued-block")]
                     let pattern_started = crate::sbi::time();
                     sequential_pattern::fill(&mut payload, seed, (index * size) as u64);
-                    #[cfg(feature = "qemu-virt")]
+                    #[cfg(feature = "queued-block")]
                     { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
                 }
                 let name = alloc::format!("bench-{seed:016x}-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let push_started = crate::sbi::time();
                 stager.push(&payload).await?;
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let finish_started = crate::sbi::time();
                 let staged = stager.finish().await?;
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { stage_detail_ticks[2] += crate::sbi::time().saturating_sub(finish_started); }
                 staged_files.push((path, staged));
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
               file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
@@ -3412,7 +3840,7 @@ async fn storage_file_tree_bench(
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
               file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
             if unique {
@@ -3421,19 +3849,19 @@ async fn storage_file_tree_bench(
                     let reader = root.reader(&RelPath::parse(&name)?)?;
                     let mut read = 0;
                     for chunk in 0..reader.chunk_count() {
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         let read_started = crate::sbi::time();
                         let bytes = reader.read_chunk(chunk).await?.ok_or(FileError::Conflict)?;
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         let match_started = crate::sbi::time();
                         if bytes.is_empty() || !sequential_pattern::matches(
                             &bytes, seed, (index * size + read) as u64,
                         ) {
                             return Err(FileError::Conflict);
                         }
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
                         read += bytes.len();
                     }
@@ -3442,7 +3870,7 @@ async fn storage_file_tree_bench(
                     }
                 }
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
               file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             operations = count as u64;
@@ -3458,53 +3886,53 @@ async fn storage_file_tree_bench(
             let mut stager = root.begin_content_stager(&path, false)?;
             let mut chunk = alloc::vec![0_u8; DATA_CHUNK_SIZE];
             for index in 0..size.div_ceil(DATA_CHUNK_SIZE) {
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let pattern_started = crate::sbi::time();
                 sequential_pattern::fill(&mut chunk, seed, (index * DATA_CHUNK_SIZE) as u64);
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
                 let len = core::cmp::min(DATA_CHUNK_SIZE, size.saturating_sub(index * DATA_CHUNK_SIZE));
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let push_started = crate::sbi::time();
                 stager.push(&chunk[..len]).await?;
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             let finish_started = crate::sbi::time();
             let staged = stager.finish().await?;
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { stage_detail_ticks[2] = crate::sbi::time().saturating_sub(finish_started); }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
               file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
             tx.write_staged(&path, staged)?;
             tx.commit_durable().await?;
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
               file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
             let reader = root.reader(&path)?;
             let mut read = 0_u64;
             for index in 0..reader.chunk_count() {
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let read_started = crate::sbi::time();
                 let bytes = reader.read_chunk(index).await?.ok_or(FileError::Conflict)?;
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 let match_started = crate::sbi::time();
                 if bytes.is_empty() || !sequential_pattern::matches(&bytes, seed, read) {
                     return Err(FileError::Conflict);
                 }
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-block")]
                 { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
                 read = read.checked_add(bytes.len() as u64).ok_or(FileError::Conflict)?;
             }
             if read != size as u64 {
                 return Err(FileError::Conflict);
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
               file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             // Remove the file so repeated samples measure a steady state
@@ -3512,7 +3940,7 @@ async fn storage_file_tree_bench(
             let mut tx = root.begin()?;
             tx.remove(&path, false, false)?;
             tx.commit_durable().await?;
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             { file_phase_boundaries[3] = crate::virtio_blk::telemetry(); }
             operations = 3;
             transferred = (size as u64).saturating_add(read);
@@ -3557,19 +3985,19 @@ async fn storage_file_tree_bench(
     .await;
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
     // Per-sample accounting: the device telemetry is cumulative since boot.
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io_ended = crate::virtio_blk::telemetry();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = io_ended.saturating_sub(io_started);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
         io.read_bytes, io.write_bytes, io.used_interrupts);
     // Serialize only after measured work and aggregate counters are captured.
     #[allow(unused_mut)]
     let mut file_phase_json = String::new();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     if matches!(workload, "file-sequential" | "file-batch-create" | "file-batch-create-unique") && result.is_ok() {
         use core::fmt::Write as _;
         let stage_other = file_phase_elapsed[0].saturating_sub(stage_detail_ticks.iter().sum());

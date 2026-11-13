@@ -7576,7 +7576,7 @@ unsafe fn reclaim_authorized_domain(
         // reused: the instance registry owns Space/CSpace reset authority.
         crate::block_device::recover_faulted_domain(domain);
         crate::net_device::recover_faulted_domain(domain);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         crate::virtio_rng::recover_faulted_domain(domain);
         crate::code_pool::recover_faulted_domain(domain);
         #[cfg(feature = "ssh-component-command")]

@@ -1,0 +1,81 @@
+{
+  "status": "JH7110 cache service and permanent EQoS DMA pool implemented; physical qualification and firmware integration pending",
+  "host_tests": 81,
+  "new_cache_tests": 5,
+  "new_pool_tests": 5,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 1,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121982976,
+    "kernel_sha256": "e3001ec33a971b076049b6ae31214bcb3bbe415a53477d35d1b308d331175b22",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "duo_release_build": "passed",
+  "source_reference": "boards/milkv-mars/jh7110-cache-reference.json",
+  "mutations": [
+    "64-bit cache physical address truncated: detected",
+    "Per-line completion barrier omitted: detected",
+    "Wrong cache-line geometry accepted: detected",
+    "CPU mapping offset shifted four bytes: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage29-host-restored.log",
+      "sha256": "b19dfc040e8bed5ee8dd29da633cec7e2bd0413127380af6672868e61774bdf7"
+    },
+    {
+      "path": "target/mars-reference/stage29-rv64-build.log",
+      "sha256": "ba1df1c2bfc6e7504fbd959831a59e8636628d4638b10db614b3d465190c5e24"
+    },
+    {
+      "path": "target/mars-reference/stage29-rv64-model/serial.log",
+      "sha256": "ec6bade161765f3f2b93717afa658b4a3e88556d485a1f533a2a6dc2569d180f"
+    },
+    {
+      "path": "target/mars-reference/stage29-rv64-model/summary.json",
+      "sha256": "dacb85790a8ab9ab77c82d346681b8a206ea7b23115a162dd675395788e703fe"
+    },
+    {
+      "path": "target/mars-reference/stage29-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage29-duo-build.log",
+      "sha256": "775917e6b9d5baaeeb05152cb95c9bb4f75facb8b43813190181d85b63bec5cd"
+    },
+    {
+      "path": "target/mars-reference/stage29-mutation-physical-width.log",
+      "sha256": "2bd43c440f326ceec96e0cb74e40f92820fb392dc14a5a9ee1a34f529a58efe6"
+    },
+    {
+      "path": "target/mars-reference/stage29-mutation-barrier.log",
+      "sha256": "14de30cb15ae33bc679ffddc5850a023aa7bac9cb012dc6fa61b2c752d3f36c6"
+    },
+    {
+      "path": "target/mars-reference/stage29-mutation-geometry.log",
+      "sha256": "c1da362168be777c42d14423c81612ceceee91262bffdd4150c7caf726906560"
+    },
+    {
+      "path": "target/mars-reference/stage29-mutation-cpu-offset.log",
+      "sha256": "7de08eb2f79b8ea99e63d2926a53a5ba6da62ba28fc5113c982498c957a65ccc"
+    }
+  ],
+  "physical_acceptance": false,
+  "remaining": [
+    "DTB cache/GMAC resource admission and JH7110 clock/reset/pinmux/PHY preparation",
+    "Actual Mars pool reservation and packet-device registration",
+    "DHCP/link recovery, entropy, SSH/WASM and physical stability acceptance"
+  ],
+  "blind_spots": [
+    "Host cache model records commands but executes no cache operations",
+    "RV64 model simulates hardware/DMA effects and does not prove multicore coherence",
+    "Unsafe pool constructor requires physically correct exclusive permanent mapping",
+    "S-mode PMP/cache-control access has not been qualified on Mars"
+  ]
+}

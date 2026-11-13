@@ -1,0 +1,81 @@
+// Focused resource fixture extracted from pinned SDK facts, not a full boot DTB.
+/dts-v1/;
+/ {
+ #address-cells = <2>; #size-cells = <2>;
+ compatible = "milk-v,mars", "starfive,jh7110";
+ memory@40000000 { device_type = "memory"; reg = <0 0x40000000 1 0>; };
+ spare { phandle = <100>; linux,phandle = <100>; };
+ cpus {
+#address-cells = <1>; #size-cells = <0>; timebase-frequency = <4000000>;
+cpu@0 {
+device_type = "cpu"; reg = <0>;
+compatible = "sifive,s7", "riscv";
+status = "disabled";
+riscv,isa = "rv64imac_zba_zbb";
+mmu-type = "riscv,sv39";
+cpu0intc: interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@1 {
+device_type = "cpu"; reg = <1>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+cpu1intc: interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@2 {
+device_type = "cpu"; reg = <2>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+cpu2intc: interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@3 {
+device_type = "cpu"; reg = <3>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+cpu3intc: interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@4 {
+device_type = "cpu"; reg = <4>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+cpu4intc: interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+ };
+
+ soc {
+  compatible = "simple-bus";
+  #address-cells = <2>; #size-cells = <2>; ranges;
+  interrupt-parent = <&plic>;
+  spare-serial@10010000 {
+   compatible = "snps,dw-apb-uart"; reg = <0 0x10010000 0 0x10000>;
+   reg-io-width = <4>; reg-shift = <2>; interrupts = <33>; status = "okay";
+  };
+  serial@10000000 {
+   compatible = "snps,dw-apb-uart"; reg = <0 0x10000000 0 0x10000>;
+   reg-io-width = <4>; reg-shift = <2>; interrupts = <32>; status = "okay";
+  };
+  plic: plic@c000000 {
+   compatible = "riscv,plic0"; reg = <0 0x0c000000 0 0x4000000>;
+   interrupt-controller; #interrupt-cells = <1>; riscv,ndev = <136>;
+   interrupts-extended = <&cpu0intc 11 &cpu1intc 11 &cpu1intc 9
+    &cpu2intc 11 &cpu2intc 9 &cpu3intc 11 &cpu3intc 9 &cpu4intc 11 &cpu4intc 9>;
+  };
+  sdio1@16020000 {
+   compatible = "starfive,jh7110-sdio"; reg = <0 0x16020000 0 0x10000>;
+   interrupts = <75>; fifo-depth = <32>; bus-width = <4>; status = "okay";
+  };
+  clock-controller {
+   compatible = "starfive,jh7110-clkgen";
+   reg = <0 0x13020000 0 0x10000>, <0 0x10230000 0 0x10000>, <0 0x17000000 0 0x10000>;
+  };
+  sys_syscon@13030000 { compatible = "syscon"; reg = <0 0x13030000 0 0x1000>; };
+  gpio@13040000 { compatible = "starfive,jh7110-sys-pinctrl"; reg = <0 0x13040000 0 0x10000>; };
+ };
+};

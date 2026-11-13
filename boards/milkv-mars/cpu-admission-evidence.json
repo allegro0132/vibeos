@@ -1,0 +1,106 @@
+{
+  "status": "CPU inventory and Mars hart admission verified in software; production Mars boot entry pending",
+  "host_tests": 29,
+  "python_regressions": 9,
+  "live_qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 390,
+    "kernel_sha256": "d6298a9defda64f73ea579960cf42570ea19418079b145e2d8a8470e46f64243",
+    "physical_acceptance": false
+  },
+  "negative_live_qemu": {
+    "status": "rejected",
+    "reason": "DTB timebase mismatch",
+    "kernel_sha256": "d6298a9defda64f73ea579960cf42570ea19418079b145e2d8a8470e46f64243",
+    "physical_acceptance": false
+  },
+  "target_builds": {
+    "mars_bsp_rv64_check": "passed",
+    "duo_release": "passed"
+  },
+  "mutations": [
+    "Removing disabled-hart filter fails Mars bad-secondary regression",
+    "Removing duplicate-hart rejection fails CPU inventory regression"
+  ],
+  "sources": {
+    "mars_sdk": "boards/milkv-mars/sdk-reference.json",
+    "sv39_mode_compatibility": "https://docs.riscv.org/reference/isa/priv/supervisor.html"
+  },
+  "logs": [
+    {
+      "path": "target/mars-reference/stage17-hal-tests.log",
+      "sha256": "7df10afc18339f0eb665bbfbb70c6df74fb95694c9ba4fe055ab91e1729e4c75"
+    },
+    {
+      "path": "target/mars-reference/stage17-cpu-tests.log",
+      "sha256": "a43b5dbeccbdea711125e7dab308fd4930116754cd63a151dd470900ccc8885e"
+    },
+    {
+      "path": "target/mars-reference/stage17-mars-tests.log",
+      "sha256": "fb8e3cd5dd58c2ab259c59a87339b75473e7d7b3cd58490f66ea9cecbf5d5e38"
+    },
+    {
+      "path": "target/mars-reference/stage17-python-tests.log",
+      "sha256": "ca18ffc8e8fdc6b71e49e9b4fd64e04661daa3243fb767d57a64ce80ea2d7b63"
+    },
+    {
+      "path": "target/mars-reference/stage17-mars-rv64-check.log",
+      "sha256": "40996ea4dd86b38a7059229a60a944e46d35e54e37a9580a12ac9269af1f4ce7"
+    },
+    {
+      "path": "target/mars-reference/stage17-duo-build.log",
+      "sha256": "b9b17ae38b2c6fe3607d09b72ae303d09ddd574f134995785daa6a910289d90f"
+    },
+    {
+      "path": "target/mars-reference/stage17-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage17-qemu-final-build.log",
+      "sha256": "492c15862cac300a91114a00c38075f02f9cae82c9369cb7c42e79bfc1c6e2a0"
+    },
+    {
+      "path": "target/mars-reference/stage17-mutation-disabled-hart.log",
+      "sha256": "116593780f059d7a0ae6680392f7ea2e94d3abb398b31fd46d83c5c6a8d3f4a0"
+    },
+    {
+      "path": "target/mars-reference/stage17-mutation-duplicate-id.log",
+      "sha256": "5231fe0cad4ef0f192f375c4321508ab7a967083ce4a7dec1b22cf40d1a81576"
+    },
+    {
+      "path": "target/mars-reference/stage17-live-dtb-final/serial.log",
+      "sha256": "f86f906c4976473025e66336a3c4c93c837728663b1e97eabe6152f73f323ccb"
+    },
+    {
+      "path": "target/mars-reference/stage17-live-dtb-final/summary.json",
+      "sha256": "260ca2791ebd4fd496465ff6b23fb9e65067b11f0227b1ec63c6cff33df9cda4"
+    },
+    {
+      "path": "target/mars-reference/stage17-dtb-rejection/serial.log",
+      "sha256": "1d289e1e8e0bbf9072d1113f5d0860505219a2a03f2a4549f435805369307458"
+    },
+    {
+      "path": "target/mars-reference/stage17-dtb-rejection/summary.json",
+      "sha256": "070cbc794f1634837b562346bd88643fde9a154e1125a8a3bc5389b19f8e17f8"
+    },
+    {
+      "path": "target/mars-reference/stage17-qemu.dtb",
+      "sha256": "1cdbe7acf0a785216f87f7d6a1d7db3496dc24277b90e654dac7b5e13d9dd17a"
+    },
+    {
+      "path": "target/mars-reference/stage17-wrong-timebase.dtb",
+      "sha256": "732db0d3a8af365994e56ead9641207792d053b6bddebf4d1634ac348e44d14f"
+    }
+  ],
+  "hardware_acceptance": "not run; live probe is QEMU only, all U74 boot choices are host tests",
+  "remaining": [
+    "Connect Mars DTB CPU, memory, reservation and resource admission to production firmware entry",
+    "Probe SBI HSM/IPI/RFENCE/TIME and verify four real application harts online",
+    "Remove remaining kernel board-selection branches and integrate JH7110 SD/EQoS",
+    "Build boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stability acceptance"
+  ]
+}

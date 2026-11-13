@@ -1,0 +1,120 @@
+{
+  "status": "Explicit-target SSH collector passed software checks and QEMU upload/reboot-verify; no physical Mars acceptance",
+  "phases": [
+    {
+      "phase": "upload",
+      "command_checks": 34,
+      "summary": "target/mars-reference/stage62-ssh-client-qemu-v3/mars-ssh-1/summary.json",
+      "summary_sha256": "bdbee2093bac148d08eaac7ff7a44eb7292c26cc192f07b5377ee6c7698c43db"
+    },
+    {
+      "phase": "verify",
+      "command_checks": 21,
+      "summary": "target/mars-reference/stage62-ssh-client-qemu-v3/mars-ssh-2/summary.json",
+      "summary_sha256": "6f3330797f9182c0440127d6a68bfef57211d357f7a61bb6b8919dac3a9a3828"
+    }
+  ],
+  "host_tests_passed": 8,
+  "known_host_pin_required": true,
+  "private_credentials_copied": false,
+  "automatic_retries": false,
+  "verify_uploads": false,
+  "verify_binds_upload_summary": true,
+  "host_key_changed_rejected": true,
+  "fixture_changed_rejected": true,
+  "raw_command_outputs_rehashed": true,
+  "thread_cases": 10,
+  "pthread_cases": 3,
+  "qemu_result": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 416,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEv77TCmCj86K8CE30waiOyjVb78ojJKriWghEt9Edo/",
+    "identity_persisted": true,
+    "authentication_tested": true,
+    "wasm_tested": true,
+    "wasm_threads_tested": true,
+    "wasmtime_tested": true,
+    "command_retries_allowed": false,
+    "consecutive_echo_connections_per_boot": 16,
+    "module_sha256": {
+      "composition-hello.wasm": "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303",
+      "composition-trap.wasm": "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f",
+      "threads-atomics.wasm": "ab036c42a427ec15eddb0b6b91f3ec81547a6afceaa3137ac76ca685bfabd8b9",
+      "threads-counter.wasm": "308a068267f20139355e8de33127427a2e9305d9130ed2c979306134e11795fe",
+      "threads-wait-timeout.wasm": "b8203ab87455321b01ce1d8659e2c35ec93b6455699dd5053098bde37b8ee16d",
+      "threads-exit.wasm": "0d5494980be30846ca87ed0d32e2bb12a8ede4fbbc822b82ac8c4e76c0ba2290",
+      "threads-spawn-cap.wasm": "f4c2e694fc7216bd8e35cd24ef8442c6bb7df412699743c5fdb4126af2f44f17",
+      "threads-grow.wasm": "e227726a61be015cd7dbe94537c3bf5e6e822e80de490111a8d3674935562751",
+      "threads-fault.wasm": "159c46b8ecc0231f4079704cb55822cc202e575a0674e241c73bbdb39ee0433a",
+      "threads-busy.wasm": "d51f7be802f8a192c160524ef13fe9ed6df7598c99dfd6ee8986e19151a1cf49",
+      "threads-defined-shared.wasm": "648c01ec460c361e7f587f44e8b498754e94f3939afffa366a4ea13bd12335b5",
+      "threads-no-start.wasm": "e67a7c8291fb605526e82fcd1b9f2832548d693b3b38a0665aae902c83f4210c",
+      "c-threads.wasm": "bc604d893f948a8afe3725907f993eefee9d66e37c286927911d997eea94c92a"
+    },
+    "physical_acceptance": false,
+    "kernel_sha256": "d8da2744267e8d9d0781fd88bb66806818d37d2629d1d43a9db4d46613a67884",
+    "preauth_command_retries": 0
+  },
+  "initial_runs": [
+    "Boot-two sleep_ms wakes promptly failed while persistent recovery overlapped selftests",
+    "Boot-two faulted-CSpace interrupt timing check failed while persistent recovery overlapped selftests"
+  ],
+  "harness_fix": "Wait for SSH service initialization before launching selftests; await exact selftest success before command checks; fail immediately on SELFTEST FAILED. Kernel timing assertions unchanged.",
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "cold_boot_verified": false,
+  "one_hour_stability_tested": false,
+  "sd_image_repacked": false,
+  "logs": [
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v3/boot-1.log",
+      "sha256": "9f5044a325a9cd7db2668574f2e658c04f58d0e5517dd850db88b0ecbd65c565"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v3/mars-ssh-1/summary.json",
+      "sha256": "bdbee2093bac148d08eaac7ff7a44eb7292c26cc192f07b5377ee6c7698c43db"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v3/boot-2.log",
+      "sha256": "76cad10cab11a5b2570f2a484bfb2aab0bb4042d132545033afd418956b8d381"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v3/mars-ssh-2/summary.json",
+      "sha256": "6f3330797f9182c0440127d6a68bfef57211d357f7a61bb6b8919dac3a9a3828"
+    },
+    {
+      "path": "target/mars-reference/stage62-host-tests.log",
+      "sha256": "489d8fec4214192d21ef621f802a943fb57007a29204410d590ff3ceb58c5003"
+    },
+    {
+      "path": "target/mars-reference/stage62-cli-help.log",
+      "sha256": "141a42dc7e81c6d5857940265efddec2727307c7d1c79273e78f1ade966c54e7"
+    },
+    {
+      "path": "target/mars-reference/stage62-runtime.log",
+      "sha256": "9fa1e0d4bad667f7f88ed994f2791755478d74e05939b5b436e87629534a14b1"
+    },
+    {
+      "path": "target/mars-reference/stage62-runtime-v2.log",
+      "sha256": "ce07e80ab9f16b5cc519eedab50d196eeb24e68583ad5d9992519ce69f051eca"
+    },
+    {
+      "path": "target/mars-reference/stage62-runtime-v3.log",
+      "sha256": "9d1010913b435113effdb137f97cfb2f263926e123d1e8f5656b561afb4f9d44"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu/boot-2.log",
+      "sha256": "a9ea5061d3994176c06d4cf8940bcaacdab6e75ecba334ae7b3cd12f51c21253"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v2/boot-2.log",
+      "sha256": "14e286ccaa842bfc921a1044bc68140e6681bcb891b9107f67c9ff138fd752f0"
+    },
+    {
+      "path": "target/mars-reference/stage62-ssh-client-qemu-v3/result.json",
+      "sha256": "9d1010913b435113effdb137f97cfb2f263926e123d1e8f5656b561afb4f9d44"
+    }
+  ]
+}

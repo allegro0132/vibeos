@@ -1,16 +1,14 @@
-//! Capability-gated modern virtio-rng backend for the QEMU `virt` machine.
+//! Capability-gated entropy policy over a firmware-owned device instance.
 //!
 //! Entropy crosses the component boundary only as a bounded value. Client
-//! pointers never enter a descriptor: the device can write solely into the
-//! fixed SYSTEM-owned DMA slab below. Every invocation is fallible, retains its
+//! pointers never enter a hardware descriptor: firmware owns device buffers. Every invocation is fallible, retains its
 //! non-cloneable capability lease until completion, and either returns exactly
 //! the requested byte count or no bytes at all.
 //!
-//! This whole module is QEMU-only. In particular, the Milk-V Duo build gets no
-//! synthetic provider from this file; SSH must remain disabled there until a
-//! separately validated hardware source exists.
+//! Firmware explicitly selects this service and supplies the entropy provider.
+//! This file never creates a synthetic source or qualifies hardware entropy.
 
-#![cfg(feature = "qemu-virt")]
+#![cfg(feature = "queued-entropy")]
 
 extern crate alloc;
 
@@ -28,10 +26,10 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, ENTROPY_QUEUE_SIZE};
-use crate::virtio_mmio::MmioTransport;
+use crate::entropy_device::Endpoint;
 use crate::world::Space;
-use vibeos_driver_virtio_rng::{Engine, Submission};
+use crate::entropy_device::Engine;
+use vibeos_hal::entropy::Submission;
 
 const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
@@ -40,7 +38,7 @@ const REQUEST_TIMEOUT_MS: u64 = 2_000;
 ///
 /// The bound limits DMA exposure, queue work, per-client kernel state, and the
 /// amount of entropy copied through a capability invocation.
-pub use vibeos_driver_virtio_rng::MAX_RANDOM_BYTES;
+pub use vibeos_hal::entropy::MAX_RANDOM_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RandomError {
@@ -59,8 +57,8 @@ pub enum RandomError {
     IdentityExhausted,
 }
 
-fn map_engine_error(error: vibeos_driver_virtio_rng::Error) -> RandomError {
-    use vibeos_driver_virtio_rng::Error;
+fn map_engine_error(error: vibeos_hal::entropy::Error) -> RandomError {
+    use vibeos_hal::entropy::Error;
     match error {
         Error::InvalidLength => RandomError::InvalidLength,
         Error::Busy => RandomError::Busy,
@@ -155,25 +153,26 @@ impl Drop for RandomBytes {
     }
 }
 
-/// Capability naming exactly one discovered modern virtio-rng MMIO window.
+/// Capability naming exactly one firmware-admitted entropy endpoint.
 pub struct MmioWindow {
-    transport: MmioTransport,
+    transport: Endpoint,
 }
 
 impl MmioWindow {
-    fn new(transport: MmioTransport) -> Arc<Self> {
+    fn new(transport: Endpoint) -> Arc<Self> {
         Arc::new(Self { transport })
     }
 }
 
 impl Resource for MmioWindow {
     fn kind(&self) -> &'static str {
-        "virtio-mmio"
+        vibeos_hal::entropy::device().resource_kind
     }
 
     fn describe(&self) -> String {
         format!(
-            "modern entropy transport slot {} @ {:#x}, IRQ {}, vendor {:#x}",
+            "{} slot {} @ {:#x}, IRQ {}, vendor {:#x}",
+            vibeos_hal::entropy::device().transport_name,
             self.transport.slot(),
             self.transport.base(),
             self.transport.irq(),
@@ -186,32 +185,37 @@ impl Resource for MmioWindow {
     }
 }
 
-/// Capability naming the sole fixed SYSTEM-owned entropy DMA slab.
-pub struct DmaRegion;
+/// Capability naming the sole firmware-owned entropy instance state. Both
+/// DMA and PIO implementations require the same revocable READ/WRITE claim.
+pub struct InstanceState;
 
-impl Resource for DmaRegion {
+impl Resource for InstanceState {
     fn kind(&self) -> &'static str {
-        "dma-region"
+        match crate::entropy_device::backing() {
+            vibeos_hal::entropy::Backing::Dma { .. } => "dma-region",
+            vibeos_hal::entropy::Backing::DriverOwned => "driver-state",
+        }
     }
-
     fn describe(&self) -> String {
-        format!(
-            "SYSTEM stable entropy slab @ {:#x}, {} bytes",
-            vibeos_driver_virtio_rng::dma_base(),
-            vibeos_driver_virtio_rng::DMA_BYTES
-        )
+        match crate::entropy_device::backing() {
+            vibeos_hal::entropy::Backing::Dma { cpu_base, bytes } => format!(
+                "SYSTEM stable entropy slab @ {:#x}, {} bytes", cpu_base(), bytes),
+            vibeos_hal::entropy::Backing::DriverOwned =>
+                String::from("firmware-owned entropy controller state (no DMA)"),
+        }
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Bounded, fallible entropy service. Possessing the Rust object is not enough:
 /// every public operation accepts an invocation lease and checks READ rights.
+#[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
 pub struct RandomSource;
+#[cfg(all(feature = "universal", feature = "jitter-entropy"))]
+pub use crate::jitterentropy_random::RandomSource;
 
 impl RandomSource {
+    #[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
     fn new() -> Arc<Self> {
         Arc::new(Self)
     }
@@ -222,9 +226,9 @@ impl RandomSource {
             online: control.online,
             quarantined: control.quarantined,
             max_request_bytes: MAX_RANDOM_BYTES as u16,
-            queue_size: ENTROPY_QUEUE_SIZE,
+            queue_size: vibeos_hal::entropy::device().queue_size,
             session_epoch: control.epoch,
-            irq: control.transport.map_or(0, MmioTransport::irq),
+            irq: control.transport.map_or(0, Endpoint::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
             bytes_returned: BYTE_COUNT.load(Ordering::Acquire),
             resets: RESET_COUNT.load(Ordering::Acquire),
@@ -233,6 +237,7 @@ impl RandomSource {
     }
 }
 
+#[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
 impl Resource for RandomSource {
     fn kind(&self) -> &'static str {
         "random-source"
@@ -278,6 +283,14 @@ pub async fn bytes_with(
     result
 }
 
+/// Trusted kernel provisioning path; never exported as a component syscall.
+/// Uses the same supervised request queue and reset/quarantine policy as the
+/// capability frontend. The caller controls identity-storage authority.
+#[cfg(feature = "provisioned-ssh")]
+pub async fn fill_seed(output: &mut [u8; 32]) -> Result<(), RandomError> {
+    request(output.len()).await?.copy_to(output)
+}
+
 /// Convenience wrapper for callers which already own a fixed destination.
 /// The destination pointer never crosses the service or DMA boundary.
 pub async fn fill_with(
@@ -290,21 +303,23 @@ pub async fn fill_with(
 
 pub struct RandomResources {
     pub mmio: Arc<MmioWindow>,
-    pub dma: Arc<DmaRegion>,
+    pub state: Arc<InstanceState>,
     pub source: Arc<RandomSource>,
 }
 
-/// Discover only a real QEMU modern transport with device id 4.
+/// Discover only the endpoint admitted by the firmware entropy provider.
 ///
-/// There is intentionally no clock/counter/deterministic fallback. Since this
-/// module is removed wholesale outside `qemu-virt`, a Milk-V build cannot
-/// accidentally publish a fake `RandomSource`.
+/// There is intentionally no clock/counter/deterministic fallback. Since the
+/// provider must be supplied by firmware, the kernel cannot manufacture an
+/// available source when hardware admission fails.
 pub fn discover() -> Option<RandomResources> {
-    // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
-    // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_entropy(crate::platform::VIRTIO_MMIO) }?;
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().entropy_backend != vibeos_hal::runtime_platform::EntropyBackend::Queued { return None; }
+    // Safety: firmware resources are mapped before device discovery begins;
+    // the provider validates hardware identity and assigned resource ownership.
+    let transport = unsafe { Endpoint::discover() }?;
     {
-        // The transport is a boot-discovered, immutable part of the DMA claim.
+        // The endpoint is a boot-discovered, immutable part of the instance claim.
         // Publish it before any component can claim the slab so raw-fault
         // recovery never has to rely on a half-completed driver attach.
         let mut control = CONTROL.lock();
@@ -320,17 +335,18 @@ pub fn discover() -> Option<RandomResources> {
     }
     Some(RandomResources {
         mmio: MmioWindow::new(transport),
-        dma: Arc::new(DmaRegion),
+        state: Arc::new(InstanceState),
         source: RandomSource::new(),
     })
 }
 
-// Safety: DMA_CLAIM_ARENA serializes task-side CPU access. Its non-zero value
+// Safety: INSTANCE_CLAIM_ARENA serializes task-side access to the controller
+// and its backing state, whether or not hardware DMA is used. Its non-zero value
 // is the exact tracked arena which owns the current device incarnation, so
 // fault recovery can identify a claim even if attach has not yet published any
-// other driver state. A confirmed status-zero reset is the only path which
-// releases the slab for another incarnation.
-static DMA_CLAIM_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
+// other driver state. Only confirmed reset/retirement under the existing
+// teardown barriers may release the instance claim for another incarnation.
+static INSTANCE_CLAIM_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 
 #[derive(Clone, Copy)]
 struct PendingRequest {
@@ -354,7 +370,7 @@ enum RequestSlot {
 }
 
 struct DriverControl {
-    transport: Option<MmioTransport>,
+    transport: Option<Endpoint>,
     accepted_features: u64,
     epoch: u64,
     online: bool,
@@ -363,7 +379,7 @@ struct DriverControl {
 
 struct DriverAuthority {
     mmio: Revocable<MmioWindow>,
-    dma: Revocable<DmaRegion>,
+    dma: Revocable<InstanceState>,
     source: Revocable<RandomSource>,
 }
 
@@ -554,7 +570,7 @@ pub async fn driver_task(space: &'static Space, mmio_cap: Cap, dma_cap: Cap, sou
         let cspace = space.0.lock();
         match (
             cspace.lookup_revocable::<MmioWindow>(mmio_cap, Rights::READ.union(Rights::WRITE)),
-            cspace.lookup_revocable::<DmaRegion>(dma_cap, Rights::READ.union(Rights::WRITE)),
+            cspace.lookup_revocable::<InstanceState>(dma_cap, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<RandomSource>(source_cap, Rights::READ),
         ) {
             (Ok(mmio), Ok(dma), Ok(source)) => Some(DriverAuthority { mmio, dma, source }),
@@ -668,15 +684,22 @@ fn complete_active(result: Result<RandomBytes, RandomError>) {
     }
 }
 
+fn polling_completion() -> bool {
+    vibeos_hal::entropy::device().completion_mode == vibeos_hal::entropy::CompletionMode::Polling
+}
+fn enable_completion_irq(transport: Endpoint) -> Result<(), plic::RegisterError> {
+    if polling_completion() { plic::disable(transport.irq()) } else { plic::enable(transport.irq()) }
+}
+
 struct DriverSession {
-    transport: MmioTransport,
+    transport: Endpoint,
     engine: Engine,
     claim_arena: ArenaId,
     armed: bool,
 }
 
 impl DriverSession {
-    fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
+    fn attach(transport: Endpoint, authority: DriverAuthority) -> Option<Self> {
         if CONTROL.lock().quarantined {
             complete_active(Err(RandomError::Quarantined));
             return None;
@@ -691,7 +714,7 @@ impl DriverSession {
             return None;
         }
         let claim_arena = domain.arena;
-        if DMA_CLAIM_ARENA
+        if INSTANCE_CLAIM_ARENA
             .compare_exchange(
                 ArenaId::UNTRACKED.get(),
                 claim_arena.get(),
@@ -725,7 +748,7 @@ impl DriverSession {
                 return None;
             }
         };
-        // Safety: this incarnation holds the exact DMA_CLAIM_ARENA claim and
+        // Safety: this incarnation holds the exact INSTANCE_CLAIM_ARENA claim and
         // no Engine has been published. On later attach failure the local
         // engine is never accessed again before teardown resets the device.
         let engine = match unsafe { Engine::prepare(transport, epoch, RESET_POLL_BUDGET) } {
@@ -737,8 +760,8 @@ impl DriverSession {
         };
 
         let _ = plic::unregister(transport.irq());
-        if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
-            || plic::enable(transport.irq()).is_err()
+        if (!polling_completion() && plic::register(transport.irq(), irq_top_half, transport.base()).is_err())
+            || enable_completion_irq(transport).is_err()
         {
             shutdown(transport, claim_arena, RandomError::DriverCancelled);
             return None;
@@ -835,7 +858,7 @@ impl DriverSession {
         if !authority_live(self.transport) {
             return Err(RandomError::AuthorityRevoked);
         }
-        let _ = virtio::InterruptCauses::from_status(IRQ_CAUSES.swap(0, Ordering::AcqRel));
+        let _ = IRQ_CAUSES.swap(0, Ordering::AcqRel);
         if !self.engine.operational() {
             self.engine.require_reset();
             self.reset_required_transport()?;
@@ -865,7 +888,7 @@ impl DriverSession {
                 .reset_and_prepare(epoch, RESET_POLL_BUDGET)
                 .is_ok()
             {
-                if plic::enable(self.transport.irq()).is_ok() {
+                if enable_completion_irq(self.transport).is_ok() {
                     if self.engine.start().is_ok() {
                         let mut control = CONTROL.lock();
                         control.accepted_features = self.engine.accepted_features();
@@ -924,7 +947,7 @@ impl DriverSession {
         *AUTHORITY.lock() = None;
         self.armed = false;
         // Reset was not confirmed, so the device may still own every DMA byte.
-        // DMA_CLAIM_ARENA intentionally retains this exact incarnation forever.
+        // INSTANCE_CLAIM_ARENA intentionally retains this exact incarnation forever.
     }
 }
 
@@ -952,22 +975,22 @@ fn advance_epoch() -> Result<u64, RandomError> {
     Ok(epoch)
 }
 
-fn attach_failed(transport: MmioTransport, claim_arena: ArenaId, error: RandomError) {
+fn attach_failed(transport: Endpoint, claim_arena: ArenaId, error: RandomError) {
     // Safety: attach owns the exact DMA claim and the failed local Engine is
     // no longer accessed; no replacement can attach until claim release.
-    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
+    let reset = unsafe { crate::entropy_device::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
     finish_claimed_teardown(claim_arena, reset, error);
 }
 
-fn quarantine_inconsistent_attach(transport: MmioTransport) {
+fn quarantine_inconsistent_attach(transport: Endpoint) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
     // Do not clear DMA here: the inconsistent stale authority means an old CPU
     // session cannot be proven quiescent. Reset best-effort and quarantine the
     // exact claim forever instead.
-    let _ = transport.reset(RESET_POLL_BUDGET);
+    let _ = transport.quiesce(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
@@ -977,17 +1000,17 @@ fn quarantine_inconsistent_attach(transport: MmioTransport) {
         control.quarantined = true;
     }
     complete_active(Err(RandomError::Quarantined));
-    // DMA_CLAIM_ARENA intentionally remains non-zero forever.
+    // INSTANCE_CLAIM_ARENA intentionally remains non-zero forever.
 }
 
-fn shutdown(transport: MmioTransport, claim_arena: ArenaId, reason: RandomError) {
+fn shutdown(transport: Endpoint, claim_arena: ArenaId, reason: RandomError) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
     CONTROL.lock().online = false;
     // Safety: ordinary teardown or fault recovery owns the exact claim; a
     // faulted owner is permanently detached before this path, and normal
     // DriverSession teardown performs no concurrent Engine access.
-    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
+    let reset = unsafe { crate::entropy_device::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
     finish_claimed_teardown(claim_arena, reset, reason);
@@ -1000,7 +1023,7 @@ fn finish_claimed_teardown(claim_arena: ArenaId, reset: bool, reason: RandomErro
     let mut control = CONTROL.lock();
     control.online = false;
     let owns_claim =
-        claim_arena.is_tracked() && DMA_CLAIM_ARENA.load(Ordering::Acquire) == claim_arena.get();
+        claim_arena.is_tracked() && INSTANCE_CLAIM_ARENA.load(Ordering::Acquire) == claim_arena.get();
     if !reset || !owns_claim || matches!(reason, RandomError::IdentityExhausted) {
         control.quarantined = true;
     }
@@ -1020,7 +1043,7 @@ fn finish_claimed_teardown(claim_arena: ArenaId, reset: bool, reason: RandomErro
 
 fn release_dma_claim(claim_arena: ArenaId) -> bool {
     claim_arena.is_tracked()
-        && DMA_CLAIM_ARENA
+        && INSTANCE_CLAIM_ARENA
             .compare_exchange(
                 claim_arena.get(),
                 ArenaId::UNTRACKED.get(),
@@ -1030,7 +1053,7 @@ fn release_dma_claim(claim_arena: ArenaId) -> bool {
             .is_ok()
 }
 
-fn authority_live(transport: MmioTransport) -> bool {
+fn authority_live(transport: Endpoint) -> bool {
     let authority = AUTHORITY.lock();
     let Some(authority) = authority.as_ref() else {
         return false;
@@ -1050,6 +1073,7 @@ enum WaitOutcome {
 }
 
 enum WaitSignal {
+    PollAgain,
     Completed,
     DeviceNeedsReset,
     Irq,
@@ -1061,6 +1085,7 @@ async fn wait_for_completion(
     submission: Submission,
     deadline: u64,
 ) -> WaitOutcome {
+    let polling = polling_completion();
     loop {
         let irq = IRQ_WAIT.wait();
         if !engine.operational() {
@@ -1077,7 +1102,7 @@ async fn wait_for_completion(
             .saturating_mul(1_000)
             .div_ceil(exec::timebase_hz())
             .max(1);
-        let timeout = exec::sleep_ms(remaining_ms);
+        let timeout = exec::sleep_ms(if polling { remaining_ms.min(1) } else { remaining_ms });
         let mut irq = pin!(irq);
         let mut timeout = pin!(timeout);
         let signal = poll_fn(|cx| {
@@ -1088,9 +1113,9 @@ async fn wait_for_completion(
                 return Poll::Ready(WaitSignal::Completed);
             }
             if timeout.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(WaitSignal::TimedOut);
+                return Poll::Ready(if polling && crate::sbi::time() < deadline { WaitSignal::PollAgain } else { WaitSignal::TimedOut });
             }
-            if irq.as_mut().poll(cx).is_ready() {
+            if !polling && irq.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(WaitSignal::Irq);
             }
             Poll::Pending
@@ -1100,29 +1125,29 @@ async fn wait_for_completion(
             WaitSignal::Completed => return WaitOutcome::Completed,
             WaitSignal::DeviceNeedsReset => return WaitOutcome::DeviceNeedsReset,
             WaitSignal::TimedOut => return WaitOutcome::TimedOut,
-            WaitSignal::Irq => {}
+            WaitSignal::Irq | WaitSignal::PollAgain => {}
         }
     }
 }
 
 fn irq_top_half(transport_base: usize, _irq_entry: u64) {
     let causes = acknowledge_irq_transport(transport_base);
-    if causes != 0 {
-        if virtio::InterruptCauses::from_status(causes).used_buffer() {
+    if causes.completion || causes.state_changed {
+        if causes.completion {
             USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        IRQ_CAUSES.fetch_or(causes, Ordering::Release);
+        IRQ_CAUSES.fetch_or(u32::from(causes.completion) | (u32::from(causes.state_changed) << 1), Ordering::Release);
         IRQ_WAIT.wake_all();
         REQUEST_WAIT.wake_all();
     }
 }
 
-fn acknowledge_irq_transport(transport_base: usize) -> u32 {
-    // SAFETY: QEMU's BSP identity-maps every VirtIO transport for the firmware
-    // lifetime and assigns this fixed slot only to the entropy device. PLIC
+fn acknowledge_irq_transport(transport_base: usize) -> vibeos_hal::entropy::Events {
+    // SAFETY: firmware retains immutable resources for the sole entropy
+    // endpoint for its lifetime. PLIC
     // teardown may leave one copied handler in flight, but concurrent W1C
     // acknowledgements of the same transport are explicitly supported.
-    unsafe { vibeos_driver_virtio_rng::acknowledge_interrupt_at(transport_base) }
+    unsafe { crate::entropy_device::acknowledge_interrupt_at(transport_base) }
 }
 
 pub fn is_online() -> bool {
@@ -1147,7 +1172,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     // remains valid from the first successful claim instruction, including the
     // attach window before DriverSession exists or CONTROL has been touched by
     // that component.
-    if !domain.arena.is_tracked() || DMA_CLAIM_ARENA.load(Ordering::Acquire) != domain.arena.get() {
+    if !domain.arena.is_tracked() || INSTANCE_CLAIM_ARENA.load(Ordering::Acquire) != domain.arena.get() {
         return;
     }
 

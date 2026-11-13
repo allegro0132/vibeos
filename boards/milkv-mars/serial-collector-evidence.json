@@ -1,0 +1,45 @@
+{
+  "status": "Passive serial collector host-tested; no physical port opened",
+  "host_tests": 11,
+  "hardware_tests": 0,
+  "physical_acceptance": false,
+  "qemu_transcript_rejected_as_mars": true,
+  "mutations": [
+    "late panic filter disabled: detected",
+    "multiple boot detection disabled: detected",
+    "capture error reported as success: detected"
+  ],
+  "blind_spots": [
+    "Host PTY test does not validate USB adapter or Mars UART electrical operation",
+    "Observed text does not prove physical identity or a cold power cycle",
+    "No physical storage/network/entropy/SSH/WASM/stability acceptance"
+  ],
+  "sources": [
+    {
+      "path": "scripts/mars-serial-accept.py",
+      "sha256": "386ed2e3fb88c6dabe94bb7e840ffe4aecd449701a9889b6a7a4e44c5bb52fcf"
+    },
+    {
+      "path": "scripts/tests/test_mars_serial.py",
+      "sha256": "7d68911afc5d968492936c2117996af5ba6e1d1c3706f782b7a015954eacc08c"
+    }
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage36-serial-tests.log",
+      "sha256": "b40269c9ce11c58119adca2872f662c7fa8b2b3a1951015053ad12c342cb0013"
+    },
+    {
+      "path": "target/mars-reference/stage36-mutation-capture-error.log",
+      "sha256": "fc3905048f02cc2d6e9711635a52aaf7e627268873ee1bdd39185b9c468e1030"
+    },
+    {
+      "path": "target/mars-reference/stage36-mutation-late-panic.log",
+      "sha256": "3be5f21d19999bf109fe9b540870bdf860abb3018debd26492cde1c94dc6e089"
+    },
+    {
+      "path": "target/mars-reference/stage36-mutation-reboot-count.log",
+      "sha256": "1c0ff02e19b4ffde7255c156987dae27156365691ead80567a4b65bd82167ce3"
+    }
+  ]
+}

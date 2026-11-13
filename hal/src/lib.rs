@@ -7,6 +7,10 @@
 //! drivers consume the smaller device-specific descriptions.
 
 pub mod arch;
+pub mod boot;
+pub mod devices;
+pub mod memory;
+pub mod fdt;
 
 /// Largest Ethernet frame handled by the network interface contract,
 /// excluding the four-byte frame check sequence supplied and consumed by the
@@ -121,6 +125,7 @@ impl IdentityMapping {
 /// the kernel (control/enable and supervisor contexts).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MmuDescription {
+    pub ram_granularity: MappingGranularity,
     pub ram: AddressRange,
     pub ram_attributes: MemoryAttributes,
     pub mmio_attributes: MemoryAttributes,
@@ -230,37 +235,32 @@ pub struct PciHostDescription {
     pub intx_first_irq: u32,
 }
 
-/// Synopsys DWMAC instance plus board-level clock/PHY wiring.
+/// Synopsys DWMAC controller resources after firmware platform selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DwmacDescription {
     pub registers: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
-    pub efuse: AddressRange,
     pub phy_address: u8,
     pub dma_address_bits: u8,
     pub cache_line_bytes: usize,
 }
 
-/// SDHCI instance plus board-level pinmux and source-clock wiring.
+/// SDHCI controller resources after platform source-clock selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SdhciDescription {
     pub registers: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
     pub source_clock_hz: u32,
     pub bus_width: u8,
     pub init_clock_hz: u32,
     pub data_clock_hz: u32,
 }
 
-/// Synopsys DWC2 USB 2.0 OTG core plus SoC-specific PHY and role wiring.
+/// Synopsys DWC2 controller resources; platform PHY/role wiring is separate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Dwc2Description {
     pub registers: AddressRange,
-    pub phy: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
     pub dma_address_bits: u8,
     pub cache_line_bytes: usize,
 }
@@ -297,8 +297,47 @@ pub trait Board {
     const INFO: BoardInfo;
     const MEMORY_MAP: &'static [MemoryRegion];
     const MMU: MmuDescription;
+    const RTC: Option<AddressRange> = None;
+    const RESET: Option<fn() -> !> = None;
+    /// Optional board transport preparation before entering the SBI reset service.
+    const PREPARE_RESET: Option<fn() -> bool> = None;
     const HART_IDS: &'static [usize];
 
     /// Return the supervisor PLIC context for an OpenSBI-visible physical hart.
     fn plic_s_context(physical_hart: usize) -> Option<usize>;
 }
+
+/// DesignWare MSHC resource contract, independent of a specific SoC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DwMshcDescription {
+    pub registers: AddressRange,
+    pub irq: u32,
+    pub source_clock_hz: u32,
+    pub data_clock_hz: u32,
+    pub fifo_depth_words: u16,
+    pub fifo_offset: usize,
+}
+
+pub mod block;
+
+pub mod entropy;
+
+pub mod queued_block;
+
+pub mod network;
+
+pub mod queued_network;
+
+pub mod pci;
+
+pub mod usb;
+
+pub mod usb_polling;
+
+pub mod device_transport;
+
+pub mod runtime_platform;
+
+pub mod tcp_segmentation;
+
+pub mod network_rx;

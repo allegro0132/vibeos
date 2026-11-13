@@ -26,7 +26,7 @@ use crate::sync::SpinLock;
 use crate::virtio::{self, NegotiatedFeatures, NET_HEADER_SIZE, NET_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
-use vibeos_driver_virtio_net::{Engine, HardwareError, ResetReason};
+use crate::queued_network::{Engine, HardwareError, ResetReason};
 
 const TX_TIMEOUT_MS: u64 = 2_000;
 const IDLE_POLL_MS: u64 = 1;
@@ -40,6 +40,7 @@ const HELLO_PAYLOAD: &[u8] = b"VIBEOS-NET-HELLO-v1";
 const CHALLENGE_PAYLOAD: &[u8] = b"VIBEOS-NET-CHALLENGE-v1";
 const ACK_PAYLOAD: &[u8] = b"VIBEOS-NET-ACK-v1";
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetError {
     Offline,
@@ -56,6 +57,7 @@ pub enum NetError {
     IdentityExhausted,
 }
 
+#[cfg(not(feature = "universal"))]
 impl core::fmt::Display for NetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -75,6 +77,7 @@ impl core::fmt::Display for NetError {
     }
 }
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetInfo {
     pub online: bool,
@@ -141,8 +144,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable net slab @ {:#x}, {} bytes, page aligned",
-            vibeos_driver_virtio_net::dma_base(),
-            vibeos_driver_virtio_net::dma_size()
+            crate::queued_network::dma_base(),
+            crate::queued_network::dma_size()
         )
     }
 
@@ -153,8 +156,10 @@ impl Resource for DmaRegion {
 
 /// Client-visible control and status authority. Packet transfer itself uses
 /// the two directional `Endpoint<StampedPacket>` capabilities.
+#[cfg(not(feature = "universal"))]
 pub struct NetDevice;
 
+#[cfg(not(feature = "universal"))]
 impl NetDevice {
     fn new() -> Arc<Self> {
         Arc::new(Self)
@@ -191,7 +196,41 @@ impl NetDevice {
         }
     }
 }
+#[cfg(feature = "universal")]
+pub(crate) fn universal_info() -> NetInfo {
+        let control = CONTROL.lock();
+        NetInfo {
+            online: control.online,
+            quarantined: control.quarantined,
+            queue_size: NET_QUEUE_SIZE,
+            header_size: NET_HEADER_SIZE,
+            accepted_features: control.features.map_or(0, |features| features.accepted()),
+            session_epoch: control.sessions.device_epoch(),
+            stack_generation: control
+                .sessions
+                .active_stamp()
+                .map_or(0, PacketStamp::stack_generation),
+            irq: control.transport.map_or(0, MmioTransport::irq),
+            used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
+            rx_packets: RX_PACKET_COUNT.load(Ordering::Acquire),
+            tx_packets: TX_PACKET_COUNT.load(Ordering::Acquire),
+            stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
+                .load(Ordering::Acquire),
+            stale_egress_stack_generation_drops: STALE_EGRESS_STACK_GENERATION_DROPS
+                .load(Ordering::Acquire),
+            resets: RESET_COUNT.load(Ordering::Acquire),
+            timeouts: TIMEOUT_COUNT.load(Ordering::Acquire),
+            rx_inflight: control.rx_inflight,
+            tx_inflight: control.tx_inflight,
+            ethernet_address: GUEST_MAC,
+            phy_link_up: true,
+            ..NetInfo::default()
+        }
+    }
 
+#[cfg(not(feature = "universal"))]
 impl Resource for NetDevice {
     fn kind(&self) -> &'static str {
         "network-device"
@@ -384,7 +423,7 @@ pub struct NetResources {
 pub fn discover() -> Option<NetResources> {
     // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
     // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_network(crate::platform::VIRTIO_MMIO) }?;
+    let transport = unsafe { MmioTransport::scan_network() }?;
     Some(NetResources {
         location: crate::net_device::NetworkLocation::Mmio {
             base: transport.base(),
@@ -509,7 +548,7 @@ struct DriverSession {
 
 impl DriverSession {
     fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
-        if CONTROL.lock().quarantined || vibeos_driver_virtio_net::dma_quarantined() {
+        if CONTROL.lock().quarantined || crate::queued_network::dma_quarantined() {
             return None;
         }
         {
@@ -543,7 +582,7 @@ impl DriverSession {
             Err(_) => {
                 let mut control = CONTROL.lock();
                 control.sessions.detach_device();
-                control.quarantined = vibeos_driver_virtio_net::dma_quarantined();
+                control.quarantined = crate::queued_network::dma_quarantined();
                 *AUTHORITY.lock() = None;
                 clear_driver_domain();
                 return None;
@@ -795,7 +834,7 @@ fn map_reset_reason(error: HardwareError) -> ResetReason {
 fn quarantine_identity_exhausted(transport: MmioTransport) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
-    vibeos_driver_virtio_net::quarantine_before_attach(transport);
+    crate::queued_network::quarantine_before_attach(transport);
     IRQ_CAUSES.store(0, Ordering::Release);
     {
         let mut control = CONTROL.lock();
@@ -936,7 +975,7 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
     // Safety: PLIC registration captures the base from a successfully probed
     // transport and unregisters the callback before transport retirement.
-    unsafe { vibeos_driver_virtio_net::acknowledge_irq_at_base(transport_base) }
+    unsafe { crate::queued_network::acknowledge_irq_at_base(transport_base) }
 }
 
 pub fn hello_packet() -> Packet {
@@ -997,7 +1036,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
         // in this exact owner/arena incarnation. PLIC delivery is detached
         // before the hardware crate clears DMA or releases its global claim;
         // the abandoned DriverSession can therefore never run or Drop later.
-        let reset = unsafe { vibeos_driver_virtio_net::recover_faulted_transport(transport) };
+        let reset = unsafe { crate::queued_network::recover_faulted_transport(transport) };
         IRQ_CAUSES.store(0, Ordering::Release);
         let mut control = CONTROL.lock();
         control.online = false;
@@ -1017,3 +1056,6 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 pub fn debug_waiter_count() -> usize {
     IRQ_WAIT.waiter_count()
 }
+
+#[cfg(feature = "universal")]
+pub use crate::universal_net::{NetError, NetInfo, NetDevice};

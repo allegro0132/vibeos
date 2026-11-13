@@ -1,0 +1,40 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "sha256": "4834672066b8e4d7a2ae14169cc235de904966e8b8c3bc6b03cc5f670ece4a80"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dtsi",
+      "sha256": "74ec33a74931aed76cc62a32a00382b5af18b6a30d8c10b50fc1b1985cbbd8fd"
+    },
+    {
+      "path": "linux/include/dt-bindings/clock/starfive-jh7110-clkgen.h",
+      "sha256": "7b9cae8485cf52fed31a33362339cff81b3db204b5d3aad236f0632b16df8271"
+    },
+    {
+      "path": "linux/include/dt-bindings/reset/starfive-jh7110.h",
+      "sha256": "283388e54a663602b6840d3a5af6e1b5d90b1f093b077ee167d933db8e370505"
+    }
+  ],
+  "sdk_dtb_sha256": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d",
+  "gmac": "0x16030000",
+  "clock_ids": [
+    108,
+    224,
+    109,
+    221,
+    222,
+    111,
+    223
+  ],
+  "reset_ids": [
+    161,
+    160
+  ],
+  "phy_binding": "Vendor ethernet-phy@0 tuning node has no reg or phy-handle; address and identity must be discovered via MDIO",
+  "dma_coherent_property_is_hardware_proof": false,
+  "hardware_qualification": false
+}

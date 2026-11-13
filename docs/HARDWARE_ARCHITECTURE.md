@@ -5,16 +5,19 @@ compiled. The Cargo composition and downward dependency direction are:
 
 ```text
 firmware/<board>  (selects features, owns entry point and final linking)
+        ├── boards/<board> + UART/PLIC engines
+        ├── immutable HAL boot/device operation tables
         └── kernel archive
               ├── policy/image   (logical resources)
-              ├── boards/<board> (typed physical descriptions)
+              ├── hal            (firmware-supplied physical resources)
               └── kernel adapters (capabilities, IRQs, supervision)
                        └── drivers/* (register/protocol engines)
                                   └── hal + core
 ```
 
-The selected `boards/<board>` BSP constructs the
-typed `vibeos_hal::BoardInfo` consumed by the kernel adapters: RAM and MMIO
+The final firmware uses its `boards/<board>` BSP to construct the immutable
+`vibeos_hal::boot::BootPlatform` consumed by the kernel. The kernel archive
+has no BSP dependency or board-selection facade. The contract includes: RAM and MMIO
 ranges, MMU mappings, hart and interrupt-controller facts, UART details, and
 optional per-device descriptions. Drivers receive only the description they
 need; they do not import a BSP or select a board themselves. Consequently,
@@ -43,10 +46,33 @@ Final entry symbols and linking also remain in those crates. Build from one
 firmware directory at a time so Cargo uses `firmware/.cargo/config.toml` and
 does not combine both board features into one kernel archive.
 
+## Firmware-owned early devices
+
+UART and PLIC instances are now composed directly by the final firmware via
+`firmware/early_devices.rs`. The immutable `VIBEOS_EARLY_DEVICES` Rust static
+contains HAL descriptions and operation tables; it needs no heap or mutable
+registration before the first console write. This is an internal static-link
+contract, not a stable module ABI. Firmware supplies the mapping and lifetime
+obligations; the kernel serializes TX, config and PLIC enable updates.
+
+The kernel UART/PLIC adapters contain queues, IRQ-handler publication and
+policy only. They neither access registers nor import a board/driver crate.
+The MMU and other device adapters obtain physical descriptions through
+`VIBEOS_BOOT_PLATFORM`. RAM page tables are allocated statically by firmware
+and borrowed under the kernel page-table ownership protocol. Multiple GiB
+windows and 2 MiB RAM leaves are supported; all runtime permission-changing
+pools are split before publishing the address space. Other hardware engines
+still have direct kernel dependencies pending the remaining driver migration.
+See `MILKV_MARS.md` for the remaining port work.
+
 ## Driver crates
 
 | Crate | Owns | Deliberately left to the kernel adapter |
 |---|---|---|
+| `drivers/uart16550` | 16550/DW APB register access and interrupt acknowledgement | Console buffering, locks, framing and wakeups |
+| `drivers/plic` | PLIC register access, context reset, enable/claim/complete | Context selection, locking and atomic handler registry |
+| `drivers/sd-protocol` | SD CSD capacity and block/byte address encoding | Controller transport and managed storage policy |
+| `drivers/dw-mshc` | DW-MSHC PIO SD engine; currently unattached | SoC preparation and generic block-service integration remain pending |
 | `drivers/pci` | Generic PCI ECAM discovery, type-0 BAR sizing/assignment, bus-master enablement | Serialized host access, device policy, INTx routing |
 | `drivers/virtio-core` | VirtIO 1.2 wire constants, feature/status machines, descriptors and split-queue lifecycle models | MMIO access, DMA storage, interrupts and device policy |
 | `drivers/virtio-mmio` | Modern VirtIO MMIO probing, register transport, feature and queue setup primitives | Device-specific queues, DMA allocation, interrupts and recovery |
@@ -88,3 +114,175 @@ assigns the boot-local `netN` sequence. The netstack allocates state for that
 runtime list; it has no fixed interface-count table. A service listener stays
 attached to the policy root that minted it, even if another topology changes
 that root's ordinal on a later boot.
+
+The synchronous PIO block boundary is now firmware-owned as well. The HAL
+operation table carries device metadata and serialized initialization, read,
+write, flush and diagnostic callbacks. It cannot retain caller buffers or
+publication callbacks. Kernel partition admission uses the reusable HAL
+`BlockWindow`; card protocol probing lives in the SDHCI crate. This boundary
+is ready for a DW-MSHC provider without importing SDHCI types into the kernel.
+Asynchronous DMA backends still need their completion and ownership migration.
+
+The HAL entropy operation table separates asynchronous RNG hardware ownership
+from kernel request policy. Firmware retains the driver engine, DMA slab and
+hardware completion records; kernel requests use epoch/serial tokens. Read-only
+completion queries can cross scheduler awaits, while state mutation requires
+exclusive invocation ownership. The minimal IRQ acknowledgement callback never
+borrows firmware engine state. Confirmed reset remains the prerequisite for
+releasing the kernel's DMA claim; failed resets retain quarantine.
+
+SD slot clock/pad/supply operations are supplied by a platform crate through
+HAL `SdPlatform` hooks. SDHCI receives only its own controller aperture and
+clock rates; it no longer receives a SoC control aperture. Firmware composes
+the controller and platform implementations, preserving power/reset ordering.
+
+Queued block devices are also composed by firmware. The kernel sends HAL
+operations and keeps scheduling, request publication accounting and capability
+policy; firmware owns the engine and DMA state. Operation tokens identify a
+specific epoch and serial. Driver completion validation precedes copying data
+back to kernel request buffers. Existing timeout, cancel, revoke and fault
+recovery paths retain their reset-before-reuse ordering across this boundary.
+
+The HAL packet-device boundary now composes the Duo DWMAC instance in firmware.
+Packet endpoints, stack generations and capability/fault policy remain kernel
+services. Firmware retains a fixed `.dma` slab and an instance claim. Ordinary
+shutdown consumes the engine; fault recovery explicitly abandons old metadata
+without a destructor and does not release the claim until reset succeeds.
+
+QEMU queued networking is now assembled by firmware as well. Kernel invocation
+tokens record release locally so repeated cleanup cannot dispatch a shutdown to
+a replacement firmware instance. Network frame bounds are checked before the
+HAL frame exposes a byte slice; controller ring/header validation stays in the
+driver. Packet-session policy and endpoint scheduling remain in the kernel.
+
+BootPlatform provides boot-only platform initialization and reporting callbacks,
+invoked after MMIO mapping and before SMP/services. Board-specific LED setup and
+its diagnostic formatting now belong to Duo firmware. The kernel has no LED
+hardware dependency or board-selection branch for that startup operation.
+
+PCI host enumeration and BAR allocation are now firmware-owned. HAL function
+snapshots describe resources without embedding ECAM access. Kernel callers
+serialize host operations and request bus-master activation through the host,
+which validates membership in its current inventory before writing configuration
+space. USB controller ownership is a subsequent boundary migration.
+
+XHCI controller and DMA storage are now firmware-owned. Kernel USB policy keeps
+resource admission, locking, IRQ registration and TTY injection. A failed IRQ
+route is masked and remains unpublished; firmware retains its controller for a
+same-resource retry, preventing a second live mutable DMA borrow. The IRQ token
+contains only live MMIO context and bypasses controller-state borrowing.
+
+Duo's polling USB host is now composed by firmware. HAL `usb_polling::Host`
+provides serialized operations and bounded descriptor/HID snapshots; the kernel
+keeps initialization publication, hotplug/class-selection policy, TTY delivery,
+and CDC network sessions. Firmware owns DWC2's controller, instance claim and
+permanent `.dma` storage. Failed initialization leaves no published kernel token;
+successful initialization is idempotent. The Duo kernel production dependency
+graph now contains no BSP or concrete driver crate. CV1800B USB clock/PHY access
+still lives in the DWC2 implementation and needs the later SoC-resource split.
+
+Fixed VirtIO discovery, status reads, reset confirmation and task-context IRQ
+acknowledgement now cross a firmware transport table. Kernel transport tokens
+contain only copied resource identity. Firmware resolves them against its own
+MMIO description and checks the complete descriptor before use; a supplied base
+is never dereferenced. Missing/mismatched resources report reset-required or
+failed reset, preserving quarantine. IRQ top halves retain the existing stateless
+firmware acknowledgement callbacks and never borrow an engine.
+
+Pure VirtIO wire types and state machines now live in `contracts/virtio`.
+`drivers/virtio-core` is a source-compatible re-export for existing driver users.
+The contract performs no MMIO and owns no DMA. Its existing 44 protocol tests
+moved with it. Neither QEMU nor Duo kernel production graphs contain concrete
+drivers or BSPs. `python3 scripts/check-driver-boundaries.py` enforces declared
+workspace normal/build/optional edges, excludes test-only fixtures, and checks
+that drivers also cannot reach the kernel or a BSP. This dependency gate does
+not prove the remaining board-feature or SoC-register-policy separation.
+
+DWMAC receives controller resources and a firmware-selected Ethernet platform
+operation table. CV1800B clocks, integrated PHY/eFuse calibration and C906 cache
+instructions live under `platform/cv1800b`; the driver no longer receives SoC or
+eFuse apertures. Firmware supplies platform diagnostics while keeping existing
+network telemetry fields. DMA callbacks use physical spans and explicit sync
+directions; the fixed identity-mapped pool must meet both the controller's
+32-bit reach and 64-byte isolation requirements. Platform setup failure releases
+the claim without touching the clockless MAC or running controller teardown.
+
+The complete pre-migration PHY register sequence is retained as a golden trace
+for fallback and programmed eFuse paths. This verifies software ordering; host
+cache tests only execute compiler fences and cannot establish physical DMA
+coherence. JH7110 must provide its own cache implementation and EQoS controller.
+
+DWC2 now receives only controller resources plus firmware-selected USB platform
+and DMA operations. CV1800B clock enables, role override and the UTMI reset pulse
+are owned by `platform/cv1800b/usb`. Successful preparation returns an owned
+opaque rollback token; failed controller initialization passes that token back
+before releasing the instance claim. Failed platform preparation never accesses
+the USB core. Successful initialization retains the platform resources.
+The shared C906 DMA implementation preserves USB input invalidation and output
+cleaning, and remains outside all controller crates.
+
+Provisioned SSH, WASI commands, Wasmtime commands and DHCP iperf3 now have
+board-neutral kernel service features: `provisioned-ssh`, `provisioned-command`,
+`provisioned-wasmtime` and `dhcp-iperf3-server`. Existing `milkv-*` service names
+remain aliases. Service selection does not select entropy: Duo firmware binds
+its existing jitter collector explicitly, while QEMU uses the supervised VirtIO
+entropy queue. Missing or conflicting provider selections fail compilation.
+
+Key provisioning uses the selected entropy frontend asynchronously; a failed
+seed request clears its output. Client key generation keeps its update lock
+until entropy generation and persistence finish. `ssh-keycat` names the existing
+SSH key-object handler without conflicting with file-tree capability paths;
+the old `cat` registration remains for images without that path parser. Identity
+encoding, authorization policy and on-media object kind are unchanged. This
+service separation does not yet remove board-named device/acceptance features.
+
+### Independently selected block and network frontends
+
+Firmware can select `pio-block` or `queued-block`, and `packet-network` or
+`queued-network`, without selecting a kernel board profile. Exactly one of
+each pair is required. These are static HAL frontend implementations, not
+concrete controller drivers. The old `qemu-virt`/`milkv-duo` profiles retain
+their original selections and compatibility behavior. Storage V2 batching,
+block/network diagnostics and recovery paths follow the interface selection.
+The existing internal `sdhci_blk`/`dwmac_net` adapter filenames remain; their
+hardware implementation is still provided through firmware-owned HAL tables.
+
+`BootPlatform.managed_block_id` is a nonzero image-provided storage namespace
+identity. It is independent of backend choice; QEMU and Duo retain their
+existing values. The primary NIC's displayed driver name also comes from
+`BootPlatform`, allowing EQoS to identify itself without kernel board branches.
+
+`firmware/qemu-hal-test` is a composition acceptance image. It links the real
+QEMU storage/network/transport providers and the shared UART/PLIC composition,
+but enables neither kernel board profile, USB nor entropy services. Its linker
+layout reuses the ordinary QEMU template. It is not a replacement for either
+production firmware or a Mars image. Four frontend combinations are checked
+with the generic network, WASI and legacy-shell services; only the queued pair
+has been run in this QEMU composition image.
+
+After building from `firmware/qemu-hal-test`, existing golden tests can use it:
+
+```sh
+QEMU_TEST_KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-hal-test \
+  scripts/qemu-test.sh block
+```
+
+`QEMU_TEST_KERNEL` skips the test harness's default build and requires the
+supplied ELF to exist. Omitting it preserves the original build/test behavior.
+The `net`, `block_recovery` and `net_recovery` cases exercise real providers and
+unchanged client authority/recovery contracts. The optional live DTB probe and
+390 target selftests also run on this image. USB, entropy and acceptance-only
+kernel board switches remain to be separated; this stage does not claim a
+fully board-independent kernel.
+
+### JH7110 SD resources
+
+The JH7110 platform crate depends only on HAL. Mars BSP supplies the SDIO1 pin
+order and settling interval; final firmware will own the exclusive CRG/SYSCON/
+IOMUX handles and invoke preparation before constructing the controller engine.
+The returned source rate is an input to the DW-MSHC description. Neither the
+kernel nor the controller driver gains a JH7110/BSP dependency. The initial pin
+implementation supports SYS GPIO7..12 and integer PLL2 or oscillator parents;
+unsupported configurations fail explicitly. MMIO access uses RISC-V I/O fences.
+The host and RV64 register-model tests cannot qualify those real MMIO accesses
+or the board's electrical behavior.

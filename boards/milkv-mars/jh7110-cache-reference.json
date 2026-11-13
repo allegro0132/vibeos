@@ -1,0 +1,26 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "u-boot/arch/riscv/cpu/jh7110/cache.c",
+      "sha256": "724add433e458a8a3a594e6d2760db86416a7194b857c2ad8c18683669dae5d4"
+    },
+    {
+      "path": "linux/drivers/soc/sifive/sifive_l2_cache.c",
+      "sha256": "b0b191c6a0dde3bf1322366e173ac813a1d0eb751d55bf190bc657a64cac24fe"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "sha256": "4834672066b8e4d7a2ae14169cc235de904966e8b8c3bc6b03cc5f670ece4a80"
+    }
+  ],
+  "control_base": "0x02010000",
+  "control_bytes": 16384,
+  "flush64_offset": 512,
+  "cache_line_bytes": 64,
+  "operation": "64-bit physical line address write, followed by full IO/memory barrier; same SDK clean/invalidate path for both DMA directions",
+  "uncached_alias_used": false,
+  "thead_instructions_used": false,
+  "hardware_qualification": false
+}

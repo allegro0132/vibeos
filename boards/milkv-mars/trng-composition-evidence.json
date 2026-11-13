@@ -1,0 +1,226 @@
+{
+  "status": "Explicit native TRNG diagnostic payloads built; physical diagnostic not run",
+  "profiles": [
+    {
+      "path": "target/milkv-mars/bringup-trng-probe",
+      "manifest": {
+        "profile": "mars-4gb-serial-sd-bringup-trng-probe",
+        "trng_boot_probe": true,
+        "entropy_qualified": false,
+        "source_commit": "7c45f1434f5fd5bec507b549fe1ead88e41625dd",
+        "source_dirty": true,
+        "rustc": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)",
+        "target": "riscv64imac-unknown-none-elf",
+        "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+        "sd_data_first_sector": 262144,
+        "sd_data_sector_count": 1048576,
+        "sector_bytes": 512,
+        "network_available": false,
+        "network_composed": false,
+        "network_hardware_verified": false,
+        "ssh_enabled": false,
+        "network_services": [],
+        "paired_boot_firmware_bundled": false,
+        "flashable_sd_image": false,
+        "physical_acceptance": false,
+        "artifacts": [
+          {
+            "name": "vibeos.elf",
+            "bytes": 12769760,
+            "sha256": "6bcbc97cdab124af1b28f6533c8c53067ccbacd2a3bf805dc10182f24cb25ade"
+          },
+          {
+            "name": "vibeos.bin",
+            "bytes": 3373424,
+            "sha256": "f7c5ec5c5ba12662a36a0c130ccd83e50f24a4a483085f74c1017a8bd0f17544"
+          },
+          {
+            "name": "elf-check.json",
+            "bytes": 633,
+            "sha256": "8779cd6651d82726ad3df4b32b83d9c4c8f903263bf08e1f024109cd1ad8ae5d"
+          }
+        ]
+      },
+      "elf_check": {
+        "status": "elf-contract-passed",
+        "entry": 1075838976,
+        "heap_start": 1095307264,
+        "heap_end": 5368709120,
+        "elf_sha256": "6bcbc97cdab124af1b28f6533c8c53067ccbacd2a3bf805dc10182f24cb25ade",
+        "loads": [
+          {
+            "address": 1075838976,
+            "file_bytes": 2940928,
+            "memory_bytes": 2940928,
+            "flags": 5
+          },
+          {
+            "address": 1078779904,
+            "file_bytes": 380928,
+            "memory_bytes": 380928,
+            "flags": 4
+          },
+          {
+            "address": 1079160832,
+            "file_bytes": 51568,
+            "memory_bytes": 15097856,
+            "flags": 6
+          }
+        ],
+        "physical_acceptance": false,
+        "flashable_sd_image": false
+      }
+    },
+    {
+      "path": "target/milkv-mars/ethernet-trng-probe",
+      "manifest": {
+        "profile": "mars-4gb-sd-dhcp-iperf3-bringup-trng-probe",
+        "trng_boot_probe": true,
+        "entropy_qualified": false,
+        "source_commit": "7c45f1434f5fd5bec507b549fe1ead88e41625dd",
+        "source_dirty": true,
+        "rustc": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)",
+        "target": "riscv64imac-unknown-none-elf",
+        "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+        "sd_data_first_sector": 262144,
+        "sd_data_sector_count": 1048576,
+        "sector_bytes": 512,
+        "network_available": true,
+        "network_composed": true,
+        "network_hardware_verified": false,
+        "ssh_enabled": false,
+        "network_services": [
+          "dhcp",
+          "iperf3-tcp-5201"
+        ],
+        "paired_boot_firmware_bundled": false,
+        "flashable_sd_image": false,
+        "physical_acceptance": false,
+        "artifacts": [
+          {
+            "name": "vibeos.elf",
+            "bytes": 13282928,
+            "sha256": "69a9001288ad4443449ea7190754dc7c2086f6dc2decace1b7f37fa60f978869"
+          },
+          {
+            "name": "vibeos.bin",
+            "bytes": 3533656,
+            "sha256": "306c2f82059626729904562f5dfb03508c7a9a65c68277c9f34470c3d9b6e7c2"
+          },
+          {
+            "name": "elf-check.json",
+            "bytes": 750,
+            "sha256": "7e2d1c2759620cc8201946a56875a7ad16369fc89c1bae4c0d62612b6f6f2b6a"
+          }
+        ]
+      },
+      "elf_check": {
+        "status": "elf-contract-passed",
+        "entry": 1075838976,
+        "heap_start": 1095565312,
+        "heap_end": 5368709120,
+        "elf_sha256": "69a9001288ad4443449ea7190754dc7c2086f6dc2decace1b7f37fa60f978869",
+        "loads": [
+          {
+            "address": 1075838976,
+            "file_bytes": 3043328,
+            "memory_bytes": 3043328,
+            "flags": 5
+          },
+          {
+            "address": 1078882304,
+            "file_bytes": 438272,
+            "memory_bytes": 438272,
+            "flags": 4
+          },
+          {
+            "address": 1079320576,
+            "file_bytes": 52056,
+            "memory_bytes": 15196160,
+            "flags": 6
+          }
+        ],
+        "physical_acceptance": false,
+        "flashable_sd_image": false,
+        "eqos_dma": {
+          "base": 1088122880,
+          "bytes": 102400,
+          "address_bits": 32,
+          "cache_line_bytes": 64
+        }
+      }
+    }
+  ],
+  "host_tests_per_configuration": 11,
+  "host_configurations": [
+    "ethernet",
+    "ethernet,trng-probe"
+  ],
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 2,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121921536,
+    "kernel_sha256": "76b407861d369362a5c0b3b9297ce604957cc16812e9475f3b276c2df7062779",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "mutation": "missing required TRNG admission detected",
+  "invalid_cli_cases_rejected": 3,
+  "physical_acceptance": false,
+  "entropy_service_registered": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "QEMU executes protocol/platform models, not the native Mars diagnostic entry",
+    "Boot firmware SEC quiescence and stable physical parent clocks still require hardware handoff verification",
+    "No Mars protocol-observed log collected",
+    "Two conditioned output blocks cannot qualify physical entropy quality",
+    "Diagnostic payload SD packaging remains pending; no SSH enabled"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage43-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage43-host-default.log",
+      "sha256": "1d5b7e5f7110bdbab9dd289c4c95870a407303349f404d6f15ad0b3ed2e534e0"
+    },
+    {
+      "path": "target/mars-reference/stage43-host-probe.log",
+      "sha256": "7c8bcd2e161b220cfa5201f1fa5f1cb5d9ee08407b850a5a0a8bcac7417b11bf"
+    },
+    {
+      "path": "target/mars-reference/stage43-host.log",
+      "sha256": "946dcb75bc298930feeaee20dd870ea46aef8e23c256f9c79565df20e1d3cf2f"
+    },
+    {
+      "path": "target/mars-reference/stage43-mutation-admission.log",
+      "sha256": "c098e843cc1488c5e630b9a9daa2f523a662826062c46d72a277fd4c04bd8cd8"
+    },
+    {
+      "path": "target/mars-reference/stage43-network-probe-build.log",
+      "sha256": "88f0c5ea1b26e4481f7bce73d3a17adf4b2ef98c78c9943b1ebe8665737629fc"
+    },
+    {
+      "path": "target/mars-reference/stage43-probe-build.log",
+      "sha256": "d1b07e941e01dbcdda6548f44bdd90247f5dcc8a52ceb63536b99913c2f5776e"
+    },
+    {
+      "path": "target/mars-reference/stage43-rv64-build.log",
+      "sha256": "065fb22ae97a0aedc21ea37e3270ea4a1cd31d31152f95ae898936800a9868cf"
+    },
+    {
+      "path": "target/mars-reference/stage43-rv64-model/serial.log",
+      "sha256": "b1e5233690dc66c823a5486b1110e9d186459682c48ca07120ec6f28333c68ea"
+    },
+    {
+      "path": "target/mars-reference/stage43-rv64-model/summary.json",
+      "sha256": "1b8e0afd7fda172b62729e9674fed5cb963b0bbd166f03b1417f41b6fe04f8e7"
+    }
+  ]
+}

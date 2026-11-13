@@ -1,0 +1,87 @@
+{
+  "status": "Mars console/SD resource admission and static BSP composition implemented; production firmware entry pending",
+  "host_tests": 18,
+  "python_tests": 16,
+  "official_sdk_dtb": "passed resources, memory, four-hart admission with physical boot hart 4",
+  "reference_manifest": "boards/milkv-mars/resource-reference.json",
+  "rv64_fixture": "passed; parser only, no JH7110 MMIO",
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122011648,
+    "kernel_sha256": "a7f1ce309be955f335d06918f2ecdd6f3ef2b13bee1d0be0bacf8d50fca346f5",
+    "physical_acceptance": false,
+    "require_admission": true
+  },
+  "mutations": [
+    "Missing supervisor IRQ validation detected",
+    "Duplicate referenced phandle accepted: detected",
+    "Missing UART register-width check detected",
+    "Non-identity bus accepted: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage23-host-restored.log",
+      "sha256": "3fe97f169c4cf084ba10b3350eaaa0dce2ed9698896d29c4e88aebdb57e01572"
+    },
+    {
+      "path": "target/mars-reference/stage23-resources.log",
+      "sha256": "ca166c285ab86e08bf631820df4a781bde411e3d619a98a67bc02c37d6a82c43"
+    },
+    {
+      "path": "target/mars-reference/stage23-python.log",
+      "sha256": "25d718152414a917d6eb4a014d599eff20a2b538451c2591d104ace11b9de0dd"
+    },
+    {
+      "path": "target/mars-reference/stage23-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage23-sdk-admission.log",
+      "sha256": "f6be7e293a008f93d7c71f3aaa5586aba77e82ffb6a4d5f310022dd07200d141"
+    },
+    {
+      "path": "target/mars-reference/stage23-dtc.log",
+      "sha256": "2f617c04e733ad96a1d4bc1d00ac216975ed8a6ef5b741f0c143e92abb58f615"
+    },
+    {
+      "path": "target/mars-reference/stage23-rv64-build.log",
+      "sha256": "9eede62cc10fb6a35715917820307e1daa76da3475abfc3ddf452b12679a3559"
+    },
+    {
+      "path": "target/mars-reference/stage23-rv64-resource-model/serial.log",
+      "sha256": "04e5767e8d4ee7ffdca34144a7630f26bddfdb3e5456fe08ba9585d4e96f9a0d"
+    },
+    {
+      "path": "target/mars-reference/stage23-rv64-resource-model/summary.json",
+      "sha256": "0ff2a262b49d9d76ee238b33d6491a2d8b87df21ce5d8ee7a090b55d7ccd3a3e"
+    },
+    {
+      "path": "target/mars-reference/stage23-mutation-supervisor-route.log",
+      "sha256": "e3fc237be63e3b284327c19ed471f14d36c0639fa0977ffc7bbbc152821f2f83"
+    },
+    {
+      "path": "target/mars-reference/stage23-mutation-duplicate-handle.log",
+      "sha256": "c580e0b003c67af2c1a55c1aca160e121258a7b58fe1a0c510bf6f0bdc2790c0"
+    },
+    {
+      "path": "target/mars-reference/stage23-mutation-uart-width.log",
+      "sha256": "cd0e5cd45a4e8e00e8452edbf126672def3ab636fcc2a74b74208ca5383b7e38"
+    },
+    {
+      "path": "target/mars-reference/stage23-mutation-bus-translation.log",
+      "sha256": "563216e0383b157077ccc4ad80caa7ef5811f7f50db2345074eadff229a9b76d"
+    }
+  ],
+  "physical_acceptance": false,
+  "remaining": [
+    "Production Mars firmware entry and SBI HSM/IPI/RFENCE/TIME qualification",
+    "Bind prepared DW-MSHC instance and data partition",
+    "GMAC/PHY/DMA resource admission, EQoS and cache qualification",
+    "Paired boot firmware, SD image and physical acceptance"
+  ]
+}

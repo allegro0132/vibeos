@@ -1,0 +1,12 @@
+/dts-v1/;
+/ {
+ #address-cells = <2>; #size-cells = <2>;
+ memory@80000000 { device_type = "memory"; reg = <0 0x80000000 0 0x08000000>; };
+ cpus {
+  #address-cells = <1>; #size-cells = <0>; timebase-frequency = <10000000>;
+  cpu@0 { device_type = "cpu"; reg = <0>; status = "okay"; mmu-type = "riscv,sv39"; };
+  cpu@1 { device_type = "cpu"; reg = <1>; status = "okay"; mmu-type = "riscv,sv39"; };
+  cpu@2 { device_type = "cpu"; reg = <2>; status = "okay"; mmu-type = "riscv,sv39"; };
+  cpu@3 { device_type = "cpu"; reg = <3>; status = "okay"; mmu-type = "riscv,sv39"; };
+ };
+};

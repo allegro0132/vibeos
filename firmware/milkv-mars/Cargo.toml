@@ -1,0 +1,130 @@
+[package]
+name = "vibeos-firmware-milkv-mars"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+hang-watchdog = ["vibeos-kernel?/hang-watchdog"]
+hang-failure-report = ["vibeos-kernel?/hang-failure-report"]
+hang-watchdog-selftest = ["hang-watchdog", "vibeos-kernel?/hang-watchdog-selftest"]
+gro-prefix-views = ["gro-checked", "vibeos-kernel?/gro-prefix-views"]
+gro-full-batch = ["gro-wide", "vibeos-kernel?/gro-full-batch"]
+gro-wide = ["gro-checked", "vibeos-kernel?/gro-wide"]
+rx-align-empty = ["vibeos-kernel?/rx-align-empty"]
+application-rx-batch = ["vibeos-kernel?/application-rx-batch"]
+tcp-read-profile = ["vibeos-kernel?/tcp-read-profile"]
+receive-exchange-profile = ["receive-buffer-exchange-experiment", "vibeos-kernel?/receive-exchange-profile"]
+rx-boundary-profile = ["network-inline-rx", "rx-publish-batch", "vibeos-kernel?/rx-boundary-profile"]
+gro-checked = ["gro-scatter", "vibeos-kernel?/gro-checked"]
+gro-scatter = ["gro-batch-release", "vibeos-kernel?/gro-scatter"]
+frontend-rx-batch = ["vibeos-kernel?/frontend-rx-batch"]
+network-service-peer = ["network-inline-rx", "vibeos-kernel?/network-service-peer"]
+network-inline-rx = ["rx-interrupt-experiment", "rx-pool-experiment", "vibeos-kernel?/network-inline-rx"]
+rx-admission-batch = ["rx-pool-experiment", "vibeos-hal/rx-admission-batch", "vibeos-kernel?/rx-admission-batch"]
+rx-compact-owner-experiment = ["vibeos-eqos-net/rx-compact-owner"]
+rx-queue-profile = ["vibeos-kernel?/rx-queue-profile"]
+gro-batch-release = ["bounded-gro", "rx-pool-experiment", "vibeos-hal/rx-batch-release", "vibeos-kernel?/gro-batch-release"]
+# Diagnostic only: report prolonged spinlock waits through SBI.
+lock-stall-probe = ["vibeos-kernel?/lock-stall-probe"]
+# Local TCP GRO: ignore meaningless IDs only for atomic IPv4 datagrams.
+gro-atomic-id = ["bounded-gro", "vibeos-kernel?/gro-atomic-id"]
+gro-end-profile = ["bounded-gro", "vibeos-kernel?/gro-end-profile"]
+rx-publish-batch = ["rx-pool-experiment", "vibeos-kernel?/rx-publish-batch"]
+tx-lease-profile = ["dep:vibeos-kernel", "vibeos-kernel/tx-lease-profile"]
+counter-probe = ["dep:vibeos-kernel", "vibeos-kernel/counter-probe"]
+rx-metadata-profile = ["rx-pool-experiment"]
+skip-empty-service-experiment = ["vibeos-kernel?/skip-empty-service"]
+receive-buffer-exchange-experiment = ["vibeos-kernel?/receive-buffer-exchange"]
+copy-profile = ["dep:vibeos-kernel", "vibeos-kernel/copy-profile"]
+pc-sample = ["dep:vibeos-kernel", "vibeos-kernel/pc-sample"]
+# GMAC front-port coherency experiment; other devices keep cache maintenance.
+gmac-coherent-experiment = ["ethernet-device"]
+rx-batch-experiment = ["rx-pool-experiment"]
+rx-tail-batch-experiment = ["rx-batch-experiment", "vibeos-eqos-net/rx-tail-batch"]
+# On-demand occupancy counters; no periodic logging or per-packet clock reads.
+rx-batch-profile = ["rx-batch-experiment"]
+rx-callback-profile = ["rx-batch-experiment"]
+rx-ring-profile = ["rx-batch-experiment", "vibeos-eqos-net/rx-stage-profile"]
+# Explicit controller timing and periodic register/checksum reports.
+controller-profile = ["ethernet-device"]
+driver-stage-profile = ["dep:vibeos-kernel", "vibeos-kernel/driver-stage-profile", "rx-pool-experiment"]
+tx-wait-profile = ["dep:vibeos-kernel", "vibeos-kernel/tx-wait-profile"]
+idle-profile = ["dep:vibeos-kernel", "vibeos-kernel/idle-profile"]
+application-event-experiment = ["vibeos-kernel?/application-event-poll"]
+network-event-experiment = ["vibeos-kernel?/network-event-poll"]
+rx-pool-experiment = ["ethernet-device", "dep:vibeos-core", "vibeos-kernel?/pooled-rx"]
+rx-interrupt-experiment = ["vibeos-kernel?/rx-interrupt-poll"]
+direct-tcp-segmentation = ["tso-experiment", "vibeos-kernel?/direct-tcp-segmentation"]
+native-tcp-segmentation = ["vibeos-kernel?/native-tcp-segmentation"]
+tso-coalesce-experiment = ["tso-experiment", "vibeos-kernel?/network-tso-coalesce"]
+# Unqualified end-to-end TSO experiment; default off.
+tso-experiment = ["vibeos-kernel?/network-tso-probe"]
+# Experimental bounded IPv4/TCP receive coalescing; disabled by default.
+bounded-gro = ["vibeos-kernel?/bounded-gro"]
+symmetric-pause-experiment = []
+tcp-throughput-probe = ["dep:vibeos-kernel", "vibeos-kernel/tcp-throughput-probe"]
+network-profile = ["dep:vibeos-kernel", "vibeos-kernel/network-profile"]
+network-tx-audit = ["dep:vibeos-kernel", "vibeos-kernel/network-tx-audit"]
+network-status-snapshot = ["dep:vibeos-kernel", "vibeos-kernel/network-status-snapshot"]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
+# Qualification experiment: complete IPv4 TX requests; RX stays in software.
+tx-checksum-experiment = ["ethernet-device"]
+# Observe hardware RX status while retaining software checksum verification.
+rx-status-experiment = ["ethernet-device"]
+# Complete IPv4 + ARP service profile; other EtherTypes/fragments are not admitted.
+rx-ipv4-checksum-experiment = ["rx-status-experiment"]
+# Skip repeated cleaning only for exclusively read-only RX payload reuse.
+rx-readonly-recycle-experiment = ["ethernet-device"]
+# Deliver erroneous descriptors to the existing reject path for diagnosis.
+rx-error-forward-experiment = ["rx-status-experiment"]
+# Burst-absorption experiment; both RX and TX ring counts increase.
+dma-ring128-experiment = ["ethernet-device"]
+tx-single-sync-experiment = ["ethernet-device"]
+default = ["image"]
+sd-device = ["dep:vibeos-driver-dw-mshc"]
+image = ["sd-device", "dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibeos-image-policy"]
+# Hardware assembly is independent of the selected network service image.
+ethernet-device = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
+# Compatibility profile used by --ethernet build/package commands.
+ethernet = ["ethernet-device", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/executor-profile", "vibeos-kernel?/network-pipeline"]
+
+# Install a retained, unstarted native owner; source approval is separate.
+entropy-device = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]
+# Compatibility diagnostic explicitly exercises and stops that owner at boot.
+trng-probe = ["entropy-device"]
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "entropy_model"
+path = "tests/entropy_model.rs"
+required-features = ["entropy-device"]
+
+[[bin]]
+name = "vibeos-milkv-mars"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["image"]
+
+[dependencies]
+vibeos-core = { path = "../../core", optional = true }
+vibeos-driver-dw-i2c = { path = "../../drivers/dw-i2c" }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars" }
+vibeos-platform-jh7110 = { path = "../../platform/jh7110" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }
+vibeos-driver-dw-mshc = { path = "../../drivers/dw-mshc", optional = true }
+vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
+vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
+
+vibeos-starfive-trng = { path = "../../drivers/starfive-trng", optional = true }
+
+[target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
+vibeos-kernel = { path = "../../kernel", optional = true, default-features = false, features = ["pio-block", "packet-network", "bounded-device-image", "legacy-shell", "wasi-preview1"] }
+vibeos-runtime-riscv = { path = "../../runtime/riscv", optional = true }
+vibeos-image-policy = { path = "../../policy/image", default-features = false, features = ["bounded-device"], optional = true }

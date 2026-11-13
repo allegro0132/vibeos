@@ -1,0 +1,95 @@
+{
+  "status": "Pre-MMU admission contract integrated; Mars production boot and memory admission incomplete",
+  "host_tests": 34,
+  "python_tests": 16,
+  "qemu_admission": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 390,
+    "kernel_sha256": "e4802d6d311033dd985ca7506c646208c110b8a011cca2c956ae3cd8c579073d",
+    "physical_acceptance": false,
+    "require_admission": true
+  },
+  "qemu_invalid_timebase": {
+    "status": "rejected",
+    "reason": "InvalidTimebase",
+    "kernel_sha256": "e4802d6d311033dd985ca7506c646208c110b8a011cca2c956ae3cd8c579073d",
+    "physical_acceptance": false,
+    "require_admission": true
+  },
+  "qemu_production_selftests": 390,
+  "duo_default_ssh_build": "passed",
+  "mutations": [
+    "Timebase rejection removal detected",
+    "Static memory rejection removal detected",
+    "Repeat publication allowed: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage21-host.log",
+      "sha256": "b82589f0999d909832e986c670843046a071e0be1f01a38bd2ededc1aa851bb3"
+    },
+    {
+      "path": "target/mars-reference/stage21-python.log",
+      "sha256": "25d718152414a917d6eb4a014d599eff20a2b538451c2591d104ace11b9de0dd"
+    },
+    {
+      "path": "target/mars-reference/stage21-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage21-restored.log",
+      "sha256": "d6ff08454ed2d3c4e6ba20bbb202891a4495e3f9c6d03d4c8203cece590b8aac"
+    },
+    {
+      "path": "target/mars-reference/stage21-duo-build.log",
+      "sha256": "cfeaea7abd0aa1c3bfec8c43b7f859de5967d48ce8d2a0514992dffc7dc3e3c0"
+    },
+    {
+      "path": "target/mars-reference/stage21-qemu-build.log",
+      "sha256": "c022b6c974df5e833b0f834ce43ef2bcd3f7ec862147aa5a818bcb8338eca2eb"
+    },
+    {
+      "path": "target/mars-reference/stage21-qemu-selftest.log",
+      "sha256": "a2e33c54eef0a0ae8ebe7b8d3cb69e077f2f5bf2499ee05232596697978b9ac2"
+    },
+    {
+      "path": "target/mars-reference/stage21-admission/serial.log",
+      "sha256": "6e327196d0857e41eaa9d48ae1ec2840b8cc3adafa6fb1273621df0f573e25ef"
+    },
+    {
+      "path": "target/mars-reference/stage21-admission/summary.json",
+      "sha256": "bac578b5476895dfafdb567ce65f4d55e7e1536acd575c07165952d4bd029ceb"
+    },
+    {
+      "path": "target/mars-reference/stage21-rejection-final/serial.log",
+      "sha256": "38069309d68e35c29c5d0defe3c73c5191e0a1919bfef81f51df45015510b627"
+    },
+    {
+      "path": "target/mars-reference/stage21-rejection-final/summary.json",
+      "sha256": "0856c229dcbd0a9fa31ba6c2d6e1ecc327e6aa8be76569d27e55cae4c62c5449"
+    },
+    {
+      "path": "target/mars-reference/stage21-mutation-timebase.log",
+      "sha256": "2a2bc2cb63dd1e2ab1df7ea6964983b7ef79765877e05a353f1c4410ae66d67c"
+    },
+    {
+      "path": "target/mars-reference/stage21-mutation-memory.log",
+      "sha256": "a6eeb0b2747bd0886170718dec6922eba41912082363255cf3fe313e19c117f9"
+    },
+    {
+      "path": "target/mars-reference/stage21-mutation-republish.log",
+      "sha256": "0a3de736a9d588f5eb174994d916e6e62a684b76b266539c5ae9fab54c334a21"
+    }
+  ],
+  "hardware_acceptance": false,
+  "remaining": [
+    "Reservation-aware allocator and Mars DTB resource publication",
+    "SBI qualification and production Mars firmware entry",
+    "DW-MSHC registration and data partition enforcement",
+    "EQoS and DMA/cache qualification",
+    "Paired boot components, SD image and physical acceptance"
+  ]
+}

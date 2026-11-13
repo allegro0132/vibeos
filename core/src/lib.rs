@@ -8,16 +8,49 @@
 
 extern crate alloc;
 
+#[cfg(feature = "hang-failure-report")]
+pub mod hang_watch;
 pub mod arch;
 pub mod bench;
+pub mod boot_log;
 pub mod cap;
 pub mod chan;
 pub mod exec;
+#[cfg(feature = "idle-profile")]
+mod idle_profile;
 pub mod heap;
 pub mod instance;
 pub mod interrupt;
 pub mod ipi;
 pub mod mmu;
 pub mod net;
+pub mod net_profile;
+#[cfg(feature = "rx-boundary-profile")]
+pub mod net_rx_boundary;
+#[cfg(feature = "copy-profile")]
+pub mod copy_profile;
+#[cfg(feature = "pc-sample")]
+pub mod pc_sample;
+pub mod net_tx_audit;
+pub mod poll_budget;
 pub mod runqueue;
+#[cfg(feature = "lock-stall-probe")]
+mod lock_stall;
+#[cfg(feature = "lock-stall-probe")]
+pub use lock_stall::{LoopStallKind, LoopStallProbe};
 pub mod sync;
+
+pub mod net_segmentation;
+
+#[cfg(feature = "network-tso-probe")]
+pub mod net_tso_probe;
+
+pub mod net_tx_coalesce;
+
+pub mod net_segment_pool;
+
+pub mod net_transmit;
+pub mod net_receive;
+
+#[cfg(feature = "tx-lease-profile")]
+pub mod tx_lease_profile;

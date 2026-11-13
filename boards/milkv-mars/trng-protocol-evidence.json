@@ -1,0 +1,73 @@
+{
+  "status": "Independent JH7110 TRNG command protocol implemented; production composition and entropy qualification pending",
+  "host_tests": 10,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121933824,
+    "kernel_sha256": "f61dc0c7ecbcf2298af0975f00b08a03a4e4f12000f4c77f5729f3e902ee625c",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "JH7110_TRNG_MODEL PASS reseed=per-block failure=no-output entropy=unqualified",
+  "mutations": [
+    "deadline disabled: detected",
+    "duplicate output allowed: detected",
+    "faulted instance reused: detected",
+    "lockup handling removed: detected"
+  ],
+  "production_driver_registered": false,
+  "entropy_qualified": false,
+  "physical_acceptance": false,
+  "existing_sd_image_sha256": "8008a8780286ad90242f7e95d2025e1930c27801c24f0c97da505afee8da9e92",
+  "blind_spots": [
+    "No physical register, clock or shared SEC reset validation",
+    "Mission and nonce mode readback has not been verified on Mars",
+    "No raw-noise analysis or entropy credit is provided",
+    "IRQ masking and future HAL integration are owner obligations not exercised here",
+    "No new physical SSH/WASM or cold-boot/stability evidence"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage37-host.log",
+      "sha256": "a299f8219cfa8baf4896ad8ae84bd39a4653b4a8519fc69d8fdd4abb8bde7d01"
+    },
+    {
+      "path": "target/mars-reference/stage37-rv64-build.log",
+      "sha256": "eb337fd54b45899f78200f4de28598a337e9de7906757979d027c29e51347715"
+    },
+    {
+      "path": "target/mars-reference/stage37-rv64-model/serial.log",
+      "sha256": "4d4af76c308110f4e0ac86d548a16fd8a684769426e6ef282e5969f9afed599d"
+    },
+    {
+      "path": "target/mars-reference/stage37-rv64-model/summary.json",
+      "sha256": "ae9d4b58604a90faf4786eb282232d7e0e690888419fb56e1e59b61c6ed6deeb"
+    },
+    {
+      "path": "target/mars-reference/stage37-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage37-mutation-deadline.log",
+      "sha256": "acdbf1d3afe757efb6d4661ddfb2a82f56696a96f7b081cb699a294721fd8d69"
+    },
+    {
+      "path": "target/mars-reference/stage37-mutation-duplicate.log",
+      "sha256": "1eab39177bb0058512e3372f7019069c423aa30d58dadd2668ceb4835e943a76"
+    },
+    {
+      "path": "target/mars-reference/stage37-mutation-lockup.log",
+      "sha256": "c1857b1899ee69e559826c19bf414e3fc48fba27005caf08a76c9a1aa2646f73"
+    },
+    {
+      "path": "target/mars-reference/stage37-mutation-quarantine.log",
+      "sha256": "d1593aa81e5ec4e2f3490ab52954537818fa577c05bb6a75b832b83874bb71c0"
+    }
+  ]
+}

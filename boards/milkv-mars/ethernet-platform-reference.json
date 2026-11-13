@@ -1,0 +1,52 @@
+{
+  "sdk_repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "sdk_files": [
+    {
+      "path": "u-boot/arch/riscv/cpu/jh7110/pll.c",
+      "sha256": "02f73f494d2836f7a24b5340d9cc80d482862049514dc87768aa70b61f68f0b2"
+    },
+    {
+      "path": "u-boot/drivers/reset/reset-jh7110.c",
+      "sha256": "2ea19b32b6ef9dc03d31bf6d88a3a7ffec28efb1a2e6acb2c85ea6cdc67877a9"
+    },
+    {
+      "path": "u-boot/board/starfive/visionfive2/spl.c",
+      "sha256": "bb101bcb7e3e61f9cec9a74dd4049ba79d24283bf6b892847bcd41c7250f9331"
+    },
+    {
+      "path": "linux/drivers/clk/starfive/clk-starfive-jh7110-sys.c",
+      "sha256": "480e53dc91cc0fa23e01ce9173d1b72120c3d33b73be4ee155a21149da24c79b"
+    },
+    {
+      "path": "linux/drivers/clk/starfive/clk-starfive-jh7110-aon.c",
+      "sha256": "254d43c46807cc1414713d654d03717846073a5c5538d0fb7a99dd7727448d27"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "sha256": "4834672066b8e4d7a2ae14169cc235de904966e8b8c3bc6b03cc5f670ece4a80"
+    }
+  ],
+  "board_tx_parent_reference": {
+    "repository": "https://github.com/torvalds/linux",
+    "version": "v6.12",
+    "path": "arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts",
+    "sha256": "4b585d37fec8987041bc3a6be4f230b10246083441ef47cc062deaf80333b803"
+  },
+  "tx_parent": "external RGMII RX via GMAC0_RMII_RTX, divider 1",
+  "shared_pll_writes": false,
+  "csr_rate": "decoded PLL2/osc -> AXI_CFG0 -> STG_AXIAHB",
+  "gtx_rate_hz": 125000000,
+  "aon_reset_ids": [
+    160,
+    161
+  ],
+  "tx_pad_offsets": [
+    120,
+    124,
+    128,
+    132,
+    136
+  ],
+  "hardware_qualification": false
+}

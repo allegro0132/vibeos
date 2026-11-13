@@ -1,0 +1,10 @@
+# VibeOS build configuration. Edit this file or run ./configure.sh.
+version = 1
+boards = [
+    "milkv-duo",
+    "milkv-mars",
+    "qemu-virt",
+]
+components = ["vsh"]
+
+[drivers]

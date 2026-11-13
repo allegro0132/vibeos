@@ -1,0 +1,25 @@
+{
+  "sources": [
+    {
+      "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+      "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+      "path": "linux/drivers/net/phy/motorcomm.c",
+      "sha256": "1111d3bc199b1d4496c41e2e344ad2bb9235e24d461fbef369f780d1d22c0bb0"
+    },
+    {
+      "repository": "https://github.com/torvalds/linux",
+      "version": "v6.12",
+      "path": "drivers/net/phy/motorcomm.c",
+      "sha256": "9a3160905b05bca2ecd69d2fa86cb299b38bb8383a11c39c7624965126d13f22"
+    }
+  ],
+  "phy_id": "0x4f51e91b",
+  "board_phy_address": "discovered, not assumed",
+  "extended_registers": {
+    "chip_configuration": "0xa001",
+    "rgmii_configuration": "0xa003",
+    "pad_drive": "0xa010"
+  },
+  "advertisement": "10/100/1000 full duplex, no pause",
+  "hardware_qualification": false
+}

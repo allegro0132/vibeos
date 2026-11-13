@@ -1,0 +1,79 @@
+{
+  "status": "Stopped link reconfiguration and kernel elapsed-time PHY polling implemented; firmware assembly pending",
+  "host_tests": 41,
+  "new_tests": 4,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 3,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121946112,
+    "kernel_sha256": "8e20836fa4a8cd8b3b75a1438a86189afbfaed7a9575679f482d049e04f0c655",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "PACKET_LINK_MODEL PASS reconfigure=stopped cadence=elapsed-time",
+  "duo_release_build": "passed",
+  "mars_release_elf_contract": "passed",
+  "mutations": [
+    "running controller speed change allowed: detected",
+    "running/quarantined backend released: detected",
+    "poll deadline shifted: detected",
+    "stale configuration retained: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage33-host-restored.log",
+      "sha256": "f5fe3a393b0db06c18ba293d420e37443a905c30b9a51f186db68ff4cb2e3216"
+    },
+    {
+      "path": "target/mars-reference/stage33-rv64-build.log",
+      "sha256": "da27d50f6bca43e8da718423e666a31d431c839a44bacd6b30d3f20b868907a9"
+    },
+    {
+      "path": "target/mars-reference/stage33-rv64-model/serial.log",
+      "sha256": "f8f93595d1b9bca573199c76a718b8714e08719886bc29e36e5033051475843d"
+    },
+    {
+      "path": "target/mars-reference/stage33-rv64-model/summary.json",
+      "sha256": "a111df20be6815d042ef46f38c60c6b0d4a5c87fc9c231089822b4434a6b922d"
+    },
+    {
+      "path": "target/mars-reference/stage33-duo-build.log",
+      "sha256": "90c2291b67b5bd3cc5589dbd397d7b46577e8d881007ab38839a85771d106d0a"
+    },
+    {
+      "path": "target/mars-reference/stage33-mars-build.log",
+      "sha256": "940b4bfa4f49b784fb2bc644c988b97a509deab91c38df6c78302f41ccc023c0"
+    },
+    {
+      "path": "target/mars-reference/stage33-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage33-mutation-running-link.log",
+      "sha256": "a8b2697298dbf1fb1d31bdb584c28811b0cab55175e1768664bf29be3fc5c50a"
+    },
+    {
+      "path": "target/mars-reference/stage33-mutation-backend-release.log",
+      "sha256": "208c2a54b89dfee783bfb598573345e8380d4294ab22508d7e1aaa82a8ff1c2e"
+    },
+    {
+      "path": "target/mars-reference/stage33-mutation-poll-boundary.log",
+      "sha256": "58a2cb70085b38b42b70ef3ad7651e31b4213b7a1bd734b482574694ac7dbfcc"
+    },
+    {
+      "path": "target/mars-reference/stage33-mutation-stale-config.log",
+      "sha256": "656470583b1719dd75ebf98ac0de2869a9d69ee852351f7a798fb96eba704908"
+    }
+  ],
+  "physical_acceptance": false,
+  "blind_spots": [
+    "QEMU cadence helper test does not execute the complete packet task with DHCP backpressure",
+    "PHY timing, physical link changes and real controller stop completion are not modeled",
+    "Production Mars firmware still does not register an EQoS packet device"
+  ]
+}

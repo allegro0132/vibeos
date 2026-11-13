@@ -5,3 +5,11 @@ edition = "2021"
 
 [lib]
 test = true
+
+[dev-dependencies]
+vibeos-driver-virtio-core = { path = "../drivers/virtio-core" }
+
+[features]
+rx-admission-batch = []
+rx-batch-release = []
+runtime-platform = []

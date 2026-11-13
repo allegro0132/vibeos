@@ -23,7 +23,12 @@ const ACQUIRING: u64 = 1;
 const HELD: u64 = 2;
 const RECOVERING: u64 = 3;
 
-static TASK_RECOVERY_CONTEXTS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+// Read at every recoverable acquisition and changed at task boundaries.
+// Per-hart cache isolation avoids invalidating another hart's current identity.
+#[repr(align(64))]
+struct HartRecoveryContext(AtomicU64);
+static TASK_RECOVERY_CONTEXTS: [HartRecoveryContext; MAX_HARTS] =
+    [const { HartRecoveryContext(AtomicU64::new(0)) }; MAX_HARTS];
 
 const fn state_token(generation: u64, phase: u64) -> u64 {
     (generation << PHASE_BITS) | phase
@@ -82,7 +87,7 @@ fn recovery_context_hart_index() -> Option<usize> {
 
 fn current_task_recovery_key() -> u64 {
     recovery_context_hart_index()
-        .map(|hart| TASK_RECOVERY_CONTEXTS[hart].load(Ordering::Acquire))
+        .map(|hart| TASK_RECOVERY_CONTEXTS[hart].0.load(Ordering::Acquire))
         .unwrap_or(0)
 }
 
@@ -98,7 +103,7 @@ pub fn enter_task_recovery_context(key: TaskRecoveryKey) -> TaskRecoveryContext 
         irq_restore(irq);
         panic!("task recovery context requires a mapped logical hart");
     };
-    let slot = &TASK_RECOVERY_CONTEXTS[hart];
+    let slot = &TASK_RECOVERY_CONTEXTS[hart].0;
     let previous = slot.swap(key.get(), Ordering::AcqRel);
     let physical_hart = current_hart_id();
     irq_restore(irq);
@@ -123,7 +128,7 @@ pub(crate) unsafe fn enter_task_recovery_context_on_hart(
 ) -> TaskRecoveryContext {
     let irq = irq_save();
     debug_assert_eq!(recovery_context_hart_index(), Some(hart.index()));
-    let slot = &TASK_RECOVERY_CONTEXTS[hart.index()];
+    let slot = &TASK_RECOVERY_CONTEXTS[hart.index()].0;
     let previous = slot.swap(key.get(), Ordering::AcqRel);
     let physical_hart = current_hart_id();
     irq_restore(irq);
@@ -311,6 +316,10 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_fast(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "lock-stall-probe")]
+        let mut stall = crate::lock_stall::Probe::new();
+        #[cfg(feature = "network-profile")]
+        let mut profile_wait = None;
         let mut contended = false;
         loop {
             match self.fast_locked.compare_exchange_weak(
@@ -322,15 +331,23 @@ impl<T> SpinLock<T> {
                 Ok(_) => break,
                 Err(actual) => {
                     if actual && !contended {
+                        #[cfg(feature = "network-profile")]
+                        { profile_wait = crate::net_profile::lock_start(); }
                         contended = true;
                         if self.stats_enabled.load(Ordering::Relaxed) {
                             self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    #[cfg(feature = "lock-stall-probe")]
+                    if let Some(elapsed) = stall.check() {
+                        crate::lock_stall::report(self as *const Self as usize, elapsed, false, 0, 0, 0);
+                    }
                     core::hint::spin_loop();
                 }
             }
         }
+        #[cfg(feature = "network-profile")]
+        crate::net_profile::lock_end_at(profile_wait, contended, self as *const Self as usize);
         if self.stats_enabled.load(Ordering::Relaxed) {
             self.acquisitions.fetch_add(1, Ordering::Relaxed);
         }
@@ -344,6 +361,10 @@ impl<T> SpinLock<T> {
     }
 
     fn lock_recoverable(&self, irq: bool) -> SpinGuard<'_, T> {
+        #[cfg(feature = "lock-stall-probe")]
+        let mut stall = crate::lock_stall::Probe::new();
+        #[cfg(feature = "network-profile")]
+        let mut profile_wait = None;
         let mut contended = false;
         let acquiring_token = loop {
             let observed = self.state.load(Ordering::Relaxed);
@@ -368,6 +389,8 @@ impl<T> SpinLock<T> {
                         // A weak CAS may fail spuriously while the same FREE
                         // token remains. Count only an observed non-free phase.
                         if token_phase(actual) != FREE && !contended {
+                            #[cfg(feature = "network-profile")]
+                            { profile_wait = crate::net_profile::lock_start(); }
                             contended = true;
                             if self.stats_enabled.load(Ordering::Relaxed) {
                                 self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -376,14 +399,24 @@ impl<T> SpinLock<T> {
                     }
                 }
             } else if !contended {
+                #[cfg(feature = "network-profile")]
+                { profile_wait = crate::net_profile::lock_start(); }
                 contended = true;
                 if self.stats_enabled.load(Ordering::Relaxed) {
                     self.contended_acquisitions.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            #[cfg(feature = "lock-stall-probe")]
+            if let Some(elapsed) = stall.check() {
+                crate::lock_stall::report(self as *const Self as usize, elapsed, true,
+                    self.state.load(Ordering::Relaxed), self.owner.load(Ordering::Relaxed),
+                    self.recovery_key.load(Ordering::Relaxed));
+            }
             core::hint::spin_loop();
         };
 
+        #[cfg(feature = "network-profile")]
+        crate::net_profile::lock_end_at(profile_wait, contended, self as *const Self as usize);
         let acquisition_hart = current_hart_id();
         let domain = heap::current_domain();
         self.owner.store(domain.owner.get(), Ordering::Relaxed);

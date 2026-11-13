@@ -4910,3 +4910,34 @@ fn a_parallel_domain_fault_collects_queued_siblings_on_other_harts() {
     assert_eq!(exec::reclaimable_domain_count(), domains_before);
     assert!(!exec::current_domain_tearing_down());
 }
+
+#[test]
+fn cancel_before_first_poll_requires_excluding_remote_steals() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    let local = exec::HartId::new(current_hart_id()).unwrap();
+    let remote = (local.index() + 1) % exec::MAX_HARTS;
+    let ordinary = exec::spawn_tracked("cancel-stealable-probe", async {
+        std::future::pending::<()>().await;
+    });
+    {
+        let _hart = TestHartScope::enter(remote);
+        assert!(exec::poll_once());
+    }
+    assert_eq!(ordinary.polls(), 1, "a remote hart may run before caller cancels");
+    assert_eq!(ordinary.cancel(), CancelOutcome::Requested);
+    assert_eq!(ordinary.state(), TaskState::Cancelled);
+
+    let pinned = exec::spawn_pinned_on(local, "cancel-pinned-probe", async {
+        panic!("ready cancellation must not poll this future");
+    });
+    {
+        let _hart = TestHartScope::enter(remote);
+        exec::poll_once();
+    }
+    assert_eq!(pinned.polls(), 0);
+    assert_eq!(pinned.cancel(), CancelOutcome::Requested);
+    let exit = pinned.try_exit().expect("ready cancellation is terminal");
+    assert_eq!(exit.state(), TaskState::Cancelled);
+    assert_eq!(exit.polls(), 0);
+}

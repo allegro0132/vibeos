@@ -1,0 +1,21 @@
+/dts-v1/;
+/ {
+    description = "Mars paired OpenSBI and U-Boot";
+    #address-cells = <2>;
+    images {
+        firmware {
+            data = /incbin/("fw_payload.bin");
+            type = "firmware";
+            arch = "riscv";
+            os = "u-boot";
+            load = <0 0x40000000>;
+            entry = <0 0x40000000>;
+            compression = "none";
+            hash-1 { algo = "sha256"; };
+        };
+    };
+    configurations {
+        default = "config-1";
+        config-1 { firmware = "firmware"; };
+    };
+};

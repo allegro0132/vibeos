@@ -10,6 +10,20 @@
 
 extern crate alloc;
 
+#[cfg(feature = "tcp-read-profile")]
+pub mod receive_profile;
+
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_ownership;
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_storage;
+#[cfg(feature = "receive-buffer-exchange")]
+mod receive_queue;
+#[cfg(feature = "receive-buffer-exchange")]
+mod receive_metadata;
+#[cfg(feature = "receive-buffer-exchange")]
+pub const RECEIVE_POOL_SLOTS: usize = 3;
+
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -24,6 +38,11 @@ use vibeos_core::sync::SpinLock;
 pub const DEFAULT_TCP_FRONTEND_BUFFER_BYTES: usize = 4 * 1024;
 pub const MAX_TCP_FRONTEND_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_TCP_IO_BYTES_PER_CALL: usize = 32 * 1024;
+/// Producer-owned range publication is bounded by one frontend queue, while
+/// each application read retains the smaller per-call execution budget.
+#[cfg(feature = "receive-buffer-exchange")]
+pub const MAX_TCP_RECEIVE_TRANSFER_BYTES: usize = MAX_TCP_FRONTEND_BUFFER_BYTES;
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcpStreamState {
@@ -135,13 +154,120 @@ pub struct TcpListenerSnapshot {
     pub close_request: Option<TcpCloseRequest>,
 }
 
+/// Work available at one network-side reconciliation boundary. This is a hint,
+/// not authority: copying still checks the live queue under its guard. New work
+/// arriving afterward is handled by the next drive and existing readiness hints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TcpFrontendDriveState {
+    pub receive_capacity: usize,
+    pub queued_send_bytes: usize,
+}
+
+/// Synchronous, bounded receive transaction. The adapter must not await or
+/// re-enter this listener while the transaction holds its metadata guard.
+/// The queue storage and guard never escape the callback.
+pub struct TcpReceiveBatch<'a> {
+    inner: &'a mut Inner,
+    capacity: usize,
+    became_readable: bool,
+}
+
+impl TcpReceiveBatch<'_> {
+    /// Generation checked while the producer transaction holds the listener guard.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn exchange_generation(&self) -> Option<NonZeroU64> {
+        if self.inner.receive_exchange.is_none() || !matches!(self.inner.state,
+            TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return None;
+        }
+        NonZeroU64::new(self.inner.generation)
+    }
+
+    /// Publish an exchanged range in stream order with copied fallback bytes.
+    /// The enclosing transaction performs notification only after unlocking.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn publish_exchange(&mut self, ticket: receive_ownership::Ticket,
+        owner: receive_ownership::Owner, generation: NonZeroU64) -> Result<usize, TcpFrontendError> {
+        if self.exchange_generation() != Some(generation) {
+            return Err(TcpFrontendError::StaleConnection);
+        }
+        let was_empty = self.inner.received_len() == 0;
+        let length = self.inner.receive_exchange.as_mut().ok_or(TcpFrontendError::InvalidIdentity)?
+            .publish(ticket, owner, generation).map_err(|_| TcpFrontendError::InvalidIdentity)?;
+        self.became_readable |= was_empty && length != 0;
+        Ok(length)
+    }
+
+    pub fn receive(&mut self, input: &[u8]) -> usize {
+        if !matches!(self.inner.state,
+            TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return 0;
+        }
+        let length = input.len().min(MAX_TCP_IO_BYTES_PER_CALL)
+            .min(self.capacity.saturating_sub(self.inner.received_len()));
+        let was_empty = self.inner.received_len() == 0;
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut self.inner.receive_exchange {
+            let accepted = queue.push_copy(&input[..length]);
+            self.became_readable |= was_empty && accepted != 0;
+            return accepted;
+        }
+        self.inner.receive.extend(&input[..length]);
+        self.became_readable |= was_empty && length != 0;
+        length
+    }
+}
+
 struct Inner {
     state: TcpStreamState,
     generation: u64,
     accepted: bool,
     receive: VecDeque<u8>,
+    #[cfg(feature = "receive-buffer-exchange")]
+    receive_exchange: Option<receive_queue::Queue<RECEIVE_POOL_SLOTS>>,
     transmit: VecDeque<u8>,
     close_request: Option<TcpCloseRequest>,
+}
+
+impl Inner {
+    fn publish_state(&mut self, state: TcpStreamState) -> Result<bool, TcpFrontendError> {
+        let changed = self.state != state;
+        let was_active = is_connection_state(self.state);
+        let becomes_active = is_connection_state(state);
+        if !was_active && becomes_active {
+            self.generation = self
+                .generation
+                .checked_add(1)
+                .ok_or(TcpFrontendError::GenerationExhausted)?;
+            self.accepted = false;
+            self.clear_receive()?;
+            self.transmit.clear();
+            self.close_request = None;
+        }
+        if matches!(state, TcpStreamState::Listening | TcpStreamState::Reset) {
+            self.clear_receive()?;
+            self.transmit.clear();
+            self.close_request = None;
+            if state == TcpStreamState::Listening {
+                self.accepted = false;
+            }
+        }
+        self.state = state;
+        Ok(changed)
+    }
+    fn received_len(&self) -> usize {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &self.receive_exchange { return queue.len(); }
+        self.receive.len()
+    }
+    fn clear_receive(&mut self) -> Result<(), TcpFrontendError> {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut self.receive_exchange {
+            return queue.clear().map_err(|_| TcpFrontendError::InvalidIdentity);
+        }
+        self.receive.clear();
+        Ok(())
+    }
 }
 
 /// Stable capability resource for one exclusive local TCP port.
@@ -149,6 +275,10 @@ struct Inner {
 /// The resource contains only bounded byte queues and lifecycle metadata. The
 /// corresponding smoltcp socket remains private to the netstack task.
 pub struct TcpListener {
+    #[cfg(feature = "activity-events")]
+    on_application: Arc<vibeos_core::exec::WaitQueue>,
+    #[cfg(feature = "activity-events")]
+    on_network: Arc<vibeos_core::exec::WaitQueue>,
     name: String,
     id: TcpListenerId,
     port: u16,
@@ -156,9 +286,38 @@ pub struct TcpListener {
     receive_capacity: usize,
     transmit_capacity: usize,
     inner: SpinLock<Inner>,
+    #[cfg(feature = "receive-buffer-exchange")]
+    has_receive_exchange: bool,
 }
 
 impl TcpListener {
+    /// Prepare a listener before polling network/frontend work. Notification
+    /// never grants read/write authority and may outlive a revoked capability.
+    #[cfg(feature = "activity-events")]
+    pub fn application_event(&self) -> vibeos_core::chan::MessageEvent {
+        vibeos_core::chan::MessageEvent::from_queue(self.on_application.clone())
+    }
+    #[inline]
+    fn notify_application_progress(&self) {
+        #[cfg(feature = "activity-events")]
+        self.on_application.wake_all();
+    }
+
+    /// Network-to-application readiness hint. Capture before checking I/O;
+    /// the caller must still check capability authority and connection generation.
+    #[cfg(feature = "activity-events")]
+    pub fn network_event(&self) -> vibeos_core::chan::MessageEvent {
+        vibeos_core::chan::MessageEvent::from_queue(self.on_network.clone())
+    }
+
+    #[inline]
+    fn notify_network_progress(&self, changed: bool) {
+        #[cfg(feature = "activity-events")]
+        if changed { self.on_network.wake_all(); }
+        #[cfg(not(feature = "activity-events"))]
+        let _ = changed;
+    }
+
     pub fn new(
         name: &str,
         id: TcpListenerId,
@@ -208,23 +367,121 @@ impl TcpListener {
 
         let mut system = heap::enter_owner(OwnerId::SYSTEM);
         let listener = Arc::new(Self {
+            #[cfg(feature = "activity-events")]
+            on_application: Arc::new(vibeos_core::exec::WaitQueue::new()),
+            #[cfg(feature = "activity-events")]
+            on_network: Arc::new(vibeos_core::exec::WaitQueue::new()),
             name: name.to_string(),
             id,
             port,
             port_group,
             receive_capacity,
             transmit_capacity,
+            #[cfg(feature = "receive-buffer-exchange")]
+            has_receive_exchange: false,
             inner: SpinLock::new(Inner {
                 state: TcpStreamState::Listening,
                 generation: 0,
                 accepted: false,
                 receive: VecDeque::with_capacity(receive_capacity),
+                #[cfg(feature = "receive-buffer-exchange")]
+                receive_exchange: None,
                 transmit: VecDeque::with_capacity(transmit_capacity),
                 close_request: None,
             }),
         });
         system.restore();
         Ok(listener)
+    }
+
+    /// Diagnostic identity only; never dereferenced by the profiler. The
+    /// listener is Arc-owned, so this address is stable for its lifetime.
+    #[cfg(feature = "network-profile")]
+    pub fn profile_lock_address(&self) -> usize {
+        &self.inner as *const SpinLock<Inner> as usize
+    }
+
+    /// Experimental stable-storage frontend, constructed once by image policy.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn new_with_receive_storage(name: &str, id: TcpListenerId, port: u16,
+        receive_capacity: usize, transmit_capacity: usize,
+        pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Result<Arc<Self>, TcpFrontendError> {
+        let listener = Self::new(name, id, port, receive_capacity, transmit_capacity)?;
+        Ok(Self::attach_receive_storage(listener, pool))
+    }
+
+    /// Shared service port with one independently budgeted pool per frontend.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn new_shared_with_receive_storage(name: &str, id: TcpListenerId, port: u16,
+        receive_capacity: usize, transmit_capacity: usize, port_group: TcpPortGroupId,
+        pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Result<Arc<Self>, TcpFrontendError> {
+        let listener = Self::new_shared(name, id, port, receive_capacity, transmit_capacity, port_group)?;
+        Ok(Self::attach_receive_storage(listener, pool))
+    }
+
+    #[cfg(feature = "receive-buffer-exchange")]
+    fn attach_receive_storage(mut listener: Arc<Self>, pool: &'static receive_storage::Storage<RECEIVE_POOL_SLOTS>) -> Arc<Self> {
+        let _system = heap::enter_owner(OwnerId::SYSTEM);
+        let unique = Arc::get_mut(&mut listener).expect("unpublished listener");
+        unique.has_receive_exchange = true;
+        {
+            let mut inner = unique.inner.lock();
+            let copied = core::mem::take(&mut inner.receive);
+            inner.receive_exchange = Some(receive_queue::Queue::new(pool, unique.receive_capacity, copied));
+        }
+        listener
+    }
+
+    /// Stable pool selected by image assembly, shared with the protocol owner.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn receive_storage(&self) -> Option<&'static receive_storage::Storage<RECEIVE_POOL_SLOTS>> {
+        self.inner.lock().receive_exchange.as_ref().map(|queue| queue.pool())
+    }
+
+    /// Snapshot the connection generation for a serialized protocol producer.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn network_exchange_generation(&self) -> Option<NonZeroU64> {
+        let inner = self.inner.lock();
+        if !self.has_receive_exchange || !matches!(inner.state, TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) { return None; }
+        NonZeroU64::new(inner.generation)
+    }
+
+    /// Check connection/state/capacity and publish under the listener lock.
+    /// This provides normal concurrent serialization, not hard-fault rollback
+    /// between pool publication and queue insertion.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn network_publish_exchange(&self, ticket: receive_ownership::Ticket,
+        owner: receive_ownership::Owner, generation: NonZeroU64) -> Result<usize, TcpFrontendError> {
+        let mut inner = self.inner.lock();
+        if inner.generation != generation.get() || !matches!(inner.state, TcpStreamState::Established | TcpStreamState::PeerClosed | TcpStreamState::Closing) {
+            return Err(TcpFrontendError::StaleConnection);
+        }
+        let became_readable = inner.received_len() == 0;
+        let length = inner.receive_exchange.as_mut().ok_or(TcpFrontendError::InvalidIdentity)?
+            .publish(ticket, owner, generation).map_err(|_| TcpFrontendError::InvalidIdentity)?;
+        drop(inner);
+        self.notify_network_progress(became_readable);
+        Ok(length)
+    }
+
+    /// Trusted adapter entry with exact consumer provenance for read retirement.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub fn try_recv_for(&self, connection: TcpConnectionToken, consumer: receive_ownership::Owner,
+        output: &mut [u8]) -> Result<TcpIoResult, TcpFrontendError> {
+        if !self.has_receive_exchange { return self.try_recv(connection, output); }
+        let mut inner = self.inner.lock();
+        validate_connection(self.id, &inner, connection)?;
+        if output.is_empty() { return Ok(TcpIoResult::Progress(0)); }
+        if inner.received_len() != 0 {
+            let length = inner.receive_exchange.as_mut().unwrap().read(consumer, output)
+                .map_err(|_| TcpFrontendError::InvalidIdentity)?;
+            drop(inner);
+            self.notify_application_progress();
+            return Ok(TcpIoResult::Progress(length));
+        }
+        if matches!(inner.state, TcpStreamState::PeerClosed | TcpStreamState::Reset | TcpStreamState::Closed | TcpStreamState::Listening) {
+            Ok(TcpIoResult::Closed)
+        } else { Ok(TcpIoResult::WouldBlock) }
     }
 
     pub const fn id(&self) -> TcpListenerId {
@@ -247,7 +504,7 @@ impl TcpListener {
             state: inner.state,
             connection_generation: inner.generation,
             accepted: inner.accepted,
-            readable_bytes: inner.receive.len(),
+            readable_bytes: inner.received_len(),
             queued_send_bytes: inner.transmit.len(),
             writable_bytes: self.transmit_capacity.saturating_sub(inner.transmit.len()),
             close_request: inner.close_request,
@@ -266,10 +523,10 @@ impl TcpListener {
             return None;
         }
         inner.accepted = true;
-        Some(TcpConnectionToken {
-            listener: self.id,
-            generation: inner.generation,
-        })
+        let token = TcpConnectionToken { listener: self.id, generation: inner.generation };
+        drop(inner);
+        self.notify_application_progress();
+        Some(token)
     }
 
     /// Application side: receive one bounded fragment for an accepted peer.
@@ -278,6 +535,30 @@ impl TcpListener {
         connection: TcpConnectionToken,
         output: &mut [u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        #[cfg(feature = "tcp-read-profile")]
+        let sample = {
+            #[cfg(feature = "receive-buffer-exchange")]
+            let exchanged = self.has_receive_exchange;
+            #[cfg(not(feature = "receive-buffer-exchange"))]
+            let exchanged = false;
+            receive_profile::RECORDER.begin(exchanged)
+        };
+        let result = self.try_recv_inner(connection, output);
+        #[cfg(feature = "tcp-read-profile")]
+        sample.finish(&result, output.len());
+        result
+    }
+
+    #[inline]
+    fn try_recv_inner(&self, connection: TcpConnectionToken, output: &mut [u8])
+        -> Result<TcpIoResult, TcpFrontendError> {
+        #[cfg(feature = "receive-buffer-exchange")]
+        if self.has_receive_exchange {
+            let consumer = receive_ownership::Owner::current_reader()
+                .ok_or(TcpFrontendError::InvalidIdentity)?;
+            return self.try_recv_for(connection, consumer, output);
+        }
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         if output.is_empty() {
@@ -286,7 +567,7 @@ impl TcpListener {
         let length = output
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
-            .min(inner.receive.len());
+            .min(inner.received_len());
         if length != 0 {
             let (first, second) = inner.receive.as_slices();
             let first_length = length.min(first.len());
@@ -294,6 +575,8 @@ impl TcpListener {
             let second_length = length - first_length;
             output[first_length..length].copy_from_slice(&second[..second_length]);
             inner.receive.drain(..length);
+            drop(inner);
+            self.notify_application_progress();
             return Ok(TcpIoResult::Progress(length));
         }
         if matches!(
@@ -315,12 +598,13 @@ impl TcpListener {
         connection: TcpConnectionToken,
         input: &[u8],
     ) -> Result<TcpIoResult, TcpFrontendError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         if input.is_empty() {
             return Ok(TcpIoResult::Progress(0));
         }
-        if !matches!(
+        if inner.close_request.is_some() || !matches!(
             inner.state,
             TcpStreamState::Established | TcpStreamState::PeerClosed
         ) {
@@ -336,6 +620,8 @@ impl TcpListener {
         // Passing the slice iterator directly selects VecDeque's specialized
         // wrapped bulk-copy implementation for Copy elements.
         inner.transmit.extend(&input[..length]);
+        drop(inner);
+        self.notify_application_progress();
         Ok(TcpIoResult::Progress(length))
     }
 
@@ -355,34 +641,51 @@ impl TcpListener {
         let mut inner = self.inner.lock();
         validate_connection(self.id, &inner, connection)?;
         inner.close_request = Some(request);
+        drop(inner);
+        self.notify_application_progress();
         Ok(())
     }
 
     /// Netstack side: publish the current transport state.
     pub fn network_update_state(&self, state: TcpStreamState) -> Result<(), TcpFrontendError> {
+        self.network_begin_drive(state).map(|_| ())
+    }
+
+    /// Publish transport state and capture bounded work with one metadata guard.
+    pub fn network_begin_drive(&self, state: TcpStreamState)
+        -> Result<TcpFrontendDriveState, TcpFrontendError>
+    {
         let mut inner = self.inner.lock();
-        let was_active = is_connection_state(inner.state);
-        let becomes_active = is_connection_state(state);
-        if !was_active && becomes_active {
-            inner.generation = inner
-                .generation
-                .checked_add(1)
-                .ok_or(TcpFrontendError::GenerationExhausted)?;
-            inner.accepted = false;
-            inner.receive.clear();
-            inner.transmit.clear();
-            inner.close_request = None;
-        }
-        if matches!(state, TcpStreamState::Listening | TcpStreamState::Reset) {
-            inner.receive.clear();
-            inner.transmit.clear();
-            inner.close_request = None;
-            if state == TcpStreamState::Listening {
-                inner.accepted = false;
-            }
-        }
-        inner.state = state;
-        Ok(())
+        let changed = inner.publish_state(state)?;
+        let drive = TcpFrontendDriveState {
+            receive_capacity: self.receive_capacity.saturating_sub(inner.received_len()),
+            queued_send_bytes: inner.transmit.len(),
+        };
+        drop(inner);
+        self.notify_network_progress(changed);
+        Ok(drive)
+    }
+
+    /// Publish state and deliver a bounded receive batch under one guard.
+    /// Notification happens after all committed bytes are visible and the
+    /// guard is released. Returning an error from the callback does not roll
+    /// back bytes already accepted, matching ordinary network_receive calls.
+    pub fn network_receive_drive<R>(&self, state: TcpStreamState,
+        receive: impl FnOnce(TcpFrontendDriveState, &mut TcpReceiveBatch<'_>) -> R,
+    ) -> Result<(TcpFrontendDriveState, R), TcpFrontendError> {
+        let mut inner = self.inner.lock();
+        let changed = inner.publish_state(state)?;
+        let drive = TcpFrontendDriveState {
+            receive_capacity: self.receive_capacity.saturating_sub(inner.received_len()),
+            queued_send_bytes: inner.transmit.len(),
+        };
+        let mut batch = TcpReceiveBatch { inner: &mut inner,
+            capacity: self.receive_capacity, became_readable: false };
+        let result = receive(drive, &mut batch);
+        let notify = changed || batch.became_readable;
+        drop(inner);
+        self.notify_network_progress(notify);
+        Ok((drive, result))
     }
 
     /// Netstack side: copy received transport bytes toward the application.
@@ -397,14 +700,24 @@ impl TcpListener {
         let length = input
             .len()
             .min(MAX_TCP_IO_BYTES_PER_CALL)
-            .min(self.receive_capacity.saturating_sub(inner.receive.len()));
+            .min(self.receive_capacity.saturating_sub(inner.received_len()));
+        let became_readable = length != 0 && inner.received_len() == 0;
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(queue) = &mut inner.receive_exchange {
+            let accepted = queue.push_copy(&input[..length]);
+            drop(inner);
+            self.notify_network_progress(became_readable && accepted != 0);
+            return accepted;
+        }
         inner.receive.extend(&input[..length]);
+        drop(inner);
+        self.notify_network_progress(became_readable);
         length
     }
 
     pub fn network_receive_capacity(&self) -> usize {
         let inner = self.inner.lock();
-        self.receive_capacity.saturating_sub(inner.receive.len())
+        self.receive_capacity.saturating_sub(inner.received_len())
     }
 
     /// Netstack side: inspect queued transmit bytes without consuming them.
@@ -426,7 +739,10 @@ impl TcpListener {
     pub fn network_consume_transmit(&self, length: usize) {
         let mut inner = self.inner.lock();
         let length = length.min(inner.transmit.len());
+        let became_writable = length != 0 && inner.transmit.len() == self.transmit_capacity;
         inner.transmit.drain(..length);
+        drop(inner);
+        self.notify_network_progress(became_writable);
     }
 
     /// Convenience operation for tests or transports which accept the entire

@@ -1,0 +1,76 @@
+{
+  "status": "EQoS register controller, ordered MMIO adapter and ring backend implemented; JH7110 memory/cache/PHY integration pending",
+  "host_tests": 44,
+  "controller_backend_tests": 12,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 2,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122007552,
+    "kernel_sha256": "a7e95a98f07b5f6016dbb4f25fd388acee66fc6046d6fa44a71cc6c1a86fcdb9",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "source_reference": "boards/milkv-mars/eqos-reference.json",
+  "mutations": [
+    "SWR completion wait bypassed: detected",
+    "TX descriptor base replaced by RX base: detected",
+    "FCS stripping enabled against codec contract: detected",
+    "Dedicated-pool admission bypassed: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage28-host-restored.log",
+      "sha256": "e2c17748e1d648241de05280aff020dfbcb364f12d0debc8dc1a09716952d87c"
+    },
+    {
+      "path": "target/mars-reference/stage28-rv64-build.log",
+      "sha256": "2907b307aa24d4b1c788c752741b0d2bae4aad9652ead05f6eaf3c410cf0af94"
+    },
+    {
+      "path": "target/mars-reference/stage28-rv64-model/serial.log",
+      "sha256": "f6fb0becba0f5ac0936a862b4e74b6226157a8edac85f8c581dd5fc092544cf4"
+    },
+    {
+      "path": "target/mars-reference/stage28-rv64-model/summary.json",
+      "sha256": "2f92a7323b850aa6f8bc8b5fc04fbe5ec7a641a860c6064cfc1cd1d7071fe0ad"
+    },
+    {
+      "path": "target/mars-reference/stage28-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage28-mutation-reset.log",
+      "sha256": "0497177f68bd6a478238d8297b2d3e892a23b39a3616917d4c263380787a539b"
+    },
+    {
+      "path": "target/mars-reference/stage28-mutation-base.log",
+      "sha256": "ea7efc308f152f7874467ea9f2da55d3da5b7c2d07fe3f67113f0d21deb4fbc7"
+    },
+    {
+      "path": "target/mars-reference/stage28-mutation-fcs.log",
+      "sha256": "707623b987c1247dbda8855f46e748f0d50694ecbd5e0d39001882d38fd4fdd5"
+    },
+    {
+      "path": "target/mars-reference/stage28-mutation-pool.log",
+      "sha256": "e0461c1f4745929ba24341e7d9e2f475e00b52fc0eef3bfc9eb9546ff5c12c45"
+    }
+  ],
+  "physical_acceptance": false,
+  "remaining": [
+    "JH7110 clock/reset/pinmux/PHY and actual DMA memory/cache provider",
+    "Mars firmware packet-device registration and DTB GMAC admission",
+    "DHCP/link recovery and qualified entropy/SSH/WASM integration",
+    "Physical serial/SD/network/stability qualification"
+  ],
+  "blind_spots": [
+    "Register models cannot establish physical reset quiescence",
+    "Host MMIO adapter test uses ordinary RAM and compiler fences",
+    "RV64 model executes controller code but emulates register/DMA effects",
+    "No physical GMAC traffic or JH7110 cache operation has been executed"
+  ]
+}

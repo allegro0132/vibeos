@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 vibeos-hal = { path = "../../hal" }
+vibeos-ethernet = { path = "../ethernet" }

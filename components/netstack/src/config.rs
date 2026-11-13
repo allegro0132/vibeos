@@ -160,6 +160,9 @@ pub fn vsh_dhclient(args: &[String]) -> Result<String, Status> {
 /// Admit one capability-backed interface into the operator-visible table.
 /// Merely parsing `netN` never marks it present.
 pub fn register_interface(interface: NetworkInterfaceId, has_service_listener: bool) -> bool {
+    // This table outlives every stack incarnation. Its backing allocation must
+    // not escape from the calling stack's raw-reclaimable arena.
+    let _system = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
     let mut control = CONTROL.lock();
     let index = interface.index();
     if index >= control.len() {
@@ -179,6 +182,8 @@ pub fn register_interface(interface: NetworkInterfaceId, has_service_listener: b
 }
 
 pub fn register_listener(interface: NetworkInterfaceId, listener_id: u64) -> bool {
+    // Listener routing remains published after stack cancellation/restart.
+    let _system = vibeos_core::heap::enter_owner(vibeos_core::heap::OwnerId::SYSTEM);
     let mut listeners = LISTENER_INTERFACES.lock();
     if let Some((_, registered)) = listeners
         .iter()

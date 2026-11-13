@@ -25,6 +25,7 @@ const IO_CHUNK_BYTES: usize = 32 * 1024;
 static TEST_PAYLOAD: [u8; IO_CHUNK_BYTES] = [0xa5; IO_CHUNK_BYTES];
 const IDLE_POLL_MS: u64 = 1;
 const TEST_END_GRACE_MS: u64 = 5_000;
+const SETUP_TIMEOUT_MS: u64 = 10_000;
 
 const TEST_START: u8 = 1;
 const TEST_RUNNING: u8 = 2;
@@ -44,6 +45,11 @@ pub enum SocketError {
 }
 
 pub trait Platform: Sync {
+    #[cfg(feature = "event-driven")]
+    fn tcp_activity(&self, _listener: Cap) -> Result<Option<vibeos_core::chan::MessageEvent>, SocketError> {
+        Ok(None)
+    }
+
     fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, SocketError>;
     fn tcp_recv(
         &self,
@@ -66,11 +72,55 @@ pub trait Platform: Sync {
 type Space = dyn Platform;
 
 pub async fn task(space: &Space, control_listener: Cap, data_listener: Cap) {
+    #[cfg(feature = "event-driven")]
+    let notifications = match (space.tcp_activity(control_listener), space.tcp_activity(data_listener)) {
+        (Ok(Some(control)), Ok(Some(data))) => Some([control, data]),
+        (Err(_), _) | (_, Err(_)) => return,
+        _ => None,
+    };
+    #[cfg(feature = "event-driven")]
+    let mut armed = false;
     let mut server = Server::new();
+    let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(1, 64);
     loop {
+        // A first idle pass prepares the next pass. Capture epochs before the
+        // second full I/O check so arrivals before waiter registration survive.
+        #[cfg(feature = "event-driven")]
+        let waits = if armed {
+            notifications.as_ref().map(|events| [events[0].wait(), events[1].wait()])
+        } else { None };
         match server.drive(space, control_listener, data_listener) {
-            Ok(true) => vibeos_core::exec::yield_now().await,
-            Ok(false) => vibeos_core::exec::sleep_ms(IDLE_POLL_MS).await,
+            Ok(worked) => {
+                #[cfg(feature = "event-driven")]
+                if notifications.is_some() {
+                    vibeos_core::net_profile::poll_decision(worked, worked || waits.is_none());
+                    if worked {
+                        armed = false;
+                        vibeos_core::exec::yield_now().await;
+                    } else if let Some(mut waits) = waits {
+                        use core::{future::{poll_fn, Future}, pin::{pin, Pin}, task::Poll};
+                        // Retain bounded deadline/revocation observation even
+                        // when no transport event arrives.
+                        let mut timer = pin!(vibeos_core::exec::sleep_ms(IDLE_POLL_MS));
+                        poll_fn(|cx| {
+                            if timer.as_mut().poll(cx).is_ready() { return Poll::Ready(()); }
+                            for waiter in &mut waits {
+                                if Pin::new(waiter).poll(cx).is_ready() { return Poll::Ready(()); }
+                            }
+                            Poll::Pending
+                        }).await;
+                        armed = false;
+                    } else {
+                        armed = true;
+                    }
+                    continue;
+                }
+                if poll_budget.runnable(space.now_ms(), worked) {
+                    vibeos_core::exec::yield_now().await;
+                } else {
+                    vibeos_core::exec::sleep_ms(IDLE_POLL_MS).await;
+                }
+            }
             Err(SocketError::AuthorityRevoked) => return,
             Err(SocketError::StaleConnection | SocketError::Failed) => {
                 space.event(server.phase_name());
@@ -103,6 +153,8 @@ struct Parameters {
 }
 
 pub struct Server {
+    // Reused for bounded synchronous I/O; only returned/queued prefixes are read.
+    scratch: [u8; IO_CHUNK_BYTES],
     phase: Phase,
     control: Option<TcpConnectionToken>,
     data: Option<TcpConnectionToken>,
@@ -113,6 +165,7 @@ pub struct Server {
     control_rx: Vec<u8>,
     control_tx: VecDeque<u8>,
     parameters: Parameters,
+    setup_started_ms: u64,
     test_started_ms: u64,
     test_elapsed_ms: u64,
     bytes_transferred: u64,
@@ -121,6 +174,7 @@ pub struct Server {
 impl Server {
     pub const fn new() -> Self {
         Self {
+            scratch: [0; IO_CHUNK_BYTES],
             phase: Phase::AcceptControl,
             control: None,
             data: None,
@@ -134,6 +188,7 @@ impl Server {
                 reverse: false,
                 duration_seconds: 0,
             },
+            setup_started_ms: 0,
             test_started_ms: 0,
             test_elapsed_ms: 0,
             bytes_transferred: 0,
@@ -146,6 +201,12 @@ impl Server {
         first_listener: Cap,
         second_listener: Cap,
     ) -> Result<bool, SocketError> {
+        // A peer can abandon stream creation without sending any more bytes.
+        // Bound the complete setup, including partial cookies and parameters.
+        if matches!(self.phase, Phase::ControlCookie | Phase::Parameters | Phase::AcceptData | Phase::DataCookie)
+            && space.now_ms().saturating_sub(self.setup_started_ms) >= SETUP_TIMEOUT_MS {
+            return Err(SocketError::Failed);
+        }
         let mut worked = self.flush_control(space, first_listener, second_listener)?;
 
         match self.phase {
@@ -157,6 +218,7 @@ impl Server {
                     self.control_on_first = false;
                 }
                 if self.control.is_some() {
+                    self.setup_started_ms = space.now_ms();
                     self.phase = Phase::ControlCookie;
                     worked = true;
                 }
@@ -166,17 +228,16 @@ impl Server {
                     return Err(SocketError::Failed);
                 };
                 let control_listener = self.control_listener(first_listener, second_listener);
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(control_listener, control, &mut scratch)? {
+                match space.tcp_recv(control_listener, control, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         worked |= length != 0;
                         let needed = COOKIE_BYTES - self.cookie_received;
                         let copied = needed.min(length);
                         self.cookie[self.cookie_received..self.cookie_received + copied]
-                            .copy_from_slice(&scratch[..copied]);
+                            .copy_from_slice(&self.scratch[..copied]);
                         self.cookie_received += copied;
                         if self.cookie_received == COOKIE_BYTES {
-                            self.control_rx.extend_from_slice(&scratch[copied..length]);
+                            self.control_rx.extend_from_slice(&self.scratch[copied..length]);
                             self.control_tx.push_back(PARAM_EXCHANGE);
                             self.phase = Phase::Parameters;
                         }
@@ -198,23 +259,26 @@ impl Server {
             Phase::AcceptData => {
                 let data_listener = self.data_listener(first_listener, second_listener);
                 self.data = space.tcp_accept(data_listener)?;
+                // Accept first so abort can reset an already-arrived data
+                // connection as well as the abandoned control connection.
+                worked |= self.check_setup_control(space, first_listener, second_listener)?;
                 if self.data.is_some() {
                     self.phase = Phase::DataCookie;
                     worked = true;
                 }
             }
             Phase::DataCookie => {
+                worked |= self.check_setup_control(space, first_listener, second_listener)?;
                 let Some(data) = self.data else {
                     return Err(SocketError::Failed);
                 };
                 let data_listener = self.data_listener(first_listener, second_listener);
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(data_listener, data, &mut scratch)? {
+                match space.tcp_recv(data_listener, data, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         worked |= length != 0;
                         let needed = COOKIE_BYTES - self.data_cookie_received;
                         let copied = needed.min(length);
-                        if scratch[..copied]
+                        if self.scratch[..copied]
                             != self.cookie
                                 [self.data_cookie_received..self.data_cookie_received + copied]
                         {
@@ -284,8 +348,7 @@ impl Server {
                 let Some(connection) = self.data else {
                     return Err(SocketError::Failed);
                 };
-                let mut scratch = [0u8; IO_CHUNK_BYTES];
-                match space.tcp_recv(data_listener, connection, &mut scratch)? {
+                match space.tcp_recv(data_listener, connection, &mut self.scratch)? {
                     TcpIoResult::Progress(length) => {
                         self.bytes_transferred =
                             self.bytes_transferred.saturating_add(length as u64);
@@ -369,6 +432,14 @@ impl Server {
         }
     }
 
+    fn check_setup_control(&mut self, space: &Space, first: Cap, second: Cap) -> Result<bool, SocketError> {
+        let worked = self.read_control(space, self.control_listener(first, second))?;
+        // No control message is valid between CREATE_STREAMS and TEST_START.
+        // CLIENT_TERMINATE, unexpected input and EOF all take the abort path.
+        if !self.control_rx.is_empty() { return Err(SocketError::Failed); }
+        Ok(worked)
+    }
+
     fn control_listener(&self, first: Cap, second: Cap) -> Cap {
         if self.control_on_first {
             first
@@ -398,12 +469,11 @@ impl Server {
             return Ok(false);
         }
         let listener = self.control_listener(first_listener, second_listener);
-        let mut chunk = [0u8; IO_CHUNK_BYTES];
-        let length = chunk.len().min(self.control_tx.len());
-        for (output, queued) in chunk[..length].iter_mut().zip(self.control_tx.iter()) {
+        let length = self.scratch.len().min(self.control_tx.len());
+        for (output, queued) in self.scratch[..length].iter_mut().zip(self.control_tx.iter()) {
             *output = *queued;
         }
-        match space.tcp_send(listener, connection, &chunk[..length])? {
+        match space.tcp_send(listener, connection, &self.scratch[..length])? {
             TcpIoResult::Progress(sent) => {
                 self.control_tx.drain(..sent);
                 Ok(sent != 0)
@@ -420,10 +490,9 @@ impl Server {
         if self.control_rx.len() >= MAX_CONTROL_JSON_BYTES + 4 {
             return Err(SocketError::Failed);
         }
-        let mut scratch = [0u8; IO_CHUNK_BYTES];
-        match space.tcp_recv(listener, connection, &mut scratch)? {
+        match space.tcp_recv(listener, connection, &mut self.scratch)? {
             TcpIoResult::Progress(length) => {
-                self.control_rx.extend_from_slice(&scratch[..length]);
+                self.control_rx.extend_from_slice(&self.scratch[..length]);
                 Ok(length != 0)
             }
             TcpIoResult::WouldBlock => Ok(false),
@@ -435,14 +504,21 @@ impl Server {
         let Some(connection) = self.data else {
             return Err(SocketError::Failed);
         };
-        let mut scratch = [0u8; IO_CHUNK_BYTES];
-        match space.tcp_recv(listener, connection, &mut scratch)? {
-            TcpIoResult::Progress(length) => {
-                self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
-                Ok(length != 0)
+        // Drain a bounded amount of ready data in this task poll. Every chunk
+        // still crosses the adapter's live capability/connection checks. Stop
+        // on no progress; never spin waiting for another packet to arrive.
+        let budget = if cfg!(feature = "receive-batch") { 4 } else { 1 };
+        let mut worked = false;
+        for _ in 0..budget {
+            match space.tcp_recv(listener, connection, &mut self.scratch)? {
+                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock | TcpIoResult::Closed => break,
+                TcpIoResult::Progress(length) => {
+                    self.bytes_transferred = self.bytes_transferred.saturating_add(length as u64);
+                    worked = true;
+                }
             }
-            TcpIoResult::WouldBlock | TcpIoResult::Closed => Ok(false),
         }
+        Ok(worked)
     }
 
     fn send_payload(&mut self, space: &Space, listener: Cap) -> Result<bool, SocketError> {
@@ -630,4 +706,152 @@ mod tests {
         assert!(json.contains("\"bytes\":123456"));
         assert!(json.contains("\"end_time\":2.345"));
     }
+
+    #[test]
+    fn reused_io_storage_never_extends_short_reads_or_partial_writes() {
+        extern crate std;
+        use std::sync::Mutex;
+        use vibeos_core::cap::{CSpace, Rights};
+        use vibeos_net_api::{TcpListener, TcpListenerId, TcpStreamState};
+        struct Mock {
+            input: Mutex<VecDeque<Vec<u8>>>,
+            output: Mutex<Vec<Vec<u8>>>,
+            fail_after: Mutex<Option<usize>>,
+        }
+        impl Platform for Mock {
+            fn tcp_accept(&self, _: Cap) -> Result<Option<TcpConnectionToken>, SocketError> { Ok(None) }
+            fn tcp_recv(&self, _: Cap, _: TcpConnectionToken, out: &mut [u8]) -> Result<TcpIoResult, SocketError> {
+                if let Some(left) = self.fail_after.lock().unwrap().as_mut() {
+                    if *left == 0 { return Err(SocketError::AuthorityRevoked); }
+                    *left -= 1;
+                }
+                let Some(bytes) = self.input.lock().unwrap().pop_front() else { return Ok(TcpIoResult::WouldBlock); };
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(TcpIoResult::Progress(bytes.len()))
+            }
+            fn tcp_send(&self, _: Cap, _: TcpConnectionToken, bytes: &[u8]) -> Result<TcpIoResult, SocketError> {
+                self.output.lock().unwrap().push(bytes.to_vec());
+                Ok(TcpIoResult::Progress(bytes.len().min(2)))
+            }
+            fn tcp_close(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { Ok(()) }
+            fn tcp_reset(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> { Ok(()) }
+            fn now_ms(&self) -> u64 { 0 }
+            fn event(&self, _: &'static str) {}
+        }
+        let listener = TcpListener::new("scratch", TcpListenerId::new(1).unwrap(), 5201, 16, 16).unwrap();
+        listener.network_update_state(TcpStreamState::Established).unwrap();
+        let token = listener.try_accept().unwrap();
+        let mut space = CSpace::new("scratch"); let cap = space.mint(listener, Rights::ALL);
+        let mock = Mock { input: Mutex::new([b"abc".to_vec()].into()), output: Mutex::new(Vec::new()), fail_after: Mutex::new(None) };
+        let mut server = Server::new(); server.control = Some(token);
+        server.scratch.fill(0xa5);
+        assert!(server.read_control(&mock, cap).unwrap());
+        assert_eq!(server.control_rx, b"abc");
+        assert!(!server.read_control(&mock, cap).unwrap());
+        assert_eq!(server.control_rx, b"abc");
+        assert_eq!(server.scratch[IO_CHUNK_BYTES - 1], 0xa5);
+        server.control_tx.extend(b"xyz");
+        assert!(server.flush_control(&mock, cap, cap).unwrap());
+        assert!(server.flush_control(&mock, cap, cap).unwrap());
+        assert!(server.control_tx.is_empty());
+        assert_eq!(*mock.output.lock().unwrap(), [b"xyz".to_vec(), b"z".to_vec()]);
+        #[cfg(feature = "receive-batch")]
+        {
+            server.data = Some(token);
+            mock.input.lock().unwrap().extend((0..5).map(|_| b"abc".to_vec()));
+            assert!(server.receive_payload(&mock, cap).unwrap());
+            assert_eq!(server.bytes_transferred, 12);
+            assert_eq!(mock.input.lock().unwrap().len(), 1, "one drive must not drain an unbounded producer");
+            assert!(server.receive_payload(&mock, cap).unwrap());
+            assert_eq!(server.bytes_transferred, 15);
+            assert!(!server.receive_payload(&mock, cap).unwrap());
+            mock.input.lock().unwrap().extend((0..3).map(|_| b"abc".to_vec()));
+            *mock.fail_after.lock().unwrap() = Some(1);
+            assert_eq!(server.receive_payload(&mock, cap), Err(SocketError::AuthorityRevoked));
+            assert_eq!(server.bytes_transferred, 18);
+            assert_eq!(mock.input.lock().unwrap().len(), 2, "revocation must stop the batch immediately");
+        }
+    }
+
+    mod setup_recovery {
+        extern crate std;
+        use super::*;
+        use std::sync::{Mutex, atomic::{AtomicU64, Ordering}};
+        use vibeos_core::cap::{CSpace, Rights};
+        use vibeos_net_api::{TcpListener, TcpListenerId, TcpStreamState};
+        #[derive(Clone, Copy)]
+        enum ControlRead { Waiting, Closed, Terminate }
+        struct Mock {
+            first: Cap, control: TcpConnectionToken, data: TcpConnectionToken,
+            accept_control: Mutex<bool>, accept_data: Mutex<bool>,
+            read: Mutex<ControlRead>, reset: Mutex<Vec<TcpConnectionToken>>, now: AtomicU64,
+        }
+        impl Platform for Mock {
+            fn tcp_accept(&self, listener: Cap) -> Result<Option<TcpConnectionToken>, SocketError> {
+                let (flag, token) = if listener == self.first { (&self.accept_control, self.control) } else { (&self.accept_data, self.data) };
+                let mut flag = flag.lock().unwrap(); Ok(if core::mem::take(&mut *flag) {Some(token)} else {None})
+            }
+            fn tcp_recv(&self, _: Cap, token: TcpConnectionToken, out: &mut [u8]) -> Result<TcpIoResult, SocketError> {
+                if token != self.control { return Ok(TcpIoResult::WouldBlock); }
+                Ok(match *self.read.lock().unwrap() {
+                    ControlRead::Waiting => TcpIoResult::WouldBlock,
+                    ControlRead::Closed => TcpIoResult::Closed,
+                    ControlRead::Terminate => {out[0]=CLIENT_TERMINATE; TcpIoResult::Progress(1)}
+                })
+            }
+            fn tcp_send(&self, _: Cap, _: TcpConnectionToken, bytes: &[u8]) -> Result<TcpIoResult, SocketError> {Ok(TcpIoResult::Progress(bytes.len()))}
+            fn tcp_close(&self, _: Cap, _: TcpConnectionToken) -> Result<(), SocketError> {Ok(())}
+            fn tcp_reset(&self, _: Cap, token: TcpConnectionToken) -> Result<(), SocketError> {self.reset.lock().unwrap().push(token); Ok(())}
+            fn now_ms(&self) -> u64 {self.now.load(Ordering::Relaxed)}
+            fn event(&self, _: &'static str) {}
+        }
+        fn fixture() -> (Mock, Cap, Cap, CSpace) {
+            let mut space = CSpace::new("iperf-setup");
+            let mut make = |id| {
+                let listener=TcpListener::new("test",TcpListenerId::new(id).unwrap(),5201,64,64).unwrap();
+                listener.network_update_state(TcpStreamState::Established).unwrap();
+                let token=listener.try_accept().unwrap(); let cap=space.mint(listener,Rights::ALL); (cap,token)
+            };
+            let (a,control)=make(1); let (b,data)=make(2);
+            (Mock {first:a,control,data,accept_control:Mutex::new(false),accept_data:Mutex::new(false),read:Mutex::new(ControlRead::Waiting),reset:Mutex::new(Vec::new()),now:AtomicU64::new(500)}, a,b,space)
+        }
+        #[test]
+        fn abandoned_control_during_stream_creation_resets_both_and_allows_new_session() {
+            for phase in [Phase::AcceptData,Phase::DataCookie] {
+                for read in [ControlRead::Closed,ControlRead::Terminate] {
+                    let (mock,a,b,_space)=fixture();
+                    let mut server=Server::new();server.control=Some(mock.control);server.phase=phase;
+                    if phase==Phase::DataCookie {server.data=Some(mock.data);} else {*mock.accept_data.lock().unwrap()=true;}
+                    *mock.read.lock().unwrap()=read;
+                    assert!(server.drive(&mock,a,b).is_err());
+                    server.abort(&mock,a,b);
+                    assert_eq!(*mock.reset.lock().unwrap(),[mock.control,mock.data]);
+                    server=Server::new();*mock.accept_control.lock().unwrap()=true;*mock.read.lock().unwrap()=ControlRead::Waiting;
+                    assert_eq!(server.drive(&mock,a,b),Ok(true));
+                    assert_eq!(server.phase,Phase::ControlCookie);assert_eq!(server.setup_started_ms,500);
+                }
+            }
+        }
+        #[test]
+        fn silent_setup_expires_even_when_control_never_closes() {
+            for phase in [Phase::ControlCookie,Phase::Parameters,Phase::AcceptData,Phase::DataCookie] {
+                let (mock,a,b,_space)=fixture();let mut server=Server::new();
+                server.control=Some(mock.control);server.data=Some(mock.data);server.phase=phase;server.setup_started_ms=500;
+                mock.now.store(500+SETUP_TIMEOUT_MS-1,Ordering::Relaxed);
+                assert_eq!(server.drive(&mock,a,b),Ok(false));
+                mock.now.store(500+SETUP_TIMEOUT_MS,Ordering::Relaxed);
+                assert_eq!(server.drive(&mock,a,b),Err(SocketError::Failed));
+            }
+        }
+        #[test]
+        fn waiting_for_first_client_has_no_setup_deadline() {
+            let (mock,a,b,_space)=fixture();let mut server=Server::new();
+            mock.now.store(u64::MAX,Ordering::Relaxed);
+            assert_eq!(server.drive(&mock,a,b),Ok(false));
+            *mock.accept_control.lock().unwrap()=true;
+            assert_eq!(server.drive(&mock,a,b),Ok(true));
+            assert_eq!(server.setup_started_ms,u64::MAX);
+        }
+    }
+
 }

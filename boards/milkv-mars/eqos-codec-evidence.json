@@ -1,0 +1,76 @@
+{
+  "status": "Shared Clause 22 transactions migrated into Duo; EQoS MDIO and descriptor codecs implemented; no live Mars NIC yet",
+  "host_tests": 22,
+  "rv64_model_marker": "EQOS_MODEL PASS mdio=clause22 descriptors=bounded",
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 2,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122023936,
+    "kernel_sha256": "da28008488fca0f580b908883c21dc1170368bc55bc07bf7cd5685badc5bdb66",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "duo_release_build": "passed",
+  "dependency_boundary_guard": "passed",
+  "reference_manifest": "boards/milkv-mars/eqos-reference.json",
+  "mutations": [
+    "Dropped first BMSR read: detected by assertion",
+    "EQoS PHY shift changed from 21 to 11: detected by wire encoding assertion",
+    "Descriptor OWN changed from bit 31 to bit 30: detected by completion assertions"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage26-host-restored.log",
+      "sha256": "9bfb0a40042f36d0bc4c669645662ede02101eecb19116de6b1dae54eeb964f7"
+    },
+    {
+      "path": "target/mars-reference/stage26-rv64-build.log",
+      "sha256": "de2a79074650a890d33fc50ab2b9836f911ebe2ad3bfc375125e3bb2958a8637"
+    },
+    {
+      "path": "target/mars-reference/stage26-duo-build.log",
+      "sha256": "8264bc28e619752d448478d6fd128e748d9552429fcb433c816f177c394c1d58"
+    },
+    {
+      "path": "target/mars-reference/stage26-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage26-rv64-model/serial.log",
+      "sha256": "934483ee599641412eeef109ea0454cd1e283505b692a680db66099ece027f95"
+    },
+    {
+      "path": "target/mars-reference/stage26-rv64-model/summary.json",
+      "sha256": "154b6537ea9efad86689689285fc946a7798573a3d458035ca203bcbaa48e645"
+    },
+    {
+      "path": "target/mars-reference/stage26-mutation-latch.log",
+      "sha256": "677249ae101a7fca4f0291d106aaf3a7f62f0e58cbf666d5dca218080f94cc6f"
+    },
+    {
+      "path": "target/mars-reference/stage26-mutation-mdio.log",
+      "sha256": "2a8a46b394bd3b1f9f45fcfaca968ee28d81ff87dfa2937dbf0d0cfbb42b687f"
+    },
+    {
+      "path": "target/mars-reference/stage26-mutation-ownership.log",
+      "sha256": "1eeb8f5739f8e66c0aaab01b0e14bba0f7f20228f2f927995e41e9c4c0aee3fc"
+    }
+  ],
+  "physical_acceptance": false,
+  "remaining": [
+    "Live EQoS DMA ring lifecycle, controller setup and bounded reset/recovery",
+    "JH7110 clock/reset/pinmux, PHY/RGMII and cache maintenance",
+    "BSP DTB GMAC admission and firmware packet-device composition",
+    "DHCP/link recovery, qualified entropy, SSH/WASM and stability acceptance"
+  ],
+  "blind_spots": [
+    "Host and RV64 register models do not execute Mars MMIO or DMA",
+    "Poll-count limits do not qualify actual MDIO timing",
+    "Source encodings and descriptor snapshots do not prove cache coherence or live ownership transitions"
+  ]
+}

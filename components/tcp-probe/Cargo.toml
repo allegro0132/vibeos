@@ -1,0 +1,12 @@
+[package]
+name = "vibeos-tcp-probe"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+receive-batch = []
+event-driven = ["vibeos-net-api/activity-events"]
+
+[dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-net-api = { path = "../net-api" }

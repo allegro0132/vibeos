@@ -1,0 +1,63 @@
+{
+  "status": "DWMAC SoC and DMA separation verified in software; Mars incomplete",
+  "host_tests": 29,
+  "qemu_selftests": 390,
+  "duo_release_build": "passed",
+  "golden_trace": {
+    "source_commit": "e831630",
+    "entries": 226,
+    "covers": "all register writes and mocked delays for fallback and calibrated eFuse paths"
+  },
+  "dma_layout": {
+    "elf": "target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo",
+    "sha256": "8afc4e121fd67a18178c57b2f51d1c768809ba34b8854894b1748b89db908c30",
+    "section": [
+      "0x805de000",
+      "0x805f8000"
+    ],
+    "packet_dma": {
+      "address": "0x805de800",
+      "bytes": 102400,
+      "cache_isolated": true,
+      "reachable_32bit": true
+    }
+  },
+  "mutation": "Changing link-removal PHY tuning 0x94a0 to 0xb4a0 fails the platform sequence test in an isolated crate copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage14-host-final.log",
+      "sha256": "d4e3908a6ffae35fe3c0ac957a044fc1cb669b7701aa97e75414b8a98aecba5c"
+    },
+    {
+      "path": "target/mars-reference/stage14-mutation.log",
+      "sha256": "35e305b330cfa60d27b8e987359348bfbd390ec7502b19da9bd37bcee4d25e58"
+    },
+    {
+      "path": "target/mars-reference/stage14-qemu-selftest.log",
+      "sha256": "8178c7f4fb9d3f382c8c126178615600002c5bf8098a03e06238ed141ad00ee3"
+    },
+    {
+      "path": "target/mars-reference/stage14-duo-build.log",
+      "sha256": "1644cf2bb82cdebd8e7478dde41322ee0f19c5eec388bdacac6a5a814ed7e615"
+    },
+    {
+      "path": "target/mars-reference/stage14-boundary-audit.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage14-dma-layout.json",
+      "sha256": "9524c1a1d901559e3897882a9a7040a10e35fa31374e3b4930e2d8f82cc9cb9e"
+    },
+    {
+      "path": "platform/cv1800b/tests/ethernet-sequence.txt",
+      "sha256": "4f7113c08067aa05aff2ffe181de03cec68d584df0be55d30365057c3ea3f560"
+    }
+  ],
+  "hardware_acceptance": "not run; host cache tests only execute compiler fences",
+  "remaining": [
+    "DWC2 SoC/cache split and board-feature/service decoupling",
+    "Shared MDIO/PHY helpers; JH7110 and Mars firmware SD/EQoS integration",
+    "Boot firmware and flashable SD image",
+    "Serial/SSH, entropy qualification and physical stability acceptance"
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "status": "PIO SDHCI composition verified in host tests and target build; Mars incomplete",
+  "host_tests": 31,
+  "qemu_selftests": 390,
+  "duo_release_build": "passed",
+  "mutation": "Returning untranslated logical sector fails partition test; restored and tests rerun",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage3-host.log",
+      "sha256": "7c64f10945f0bcc0ac2af0d69bdb2f6ede016138aff7a99b583cda3caa264113"
+    },
+    {
+      "path": "target/mars-reference/stage3-partition-mutation.log",
+      "sha256": "aa4739677d852c5e0b4ca4f55f4d06a1f74b75232c612aaf5d648c9b1d981496"
+    },
+    {
+      "path": "target/mars-reference/stage3-qemu-selftest.log",
+      "sha256": "89122b1df3548e447a937603bc58fb37e9fda16bcf587729cc5e97a95d53bc5d"
+    },
+    {
+      "path": "target/mars-reference/stage3-duo-build.log",
+      "sha256": "7dccc752c9c834bb535cc2308c70c3ac44bf1dd9e23d792b83333c3817e7346f"
+    },
+    {
+      "path": "target/mars-reference/stage3-duo-kernel-dependencies.log",
+      "sha256": "6a6df7764cba669744e3959da78dc203105add2824546abd453ad12873da3790"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Other concrete driver dependencies",
+    "Duo SoC setup extraction",
+    "Mars firmware/platform and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Serial/SSH and physical stress acceptance"
+  ]
+}

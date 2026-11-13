@@ -60,11 +60,11 @@ const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 
 /// Largest page run one block-device request may carry, derived from the
-/// selected board backend's maximum transfer size.
-#[cfg(feature = "qemu-virt")]
+/// selected HAL backend's maximum transfer size.
+#[cfg(feature = "queued-block")]
 const MAX_PAGES_PER_REQUEST: usize =
     crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
-#[cfg(feature = "milkv-duo")]
+#[cfg(all(feature = "pio-block", not(feature = "universal")))]
 const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
     * LOGICAL_BLOCK_SIZE
     / vibeos_segment_format::PAGE_SIZE;
@@ -1228,6 +1228,18 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 ) => FileError::Conflict,
                 _ => FileError::ServiceUnavailable,
             });
+            if result.is_ok() {
+                // File-tree root publication relocates the authority snapshot
+                // without changing its logical journal. Keep the object-store
+                // facade on that exact checkpoint before releasing the epoch.
+                let view = poll_as_system(recover_recognized_persistent_authority(
+                    operation.store(),
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                .map_err(|_| FileError::ServiceUnavailable)?;
+                self.runtime.publish_authority(view);
+            }
             operation.finish();
             result
         })
@@ -1481,6 +1493,7 @@ impl StorageV2Runtime {
         let page_operation = match self.device.begin_operation(task, domain, token) {
             Ok(operation) => operation,
             Err(error) => {
+                crate::uart::_print(format_args!("  storage v2 page admission failed: {error:?}\n"));
                 assert!(self.clear(claim));
                 return Err(match error {
                     PageIoError::OperationBusy => V2RuntimeError::Busy,
@@ -2287,6 +2300,18 @@ impl StorageV2Runtime {
             poll_as_system(operation.store().grow(&maintenance, additional))
                 .await
                 .map_err(|_| V2RuntimeError::Corrupt)?;
+            // Growth advances the physical checkpoint even though the logical
+            // authority stream is unchanged. Publish a fresh generation witness
+            // before an ordinary object append captures its predecessor.
+            if self.authority_view().is_some() {
+                let view = poll_as_system(recover_recognized_persistent_authority(
+                    operation.store(),
+                    crate::durable_cspace::storage_v2_external_policy_sha256(),
+                ))
+                .await
+                .map_err(|_| V2RuntimeError::Corrupt)?;
+                self.publish_authority(view);
+            }
         } else {
             // Growth is exhausted: reclaim dead space now, while enough free
             // segments remain for the collector's relocation targets. Each
@@ -2304,7 +2329,7 @@ impl StorageV2Runtime {
             let mut last_free = info.free_segments;
             let mut stalled = 0_u32;
             for _ in 0..8 {
-                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                #[cfg(all(feature = "storage-bench", feature = "queued-block"))]
                 let io_before = crate::virtio_blk::telemetry();
                 let _telemetry = match poll_as_system(operation.store().collect_garbage()).await {
                     Ok(telemetry) => telemetry,
@@ -2324,7 +2349,7 @@ impl StorageV2Runtime {
                     current.free_segments,
                     floor
                 );
-                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                #[cfg(all(feature = "storage-bench", feature = "queued-block"))]
                 {
                     let io = crate::virtio_blk::telemetry().saturating_sub(io_before);
                     crate::println!(

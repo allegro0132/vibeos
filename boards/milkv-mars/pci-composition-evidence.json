@@ -1,0 +1,45 @@
+{
+  "status": "PCI firmware composition verified; Mars incomplete",
+  "host_tests": 24,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "PCI BAR/INTx and XHCI",
+    "HID input and hotplug",
+    "BOT/SCSI backing file I/O",
+    "Duo release build"
+  ],
+  "mutation": "Removing current-inventory membership check fails bus-master regression in isolated copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage10-host.log",
+      "sha256": "660a105a69acbbf15eb3b554f92fdae7d1da8a841ac6cf0ef8b7dff5f11c3bca"
+    },
+    {
+      "path": "target/mars-reference/stage10-inventory-mutation.log",
+      "sha256": "fbe462a27ecce65f4e622c9b5c093c6b96693e7c47ae627d5e54748f9b1acb6e"
+    },
+    {
+      "path": "target/mars-reference/stage10-qemu-usb.log",
+      "sha256": "68aae71d58a1060f57cb05597b6f25e61f039cc00f0612ccfbefddfd97e9a4a6"
+    },
+    {
+      "path": "target/mars-reference/stage10-qemu-selftest.log",
+      "sha256": "2fa75b60d14155ff49bebfef10b627a73017bd208083ff5937361e6a5a9a53e4"
+    },
+    {
+      "path": "target/mars-reference/stage10-duo-build.log",
+      "sha256": "99f1b25c4813a5547f39bee872636156d5a363a52949792e566ac1eaf2fac87e"
+    },
+    {
+      "path": "target/mars-reference/stage10-kernel-dependencies.log",
+      "sha256": "0eabca176344e62304b756f1a5b800472a8b298e41e99333fc8893f0aa98f117"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "USB controllers and shared VirtIO transport/protocol migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

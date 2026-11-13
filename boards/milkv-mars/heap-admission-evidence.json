@@ -1,0 +1,91 @@
+{
+  "status": "Reservation-subtracted boot heap integrated and tested on QEMU; Mars composition incomplete",
+  "heap_host_tests": 47,
+  "heap_with_telemetry_tests": 49,
+  "hal_host_tests": 35,
+  "python_tests": 16,
+  "live_qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122023936,
+    "kernel_sha256": "cfd750525057c940c0e861f9dd084fc7f2b8e877b6be5fc9e572fca1e636622b",
+    "physical_acceptance": false,
+    "require_admission": true
+  },
+  "production_qemu_selftests": 390,
+  "duo_default_ssh_build": "passed",
+  "mutations": [
+    "Merge across reserved hole detected",
+    "Missing per-extent tail rewind detected",
+    "Reservation rounded inward detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage22-heap-restored.log",
+      "sha256": "abc8c46302426378e972043ceb9efa71c82f8db963ab01fe829a06232c0fc2ab"
+    },
+    {
+      "path": "target/mars-reference/stage22-heap-costs.log",
+      "sha256": "38d677f9c4b9ada8677c1c709927a6347c894ca754110f5d425832cf93019b93"
+    },
+    {
+      "path": "target/mars-reference/stage22-hal-restored.log",
+      "sha256": "8e6ab43b9b70f85512bb1e5ae2085257ca0fbcd8d169ca57314fd9360fcda726"
+    },
+    {
+      "path": "target/mars-reference/stage22-python.log",
+      "sha256": "6508051d44078a986bbb87b1424ea7510c64abe4a4549be6c75a6e2edfd5fac9"
+    },
+    {
+      "path": "target/mars-reference/stage22-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage22-rv64-build.log",
+      "sha256": "f540d5cad13e862b6d7fbdc690f374f11a01ea333e32ce48ab91967c1d93bc25"
+    },
+    {
+      "path": "target/mars-reference/stage22-live-heap/serial.log",
+      "sha256": "2de24105a1f689ca06b38719107168c2d309e04086f730ab42c2afdb755f188f"
+    },
+    {
+      "path": "target/mars-reference/stage22-live-heap/summary.json",
+      "sha256": "5a6edf782e3c281ea257bb1593a90b787e53fe28f449501d4cbdffe9ab966fb1"
+    },
+    {
+      "path": "target/mars-reference/stage22-qemu-build.log",
+      "sha256": "e1b48d86336ede9a870f3fdba04bf001348ed010733bcf83b12618ae06985c62"
+    },
+    {
+      "path": "target/mars-reference/stage22-qemu-selftest.log",
+      "sha256": "a2e33c54eef0a0ae8ebe7b8d3cb69e077f2f5bf2499ee05232596697978b9ac2"
+    },
+    {
+      "path": "target/mars-reference/stage22-duo-build.log",
+      "sha256": "e85f37a20de89c7f7ff01f181c99e7c67a0fb580dbf7bc632a6b1ecd2edd1311"
+    },
+    {
+      "path": "target/mars-reference/stage22-mutation-merge-hole.log",
+      "sha256": "527822107e10a48ee231545de93dca82977851934e945af222b5dabc2d45dee9"
+    },
+    {
+      "path": "target/mars-reference/stage22-mutation-tail-rewind.log",
+      "sha256": "7de863fa41a3b4fbcc6b19e00e1e4bff7d00058139ff3eae4649ab9ecdb832bd"
+    },
+    {
+      "path": "target/mars-reference/stage22-mutation-reservation-rounding.log",
+      "sha256": "386dc681b6763229227aa817f7ea6c92b3ddb859f91350c025c42f2104b5f251"
+    }
+  ],
+  "physical_acceptance": false,
+  "limits": [
+    "Host and QEMU do not qualify Mars memory map or DMA/cache behavior",
+    "Reserved RAM is excluded from allocator use, not all kernel identity mappings",
+    "Production Mars resource admission, SBI qualification and firmware entry remain pending",
+    "DW-MSHC registration, EQoS, paired boot components, SD image and physical acceptance remain pending"
+  ]
+}

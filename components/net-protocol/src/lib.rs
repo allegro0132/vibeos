@@ -3,7 +3,7 @@
 //! This module is the first protocol layer above the raw Ethernet contract in
 //! [`vibeos_core::net`]. It deliberately exposes neither file descriptors nor an
 //! ambient NIC. A supervisor resolves two directional packet capabilities as
-//! operation-time [`Revocable`] tokens and hands them to
+//! operation-time [`vibeos_core::cap::Revocable`] tokens and hands them to
 //! [`StaticIpv4TcpStack`]. Calling [`StaticIpv4TcpStack::poll_network`] with a
 //! monotonic millisecond timestamp advances ARP, IPv4, and one passive TCP
 //! connection by a bounded amount. Application byte-stream work is explicit
@@ -25,6 +25,18 @@ mod tcp_window;
 pub mod neighbor;
 pub mod router_config;
 pub mod router_dhcp;
+#[cfg(feature = "receive-buffer-exchange")]
+pub mod receive_exchange;
+mod transmit;
+mod receive;
+pub use receive::PacketReceive;
+pub use transmit::PacketTransmit;
+#[cfg(feature = "bounded-gro")]
+mod gro;
+#[cfg(feature = "bounded-gro")]
+pub use gro::{PROFILE_LEN as GRO_PROFILE_LEN, PROFILE_NONE_OFFSET as GRO_PROFILE_NONE_OFFSET};
+#[cfg(feature = "gro-checked")]
+mod checked_gro;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -40,8 +52,6 @@ use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
-use vibeos_core::cap::Revocable;
-use vibeos_core::chan::Endpoint;
 use vibeos_core::net::{Packet, PacketStamp, StampedPacket, MAX_PACKET_LEN};
 use vibeos_net_api::{TcpCloseRequest, TcpFrontendError, TcpListener};
 pub use vibeos_net_api::{TcpIoResult, TcpStreamState, TcpStreamStatus};
@@ -79,7 +89,10 @@ pub enum Ipv4RuntimeStatus {
 }
 
 /// Bytes reserved in each direction of the single TCP connection.
+#[cfg(not(feature = "tcp-large-window"))]
 pub const TCP_BUFFER_BYTES: usize = 32 * 1024;
+#[cfg(feature = "tcp-large-window")]
+pub const TCP_BUFFER_BYTES: usize = 256 * 1024;
 /// At most this many ingress frames are consumed by one cooperative poll.
 pub const MAX_INGRESS_FRAMES_PER_POLL: usize = 32;
 /// At most this many bounded egress passes are made by one cooperative poll.
@@ -246,15 +259,37 @@ impl fmt::Display for StackError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketDeviceStats {
+    #[cfg(feature = "rx-admission-batch")]
+    pub rx_admission_sizes: [u64; 9],
     pub rx_frames: u64,
     pub tx_frames: u64,
+    pub tx_segmented_requests: u64,
     pub rejected_ingress_frames: u64,
     pub rejected_device_epoch_frames: u64,
     pub rejected_stack_generation_frames: u64,
     pub tx_backpressure_events: u64,
     pub pending_egress: bool,
+    pub gro_merged_segments: u64,
+    pub gro_aggregates: u64,
+    #[cfg(feature = "gro-end-profile")]
+    pub gro_end_profile: [u64; gro::PROFILE_LEN],
+}
+
+impl Default for PacketDeviceStats {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "rx-admission-batch")]
+            rx_admission_sizes: [0; 9],
+            rx_frames: 0, tx_frames: 0, tx_segmented_requests: 0,
+            rejected_ingress_frames: 0, rejected_device_epoch_frames: 0,
+            rejected_stack_generation_frames: 0, tx_backpressure_events: 0,
+            pending_egress: false, gro_merged_segments: 0, gro_aggregates: 0,
+            #[cfg(feature = "gro-end-profile")]
+            gro_end_profile: [0; gro::PROFILE_LEN],
+        }
+    }
 }
 
 /// A lossless-at-the-endpoint-boundary smoltcp device adapter.
@@ -265,36 +300,97 @@ pub struct PacketDeviceStats {
 /// until that packet is accepted. This preserves TCP retransmission semantics
 /// without growing an unbounded second queue.
 pub struct PacketDevice {
+    #[cfg(feature = "gro-checked")]
+    checked_rx: checked_gro::Window,
+    #[cfg(feature = "rx-admission-batch")]
+    rx_batch: vibeos_core::net_receive::LoanBatch,
     stamp: PacketStamp,
-    inbound: Revocable<Endpoint<StampedPacket>>,
-    outbound: Revocable<Endpoint<StampedPacket>>,
+    inbound: PacketReceive,
+    rx_packet: Option<Packet>,
+    #[cfg(feature = "pooled-rx")]
+    rx_loan: Option<vibeos_core::net_receive::Loan>,
+    #[cfg(feature = "gro-scatter")]
+    gro_loans: [Option<vibeos_core::net_receive::Loan>; gro::MAX_SEGMENTS - 1],
+    #[cfg(feature = "gro-scatter")]
+    gro_loan_count: usize,
+    #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+    pending_rx_loan: Option<vibeos_core::net_receive::Loan>,
+    outbound: PacketTransmit,
     pending_egress: Option<StampedPacket>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_segments: Option<vibeos_core::net_segmentation::SoftwareTransmit>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_pooled: Option<transmit::Reservation>,
     stats: PacketDeviceStats,
     authority_revoked: bool,
     tx_checksum_offload: bool,
     rx_checksum_offload: bool,
+    #[cfg(feature = "bounded-gro")]
+    gro: gro::Buffer,
+    #[cfg(feature = "gro-end-profile")]
+    gro_last_none: gro::NoInput,
+    #[cfg(feature = "bounded-gro")]
+    pending_ingress: Option<Packet>,
+    #[cfg(feature = "bounded-gro")]
+    ingress_remaining: usize,
 }
 
 impl PacketDevice {
     pub fn new(
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Self {
         Self {
             stamp,
-            inbound,
-            outbound,
+            #[cfg(feature = "gro-checked")]
+            checked_rx: checked_gro::Window::new(),
+            #[cfg(feature = "rx-admission-batch")]
+            rx_batch: vibeos_core::net_receive::LoanBatch::empty(),
+            inbound: inbound.into(),
+            rx_packet: None,
+            #[cfg(feature = "pooled-rx")]
+            rx_loan: None,
+            #[cfg(feature = "gro-scatter")]
+            gro_loans: core::array::from_fn(|_| None),
+            #[cfg(feature = "gro-scatter")]
+            gro_loan_count: 0,
+            #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+            pending_rx_loan: None,
+            outbound: outbound.into(),
             pending_egress: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_segments: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_pooled: None,
             stats: PacketDeviceStats::default(),
             authority_revoked: false,
             tx_checksum_offload: false,
             rx_checksum_offload: false,
+            #[cfg(feature = "bounded-gro")]
+            gro: gro::Buffer::new(),
+            #[cfg(feature = "gro-end-profile")]
+            gro_last_none: gro::NoInput::Unsupported,
+            #[cfg(feature = "bounded-gro")]
+            pending_ingress: None,
+            #[cfg(feature = "bounded-gro")]
+            ingress_remaining: usize::MAX,
         }
     }
 
     pub const fn set_tx_checksum_offload(&mut self, enabled: bool) {
         self.tx_checksum_offload = enabled;
+    }
+
+    #[cfg(feature = "gro-scatter")]
+    fn clear_gro_loans(&mut self) {
+        let mut releases = vibeos_core::net_receive::ReleaseBatch::<{ gro::MAX_SEGMENTS }>::new();
+        for slot in &mut self.gro_loans[..self.gro_loan_count] {
+            if let Some(loan) = slot.take() {
+                if let Err(loan) = releases.push(loan) { drop(loan); }
+            }
+        }
+        self.gro_loan_count = 0;
     }
 
     pub const fn set_rx_checksum_offload(&mut self, enabled: bool) {
@@ -308,8 +404,8 @@ impl PacketDevice {
     /// Revalidate both directional authorities at a cooperative-call boundary.
     pub fn revalidate_authority(&mut self) -> Result<(), StackError> {
         if self.authority_revoked
-            || self.inbound.try_with(|_| ()).is_err()
-            || self.outbound.try_with(|_| ()).is_err()
+            || self.inbound.revalidate().is_err()
+            || self.outbound.revalidate().is_err()
         {
             self.authority_revoked = true;
             return Err(StackError::AuthorityRevoked);
@@ -319,12 +415,71 @@ impl PacketDevice {
 
     /// Try once to publish a frame retained after endpoint backpressure.
     pub fn flush_egress(&mut self) -> Result<bool, StackError> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::TxFlush);
         self.authority_result()?;
+        #[cfg(feature = "native-tcp-segmentation")]
+        if let Some(pending) = self.pending_pooled.as_mut() {
+            match pending.publish() {
+                Ok(true) => {
+                    self.stats.tx_frames = self.stats.tx_frames.saturating_add(pending.frames);
+                    self.pending_pooled = None;
+                    self.stats.pending_egress = false;
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                    return Ok(false);
+                }
+                Err(_) => {
+                    self.pending_pooled = None;
+                    self.authority_revoked = true;
+                    return Err(StackError::AuthorityRevoked);
+                }
+            }
+        }
+        #[cfg(feature = "native-tcp-segmentation")]
+        if self.pending_segments.is_some() {
+            // One logical request owns its bytes until every software segment
+            // has entered the existing queue. No successor may overtake it.
+            for _ in 0..32 {
+                let pending = self.pending_segments.as_mut().unwrap();
+                let request = pending.request(self.stamp).expect("immutable adapter session");
+                let index = pending.next_segment();
+                let length = request.header_bytes()
+                    + (request.payload_bytes() - index * request.mss()).min(request.mss());
+                let (frame, _) = Packet::write_with(length, |out| request.write_segment(index, out).unwrap())
+                    .expect("bounded software segment");
+                let packet = StampedPacket::new(frame, self.stamp);
+                match self.outbound.send_frame(packet) {
+                    Ok(Ok(())) => {
+                        pending.accepted().unwrap();
+                        self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
+                        if pending.is_complete() {
+                            self.pending_segments = None;
+                            self.stats.pending_egress = false;
+                            return Ok(true);
+                        }
+                    }
+                    Ok(Err(_)) => {
+                        self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                        self.stats.pending_egress = true;
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        self.pending_segments = None;
+                        self.authority_revoked = true;
+                        self.stats.pending_egress = false;
+                        return Err(StackError::AuthorityRevoked);
+                    }
+                }
+            }
+            return Ok(false);
+        }
         let Some(packet) = self.pending_egress.take() else {
             self.stats.pending_egress = false;
             return Ok(true);
         };
-        match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
+        match self.outbound.send_frame(packet) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
                 self.stats.pending_egress = false;
@@ -347,10 +502,20 @@ impl PacketDevice {
 
     pub fn has_immediate_work(&mut self) -> Result<bool, StackError> {
         self.authority_result()?;
+        #[cfg(feature = "rx-admission-batch")]
+        if self.rx_batch.len() != 0 { return Ok(true); }
         if self.pending_egress.is_some() {
             return Ok(true);
         }
-        match self.inbound.try_with(|endpoint| endpoint.stats().2 != 0) {
+        #[cfg(feature = "native-tcp-segmentation")]
+        if self.pending_segments.is_some() || self.pending_pooled.is_some() { return Ok(true); }
+        #[cfg(feature = "bounded-gro")]
+        if self.pending_ingress.is_some() { return Ok(true); }
+        #[cfg(feature = "gro-checked")]
+        if self.checked_rx.has_pending() { return Ok(true); }
+        #[cfg(all(feature = "pooled-rx", feature = "bounded-gro"))]
+        if self.pending_rx_loan.is_some() { return Ok(true); }
+        match self.inbound.has_message() {
             Ok(has_ingress) => Ok(has_ingress),
             Err(_) => {
                 self.authority_revoked = true;
@@ -362,7 +527,136 @@ impl PacketDevice {
     pub fn stats(&self) -> PacketDeviceStats {
         let mut stats = self.stats;
         stats.pending_egress = self.pending_egress.is_some();
+        #[cfg(feature = "native-tcp-segmentation")]
+        { stats.pending_egress |= self.pending_segments.is_some() || self.pending_pooled.is_some(); }
+        #[cfg(feature = "bounded-gro")]
+        {
+            stats.gro_merged_segments = self.gro.merged_segments;
+            stats.gro_aggregates = self.gro.aggregates;
+            #[cfg(feature = "gro-end-profile")]
+            { stats.gro_end_profile = self.gro.profile; }
+        }
         stats
+    }
+
+    #[cfg(feature = "native-tcp-segmentation")]
+    fn reserve_transmit(&mut self) -> Option<Option<transmit::Reservation>> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::TxReserve);
+        match self.outbound.reserve(self.stamp) {
+            Ok(reservation) => Some(reservation),
+            Err(transmit::ReserveError::Pool(vibeos_core::net_segment_pool::Error::Full)) => {
+                self.stats.tx_backpressure_events = self.stats.tx_backpressure_events.saturating_add(1);
+                None
+            }
+            Err(_) => { self.authority_revoked = true; None }
+        }
+    }
+
+    #[cfg(feature = "pooled-rx")]
+    fn receive_pooled(&mut self) -> Option<vibeos_core::net_receive::Loan> {
+        let _scope = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::RxLoan);
+        #[cfg(feature = "bounded-gro")]
+        if self.ingress_remaining == 0 {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::IngressBudget; }
+            return None;
+        }
+        #[cfg(feature = "rx-admission-batch")]
+        let received = if self.rx_batch.len() != 0 {
+            Some(Ok(self.rx_batch.pop().unwrap().map(Some)))
+        } else {
+            self.inbound.receive_batch_into(self.stamp, self.ingress_remaining.min(8), &mut self.rx_batch).map(|result| match result {
+                Ok(Ok(count)) => {
+                    self.stats.rx_admission_sizes[count] += 1;
+                    Ok(self.rx_batch.pop().map_or(Ok(None), |r| r.map(Some)))
+                },
+                Ok(Err(error)) => Ok(Err(error)),
+                Err(error) => Err(error),
+            })
+        };
+        #[cfg(not(feature = "rx-admission-batch"))]
+        let received = self.inbound.receive_loan(self.stamp);
+        let Some(result) = received else {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::Unsupported; }
+            return None;
+        };
+        if !matches!(&result, Ok(Ok(None)) | Err(_)) {
+            #[cfg(feature = "bounded-gro")]
+            { self.ingress_remaining -= 1; }
+        }
+        match result {
+            Ok(Ok(loan)) => {
+                if loan.is_some() { self.stats.rx_frames = self.stats.rx_frames.saturating_add(1); }
+                #[cfg(feature = "gro-end-profile")]
+                if loan.is_none() { self.gro_last_none = gro::NoInput::EmptyEndpoint; }
+                loan
+            }
+            Err(_) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Authority; }
+                self.authority_revoked = true; None
+            }
+            Ok(Err(error)) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Rejected; }
+                self.stats.rejected_ingress_frames = self.stats.rejected_ingress_frames.saturating_add(1);
+                if let vibeos_core::net_receive::Error::Session(mismatch) = error {
+                    if mismatch.device_epoch_changed() {
+                        self.stats.rejected_device_epoch_frames = self.stats.rejected_device_epoch_frames.saturating_add(1);
+                    } else {
+                        self.stats.rejected_stack_generation_frames = self.stats.rejected_stack_generation_frames.saturating_add(1);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn receive_packet(&mut self) -> Option<Packet> {
+        #[cfg(feature = "bounded-gro")]
+        if self.ingress_remaining == 0 {
+            #[cfg(feature = "gro-end-profile")]
+            { self.gro_last_none = gro::NoInput::IngressBudget; }
+            return None;
+        }
+        let packet = match self.inbound.raw_receive() {
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::EmptyEndpoint; }
+                return None;
+            },
+            Err(_) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Authority; }
+                self.authority_revoked = true;
+                return None;
+            }
+        };
+        #[cfg(feature = "bounded-gro")]
+        { self.ingress_remaining -= 1; }
+        let packet = match packet.into_packet(self.stamp) {
+            Ok(packet) => packet,
+            Err(mismatch) => {
+                #[cfg(feature = "gro-end-profile")]
+                { self.gro_last_none = gro::NoInput::Rejected; }
+                self.stats.rejected_ingress_frames =
+                    self.stats.rejected_ingress_frames.saturating_add(1);
+                if mismatch.device_epoch_changed() {
+                    self.stats.rejected_device_epoch_frames =
+                        self.stats.rejected_device_epoch_frames.saturating_add(1);
+                } else if mismatch.stack_generation_changed() {
+                    self.stats.rejected_stack_generation_frames = self
+                        .stats
+                        .rejected_stack_generation_frames
+                        .saturating_add(1);
+                }
+                return None;
+            }
+        };
+        self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
+        Some(packet)
     }
 
     fn authority_result(&self) -> Result<(), StackError> {
@@ -374,32 +668,176 @@ impl PacketDevice {
     }
 }
 
-/// An owned receive token; it never borrows the DMA or endpoint queue.
-pub struct PacketRxToken(Packet);
-
-impl phy::RxToken for PacketRxToken {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(self.0.as_bytes())
+/// Pooled builds borrow pinned storage; legacy builds retain the original
+/// owning token so moving into a second inline frame does not add a packet copy.
+#[cfg(feature = "pooled-rx")]
+type RxBytes<'a> = &'a [u8];
+#[cfg(not(feature = "pooled-rx"))]
+enum RxBytes<'a> {
+    Single(Packet, core::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "bounded-gro")]
+    Coalesced(&'a [u8]),
+}
+#[inline]
+fn single_rx(packet: Packet, storage: &mut Option<Packet>) -> RxBytes<'_> {
+    #[cfg(feature = "pooled-rx")]
+    { *storage = Some(packet); storage.as_ref().unwrap().as_bytes() }
+    #[cfg(not(feature = "pooled-rx"))]
+    { let _ = storage; RxBytes::Single(packet, core::marker::PhantomData) }
+}
+#[cfg(feature = "bounded-gro")]
+#[inline]
+fn coalesced_rx(bytes: &[u8]) -> RxBytes<'_> {
+    #[cfg(feature = "pooled-rx")]
+    { bytes }
+    #[cfg(not(feature = "pooled-rx"))]
+    { RxBytes::Coalesced(bytes) }
+}
+pub struct PacketRxToken<'a>(RxBytes<'a>,
+    #[cfg(feature = "gro-scatter")] Option<&'a [Option<vibeos_core::net_receive::Loan>]>,
+    #[cfg(feature = "gro-checked")] Option<checked_gro::Token<'a>>);
+impl phy::RxToken for PacketRxToken<'_> {
+    #[cfg(feature = "gro-checked")]
+    fn consume_gro_checked<R, F>(mut self, caps: &phy::ChecksumCapabilities, f: F) -> R
+    where F: FnOnce(phy::TcpGroRx<'_>) -> R {
+        if let Some(token) = self.2.take() {
+            return token.consume(caps, |received, _| f(received));
+        }
+        self.consume_gro(|frames| match frames {
+            [frame] => f(phy::TcpGroRx::Frame(frame)),
+            _ => f(match phy::TcpGro::new(frames, caps) {
+                Some(group) => phy::TcpGroRx::Group(group),
+                None => phy::TcpGroRx::Invalid,
+            }),
+        })
+    }
+    #[cfg(feature = "gro-scatter")]
+    #[allow(unused_mut)]
+    fn consume_gro<R, F>(mut self, f: F) -> R where F: FnOnce(&[&[u8]]) -> R {
+        #[cfg(feature = "gro-checked")]
+        if let Some(token) = self.2.take() {
+            let caps = token.caps.clone();
+            return token.consume(&caps, |_, frames| f(frames));
+        }
+        let mut frames = [&[][..]; gro::MAX_SEGMENTS];
+        frames[0] = self.0;
+        let mut count = 1;
+        if let Some(loans) = self.1 {
+            for loan in loans {
+                frames[count] = loan.as_ref().expect("admitted GRO loan").as_bytes();
+                count += 1;
+            }
+        }
+        f(&frames[..count])
+    }
+    #[allow(unused_mut)]
+    fn consume<R, F>(mut self, f: F) -> R where F: FnOnce(&[u8]) -> R {
+        #[cfg(feature = "gro-checked")]
+        if let Some(token) = self.2.take() {
+            let caps = token.caps.clone();
+            return token.consume(&caps, |received, _| match received {
+                phy::TcpGroRx::Frame(frame) => f(frame),
+                phy::TcpGroRx::Group(group) => f(&group.materialize()),
+                phy::TcpGroRx::Invalid => f(&[]),
+            });
+        }
+        #[cfg(feature = "gro-scatter")]
+        if self.1.is_some() {
+            return self.consume_gro(|frames| {
+                match phy::TcpGro::new(frames, &phy::ChecksumCapabilities::ignored()) {
+                    Some(gro) => f(&gro.materialize()),
+                    None => f(&[]),
+                }
+            });
+        }
+        #[cfg(feature = "pooled-rx")]
+        { f(self.0) }
+        #[cfg(not(feature = "pooled-rx"))]
+        { match self.0 {
+            RxBytes::Single(packet, _) => f(packet.as_bytes()),
+            #[cfg(feature = "bounded-gro")]
+            RxBytes::Coalesced(bytes) => f(bytes),
+        } }
     }
 }
 
-/// A transmit token borrowing only the adapter's one-packet pending slot.
+/// A transmit token borrowing the adapter's authority and pending slots.
+/// The device borrow already bounds its lifetime; cloning authority per token
+/// would add reference-count traffic without extending useful ownership.
 pub struct PacketTxToken<'a> {
     stamp: PacketStamp,
-    outbound: Revocable<Endpoint<StampedPacket>>,
+    outbound: &'a PacketTransmit,
     pending_egress: &'a mut Option<StampedPacket>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_segments: &'a mut Option<vibeos_core::net_segmentation::SoftwareTransmit>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    segment_size: Option<u16>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    reservation: Option<transmit::Reservation>,
+    #[cfg(feature = "native-tcp-segmentation")]
+    pending_pooled: &'a mut Option<transmit::Reservation>,
     stats: &'a mut PacketDeviceStats,
     authority_revoked: &'a mut bool,
 }
 
 impl phy::TxToken for PacketTxToken<'_> {
+    #[cfg(feature = "native-tcp-segmentation")]
+    fn set_meta(&mut self, meta: phy::PacketMeta) { self.segment_size = meta.tcp_segment_size; }
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
+        #[cfg(feature = "native-tcp-segmentation")]
+        if let Some(mss) = self.segment_size {
+            if let Some(mut reservation) = self.reservation {
+                let ticket = reservation.ticket.unwrap();
+                let mut fill = Some(f);
+                let written = reservation.authority.try_with(|q| {
+                    q.pool().write(ticket, self.stamp, len, mss as usize, fill.take().unwrap())
+                        .expect("valid native TCP serialization")
+                });
+                let result = match written {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // TxToken requires the serializer's return value even
+                        // after revocation. Use task-local scratch only here.
+                        assert!(len <= vibeos_core::net_segmentation::MAX_LOGICAL_PACKET);
+                        let mut scratch = vec![0; len];
+                        *self.authority_revoked = true;
+                        return fill.take().unwrap()(&mut scratch);
+                    }
+                };
+                #[cfg(feature = "network-tx-audit")]
+                let _ = reservation.authority.try_with(|q| q.pool().try_consume(ticket, self.stamp, |request| {
+                    vibeos_core::net_tx_audit::record_segments(0, request);
+                    Err::<(), ()>(()) // Inspection does not release the pending request.
+                }));
+                reservation.frames = (len - 54).div_ceil(mss as usize) as u64;
+                self.stats.tx_segmented_requests = self.stats.tx_segmented_requests.saturating_add(1);
+                match reservation.publish() {
+                    Ok(true) => self.stats.tx_frames = self.stats.tx_frames.saturating_add(reservation.frames),
+                    Ok(false) => { *self.pending_pooled = Some(reservation); self.stats.pending_egress = true; }
+                    Err(_) => { *self.authority_revoked = true; }
+                }
+                return result;
+            }
+            use vibeos_core::net_segmentation::{StampedSegments, SoftwareTransmit};
+            assert!(self.pending_egress.is_none() && self.pending_segments.is_none());
+            let (message, result) = StampedSegments::write_with(len, mss as usize, self.stamp, f)
+                .expect("stack supplied a supported TCP segmentation request");
+            vibeos_core::net_tx_audit::record_segments(0, message.request(self.stamp).unwrap());
+            if self.outbound.revalidate().is_err() {
+                *self.authority_revoked = true;
+                self.stats.pending_egress = false;
+            } else {
+                *self.pending_segments = Some(SoftwareTransmit::new(message));
+                self.stats.tx_segmented_requests = self.stats.tx_segmented_requests.saturating_add(1);
+                self.stats.pending_egress = true;
+            }
+            return result;
+        }
+        #[cfg(feature = "native-tcp-segmentation")]
+        drop(self.reservation);
         assert!(
             len <= MAX_PACKET_LEN,
             "smoltcp emitted a frame larger than the advertised Ethernet MTU"
@@ -408,8 +846,9 @@ impl phy::TxToken for PacketTxToken<'_> {
 
         let (frame, result) = Packet::write_with(len, f)
             .expect("smoltcp emitted an empty or oversized Ethernet frame");
+        vibeos_core::net_tx_audit::record(0, frame.as_bytes());
         let packet = StampedPacket::new(frame, self.stamp);
-        match self.outbound.try_with(|endpoint| endpoint.try_send(packet)) {
+        match self.outbound.send_frame(packet) {
             Ok(Ok(())) => {
                 self.stats.tx_frames = self.stats.tx_frames.saturating_add(1);
             }
@@ -430,7 +869,7 @@ impl phy::TxToken for PacketTxToken<'_> {
 
 impl phy::Device for PacketDevice {
     type RxToken<'a>
-        = PacketRxToken
+        = PacketRxToken<'a>
     where
         Self: 'a;
     type TxToken<'a>
@@ -439,40 +878,203 @@ impl phy::Device for PacketDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Include pooled loans and GRO, not only the legacy copied queue path.
+        // The guard ends before token consumption, leaving TCP/IP work in its
+        // parent protocol scope. TX reservation/flush inside receive is included.
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::PacketQueue);
+        #[cfg(feature = "gro-scatter")]
+        self.clear_gro_loans();
+        #[cfg(feature = "gro-checked")]
+        self.checked_rx.retire();
+        // Previous tokens cannot coexist with this mutable device invocation.
+        // Dropping an admitted loan releases storage even after revocation.
+        #[cfg(feature = "pooled-rx")]
+        { self.rx_loan = None; }
+        #[cfg(feature = "bounded-gro")]
+        if self.revalidate_authority().is_err() {
+            #[cfg(feature = "gro-checked")]
+            self.checked_rx.clear();
+            #[cfg(feature = "pooled-rx")]
+            { self.pending_rx_loan = None; }
+            #[cfg(feature = "rx-admission-batch")]
+            { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
+            return None;
+        }
         if self.flush_egress() != Ok(true) {
             return None;
         }
-        let packet = match self.inbound.try_with(|endpoint| endpoint.try_recv()) {
-            Ok(packet) => packet?,
-            Err(_) => {
-                self.authority_revoked = true;
+        #[cfg(feature = "native-tcp-segmentation")]
+        let reservation = self.reserve_transmit()?;
+        #[cfg(feature = "gro-checked")]
+        if matches!(&self.inbound, PacketReceive::Pooled { .. }) {
+            while self.checked_rx.len() < gro::MAX_SEGMENTS {
+                let Some(loan) = self.receive_pooled() else { break; };
+                self.checked_rx.push(loan);
+            }
+            if self.authority_revoked || self.revalidate_authority().is_err() {
+                self.checked_rx.clear();
+                #[cfg(feature = "rx-admission-batch")]
+                { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
                 return None;
             }
-        };
-        let packet = match packet.into_packet(self.stamp) {
-            Ok(packet) => packet,
-            Err(mismatch) => {
-                self.stats.rejected_ingress_frames =
-                    self.stats.rejected_ingress_frames.saturating_add(1);
-                if mismatch.device_epoch_changed() {
-                    self.stats.rejected_device_epoch_frames =
-                        self.stats.rejected_device_epoch_frames.saturating_add(1);
-                } else if mismatch.stack_generation_changed() {
-                    self.stats.rejected_stack_generation_frames = self
-                        .stats
-                        .rejected_stack_generation_frames
-                        .saturating_add(1);
+            if self.checked_rx.len() == 0 { return None; }
+            let caps = self.capabilities().checksum;
+            return Some((
+                PacketRxToken(&[], None, Some(checked_gro::Token {
+                    window: &mut self.checked_rx,
+                    stats: &mut self.gro,
+                    caps,
+                    #[cfg(feature = "gro-end-profile")]
+                    no_input: self.gro_last_none,
+                })),
+                PacketTxToken {
+                    stamp: self.stamp,
+                    outbound: &self.outbound,
+                    pending_egress: &mut self.pending_egress,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_segments: &mut self.pending_segments,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    segment_size: None,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    reservation,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_pooled: &mut self.pending_pooled,
+                    stats: &mut self.stats,
+                    authority_revoked: &mut self.authority_revoked,
+                },
+            ));
+        }
+        #[cfg(feature = "pooled-rx")]
+        if matches!(&self.inbound, PacketReceive::Pooled { .. }) {
+            #[cfg(feature = "bounded-gro")]
+            let loan = self.pending_rx_loan.take().or_else(|| self.receive_pooled())?;
+            #[cfg(not(feature = "bounded-gro"))]
+            let loan = self.receive_pooled()?;
+            #[cfg(feature = "gro-scatter")]
+            let began = self.gro.begin_scattered(loan.as_bytes(), self.rx_checksum_offload);
+            #[cfg(all(feature = "bounded-gro", not(feature = "gro-scatter")))]
+            let began = self.gro.begin(loan.as_bytes(), self.rx_checksum_offload);
+            #[cfg(feature = "bounded-gro")]
+            if began {
+                #[cfg(all(feature = "gro-batch-release", not(feature = "gro-scatter")))]
+                let mut releases = vibeos_core::net_receive::ReleaseBatch::<{ gro::MAX_SEGMENTS }>::new();
+                for _ in 1..gro::MAX_SEGMENTS {
+                    if self.gro.finished() { break; }
+                    let Some(next) = self.receive_pooled() else {
+                        #[cfg(feature = "gro-end-profile")]
+                        self.gro.profile_no_input(self.gro_last_none);
+                        break;
+                    };
+                    if !self.gro.append(loan.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
+                        self.pending_rx_loan = Some(next);
+                        break;
+                    }
+                    // Copied GRO can release followers now. Scatter GRO retains
+                    // each original loan through synchronous token consumption;
+                    // the next receive or device destruction releases it.
+                    #[cfg(feature = "gro-scatter")]
+                    {
+                        self.gro_loans[self.gro_loan_count] = Some(next);
+                        self.gro_loan_count += 1;
+                    }
+                    #[cfg(all(feature = "gro-batch-release", not(feature = "gro-scatter")))]
+                    if let Err(loan) = releases.push(next) { drop(loan); }
                 }
+            }
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
+            #[cfg(feature = "bounded-gro")]
+            if self.authority_revoked || self.revalidate_authority().is_err() {
+                #[cfg(feature = "gro-scatter")]
+                self.clear_gro_loans();
+                self.pending_rx_loan = None;
+                #[cfg(feature = "rx-admission-batch")]
+                { self.rx_batch = vibeos_core::net_receive::LoanBatch::empty(); }
                 return None;
             }
+            self.rx_loan = Some(loan);
+            #[cfg(feature = "bounded-gro")]
+            let bytes = if self.gro.has_aggregate() {
+                self.gro.finish(self.rx_checksum_offload);
+                #[cfg(feature = "gro-scatter")]
+                { self.rx_loan.as_ref()?.as_bytes() }
+                #[cfg(not(feature = "gro-scatter"))]
+                { self.gro.bytes() }
+            } else { self.rx_loan.as_ref()?.as_bytes() };
+            #[cfg(not(feature = "bounded-gro"))]
+            let bytes = self.rx_loan.as_ref()?.as_bytes();
+            return Some((
+                PacketRxToken(bytes,
+                    #[cfg(feature = "gro-scatter")]
+                    if self.gro_loan_count == 0 { None } else { Some(&self.gro_loans[..self.gro_loan_count]) },
+                    #[cfg(feature = "gro-checked")] None),
+                PacketTxToken {
+                    stamp: self.stamp,
+                    outbound: &self.outbound,
+                    pending_egress: &mut self.pending_egress,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_segments: &mut self.pending_segments,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    segment_size: None,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    reservation,
+                    #[cfg(feature = "native-tcp-segmentation")]
+                    pending_pooled: &mut self.pending_pooled,
+                    stats: &mut self.stats,
+                    authority_revoked: &mut self.authority_revoked,
+                },
+            ));
+        }
+        #[cfg(feature = "bounded-gro")]
+        let packet = self.pending_ingress.take().or_else(|| self.receive_packet())?;
+        #[cfg(not(feature = "bounded-gro"))]
+        let packet = self.receive_packet()?;
+        #[cfg(feature = "bounded-gro")]
+        let bytes = if self.gro.begin(packet.as_bytes(), self.rx_checksum_offload) {
+            for _ in 1..gro::MAX_SEGMENTS {
+                if self.gro.finished() { break; }
+                let Some(next) = self.receive_packet() else {
+                        #[cfg(feature = "gro-end-profile")]
+                        self.gro.profile_no_input(self.gro_last_none);
+                        break;
+                    };
+                if !self.gro.append(packet.as_bytes(), next.as_bytes(), self.rx_checksum_offload) {
+                    self.pending_ingress = Some(next);
+                    break;
+                }
+            }
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
+            // Revocation observed while gathering invalidates the whole token.
+            if self.authority_revoked { return None; }
+            if self.gro.has_aggregate() {
+                self.gro.finish(self.rx_checksum_offload);
+                coalesced_rx(self.gro.bytes())
+            } else {
+                single_rx(packet, &mut self.rx_packet)
+            }
+        } else {
+            #[cfg(feature = "gro-end-profile")]
+            self.gro.profile_record();
+            single_rx(packet, &mut self.rx_packet)
         };
-        self.stats.rx_frames = self.stats.rx_frames.saturating_add(1);
+        #[cfg(not(feature = "bounded-gro"))]
+        let bytes = { single_rx(packet, &mut self.rx_packet) };
         Some((
-            PacketRxToken(packet),
+            PacketRxToken(bytes, #[cfg(feature = "gro-scatter")] None,
+                #[cfg(feature = "gro-checked")] None),
             PacketTxToken {
                 stamp: self.stamp,
-                outbound: self.outbound.clone(),
+                outbound: &self.outbound,
                 pending_egress: &mut self.pending_egress,
+                #[cfg(feature = "native-tcp-segmentation")]
+                pending_segments: &mut self.pending_segments,
+                #[cfg(feature = "native-tcp-segmentation")]
+                segment_size: None,
+                #[cfg(feature = "native-tcp-segmentation")]
+                reservation,
+                #[cfg(feature = "native-tcp-segmentation")]
+                pending_pooled: &mut self.pending_pooled,
                 stats: &mut self.stats,
                 authority_revoked: &mut self.authority_revoked,
             },
@@ -483,10 +1085,20 @@ impl phy::Device for PacketDevice {
         if self.flush_egress() != Ok(true) {
             return None;
         }
+        #[cfg(feature = "native-tcp-segmentation")]
+        let reservation = self.reserve_transmit()?;
         Some(PacketTxToken {
             stamp: self.stamp,
-            outbound: self.outbound.clone(),
+            outbound: &self.outbound,
             pending_egress: &mut self.pending_egress,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_segments: &mut self.pending_segments,
+            #[cfg(feature = "native-tcp-segmentation")]
+            segment_size: None,
+            #[cfg(feature = "native-tcp-segmentation")]
+            reservation,
+            #[cfg(feature = "native-tcp-segmentation")]
+            pending_pooled: &mut self.pending_pooled,
             stats: &mut self.stats,
             authority_revoked: &mut self.authority_revoked,
         })
@@ -496,6 +1108,8 @@ impl phy::Device for PacketDevice {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ethernet;
         capabilities.max_transmission_unit = MAX_PACKET_LEN;
+        #[cfg(feature = "native-tcp-segmentation")]
+        { capabilities.tcp_max_segmented_len = Some(vibeos_core::net_segmentation::MAX_LOGICAL_PACKET); }
         // Bound the advertised TCP window to the number of frames the physical
         // DWMAC RX ring can absorb before software runs again. The image packet
         // endpoints use the same or greater depth, and QEMU can safely honor
@@ -569,6 +1183,8 @@ pub struct SharedTcpPollReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TcpFrontendDriveReport {
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub exchanged_bytes: usize,
     pub received_bytes: usize,
     pub transmitted_bytes: usize,
     pub close_applied: Option<TcpCloseRequest>,
@@ -593,8 +1209,36 @@ impl From<TcpFrontendError> for TcpFrontendDriveError {
     }
 }
 
+#[cfg(feature = "receive-buffer-exchange")]
+enum ExchangeFrontend {
+    Assembled(alloc::sync::Arc<TcpListener>),
+    Capability(vibeos_core::cap::Revocable<TcpListener>),
+}
+#[cfg(feature = "receive-buffer-exchange")]
+impl ExchangeFrontend {
+    fn matches(&self, frontend: &TcpListener) -> bool {
+        match self {
+            Self::Assembled(value) => core::ptr::eq(value.as_ref(), frontend),
+            Self::Capability(value) => value.try_with(|value| core::ptr::eq(value, frontend)).unwrap_or(false),
+        }
+    }
+}
+
+#[cfg(feature = "receive-buffer-exchange")]
+struct ExchangeSockets {
+    failed: bool,
+    frontend: ExchangeFrontend,
+    owner: vibeos_net_api::receive_ownership::Owner,
+    bindings: Vec<(SocketHandle, receive_exchange::Binding<{ vibeos_net_api::RECEIVE_POOL_SLOTS }>)>,
+}
+
 struct TcpListenerEntry {
+    #[cfg(feature = "receive-buffer-exchange")]
+    exchange: Option<ExchangeSockets>,
     socket: SocketHandle,
+    // One bounded pending connection for exclusive service ports. Shared port
+    // groups already allocate their own parallel connection sockets.
+    pending: Option<SocketHandle>,
     port: u16,
     port_group: Option<u64>,
     generation: u64,
@@ -628,12 +1272,34 @@ pub struct SharedIpv4TcpStack {
     next_listener_generation: u64,
 }
 
+// Normal destruction is distinct from supervisor hard-fault retirement. Remove
+// every socket reference before releasing only the writers owned by this stack.
+// Published frontend ranges and other stacks using the same task are untouched.
+#[cfg(feature = "receive-buffer-exchange")]
+impl Drop for SharedIpv4TcpStack {
+    fn drop(&mut self) {
+        let sockets = core::mem::replace(&mut self.sockets, SocketSet::new(Vec::new()));
+        drop(sockets);
+        for listener in &mut self.listeners {
+            if let Some(exchange) = listener.exchange.take() {
+                for (_, binding) in exchange.bindings {
+                    // The private SocketSet was the sole holder of each
+                    // binding's current mutable buffer; it has now been dropped.
+                    // Invalid metadata remains quarantined rather than freeing
+                    // an unverified slot. Hard-fault lock recovery is separate.
+                    let _ = unsafe { binding.release_writer() };
+                }
+            }
+        }
+    }
+}
+
 impl SharedIpv4TcpStack {
     pub fn new(
         config: Ipv4StackConfig,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_stack_config(config)?;
 
@@ -727,24 +1393,8 @@ impl SharedIpv4TcpStack {
             return Err(StackError::TcpListenerLimitReached);
         }
 
-        let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let mut socket = tcp::Socket::new(receive, transmit);
-        socket.set_congestion_control(tcp::CongestionControl::Reno);
-        socket.set_nagle_enabled(false);
-        // The packet backends are polled and currently cannot wake this task
-        // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
-        // therefore be observed only on a later protocol poll.  On the Duo's
-        // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
-        // one MSS followed by roughly 20 ms of silence.  ACK immediately so
-        // the peer can refill the deliberately bounded receive window.
-        socket.set_ack_delay(None);
-        socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
-        socket
-            .listen(port)
-            .expect("validated non-zero TCP port must be listenable");
-
-        let socket = self.sockets.add(socket);
+        let socket = self.sockets.add(passive_socket(port));
+        let pending = port_group.is_none().then(|| self.sockets.add(passive_socket(port)));
         let generation = self.next_listener_generation;
         self.next_listener_generation = self
             .next_listener_generation
@@ -753,7 +1403,10 @@ impl SharedIpv4TcpStack {
         let slot = u8::try_from(self.listeners.len())
             .expect("the bounded TCP listener table fits in a u8");
         self.listeners.push(TcpListenerEntry {
+            #[cfg(feature = "receive-buffer-exchange")]
+            exchange: None,
             socket,
+            pending,
             port,
             port_group,
             generation,
@@ -762,6 +1415,92 @@ impl SharedIpv4TcpStack {
             last_poll: TcpListenerPollReport::default(),
         });
         Ok(TcpListenerHandle { slot, generation })
+    }
+
+    /// Attach permanent RX storage before any network poll or connection activity.
+    /// Both the active and pending sockets retain their original handles, so
+    /// pending-connection promotion does not change buffer/binding identity.
+    ///
+    /// # Safety
+    /// The stack must remain exclusively owned by `owner` until it is dropped.
+    /// No retirement of that owner's pool slots is allowed before all stack
+    /// socket references are dead. Hard-fault recovery is not implemented here;
+    /// image assembly must not enable this without a supervisor protocol.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange(&mut self, listener: TcpListenerHandle,
+        frontend: alloc::sync::Arc<TcpListener>, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let retained = ExchangeFrontend::Assembled(frontend.clone());
+        unsafe { self.install_receive_exchange(listener, frontend.as_ref(), retained, owner) }
+    }
+
+    /// Capability-preserving variant for the netstack service. No bare Arc or
+    /// resource reference is extracted from the resolved authority.
+    ///
+    /// # Safety
+    /// The same producer ownership and quiescence requirements as
+    /// enable_receive_exchange apply for the full stack lifetime.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange_capability(&mut self, listener: TcpListenerHandle,
+        frontend: vibeos_core::cap::Revocable<TcpListener>, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let retained = ExchangeFrontend::Capability(frontend.clone());
+        frontend.try_with(|value| unsafe { self.install_receive_exchange(listener, value, retained, owner) })
+            .map_err(|_| TcpFrontendDriveError::QueueInvariant)?
+    }
+
+    /// Resolve producer identity from the executing task rather than policy
+    /// input. Pool setup is a cold path; reads retain their lighter provenance.
+    ///
+    /// # Safety
+    /// The stack must remain on this producer task until destruction, and the
+    /// lifetime/quiescence contract of enable_receive_exchange still applies.
+    #[cfg(feature = "receive-buffer-exchange")]
+    pub unsafe fn enable_receive_exchange_current_task(&mut self, listener: TcpListenerHandle,
+        frontend: vibeos_core::cap::Revocable<TcpListener>,
+    ) -> Result<(), TcpFrontendDriveError> {
+        let owner = vibeos_net_api::receive_ownership::Owner::current_producer()
+            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+        unsafe { self.enable_receive_exchange_capability(listener, frontend, owner) }
+    }
+
+    #[cfg(feature = "receive-buffer-exchange")]
+    unsafe fn install_receive_exchange(&mut self, listener: TcpListenerHandle,
+        frontend: &TcpListener, retained: ExchangeFrontend, owner: vibeos_net_api::receive_ownership::Owner,
+    ) -> Result<(), TcpFrontendDriveError> {
+        self.device.revalidate_authority()?;
+        let index = self.listener_index(listener)?;
+        let entry = &self.listeners[index];
+        if entry.exchange.is_some() || entry.connection_active || self.last_now_ms != 0
+            || frontend.port() != entry.port || frontend.port_group().map(|g| g.get()) != entry.port_group {
+            return Err(TcpFrontendDriveError::QueueInvariant);
+        }
+        let pool = frontend.receive_storage().ok_or(TcpFrontendDriveError::QueueInvariant)?;
+        let handles = [Some(entry.socket), entry.pending];
+        if handles.into_iter().flatten().any(|handle| self.sockets.get::<tcp::Socket>(handle).state() != tcp::State::Listen)
+            || frontend.snapshot().state != TcpStreamState::Listening {
+            return Err(TcpFrontendDriveError::QueueInvariant);
+        }
+        let mut prepared = Vec::with_capacity(2);
+        for handle in handles.into_iter().flatten() {
+            match receive_exchange::Binding::new(pool, owner) {
+                Ok((binding, buffer)) => prepared.push((handle, binding, buffer)),
+                Err(_) => {
+                    for (_, binding, buffer) in prepared {
+                        drop(buffer);
+                        unsafe { binding.release_writer() }.map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                    }
+                    return Err(TcpFrontendDriveError::QueueInvariant);
+                }
+            }
+        }
+        let mut bindings = Vec::with_capacity(prepared.len());
+        for (handle, binding, buffer) in prepared {
+            *self.sockets.get_mut::<tcp::Socket>(handle) = passive_socket_with_receive(entry.port, buffer);
+            bindings.push((handle, binding));
+        }
+        self.listeners[index].exchange = Some(ExchangeSockets { failed: false, frontend: retained, owner, bindings });
+        Ok(())
     }
 
     pub fn tcp_listener_port(&self, listener: TcpListenerHandle) -> Result<u16, StackError> {
@@ -894,67 +1633,215 @@ impl SharedIpv4TcpStack {
         listener: TcpListenerHandle,
         frontend: &TcpListener,
     ) -> Result<TcpFrontendDriveReport, TcpFrontendDriveError> {
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::Frontend);
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendStatus);
         if self.tcp_listener_port(listener)? != frontend.port() {
             return Err(TcpFrontendDriveError::QueueInvariant);
         }
 
+        // Empty directions must still reject revoked device authority.
+        self.device.revalidate_authority()?;
         let mut report = TcpFrontendDriveReport::default();
-        frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
-        let mut scratch = [0u8; MAX_TCP_STREAM_BYTES_PER_CALL];
-
+        #[cfg(feature = "receive-buffer-exchange")]
+        if let Some(exchange) = &self.listener(listener)?.exchange {
+            if exchange.failed || !exchange.frontend.matches(frontend) {
+                return Err(TcpFrontendDriveError::QueueInvariant);
+            }
+        }
+        let transport = self.tcp_stream_status(listener)?;
+        #[cfg(feature = "frontend-rx-batch")]
+        let drive = {
+            let entry = self.listener(listener)?;
+            let socket = entry.socket;
+            let reset_requested = entry.reset_requested;
+            #[cfg(feature = "receive-buffer-exchange")]
+            let index = self.listener_index(listener)?;
+            #[cfg(feature = "receive-buffer-exchange")]
+            let mut exchange_failed = false;
+            let (drive, result) = frontend.network_receive_drive(transport.state, |drive, batch| {
+                let _phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
+                let mut budget = drive.receive_capacity.min(transport.readable_bytes);
+                #[cfg(feature = "receive-buffer-exchange")]
+                if budget != 0 && !reset_requested {
+                    self.device.revalidate_authority()?;
+                    if let Some(exchange) = &mut self.listeners[index].exchange {
+                        let generation = batch.exchange_generation()
+                            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                        let (_, binding) = exchange.bindings.iter_mut().find(|(handle, _)| *handle == socket)
+                            .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                        // The installed binding owns this socket's storage. The
+                        // listener guard serializes publication with copied RX.
+                        let transfer = match unsafe { binding.exchange(self.sockets.get_mut::<tcp::Socket>(socket), generation, budget) } {
+                            Ok(transfer) => transfer,
+                            Err(_) => {
+                                exchange_failed = true;
+                                return Err(TcpFrontendDriveError::QueueInvariant);
+                            }
+                        };
+                        if let Some(transfer) = transfer {
+                            let length = match batch.publish_exchange(transfer.ticket, exchange.owner, generation) {
+                                Ok(length) => length,
+                                Err(error) => {
+                                    exchange_failed = true;
+                                    binding.discard_unpublished(transfer)
+                                        .map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                                    return Err(error.into());
+                                }
+                            };
+                            report.exchanged_bytes += length;
+                            report.received_bytes += length;
+                            budget -= length;
+                        }
+                    }
+                }
+                for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
+                    let capacity = budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
+                    if capacity == 0 || reset_requested { break; }
+                    self.device.revalidate_authority()?;
+                    match self.sockets.get_mut::<tcp::Socket>(socket).recv(|input| {
+                        let length = batch.receive(&input[..input.len().min(capacity)]);
+                        (length, length)
+                    }) {
+                        Ok(0) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
+                        Ok(length) => {
+                            report.received_bytes += length;
+                            budget -= length;
+                        }
+                    }
+                }
+                Ok::<(), TcpFrontendDriveError>(())
+            })?;
+            // Recovery re-enters the listener: never run it under the batch guard.
+            #[cfg(feature = "receive-buffer-exchange")]
+            if exchange_failed { self.fail_receive_exchange(index, frontend); }
+            result?;
+            drive
+        };
+        #[cfg(not(feature = "frontend-rx-batch"))]
+        let drive = frontend.network_begin_drive(transport.state)?;
+        drop(phase);
+        // Conservative turn-local budgets. Concurrent application progress may
+        // add work, but cannot cause over-consumption; next drive rechecks it.
+        #[cfg(feature = "frontend-rx-batch")]
+        let mut receive_budget: usize = 0;
+        #[cfg(not(feature = "frontend-rx-batch"))]
+        let mut receive_budget = drive.receive_capacity.min(transport.readable_bytes);
+        let mut transmit_budget = drive.queued_send_bytes;
+        // Borrow transport storage only for the synchronous copy. No socket
+        // buffer escapes into the frontend, and each turn retains its byte and
+        // chunk limits even when either ring wraps. This avoids clearing and
+        // copying through a 32 KiB scratch buffer on every frontend poll.
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendRx);
+        #[cfg(all(feature = "receive-buffer-exchange", not(feature = "frontend-rx-batch")))]
+        if receive_budget != 0 {
+            let index = self.listener_index(listener)?;
+            let entry = &mut self.listeners[index];
+            if let Some(exchange) = &mut entry.exchange {
+                if !entry.reset_requested {
+                    let generation = frontend.network_exchange_generation()
+                        .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                    let (_, binding) = exchange.bindings.iter_mut().find(|(handle, _)| *handle == entry.socket)
+                        .ok_or(TcpFrontendDriveError::QueueInvariant)?;
+                    // enable_receive_exchange's owner/lifetime contract and the
+                    // private handle table preserve exclusive socket ownership.
+                    let transfer = match unsafe { binding.exchange(self.sockets.get_mut::<tcp::Socket>(entry.socket), generation, receive_budget) } {
+                        Ok(transfer) => transfer,
+                        Err(_) => {
+                            self.fail_receive_exchange(index, frontend);
+                            return Err(TcpFrontendDriveError::QueueInvariant);
+                        }
+                    };
+                    if let Some(transfer) = transfer {
+                        let length = match frontend.network_publish_exchange(transfer.ticket, exchange.owner, generation) {
+                            Ok(length) => length,
+                            Err(error) => {
+                                let cleanup = binding.discard_unpublished(transfer);
+                                self.fail_receive_exchange(index, frontend);
+                                cleanup.map_err(|_| TcpFrontendDriveError::QueueInvariant)?;
+                                return Err(error.into());
+                            }
+                        };
+                        report.exchanged_bytes += length;
+                        report.received_bytes += length;
+                        receive_budget -= length;
+                    }
+                }
+            }
+        }
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            let capacity = frontend.network_receive_capacity().min(scratch.len());
+            let capacity = receive_budget.min(MAX_TCP_STREAM_BYTES_PER_CALL);
             if capacity == 0 {
                 break;
             }
-            match self.tcp_try_recv(listener, &mut scratch[..capacity])? {
-                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock | TcpIoResult::Closed => break,
-                TcpIoResult::Progress(length) => {
-                    if frontend.network_receive(&scratch[..length]) != length {
-                        return Err(TcpFrontendDriveError::QueueInvariant);
-                    }
+            self.device.revalidate_authority()?;
+            let entry = self.listener(listener)?;
+            if entry.reset_requested {
+                break;
+            }
+            let socket = entry.socket;
+            match self.sockets.get_mut::<tcp::Socket>(socket).recv(|input| {
+                let length = frontend.network_receive(&input[..input.len().min(capacity)]);
+                (length, length)
+            }) {
+                Ok(0) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
+                Ok(length) => {
                     report.received_bytes += length;
+                    receive_budget -= length;
                 }
             }
         }
 
+        drop(phase);
+        let phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendTx);
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            let writable = self
-                .tcp_stream_status(listener)?
-                .writable_bytes
-                .min(scratch.len());
-            if writable == 0 {
+            if transmit_budget == 0 || self.tcp_stream_status(listener)?.writable_bytes == 0 {
                 break;
             }
-            let queued = frontend.network_copy_transmit(&mut scratch[..writable]);
-            if queued == 0 {
+            self.device.revalidate_authority()?;
+            let entry = self.listener(listener)?;
+            if entry.reset_requested {
                 break;
             }
-            match self.tcp_try_send(listener, &scratch[..queued])? {
-                TcpIoResult::Progress(sent) => {
+            let socket = entry.socket;
+            match self.sockets.get_mut::<tcp::Socket>(socket).send(|output| {
+                let capacity = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL).min(transmit_budget);
+                let length = frontend.network_copy_transmit(&mut output[..capacity]);
+                (length, length)
+            }) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    // Commit only bytes actually enqueued by the transport.
                     frontend.network_consume_transmit(sent);
                     report.transmitted_bytes += sent;
-                    if sent != queued {
-                        break;
-                    }
+                    transmit_budget -= sent;
                 }
-                TcpIoResult::WouldBlock => break,
-                TcpIoResult::Closed => return Err(TcpFrontendDriveError::QueueInvariant),
+                Err(tcp::SendError::InvalidState) => {
+                    return Err(TcpFrontendDriveError::QueueInvariant);
+                }
             }
         }
 
+        drop(phase);
+        let _phase = vibeos_core::net_profile::Scope::sampled(vibeos_core::net_profile::Stage::FrontendClose);
         if let Some(request) = frontend.close_request() {
             match request {
                 TcpCloseRequest::Close => {
+                    // A socket close drains only its own TX ring. The capability
+                    // frontend can still hold bytes behind transport backpressure.
+                    if frontend.snapshot().queued_send_bytes != 0 {
+                        return Ok(report);
+                    }
                     self.tcp_close(listener)?;
                 }
                 TcpCloseRequest::Reset => {
                     self.tcp_reset(listener)?;
                 }
             }
+            // Publish the non-writable state before lifting the pending-close
+            // barrier, so another hart cannot append bytes in that interval.
+            frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
             frontend.clear_close_request(request);
             report.close_applied = Some(request);
-            frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
         }
 
         Ok(report)
@@ -1001,7 +1888,8 @@ impl SharedIpv4TcpStack {
     }
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<SharedTcpPollReport, StackError> {
-        let work = self.poll_with_application(now_ms, |_, _| 0)?;
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
+        let work = self.poll_with_application::<{ !cfg!(feature = "skip-empty-service") }>(now_ms, |_, _| 0)?;
         Ok(SharedTcpPollReport {
             ingress_frames: work.ingress_frames,
             more_work: work.more_network_work,
@@ -1009,7 +1897,7 @@ impl SharedIpv4TcpStack {
         })
     }
 
-    fn poll_with_application(
+    fn poll_with_application<const SERVICE: bool>(
         &mut self,
         now_ms: u64,
         mut service: impl FnMut(TcpListenerHandle, &mut tcp::Socket<'static>) -> usize,
@@ -1029,6 +1917,8 @@ impl SharedIpv4TcpStack {
         self.interface.poll_maintenance(now);
         self.ensure_listening(false);
 
+        #[cfg(feature = "bounded-gro")]
+        { self.device.ingress_remaining = MAX_INGRESS_FRAMES_PER_POLL; }
         for _ in 0..MAX_INGRESS_FRAMES_PER_POLL {
             let ingress_result =
                 self.interface
@@ -1037,12 +1927,14 @@ impl SharedIpv4TcpStack {
             match ingress_result {
                 PollIngressSingleResult::None => {
                     ingress_budget_exhausted = false;
+                    #[cfg(feature = "bounded-gro")]
+                    { ingress_budget_exhausted = self.device.ingress_remaining == 0; }
                     break;
                 }
                 PollIngressSingleResult::PacketProcessed
                 | PollIngressSingleResult::SocketStateChanged => {
                     ingress_frames += 1;
-                    application_bytes += self.service_listeners(&mut service);
+                    if SERVICE { application_bytes += self.service_listeners(&mut service); }
                     // Preserve the boundary between old and new users of every
                     // reusable passive socket. Any queued SYN remains in the
                     // packet endpoint until the end-of-turn rearm completes.
@@ -1058,7 +1950,7 @@ impl SharedIpv4TcpStack {
 
         self.apply_dhcp_event()?;
 
-        application_bytes += self.service_listeners(&mut service);
+        if SERVICE { application_bytes += self.service_listeners(&mut service); }
         for _ in 0..MAX_EGRESS_PASSES_PER_POLL {
             let egress_result =
                 self.interface
@@ -1118,10 +2010,41 @@ impl SharedIpv4TcpStack {
         application_bytes
     }
 
+    #[cfg(feature = "receive-buffer-exchange")]
+    fn fail_receive_exchange(&mut self, index: usize, frontend: &TcpListener) {
+        let entry = &mut self.listeners[index];
+        if let Some(exchange) = &mut entry.exchange { exchange.failed = true; }
+        self.sockets.get_mut::<tcp::Socket>(entry.socket).abort();
+        if let Some(pending) = entry.pending { self.sockets.get_mut::<tcp::Socket>(pending).abort(); }
+        entry.reset_requested = true;
+        // Bytes removed from TCP but rejected by the frontend must never be
+        // followed by later bytes on the same stream. Normal errors retire the
+        // listener until stack rebuild; a caller cannot silently retry it.
+        let _ = frontend.network_update_state(TcpStreamState::Reset);
+    }
+
     fn ensure_listening(&mut self, rearm_resets: bool) {
         for listener in &mut self.listeners {
+            #[cfg(feature = "receive-buffer-exchange")]
+            if listener.exchange.as_ref().is_some_and(|exchange| exchange.failed) { continue; }
             if listener.reset_requested && !rearm_resets {
                 continue;
+            }
+            if let Some(pending) = listener.pending {
+                // Promote only at the START of a later turn. The prior turn
+                // must publish the old connection's inactive edge so queued
+                // capability bytes and close requests cannot cross generations.
+                if !rearm_resets
+                    && self.sockets.get::<tcp::Socket>(listener.socket).state() == tcp::State::Listen
+                    && self.sockets.get::<tcp::Socket>(pending).is_active()
+                {
+                    let old = core::mem::replace(&mut listener.socket, pending);
+                    listener.pending = Some(old);
+                }
+                let pending = self.sockets.get_mut::<tcp::Socket>(listener.pending.unwrap());
+                if pending.state() == tcp::State::Closed {
+                    pending.listen(listener.port).expect("validated pending port");
+                }
             }
             let socket = self.sockets.get_mut::<tcp::Socket>(listener.socket);
             // `is_open()` is also false in TIME-WAIT. Re-listening there would
@@ -1138,6 +2061,9 @@ impl SharedIpv4TcpStack {
     fn abort_for_reconfiguration(&mut self) {
         for listener in &mut self.listeners {
             self.sockets.get_mut::<tcp::Socket>(listener.socket).abort();
+            if let Some(pending) = listener.pending {
+                self.sockets.get_mut::<tcp::Socket>(pending).abort();
+            }
             listener.connection_active = false;
             listener.reset_requested = false;
             listener.last_poll = TcpListenerPollReport::default();
@@ -1247,8 +2173,8 @@ impl StaticIpv4TcpStack {
     pub fn new(
         config: StaticIpv4Config,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         validate_config(config)?;
         let mut shared = SharedIpv4TcpStack::new(config.into(), stamp, inbound, outbound)?;
@@ -1323,7 +2249,8 @@ impl StaticIpv4TcpStack {
     }
 
     pub fn poll_network(&mut self, now_ms: u64) -> Result<TcpPollReport, StackError> {
-        let work = self.poll_with_application(now_ms, |_| 0)?;
+        let _scope = vibeos_core::net_profile::Scope::enter(vibeos_core::net_profile::Stage::ProtocolPoll);
+        let work = self.poll_with_application::<{ !cfg!(feature = "skip-empty-service") }>(now_ms, |_| 0)?;
         Ok(TcpPollReport {
             ingress_frames: work.ingress_frames,
             connection_started: work.connection_started,
@@ -1333,7 +2260,7 @@ impl StaticIpv4TcpStack {
         })
     }
 
-    fn poll_with_application(
+    fn poll_with_application<const SERVICE: bool>(
         &mut self,
         now_ms: u64,
         mut service: impl FnMut(&mut tcp::Socket<'static>) -> usize,
@@ -1341,7 +2268,7 @@ impl StaticIpv4TcpStack {
         let listener = self.listener;
         let work = self
             .shared
-            .poll_with_application(now_ms, |candidate, socket| {
+            .poll_with_application::<SERVICE>(now_ms, |candidate, socket| {
                 if candidate == listener {
                     service(socket)
                 } else {
@@ -1439,8 +2366,8 @@ impl StaticIpv4EchoStack {
     pub fn new(
         config: StaticIpv4Config,
         stamp: PacketStamp,
-        inbound: Revocable<Endpoint<StampedPacket>>,
-        outbound: Revocable<Endpoint<StampedPacket>>,
+        inbound: impl Into<PacketReceive>,
+        outbound: impl Into<PacketTransmit>,
     ) -> Result<Self, StackError> {
         Ok(Self {
             tcp: StaticIpv4TcpStack::new(config, stamp, inbound, outbound)?,
@@ -1481,7 +2408,7 @@ impl StaticIpv4EchoStack {
 
     /// Advance ARP, IPv4, TCP, and the compatibility echo application.
     pub fn poll(&mut self, now_ms: u64) -> Result<PollReport, StackError> {
-        let work = self.tcp.poll_with_application(now_ms, service_echo)?;
+        let work = self.tcp.poll_with_application::<true>(now_ms, service_echo)?;
         let echo_ready = self.tcp.echo_has_immediate_work();
         let more_work = work.more_network_work || echo_ready;
         Ok(PollReport {
@@ -1556,4 +2483,33 @@ fn validate_ipv4_address(
 fn is_unicast_ipv4(octets: [u8; 4]) -> bool {
     let address = Ipv4Addr::from(octets);
     !address.is_unspecified() && !address.is_multicast() && octets != [255; 4] && octets[0] != 0
+}
+
+fn passive_socket(port: u16) -> tcp::Socket<'static> {
+    let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+    passive_socket_with_receive(port, receive)
+}
+
+fn passive_socket_with_receive(port: u16, receive: tcp::SocketBuffer<'static>) -> tcp::Socket<'static> {
+    let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+    let mut socket = tcp::Socket::new(receive, transmit);
+    socket.set_congestion_control(tcp::CongestionControl::Reno);
+    socket.set_nagle_enabled(false);
+    // The packet backends are polled and currently cannot wake this task
+    // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
+    // therefore be observed only on a later protocol poll.  On the Duo's
+    // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
+    // one MSS followed by roughly 20 ms of silence.  ACK immediately so
+    // the peer can refill the deliberately bounded receive window.
+    socket.set_ack_delay(None);
+    // A control connection may carry no application data while its separate
+    // data connection is busy (e.g. a 60-second iperf test). Probe reachability
+    // before the unchanged dead-peer timeout instead of expiring healthy peers.
+    socket.set_keep_alive(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS / 3)));
+    socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
+    socket
+        .listen(port)
+        .expect("validated non-zero TCP port must be listenable");
+
+    socket
 }

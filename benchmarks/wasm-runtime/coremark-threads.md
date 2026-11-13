@@ -192,4 +192,3 @@ continued on their fibers at 3,110,038 of 3,218,501 boundaries (`M1`),
 the 15 invocations (12 samples plus three calibrations) reported
 `reclaimed=true caps=0 waiters=0`. `comparison-fuel-batch-isa-probe.json`
 holds the verified summary of all three evidence sets.
-

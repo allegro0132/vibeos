@@ -26,7 +26,7 @@ use crate::virtio::{self, BlockOperation, UsedElement, BLOCK_MAX_TRANSFER_SIZE, 
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
-use vibeos_driver_virtio_blk::{self as block_driver, BlockEngine, HardwareError};
+use crate::queued_block::{self as block_driver, BlockEngine, HardwareError};
 use vibeos_storage_device::{MutationFailure, MutationResult};
 
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
@@ -166,7 +166,7 @@ impl Resource for DmaRegion {
         format!(
             "SYSTEM stable slab @ {:#x}, {} bytes",
             block_driver::dma_base(),
-            block_driver::DMA_BYTES
+            block_driver::dma_bytes()
         )
     }
 
@@ -300,7 +300,7 @@ pub struct BlockResources {
 pub fn discover() -> Option<BlockResources> {
     // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
     // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_block(crate::platform::VIRTIO_MMIO) }?;
+    let transport = unsafe { MmioTransport::scan_block() }?;
     Some(BlockResources {
         mmio: MmioWindow::new(transport),
         dma: Arc::new(DmaRegion),

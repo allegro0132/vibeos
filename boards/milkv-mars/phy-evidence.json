@@ -1,0 +1,76 @@
+{
+  "status": "Shared PHY discovery and YT8531 configuration implemented; Mars hardware and firmware assembly pending",
+  "host_tests": 57,
+  "new_phy_tests": 8,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 1,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121958400,
+    "kernel_sha256": "eea0d5326d5c6c073887df9be0456c302a6afefbb9f376229bc5a0af644b4b98",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "YT8531_MODEL PASS address=17 config=verified reset=bounded",
+  "duo_release_build": "passed",
+  "mutations": [
+    "reset proof removed: detected",
+    "drive mask overwrites unrelated bits: detected",
+    "readback bypassed: detected",
+    "failed link configuration remains ready: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage31-host-restored.log",
+      "sha256": "b0944cbe0f5e7525b96bdda43fc1a5892fbf4dce8eb95878acb75103e647f521"
+    },
+    {
+      "path": "target/mars-reference/stage31-rv64-build.log",
+      "sha256": "c6dec5393774369bdfc053efcd57085d424f11551bc2cbee6096010dd23f3062"
+    },
+    {
+      "path": "target/mars-reference/stage31-rv64-model/serial.log",
+      "sha256": "11b436f34fe340b90630a1926f3316d3f0f4ed9925ac81b457ce1f2ec4a2c422"
+    },
+    {
+      "path": "target/mars-reference/stage31-rv64-model/summary.json",
+      "sha256": "1cf35bb2f91ade33917e63de810edcc41c8ffbc4c03a92982891671ecd5e126f"
+    },
+    {
+      "path": "target/mars-reference/stage31-duo-build.log",
+      "sha256": "efadd0a6eff1c31ca043a150d42bb9ea5a8635b16d5998e66149e31d2c3baf38"
+    },
+    {
+      "path": "target/mars-reference/stage31-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage31-mutation-reset-proof.log",
+      "sha256": "9824571fa5de3994cd4bcdf3f4bab9b9e0e6ffc5d966d2d5887359d9b160aece"
+    },
+    {
+      "path": "target/mars-reference/stage31-mutation-drive-mask.log",
+      "sha256": "739cfcbcd9cd8627c194ce7f5ecfee943021809c419387d37c5a9fe2f4d6ee3f"
+    },
+    {
+      "path": "target/mars-reference/stage31-mutation-readback.log",
+      "sha256": "2dc659c02b1d298863f312374fc641aa1f9af1ccf133d0262b22ad47b809d072"
+    },
+    {
+      "path": "target/mars-reference/stage31-mutation-quarantine.log",
+      "sha256": "be57384c91c466ea77ab54a5739d45b8bf39b25276b420ac35ffb76b246f6b84"
+    }
+  ],
+  "source_reference": "boards/milkv-mars/phy-reference.json",
+  "physical_acceptance": false,
+  "blind_spots": [
+    "Host and RV64 models do not qualify MDIO electrical timing, real reset latency or PHY identity",
+    "Firmware must stop MAC/DMA before initialize or configure_link",
+    "Actual Ethernet clock/reset programming and packet registration remain pending",
+    "Formal SSH still requires independently provisioned identity and physically qualified entropy"
+  ]
+}

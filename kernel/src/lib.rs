@@ -27,11 +27,11 @@ mod wasi_clock;
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe",
         feature = "component-graph-principals",
@@ -85,11 +85,11 @@ compile_error!("feature `wasm-c810-s5-simd-qemu-qualification` requires the QEMU
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -142,11 +142,11 @@ compile_error!(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -184,11 +184,11 @@ compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` requires the QEMU im
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -252,11 +252,11 @@ compile_error!(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe",
         feature = "component-graph-principals",
@@ -630,12 +630,8 @@ compile_error!("C8.4 IRQ overlay cannot modify an exact-transcript QEMU acceptan
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
-#[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
-compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
 #[cfg(all(feature = "iperf3-server", not(feature = "qemu-virt")))]
 compile_error!("feature `iperf3-server` is the QEMU iperf3 server image");
-#[cfg(all(feature = "milkv-iperf3-server", not(feature = "milkv-duo")))]
-compile_error!("feature `milkv-iperf3-server` is the Milk-V Duo iperf3 server image");
 #[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
 compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
 #[cfg(all(
@@ -648,10 +644,10 @@ compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 
 ))]
 compile_error!("feature `iperf3-server` is an isolated QEMU network image");
 #[cfg(all(
-    feature = "milkv-iperf3-server",
+    feature = "dhcp-iperf3-server",
     any(
         feature = "net-shell",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-ssh-acceptance",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe"
@@ -679,7 +675,7 @@ compile_error!("feature `wasm-c53-native-async-qemu-acceptance` requires the QEM
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     )
 ))]
 compile_error!(
@@ -943,12 +939,20 @@ compile_error!(
 compile_error!(
     "the C5.4c native revoke gate and standard formal-native SSH gate are isolated images"
 );
+// Provider selection is distinct from enabling the reusable SSH service.
+// Queued sources must also pass firmware approval at endpoint discovery.
+#[cfg(all(feature = "jitter-entropy", not(feature = "universal"), not(feature = "milkv-duo")))]
+compile_error!("jitter-entropy is restricted to the existing Duo configuration");
+#[cfg(all(feature = "provisioned-ssh", not(any(feature = "queued-entropy", feature = "jitter-entropy"))))]
+compile_error!("provisioned-ssh requires an explicitly selected entropy provider");
+#[cfg(all(feature = "jitter-entropy", feature = "queued-entropy", not(feature = "universal")))]
+compile_error!("select exactly one entropy provider");
+#[cfg(all(feature = "queued-entropy", feature = "milkv-ssh-acceptance"))]
+compile_error!("queued entropy and the Duo deterministic acceptance source are mutually exclusive");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
-#[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
-compile_error!("feature `milkv-ssh` is the Milk-V Duo production SSH image");
 #[cfg(all(
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     any(
         feature = "net-shell",
         feature = "milkv-ssh-acceptance",
@@ -991,9 +995,14 @@ compile_error!(
 ))]
 compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualification image");
 
+#[cfg(all(not(feature = "universal"), any(all(feature = "pio-block", feature = "queued-block"), not(any(feature = "pio-block", feature = "queued-block")))))]
+compile_error!("select exactly one block frontend: pio-block or queued-block");
+#[cfg(all(not(feature = "universal"), any(all(feature = "packet-network", feature = "queued-network"), not(any(feature = "packet-network", feature = "queued-network")))))]
+compile_error!("select exactly one network frontend: packet-network or queued-network");
+
 extern crate alloc;
 
-#[cfg(all(feature = "milkv-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
+#[cfg(all(feature = "provisioned-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
 compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-milkv-duo.sh --wasmtime");
 
 // Portable kernel logic lives in `vibeos-core`; the bare SBI seam lives in the
@@ -1001,9 +1010,13 @@ compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-m
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
+#[cfg(feature = "network-profile")]
+pub use vibeos_core::net_profile;
+#[cfg(feature = "network-tx-audit")]
+pub use vibeos_core::net_tx_audit;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
-#[cfg(feature = "qemu-virt")]
-pub use vibeos_driver_virtio_core as virtio;
+#[cfg(any(feature = "queued-block", feature = "queued-network"))]
+pub use vibeos_virtio_protocol as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
 pub use vibeos_random as random;
@@ -1013,8 +1026,6 @@ pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
 
 mod bench_platform;
-#[cfg(feature = "milkv-duo")]
-mod board_led;
 mod cap_table_pool;
 mod code_pool;
 #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
@@ -1037,14 +1048,16 @@ mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
-#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 mod iperf3_platform;
+#[cfg(feature = "tcp-throughput-probe")]
+mod tcp_probe_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
 ))]
 mod jitterentropy_probe;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "jitter-entropy")]
 mod jitterentropy_random;
 #[cfg(feature = "legacy-shell")]
 mod legacy_shell;
@@ -1056,12 +1069,12 @@ mod net_echo_platform;
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 mod netstack_platform;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 mod pci;
 mod platform;
 mod plic;
@@ -1070,17 +1083,19 @@ mod rustc;
 mod saved_program;
 #[path = "selftest_platform.rs"]
 mod selftest;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 mod ssh_key_format;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 mod ssh_platform;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 mod ssh_provisioning;
+#[cfg(feature = "provisioned-ssh")]
+mod ssh_entropy;
 #[cfg(feature = "wasm-c84-profile-slot")]
 mod wasm_aot_profile_slot;
 #[cfg(any(
@@ -1106,37 +1121,61 @@ pub use vibeos_object_store as store;
     feature = "ssh-security-test",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 pub use vibeos_ssh_identity as ssh_security;
+#[cfg(feature = "boot-dtb-probe")]
+mod boot_dtb_probe;
 mod block_device;
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 mod dwc2_host;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "packet-network")]
+mod packet_device;
+#[cfg(feature = "direct-tcp-segmentation")]
+mod segmented_tx;
+#[cfg(feature = "pooled-rx")]
+mod detached_rx;
+#[cfg(all(feature = "direct-tcp-segmentation", any(feature = "universal", feature = "network-tso-coalesce")))]
+compile_error!("direct TCP segmentation currently requires the single packet frontend and excludes queue coalescing");
+#[cfg(feature = "packet-network")]
 mod dwmac_net;
+#[cfg(feature = "packet-network")]
+mod network_poll;
 mod net_device;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
+mod pio_block;
+#[cfg(feature = "pio-block")]
 mod sdhci_blk;
 mod segment_store_platform;
 mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
 mod trap;
+#[cfg(feature = "counter-probe")]
+mod counter_probe;
+mod boot_log;
 mod tty;
 mod uart;
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 mod usb_ecm_net;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-block")]
+mod queued_block;
+#[cfg(feature = "queued-block")]
 mod virtio_blk;
-#[cfg(feature = "qemu-virt")]
-use vibeos_driver_virtio_mmio as virtio_mmio;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "queued-block", feature = "queued-network"))]
+mod virtio_mmio;
+#[cfg(feature = "queued-network")]
+mod queued_network;
+#[cfg(feature = "queued-network")]
 mod virtio_net;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
+mod entropy_device;
+#[cfg(feature = "queued-entropy")]
 mod virtio_rng;
 mod vsh_platform;
+mod vtop_platform;
 mod world;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 mod xhci;
 
 use core::arch::global_asm;
@@ -1250,7 +1289,6 @@ _secondary_start:
 
 extern "C" {
     static __heap_start: u8;
-    static __heap_end: u8;
     static __stack_bottom: u8;
     fn _secondary_start();
 }
@@ -1291,64 +1329,87 @@ const BANNER: &str = r#"
 
 #[no_mangle]
 pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
+    #[cfg(feature = "universal")] {
+        extern "C" { fn vibeos_select_platform(hart: usize, dtb: usize) -> bool; }
+        if !unsafe { vibeos_select_platform(_boot_hart, _firmware_dtb) } { sbi::shutdown(true); }
+    }
+    boot_log::init();
     uart::early_write("\r\n[VibeOS] entry\r\n");
-    exec::configure_timebase(platform::TIMEBASE_HZ);
-    let boot_time = sbi::time();
-    #[cfg(not(feature = "legacy-shell"))]
-    let _ = boot_time;
     let boot_physical_hart = sbi::current_hart_id();
 
     let (hs, he) = (
         core::ptr::addr_of!(__heap_start) as usize,
-        core::ptr::addr_of!(__heap_end) as usize,
+        platform::description().heap_end,
     );
+    if let Some(admit) = platform::description().admit_boot {
+        let request = vibeos_hal::boot::BootRequest {
+            physical_hart: boot_physical_hart,
+            dtb_address: _firmware_dtb,
+            ram: platform::mmu().ram,
+            static_memory: vibeos_hal::AddressRange::new(platform::mmu().ram.start, hs),
+            heap_envelope: vibeos_hal::AddressRange::new(hs, he),
+        };
+        // Only this cold entry invokes admission. Secondary entry does not
+        // revalidate or mutate the firmware's published boot descriptions.
+        if let Err(error) = unsafe { admit(request) } {
+            uart::init();
+            println!("BOOT_ADMISSION FAIL: {:?}", error);
+            sbi::shutdown(true);
+        }
+    }
+    exec::configure_timebase(platform::timebase_hz());
+    let boot_time = sbi::time();
+    #[cfg(not(feature = "legacy-shell"))]
+    let _ = boot_time;
+
     // OpenSBI's DTB may be outside the RAM mapped by our bounded allocator.
     // Capture its scalar ISA intersection while physical addressing is active,
     // before page tables or heap initialization can hide/reuse the blob.
     #[cfg(feature = "wasmtime-native")]
     let wasmtime_harts = unsafe { wasmtime_platform::capture_boot_isa(_firmware_dtb, hs, he) };
 
+    #[cfg(feature = "boot-dtb-probe")]
+    let dtb_report = unsafe { boot_dtb_probe::capture(_firmware_dtb, boot_physical_hart) };
+
     mmu::init_boot(boot_physical_hart);
     uart::early_write("[VibeOS] page tables ready\r\n");
     mmu::enable(exec::HartId::BOOT.index());
     uart::early_write("[VibeOS] Sv39 enabled\r\n");
 
-    #[cfg(feature = "milkv-duo")]
-    let blue_led = board_led::init();
-    #[cfg(feature = "milkv-duo")]
-    uart::early_write(if blue_led.on() {
-        "[VibeOS] blue status LED on\r\n"
-    } else if blue_led.output_asserted() {
-        "[VibeOS] blue status LED output asserted (input unconfirmed)\r\n"
-    } else {
-        "[VibeOS] blue status LED readback failed\r\n"
-    });
+    // SAFETY: only the boot hart runs here; MMIO is mapped and no service
+    // or secondary hart can access firmware-owned platform state yet.
+    unsafe { (platform::description().early_platform_init)(uart::early_write); }
 
     uart::init();
     println!("{}", BANNER);
+    #[cfg(feature = "boot-dtb-probe")]
+    match dtb_report {
+        Ok(report) => println!("BOOT_DTB_CPUS PASS boot={} count={} timebase={}", report.boot, report.count, report.hz),
+        Err(error) => { println!("BOOT_DTB_CPUS FAIL: {}", error); sbi::shutdown(true); }
+    }
     println!(
         "  platform  {} ({} MHz timebase)",
-        platform::NAME,
-        platform::TIMEBASE_HZ / 1_000_000
+        platform::name(),
+        platform::timebase_hz() / 1_000_000
     );
-    #[cfg(feature = "milkv-duo")]
-    println!(
-        "  led       blue GPIOC24 {} (pinmux {:#x}, dir {:#010x}, data {:#010x}, input {:#010x})",
-        blue_led.status(),
-        blue_led.pinmux,
-        blue_led.direction,
-        blue_led.data,
-        blue_led.external,
-    );
+    // SAFETY: early_platform_init completed on this same boot hart.
+    unsafe { (platform::description().platform_report)(uart::_print); }
 
     #[cfg(feature = "wasmtime-native")]
     wasmtime_platform::report_boot_isa(wasmtime_harts);
-    unsafe { HEAP.init(hs, he) };
+    if let Some(regions) = platform::description().heap_regions {
+        let regions = regions();
+        assert!(!regions.is_empty() && regions.iter().all(|r| r.start >= hs && r.end <= he),
+            "firmware heap escaped linker envelope");
+        unsafe { HEAP.init_regions(regions).expect("invalid firmware heap ranges") };
+    } else {
+        unsafe { HEAP.init(hs, he) };
+    }
     println!(
         "  heap      {:#x}..{:#x}  ({} KiB)",
         hs,
         he,
-        (he - hs) / 1024
+        HEAP.stats().2 / 1024
     );
 
     ipi::mark_online(exec::HartId::BOOT, boot_physical_hart)
@@ -1360,7 +1421,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     println!(
         "  traps     stvec armed, PLIC ctx S/hart{}, IRQ {} enabled",
         boot_physical_hart,
-        uart::UART_IRQ
+        uart::irq()
     );
 
     // Install the complete fault boundary before World admits any reclaimable
@@ -1394,7 +1455,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         mmu::enabled_hart_mask()
     );
     #[cfg(all(
-        feature = "qemu-virt",
+        any(feature = "qemu-virt", feature = "universal-pci-usb"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1402,14 +1463,14 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             feature = "wasm-c810-s5-simd-qemu-qualification"
         ))
     ))]
-    {
+    if platform::info().pci.is_some() {
         let functions = pci::init().expect("QEMU PCI resource assignment must succeed");
         println!(
             "  pci       {} function(s), ECAM {:#x}, MMIO {:#x}..{:#x}",
             functions,
-            platform::PCI_ECAM_START,
-            platform::PCI_MMIO_START,
-            platform::PCI_MMIO_END,
+            platform::pci().ecam.start,
+            platform::pci().mmio.start,
+            platform::pci().mmio.end,
         );
         if let Some(info) = xhci::init().expect("QEMU XHCI initialization must succeed") {
             println!(
@@ -1423,7 +1484,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         }
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1431,11 +1492,11 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             feature = "wasm-c810-s5-simd-qemu-qualification"
         ))
     ))]
-    match dwc2_host::init() {
+    if platform::info().dwc2.is_some() { match dwc2_host::init() {
         Ok(info) => println!(
             "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
             info.release,
-            platform::USB_BASE,
+            platform::dwc2().registers.start,
             info.irq,
             info.host_channels,
             if dwc2_host::connected() {
@@ -1445,9 +1506,9 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             },
         ),
         Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
-    }
+    } }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1467,7 +1528,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         );
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1620,7 +1681,7 @@ fn start_services(boot_time: u64) -> ! {
     )))]
     world::start_net_supervisor();
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1630,7 +1691,7 @@ fn start_services(boot_time: u64) -> ! {
     ))]
     world::start_usb_net_supervisor();
     #[cfg(all(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1640,7 +1701,7 @@ fn start_services(boot_time: u64) -> ! {
     ))]
     world::start_rng_supervisor();
     #[cfg(all(
-        feature = "qemu-virt",
+        any(feature = "qemu-virt", feature = "universal-pci-usb"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1893,7 +1954,7 @@ fn start_services(boot_time: u64) -> ! {
         component_instances::run_native_async_revoke_worker(),
     );
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1909,9 +1970,9 @@ fn start_services(boot_time: u64) -> ! {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
@@ -2021,10 +2082,10 @@ fn start_secondary_harts() -> usize {
     physical_for_logical[exec::HartId::BOOT.index()] = boot_physical_hart;
     let mut next_logical_index = 1;
     assert!(
-        platform::HART_IDS.contains(&boot_physical_hart),
+        platform::hart_ids().contains(&boot_physical_hart),
         "firmware boot hart is absent from the selected platform topology"
     );
-    for &physical_hart in platform::HART_IDS {
+    for &physical_hart in platform::hart_ids() {
         if physical_hart == boot_physical_hart {
             continue;
         }
@@ -2175,9 +2236,9 @@ unsafe fn reclaim_faulted_component(
         // visible to safe lifecycle callers.
         block_device::recover_faulted_domain(domain);
         net_device::recover_faulted_domain(domain);
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_ecm_net::recover_faulted_domain(domain);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         #[cfg(feature = "wasmtime-guarded-memory")]
@@ -2256,6 +2317,7 @@ fn panic(info: &PanicInfo) -> ! {
 struct SbiWriter;
 impl core::fmt::Write for SbiWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        boot_log::append(s);
         for b in s.bytes() {
             if b == b'\n' {
                 sbi::legacy_putchar(b'\r');
@@ -2327,3 +2389,11 @@ fn oom(layout: core::alloc::Layout) -> ! {
 
 #[cfg(feature = "wasmtime-native")]
 mod wasmtime_platform;
+
+#[cfg(feature = "universal")]
+mod universal_block;
+#[cfg(feature = "universal")]
+mod universal_net;
+
+#[cfg(feature = "network-tso-probe")]
+pub use vibeos_core::net_tso_probe;

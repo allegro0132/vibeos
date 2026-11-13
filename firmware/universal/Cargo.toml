@@ -1,0 +1,89 @@
+[package]
+name = "vibeos-firmware-universal"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+universal = []
+image = ["universal", "dep:vibeos-kernel", "vibeos-kernel/universal"]
+board-qemu-virt = ["dep:vibeos-bsp-qemu-virt"]
+board-milkv-duo = ["dep:vibeos-bsp-milkv-duo"]
+board-milkv-mars = ["dep:vibeos-bsp-milkv-mars", "dep:vibeos-firmware-milkv-mars"]
+driver-uart16550 = ["dep:vibeos-driver-uart16550"]
+driver-plic = ["dep:vibeos-driver-plic"]
+driver-dw-i2c = ["dep:vibeos-driver-dw-i2c", "driver-jh7110"]
+driver-virtio-core = ["dep:vibeos-driver-virtio-core"]
+driver-virtio-mmio = ["dep:vibeos-driver-virtio-mmio", "driver-virtio-core"]
+driver-virtio-blk = ["dep:vibeos-driver-virtio-blk", "driver-virtio-mmio"]
+driver-virtio-net = ["dep:vibeos-driver-virtio-net", "driver-virtio-mmio"]
+driver-virtio-rng = ["dep:vibeos-driver-virtio-rng", "driver-virtio-mmio"]
+driver-sd-protocol = ["dep:vibeos-driver-sd-protocol"]
+driver-sdhci-blk = ["dep:vibeos-driver-sdhci-blk", "driver-cv1800b", "driver-sd-protocol"]
+driver-dw-mshc = ["dep:vibeos-driver-dw-mshc", "vibeos-firmware-milkv-mars?/sd-device", "driver-jh7110", "driver-sd-protocol"]
+driver-dwmac-net = ["dep:vibeos-driver-dwmac-net", "driver-cv1800b"]
+driver-pci = ["vibeos-kernel?/universal-pci-usb", "dep:vibeos-driver-pci"]
+driver-xhci = ["dep:vibeos-driver-xhci", "driver-pci"]
+driver-dwc2-host = ["vibeos-kernel?/universal-dwc2", "dep:vibeos-driver-dwc2-host", "driver-cv1800b", "driver-rtl815x"]
+driver-rtl815x = ["dep:vibeos-driver-rtl815x"]
+driver-milkv-duo-led = ["dep:vibeos-driver-milkv-duo-led", "driver-cv1800b"]
+driver-cv1800b = ["dep:vibeos-platform-cv1800b"]
+driver-jh7110 = ["dep:vibeos-platform-jh7110"]
+driver-eqos-net = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "ethernet-device", "driver-jh7110"]
+ethernet-device = ["vibeos-firmware-milkv-mars?/ethernet-device"]
+driver-starfive-trng = ["dep:vibeos-starfive-trng", "entropy-device"]
+entropy-device = ["vibeos-firmware-milkv-mars?/entropy-device"]
+driver-jitter-entropy = ["vibeos-kernel?/jitter-entropy"]
+component-vsh = []
+component-file-tree = ["vibeos-kernel?/file-tree"]
+component-network = []
+image-net-shell = ["vibeos-kernel?/net-shell"]
+image-ssh-command = ["vibeos-kernel?/provisioned-command"]
+component-ssh = ["vibeos-kernel?/provisioned-ssh"]
+component-wasi = ["vibeos-kernel?/wasi-preview1"]
+component-wasmtime = ["vibeos-kernel?/wasmtime-command"]
+component-python = ["vibeos-kernel?/universal-python"]
+component-iperf3 = ["vibeos-kernel?/dhcp-iperf3-server"]
+
+[[bin]]
+name = "vibeos-universal"
+path = "src/main.rs"
+required-features = ["image"]
+test = false
+bench = false
+
+[dependencies]
+vibeos-hal = { path = "../../hal", default-features = false }
+vibeos-runtime-riscv = { path = "../../runtime/riscv", default-features = false }
+vibeos-kernel = { path = "../../kernel", default-features = false, optional = true }
+vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt", default-features = false, optional = true }
+vibeos-bsp-milkv-duo = { path = "../../boards/milkv-duo", default-features = false, optional = true }
+vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars", default-features = false, optional = true }
+vibeos-firmware-milkv-mars = { path = "../../firmware/milkv-mars", default-features = false, optional = true }
+vibeos-platform-cv1800b = { path = "../../platform/cv1800b", default-features = false, optional = true }
+vibeos-platform-jh7110 = { path = "../../platform/jh7110", default-features = false, optional = true }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550", default-features = false, optional = true }
+vibeos-driver-plic = { path = "../../drivers/plic", default-features = false, optional = true }
+vibeos-driver-dw-i2c = { path = "../../drivers/dw-i2c", default-features = false, optional = true }
+vibeos-driver-virtio-core = { path = "../../drivers/virtio-core", default-features = false, optional = true }
+vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio", default-features = false, optional = true }
+vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk", default-features = false, optional = true }
+vibeos-driver-virtio-net = { path = "../../drivers/virtio-net", default-features = false, optional = true }
+vibeos-driver-virtio-rng = { path = "../../drivers/virtio-rng", default-features = false, optional = true }
+vibeos-driver-sd-protocol = { package = "vibeos-sd-protocol", path = "../../drivers/sd-protocol", default-features = false, optional = true }
+vibeos-driver-sdhci-blk = { path = "../../drivers/sdhci-blk", default-features = false, optional = true }
+vibeos-driver-dw-mshc = { path = "../../drivers/dw-mshc", default-features = false, optional = true }
+vibeos-driver-dwmac-net = { path = "../../drivers/dwmac-net", default-features = false, optional = true }
+vibeos-driver-pci = { path = "../../drivers/pci", default-features = false, optional = true }
+vibeos-driver-xhci = { path = "../../drivers/xhci", default-features = false, optional = true }
+vibeos-driver-dwc2-host = { path = "../../drivers/dwc2-host", default-features = false, optional = true }
+vibeos-driver-rtl815x = { path = "../../drivers/rtl815x", default-features = false, optional = true }
+vibeos-driver-milkv-duo-led = { path = "../../drivers/milkv-duo-led", default-features = false, optional = true }
+vibeos-eqos-net = { path = "../../drivers/eqos-net", default-features = false, optional = true }
+vibeos-ethernet = { path = "../../drivers/ethernet", default-features = false, optional = true }
+vibeos-starfive-trng = { path = "../../drivers/starfive-trng", default-features = false, optional = true }
+
+[build-dependencies]
+vibeos-config = { path = "../../tools/vibeconfig" }
+toml = "0.8"

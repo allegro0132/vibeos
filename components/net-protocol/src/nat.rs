@@ -257,6 +257,44 @@ impl<const M: usize, const F: usize> Table<M, F> {
             seed,
         })
     }
+    /// Heap-constructed table for capacities too large to build on a kernel
+    /// stack and move. Every slot is written in place; behavior is otherwise
+    /// identical to [`Table::new`].
+    pub fn new_boxed(config: Config, seed: u64) -> Result<alloc::boxed::Box<Self>, Error> {
+        if M == 0 || M > 16384 || F == 0 || !config.valid() {
+            return Err(Error::Configuration);
+        }
+        let identity = NEXT_IDENTITY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Error::GenerationExhausted)?;
+        let mut table = alloc::boxed::Box::<Self>::new_uninit();
+        let raw = table.as_mut_ptr();
+        // Safety: `raw` is valid, exclusively owned, properly aligned storage
+        // for `Self`. Each field is initialized exactly once below, the arrays
+        // element by element, before `assume_init`. No field is read first.
+        unsafe {
+            use core::ptr::addr_of_mut;
+            addr_of_mut!((*raw).identity).write(identity);
+            addr_of_mut!((*raw).tcp_sequence).write(0);
+            addr_of_mut!((*raw).config).write(config);
+            let mappings = addr_of_mut!((*raw).mappings).cast::<Option<Mapping>>();
+            for i in 0..M {
+                mappings.add(i).write(None);
+            }
+            let flows = addr_of_mut!((*raw).flows).cast::<Option<Flow>>();
+            for i in 0..F {
+                flows.add(i).write(None);
+            }
+            addr_of_mut!((*raw).generation).write(0);
+            addr_of_mut!((*raw).last_now).write(0);
+            addr_of_mut!((*raw).seed).write(seed);
+            Ok(table.assume_init())
+        }
+    }
+    /// Table capacity as (mapping slots, flow slots).
+    pub const fn capacity(&self) -> (usize, usize) {
+        (M, F)
+    }
     /// WAN lease or LAN/policy changes revoke all mappings and permissions.
     /// Validation precedes clearing, so an invalid update preserves old state.
     pub fn reconfigure(&mut self, config: Config) -> Result<(), Error> {

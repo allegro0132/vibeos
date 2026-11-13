@@ -1267,6 +1267,7 @@ pub struct SharedIpv4TcpStack {
     sockets: SocketSet<'static>,
     listeners: Vec<TcpListenerEntry>,
     dhcp_handle: Option<SocketHandle>,
+    dhcp_dns_servers: [Option<[u8; 4]>; 3],
     ipv4_status: Ipv4RuntimeStatus,
     last_now_ms: u64,
     next_listener_generation: u64,
@@ -1331,6 +1332,7 @@ impl SharedIpv4TcpStack {
             sockets: SocketSet::new(Vec::new()),
             listeners: Vec::new(),
             dhcp_handle: None,
+            dhcp_dns_servers: [None; 3],
             ipv4_status: Ipv4RuntimeStatus::Static(StaticIpv4Address {
                 address: config.ipv4_address,
                 prefix_len: config.prefix_len,
@@ -1347,6 +1349,13 @@ impl SharedIpv4TcpStack {
 
     pub const fn ipv4_status(&self) -> Ipv4RuntimeStatus {
         self.ipv4_status
+    }
+
+    /// Recursive resolvers advertised by the current DHCP lease, in server
+    /// order. Advisory only: empty unless [`Ipv4RuntimeStatus::DhcpBound`],
+    /// and never used by this stack itself.
+    pub const fn dhcp_dns_servers(&self) -> [Option<[u8; 4]>; 3] {
+        self.dhcp_dns_servers
     }
 
     /// Allocate one exclusive passive port from this shared stack.
@@ -2071,6 +2080,7 @@ impl SharedIpv4TcpStack {
     }
 
     fn remove_dhcp_socket(&mut self) {
+        self.dhcp_dns_servers = [None; 3];
         if let Some(handle) = self.dhcp_handle.take() {
             let _ = self.sockets.remove(handle);
         }
@@ -2101,7 +2111,7 @@ impl SharedIpv4TcpStack {
 
     fn apply_dhcp_event(&mut self) -> Result<(), StackError> {
         enum OwnedEvent {
-            Configured(StaticIpv4Address),
+            Configured(StaticIpv4Address, [Option<[u8; 4]>; 3]),
             Deconfigured,
         }
 
@@ -2114,16 +2124,23 @@ impl SharedIpv4TcpStack {
                 .poll()
                 .map(|event| match event {
                     dhcpv4::Event::Configured(config) => {
-                        OwnedEvent::Configured(StaticIpv4Address {
-                            address: config.address.address().octets(),
-                            prefix_len: config.address.prefix_len(),
-                            default_gateway: config.router.map(|router| router.octets()),
-                        })
+                        let mut dns = [None; 3];
+                        for (slot, server) in dns.iter_mut().zip(config.dns_servers.iter()) {
+                            *slot = Some(server.octets());
+                        }
+                        OwnedEvent::Configured(
+                            StaticIpv4Address {
+                                address: config.address.address().octets(),
+                                prefix_len: config.address.prefix_len(),
+                                default_gateway: config.router.map(|router| router.octets()),
+                            },
+                            dns,
+                        )
                     }
                     dhcpv4::Event::Deconfigured => OwnedEvent::Deconfigured,
                 });
         match event {
-            Some(OwnedEvent::Configured(address)) => {
+            Some(OwnedEvent::Configured(address, dns)) => {
                 validate_ipv4_address(
                     address.address,
                     address.prefix_len,
@@ -2137,8 +2154,10 @@ impl SharedIpv4TcpStack {
                     self.install_ipv4_address(address)?;
                 }
                 self.ipv4_status = Ipv4RuntimeStatus::DhcpBound(address);
+                self.dhcp_dns_servers = dns;
             }
             Some(OwnedEvent::Deconfigured) => {
+                self.dhcp_dns_servers = [None; 3];
                 self.abort_for_reconfiguration();
                 self.clear_interface_ipv4();
                 self.ipv4_status = Ipv4RuntimeStatus::DhcpDiscovering;

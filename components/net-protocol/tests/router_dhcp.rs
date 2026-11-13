@@ -36,6 +36,9 @@ fn checksum(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 fn response(xid: &[u8], kind: u8, address: [u8; 4]) -> Vec<u8> {
+    response_with(xid, kind, address, &[])
+}
+fn response_with(xid: &[u8], kind: u8, address: [u8; 4], extra: &[u8]) -> Vec<u8> {
     let mut b = vec![0u8; 240];
     b[..3].copy_from_slice(&[2, 1, 6]);
     b[4..8].copy_from_slice(xid);
@@ -44,8 +47,10 @@ fn response(xid: &[u8], kind: u8, address: [u8; 4]) -> Vec<u8> {
     b[236..240].copy_from_slice(&[99, 130, 83, 99]);
     b.extend_from_slice(&[
         53, 1, kind, 54, 4, 192, 168, 78, 2, 51, 4, 0, 0, 0, 10, 58, 4, 0, 0, 0, 4, 59, 4, 0, 0, 0,
-        8, 1, 4, 255, 255, 255, 0, 3, 4, 192, 168, 78, 2, 255,
+        8, 1, 4, 255, 255, 255, 0, 3, 4, 192, 168, 78, 2,
     ]);
+    b.extend_from_slice(extra);
+    b.push(255);
     let mut f = vec![0; 42];
     f[..6].fill(255);
     f[6..12].copy_from_slice(&SERVER_MAC);
@@ -95,6 +100,27 @@ fn bound(c: &mut Client) {
     assert_eq!(conf.interfaces[0].ip, [192, 168, 78, 9]);
     assert_eq!(conf.interfaces[0].gateway, Some([192, 168, 78, 2]));
     assert!(!report.rejected_lease);
+}
+#[test]
+fn lease_resolvers_are_published_only_while_bound() {
+    let mut c = client();
+    assert_eq!(c.dns_servers(), [None; 3]);
+    assert_eq!(c.poll(0).unwrap().transition, Some(None));
+    let discover = take(&mut c);
+    let dns = [6, 8, 192, 168, 78, 53, 9, 9, 9, 9];
+    c.receive(&response_with(&discover[46..50], 2, [192, 168, 78, 9], &dns));
+    c.poll(1).unwrap();
+    let request = take(&mut c);
+    assert_eq!(c.dns_servers(), [None; 3]);
+    c.receive(&response_with(&request[46..50], 5, [192, 168, 78, 9], &dns));
+    assert!(c.poll(2).unwrap().transition.unwrap().is_some());
+    assert_eq!(
+        c.dns_servers(),
+        [Some([192, 168, 78, 53]), Some([9, 9, 9, 9]), None]
+    );
+    // Lease expiry withdraws the advisory resolvers with the address.
+    assert_eq!(c.poll(10_003).unwrap().transition, Some(None));
+    assert_eq!(c.dns_servers(), [None; 3]);
 }
 #[test]
 fn acquisition_and_real_deadline_expiry_revoke_once() {

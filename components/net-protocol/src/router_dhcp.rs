@@ -126,6 +126,11 @@ impl Client {
             next_poll_delay_ms: work.next_poll_delay_ms,
         })
     }
+    /// Resolvers advertised by the bound lease (advisory; empty when unbound).
+    /// Reading them neither proves nor extends forwarding authority.
+    pub fn dns_servers(&self) -> [Option<[u8; 4]>; 3] {
+        self.stack.dhcp_dns_servers()
+    }
     /// A conservative bound for unchanged DHCP forwarding authority, never a
     /// lease extension. The stack's next poll includes renewal/rebind/expiry;
     /// the bound is unavailable if that deadline is unknown or already due.

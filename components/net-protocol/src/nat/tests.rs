@@ -1874,3 +1874,24 @@ fn tcp_software_grant_cannot_survive_closure_reopen_or_reconfiguration() {
     assert!(t.forward_tcp_software_fallback(&fresh,OUT,Packet::parse(&mut frame,MAC).unwrap(),egress(),12).is_err());
     assert_eq!(frame,original);
 }
+
+#[test]
+fn boxed_table_matches_inline_construction_at_product_capacity() {
+    let mut inline = Table::<4, 8>::new(config(), 7).unwrap();
+    let mut boxed = Table::<4, 8>::new_boxed(config(), 7).unwrap();
+    assert_eq!(boxed.capacity(), (4, 8));
+    let mut a = udp(LAN, REMOTE, 4000, 53);
+    let mut b = a.clone();
+    let la = inline
+        .forward(Direction::LanToWan, Packet::parse(&mut a, MAC).unwrap(), egress(), 1)
+        .unwrap();
+    let lb = boxed
+        .forward(Direction::LanToWan, Packet::parse(&mut b, MAC).unwrap(), egress(), 1)
+        .unwrap();
+    assert_eq!((la, &a[..la]), (lb, &b[..lb]));
+    assert_eq!(boxed.active_counts(1), (1, 1));
+    // A capacity that could not be built on a small kernel stack and moved.
+    let large = Table::<4096, 8192>::new_boxed(config(), 7).unwrap();
+    assert_eq!(large.active_counts(0), (0, 0));
+    assert!(Table::<4, 8>::new_boxed(Config { lan_prefix: 0, ..config() }, 7).is_err());
+}

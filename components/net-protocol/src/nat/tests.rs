@@ -1895,3 +1895,26 @@ fn boxed_table_matches_inline_construction_at_product_capacity() {
     assert_eq!(large.active_counts(0), (0, 0));
     assert!(Table::<4, 8>::new_boxed(Config { lan_prefix: 0, ..config() }, 7).is_err());
 }
+
+#[test]
+fn flow_listing_reports_live_flows_without_refreshing_them() {
+    let mut t = Table::<4, 8>::new(config(), 7).unwrap();
+    let mut a = udp(LAN, REMOTE, 4000, 53);
+    t.forward(Direction::LanToWan, Packet::parse(&mut a, MAC).unwrap(), egress(), 10).unwrap();
+    let mut b = udp(LAN, OTHER, 4000, 123);
+    t.forward(Direction::LanToWan, Packet::parse(&mut b, MAC).unwrap(), egress(), 20).unwrap();
+    let mut listed: Vec<FlowInfo> = t.flows(30).collect();
+    listed.sort_by_key(|f| f.remote_port);
+    assert_eq!(listed.len(), 2);
+    assert_eq!(
+        (listed[0].protocol, listed[0].internal, listed[0].internal_port, listed[0].remote, listed[0].remote_port, listed[0].state),
+        (17, LAN, 4000, REMOTE, 53, FlowState::Datagram)
+    );
+    // Endpoint-independent mapping: both remotes share the external port.
+    assert_eq!(listed[0].external_port, listed[1].external_port);
+    assert!(listed[0].external_port >= 49152 && !listed[0].offloaded);
+    assert_eq!((listed[0].expires_at, listed[1].expires_at), (10 + UDP_MS, 20 + UDP_MS));
+    // Listing is read-only: expiry still happens on the original deadline.
+    assert_eq!(t.flows(10 + UDP_MS).count(), 1);
+    assert_eq!(t.flows(20 + UDP_MS).count(), 0);
+}

@@ -224,6 +224,31 @@ struct Flow {
 }
 use crate::tcp_window::Segment;
 
+/// Coarse connection phase for display.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowState {
+    /// UDP or ICMP echo: no connection phases.
+    Datagram,
+    Opening,
+    Established,
+    Closing,
+}
+/// One tracked flow as shown to an operator. `protocol` is the IP protocol
+/// number; for ICMP echo the ports hold the identifier and `remote_port` is 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowInfo {
+    pub protocol: u8,
+    pub internal: [u8; 4],
+    pub internal_port: u16,
+    pub external_port: u16,
+    pub remote: [u8; 4],
+    pub remote_port: u16,
+    pub state: FlowState,
+    pub expires_at: u64,
+    /// The TCP connection was handed to hardware forwarding at some point.
+    pub offloaded: bool,
+}
+
 /// `M` mapping slots reserve ports 49152..49152+M in TCP/UDP and echo IDs.
 /// The image must keep this range out of its local listeners/port forwards.
 /// `seed` distributes keys; this mixer is not a cryptographic hash. Probe bounds
@@ -373,6 +398,29 @@ impl<const M: usize, const F: usize> Table<M, F> {
         })).map_err(Error::Packet)
     }
 
+    /// Diagnostic listing of live flows for operator display. A full scan:
+    /// never call it per packet. Read-only; no expiry is refreshed.
+    pub fn flows(&self, now: u64) -> impl Iterator<Item = FlowInfo> + '_ {
+        self.flows.iter().flatten().filter(move |f| self.live_flow(**f, now)).map(|f| {
+            let key = self.mappings[f.mapping].expect("live flow has a mapping").key;
+            FlowInfo {
+                protocol: key.protocol,
+                internal: key.ip,
+                internal_port: key.port,
+                external_port: PORT_BASE + f.mapping as u16,
+                remote: f.remote.ip,
+                remote_port: f.remote.port,
+                state: match f.state {
+                    State::Datagram => FlowState::Datagram,
+                    State::SynSent { .. } | State::SynReceived { .. } => FlowState::Opening,
+                    State::Established { .. } => FlowState::Established,
+                    State::Closing | State::Closed => FlowState::Closing,
+                },
+                expires_at: f.until,
+                offloaded: f.tcp_offloaded,
+            }
+        })
+    }
     /// Diagnostic count scan; ordinary established forwarding uses hash probes.
     pub fn active_counts(&self, now: u64) -> (usize, usize) {
         (

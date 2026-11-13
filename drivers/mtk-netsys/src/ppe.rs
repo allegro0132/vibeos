@@ -6,6 +6,8 @@
 
 pub mod control;
 pub mod table;
+#[cfg(feature = "ppe-capacity-test")]
+pub mod capacity;
 
 pub const ENTRY_BYTES: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

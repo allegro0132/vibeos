@@ -5,3 +5,4 @@ edition = "2021"
 
 [features]
 qdma-test = []
+ppe-capacity-test = []

@@ -4,11 +4,11 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
-use vibeos_config::{
-    atomic_write, read_config, resolve, save_config, save_resolved, Catalog, Config, Result,
-};
 #[cfg(feature = "tui")]
-mod ui;
+use vibeos_config::ui;
+use vibeos_config::{
+    atomic_write, read_config, resolve, save_resolved, save_selection, Catalog, Config, Result,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -68,7 +68,7 @@ fn run() -> Result<()> {
         }
         #[cfg(feature = "tui")]
         return ui::run(
-            &root,
+            &ui::VibeOs { root: &root },
             &catalog,
             config,
             &config_path,
@@ -120,16 +120,8 @@ fn run() -> Result<()> {
         _ => Ok(()),
     }
 }
-pub fn save(root: &Path, path: &Path, config: &Config, r: &vibeos_config::Resolved) -> Result<()> {
-    r.require_valid()?;
-    save_resolved(
-        &root
-            .join("target/config")
-            .join(&r.digest)
-            .join("resolved.toml"),
-        r,
-    )?;
-    save_config(path, config)
+fn save(root: &Path, path: &Path, config: &Config, r: &vibeos_config::Resolved) -> Result<()> {
+    save_selection(root, path, config, r)
 }
 
 fn build(root: &Path, catalog: &Catalog, r: &vibeos_config::Resolved, dry: bool) -> Result<()> {

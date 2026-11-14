@@ -1,5 +1,9 @@
 //! Host-side configuration model shared by the terminal UI and build driver.
 //! Resolution is pure: it never invokes Cargo or changes source manifests.
+//!
+//! A product repository that pins VibeOS can reuse the model and the terminal
+//! UI with its own catalog: its boards use `image = "product"`, and their node
+//! features then name Cargo features of that product's firmware crate.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -7,6 +11,9 @@ use std::{
     fs,
     path::Path,
 };
+
+#[cfg(feature = "tui")]
+pub mod ui;
 
 pub const SCHEMA: u32 = 1;
 pub type Result<T> = std::result::Result<T, String>;
@@ -34,6 +41,21 @@ impl Selection {
 pub struct Config {
     pub version: u32,
     pub boards: BTreeSet<String>,
+    pub components: BTreeSet<String>,
+    #[serde(default)]
+    pub drivers: BTreeMap<String, Selection>,
+}
+
+/// A named starting selection declared by a catalog. A catalog without any
+/// keeps the built-in `default`, `minimal` and per-board presets.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Preset {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub boards: BTreeSet<String>,
+    #[serde(default)]
     pub components: BTreeSet<String>,
     #[serde(default)]
     pub drivers: BTreeMap<String, Selection>,
@@ -73,6 +95,9 @@ pub enum Image {
     /// A product repository that pins VibeOS. This workspace only provides
     /// the platform libraries, so such a board is always configured alone.
     External,
+    /// The image of the product whose catalog this is: node and board
+    /// features name that product's firmware features. Configured alone.
+    Product,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -125,13 +150,18 @@ pub struct Catalog {
     pub version: u32,
     pub boards: Vec<Board>,
     pub nodes: Vec<Node>,
+    /// Skipped when empty so existing configuration digests do not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub presets: Vec<Preset>,
 }
 
 impl Catalog {
     pub fn load(root: &Path) -> Result<Self> {
-        let path = root.join("configs/catalog.toml");
+        Self::load_file(&root.join("configs/catalog.toml"))
+    }
+    pub fn load_file(path: &Path) -> Result<Self> {
         let catalog: Self = toml::from_str(
-            &fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?,
+            &fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
         )
         .map_err(|e| format!("{}: {e}", path.display()))?;
         catalog.validate()?;
@@ -164,9 +194,14 @@ impl Catalog {
             }
         }
         for b in &self.boards {
-            if (b.image == Image::External) == b.build_hint.is_empty() {
+            let hint_ok = match b.image {
+                Image::Universal => b.build_hint.is_empty(),
+                Image::External => !b.build_hint.is_empty(),
+                Image::Product => true,
+            };
+            if !hint_ok {
                 return Err(format!(
-                    "{}: build_hint is required for, and only for, an external image",
+                    "{}: build_hint is required for an external image and absent for a universal one",
                     b.id
                 ));
             }
@@ -246,19 +281,41 @@ impl Catalog {
         for n in &self.nodes {
             visit(self, &n.id, &mut Vec::new(), &mut done)?;
         }
+        let mut presets = BTreeSet::new();
+        for p in &self.presets {
+            if !presets.insert(&p.id) {
+                return Err(format!("duplicate preset {}", p.id));
+            }
+            if p.boards.is_empty() || p.boards.iter().any(|b| self.board(b).is_none()) {
+                return Err(format!("{}: preset needs known boards", p.id));
+            }
+            for id in &p.components {
+                if !self.node(id).is_some_and(|n| n.kind == Kind::Component) {
+                    return Err(format!("{}: unknown preset component {id}", p.id));
+                }
+            }
+            for id in p.drivers.keys() {
+                if !self.node(id).is_some_and(|n| n.kind == Kind::Driver) {
+                    return Err(format!("{}: unknown preset driver {id}", p.id));
+                }
+            }
+        }
         Ok(())
     }
     /// Fail before compiling if the catalog drifts from the actual firmware API.
     pub fn check_features(&self, root: &Path) -> Result<()> {
-        let manifest = root.join("firmware/universal/Cargo.toml");
+        self.check_features_in(&root.join("firmware/universal/Cargo.toml"))
+    }
+    /// The same check against another firmware manifest (a product image).
+    pub fn check_features_in(&self, manifest: &Path) -> Result<()> {
         let value: toml::Value = toml::from_str(
-            &fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?,
+            &fs::read_to_string(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?,
         )
         .map_err(|e| e.to_string())?;
         let features = value
             .get("features")
             .and_then(|v| v.as_table())
-            .ok_or("universal firmware has no features")?;
+            .ok_or_else(|| format!("{} has no features", manifest.display()))?;
         for (id, feature) in self
             .boards
             .iter()
@@ -273,7 +330,32 @@ impl Catalog {
         }
         Ok(())
     }
+    /// Preset ids in display order: the catalog's own, or the built-in ones.
+    pub fn preset_names(&self) -> Vec<String> {
+        if self.presets.is_empty() {
+            ["default", "minimal"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(self.boards.iter().map(|b| b.id.clone()))
+                .collect()
+        } else {
+            self.presets.iter().map(|p| p.id.clone()).collect()
+        }
+    }
+    pub fn declared_preset(&self, id: &str) -> Option<&Preset> {
+        self.presets.iter().find(|p| p.id == id)
+    }
     pub fn preset(&self, name: &str) -> Result<Config> {
+        if let Some(p) = self.declared_preset(name) {
+            let mut components = p.components.clone();
+            components.insert("vsh".into());
+            return Ok(Config {
+                version: SCHEMA,
+                boards: p.boards.clone(),
+                components,
+                drivers: p.drivers.clone(),
+            });
+        }
         let boards: BTreeSet<String> = if name == "default" || name == "minimal" {
             // Every board that can share the universal image.
             self.boards
@@ -411,7 +493,7 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
         ));
     }
     let image = selected[0].image;
-    if let Some(b) = selected.iter().find(|b| b.image == Image::External) {
+    if let Some(b) = selected.iter().find(|b| b.image != Image::Universal) {
         if selected.len() > 1 {
             return Err(format!(
                 "{} has its own image and cannot share a configuration with other boards",
@@ -429,7 +511,7 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
         target: arch.target().into(),
         features: match image {
             Image::Universal => BTreeSet::from(["image".into()]),
-            Image::External => BTreeSet::new(),
+            Image::External | Image::Product => BTreeSet::new(),
         },
         boards: BTreeMap::new(),
         errors: Vec::new(),
@@ -484,8 +566,9 @@ pub fn resolve(c: &Catalog, config: &Config) -> Result<Resolved> {
         }
         for id in &p.enabled {
             let f = &c.node(id).unwrap().feature;
-            // Feature names belong to the universal firmware manifest.
-            if !f.is_empty() && image == Image::Universal {
+            // Feature names belong to the image's firmware manifest; an
+            // external image is linked elsewhere and takes none from here.
+            if !f.is_empty() && image != Image::External {
                 r.features.insert(f.clone());
             }
         }
@@ -650,12 +733,28 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     result.map_err(|e| format!("{}: {e}", path.display()))
 }
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
-    let text = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    atomic_write(
+    save_config_with_header(
         path,
-        format!("# VibeOS build configuration. Edit this file or run ./configure.sh.\n{text}")
-            .as_bytes(),
+        config,
+        "VibeOS build configuration. Edit this file or run ./configure.sh.",
     )
+}
+/// `header` becomes the file's leading comment line.
+pub fn save_config_with_header(path: &Path, config: &Config, header: &str) -> Result<()> {
+    let text = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+    atomic_write(path, format!("# {header}\n{text}").as_bytes())
+}
+/// Write the resolved closure under `root/target/config` and the selection.
+pub fn save_selection(root: &Path, path: &Path, config: &Config, r: &Resolved) -> Result<()> {
+    r.require_valid()?;
+    save_resolved(
+        &root
+            .join("target/config")
+            .join(&r.digest)
+            .join("resolved.toml"),
+        r,
+    )?;
+    save_config(path, config)
 }
 pub fn save_resolved(path: &Path, r: &Resolved) -> Result<()> {
     r.require_valid()?;

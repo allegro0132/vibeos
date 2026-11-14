@@ -219,3 +219,89 @@ fn ssh_and_iperf3_share_one_image() {
         assert!(plan.enabled.contains("ssh") && plan.enabled.contains("iperf3"));
     }
 }
+
+/// A product repository's own catalog: features name its firmware's features.
+const PRODUCT: &str = r#"
+version = 1
+[[boards]]
+id = "dev"
+name = "Dev board"
+description = "Product board."
+arch = "aarch64"
+image = "product"
+required = ["nic"]
+defaults = []
+feature = ""
+load_address = 0
+memory_bytes = 1
+[[boards]]
+id = "emu"
+name = "Emulator"
+description = "Same image, emulated."
+arch = "aarch64"
+image = "product"
+required = []
+defaults = []
+feature = "emulated"
+load_address = 0
+memory_bytes = 1
+[[nodes]]
+id = "nic"
+name = "NIC"
+description = ""
+kind = "driver"
+feature = ""
+boards = ["dev"]
+[[nodes]]
+id = "offload"
+name = "Offload"
+description = ""
+kind = "driver"
+feature = "hw-offload"
+boards = ["dev"]
+[[nodes]]
+id = "vsh"
+name = "Shell"
+description = ""
+kind = "component"
+feature = ""
+[[nodes]]
+id = "router"
+name = "Router"
+description = ""
+kind = "component"
+feature = "router"
+boards = ["dev"]
+requires = ["offload"]
+[[presets]]
+id = "dev"
+name = "Router"
+description = "The product."
+boards = ["dev"]
+components = ["router"]
+"#;
+
+#[test]
+fn product_images_take_node_features_and_declared_presets() {
+    let c: Catalog = toml::from_str(PRODUCT).unwrap();
+    c.validate().unwrap();
+    assert_eq!(c.preset_names(), ["dev"]);
+    let r = resolve(&c, &c.preset("dev").unwrap()).unwrap();
+    r.require_valid().unwrap();
+    assert_eq!(
+        r.features,
+        BTreeSet::from(["hw-offload".to_owned(), "router".to_owned()])
+    );
+    // A board without a declared preset still gets the built-in one.
+    let r = resolve(&c, &c.preset("emu").unwrap()).unwrap();
+    assert_eq!(r.features, BTreeSet::from(["emulated".to_owned()]));
+    // Each product board has its own image.
+    let mut both = c.preset("dev").unwrap();
+    both.boards.insert("emu".into());
+    assert!(resolve(&c, &both).unwrap_err().contains("own image"));
+    // Presets are checked against the catalog.
+    let bad: Catalog =
+        toml::from_str(&PRODUCT.replace(r#"components = ["router"]"#, r#"components = ["nic"]"#))
+            .unwrap();
+    assert!(bad.validate().unwrap_err().contains("unknown preset component"));
+}

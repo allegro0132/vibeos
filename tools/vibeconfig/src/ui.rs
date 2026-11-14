@@ -5,6 +5,9 @@
 //! dependency resolver pulled in is drawn as included, and a selected component
 //! that cannot run on a board says so. Unicode and colour are optional; the
 //! same layout renders in pure ASCII for serial consoles and plain locales.
+//!
+//! The screen is shared: VibeOS drives it through [`VibeOs`], and a product
+//! that pins VibeOS supplies its own [`Product`] and catalog.
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
@@ -20,9 +23,57 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::{env, io, path::Path, time::Duration};
-use vibeos_config::{
-    resolve, Board, Catalog, Config, Image, Kind, Node, Resolved, Result, Selection,
+use crate::{
+    resolve, save_selection, Board, BoardPlan, Catalog, Config, Image, Kind, Node, Resolved,
+    Result, Selection,
 };
+
+/// What the program embedding this UI supplies.
+pub trait Product {
+    /// Shown in the header, e.g. "VibeOS".
+    fn name(&self) -> &str;
+    /// Write a selection the resolver accepted. Errors keep the UI open on
+    /// Review with the message.
+    fn save(&self, c: &Catalog, path: &Path, config: &Config, r: &Resolved) -> Result<()>;
+    /// Commands to run after saving, each with a short explanation.
+    fn next_steps(&self, c: &Catalog, r: &Resolved, path: &Path) -> Vec<(String, String)>;
+}
+
+/// The VibeOS workspace itself: universal images built by `./build.sh`.
+pub struct VibeOs<'a> {
+    pub root: &'a Path,
+}
+impl Product for VibeOs<'_> {
+    fn name(&self) -> &str {
+        "VibeOS"
+    }
+    fn save(&self, c: &Catalog, path: &Path, config: &Config, r: &Resolved) -> Result<()> {
+        c.check_features(self.root)?;
+        save_selection(self.root, path, config, r)
+    }
+    fn next_steps(&self, c: &Catalog, r: &Resolved, path: &Path) -> Vec<(String, String)> {
+        let config = path.display();
+        match r.image {
+            Image::Universal => {
+                let mut steps = vec![(
+                    format!("./build.sh --config {config}"),
+                    "build the image".to_owned(),
+                )];
+                if r.boards.contains_key("qemu-virt") {
+                    steps.push((format!("./run.sh --config {config}"), "boot it in QEMU".into()));
+                }
+                steps
+            }
+            // The image is linked by the product that pins this workspace.
+            Image::External | Image::Product => r
+                .boards
+                .keys()
+                .filter_map(|id| c.board(id))
+                .map(|b| (b.build_hint.clone(), String::new()))
+                .collect(),
+        }
+    }
+}
 
 const ASCII_BORDER: border::Set<'static> = border::Set {
     top_left: "+",
@@ -35,6 +86,8 @@ const ASCII_BORDER: border::Set<'static> = border::Set {
     horizontal_bottom: "-",
 };
 const TABS: [&str; 5] = ["Boards", "Drivers", "Components", "Presets", "Review"];
+/// Section names, in tab order.
+pub const SECTIONS: [&str; 5] = TABS;
 const BOARDS: usize = 0;
 const DRIVERS: usize = 1;
 const COMPONENTS: usize = 2;
@@ -95,6 +148,10 @@ impl Theme {
                 || env::var("TERM").is_ok_and(|t| t == "linux"),
             color: set("NO_COLOR").is_none(),
         }
+    }
+    /// A fixed theme, for snapshots that must not depend on the environment.
+    pub const fn new(ascii: bool, color: bool) -> Self {
+        Self { ascii, color }
     }
     fn pick(self, unicode: &'static str, ascii: &'static str) -> &'static str {
         if self.ascii {
@@ -329,11 +386,14 @@ impl App {
                 .into_iter()
                 .map(|name| {
                     let current = c.preset(&name).is_ok_and(|p| p == self.config);
+                    let title = c
+                        .declared_preset(&name)
+                        .map_or_else(|| name.clone(), |p| p.name.clone());
                     (
                         Row {
                             id: name.clone(),
                             mark: if current { Mark::On } else { Mark::Go },
-                            name: name.clone(),
+                            name: title,
                             note: if current {
                                 "current".into()
                             } else {
@@ -599,19 +659,21 @@ impl App {
 
     /// Validate and write the selection. A failed save lands on Review, where
     /// every problem is listed next to the board it affects.
-    fn save(&mut self, root: &Path, c: &Catalog, path: &Path) -> bool {
+    fn save(&mut self, p: &dyn Product, c: &Catalog, path: &Path) -> bool {
         let result = resolve(c, &self.config).and_then(|r| {
-            c.check_features(root)?;
-            super::save(root, path, &self.config, &r)
+            r.require_valid()?;
+            p.save(c, path, &self.config, &r)?;
+            Ok(r)
         });
         match result {
-            Ok(()) => {
+            Ok(r) => {
                 self.saved = self.config.clone();
                 self.on_disk = true;
-                let next = if self.boards(c).iter().any(|b| b.image == Image::External) {
-                    "See Review for how the image is built."
-                } else {
-                    "Next: ./build.sh"
+                let next = match p.next_steps(c, &r, path).first() {
+                    Some((command, what)) if !what.is_empty() => {
+                        format!("Next: {}", command.split(" --").next().unwrap_or(command))
+                    }
+                    _ => "See Review for how the image is built.".into(),
                 };
                 self.say(Tone::Ok, format!("Saved {}. {next}", path.display()));
                 true
@@ -642,13 +704,12 @@ fn needed_by(r: &Resolved, id: &str) -> Option<String> {
         .find_map(|reason| reason.strip_prefix("required by ").map(str::to_owned))
 }
 fn preset_names(c: &Catalog) -> Vec<String> {
-    ["default", "minimal"]
-        .into_iter()
-        .map(str::to_owned)
-        .chain(c.boards.iter().map(|b| b.id.clone()))
-        .collect()
+    c.preset_names()
 }
 fn preset_summary(c: &Catalog, name: &str) -> String {
+    if let Some(p) = c.declared_preset(name) {
+        return p.description.clone();
+    }
     match name {
         "default" => "Every board with its native storage and Ethernet drivers, the VSH \
                       console, file services and DHCP networking."
@@ -709,7 +770,7 @@ impl Drop for Restore {
 }
 
 pub fn run(
-    root: &Path,
+    p: &dyn Product,
     c: &Catalog,
     config: Config,
     path: &Path,
@@ -731,7 +792,7 @@ pub fn run(
             Terminal::new(CrosstermBackend::new(io::stdout())).map_err(|e| e.to_string())?;
         loop {
             terminal
-                .draw(|f| draw(f, c, &app, path, theme))
+                .draw(|f| draw(f, p, c, &app, path, theme))
                 .map_err(|e| e.to_string())?;
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
@@ -745,10 +806,10 @@ pub fn run(
             match app.key(c, key) {
                 Action::None => {}
                 Action::Save => {
-                    app.save(root, c, path);
+                    app.save(p, c, path);
                 }
                 Action::SaveAndQuit => {
-                    if app.save(root, c, path) {
+                    if app.save(p, c, path) {
                         break;
                     }
                 }
@@ -759,9 +820,13 @@ pub fn run(
     // Back on the normal screen: leave the next step in the scrollback.
     if app.on_disk && !app.dirty() {
         println!("Configuration: {}", path.display());
-        match app.boards(c).iter().find(|b| b.image == Image::External) {
-            Some(b) => println!("{}: {}", b.name, b.build_hint),
-            None => println!("Next: ./build.sh --config {}", path.display()),
+        if let Ok(r) = resolve(c, &app.config) {
+            for (command, what) in p.next_steps(c, &r, path) {
+                match what.is_empty() {
+                    true => println!("Next: {command}"),
+                    false => println!("Next: {command}   ({what})"),
+                }
+            }
         }
     } else {
         println!("No changes saved.");
@@ -769,15 +834,53 @@ pub fn run(
     Ok(())
 }
 
-fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
+/// Render a selection as text: `view` is a [`SECTIONS`] name and the row
+/// selected in it, `size` the terminal's columns and rows. For product tests
+/// and previews.
+pub fn snapshot(
+    p: &dyn Product,
+    c: &Catalog,
+    config: Config,
+    path: &Path,
+    view: (&str, usize),
+    size: (u16, u16),
+    theme: Theme,
+) -> Result<String> {
+    let (section, selected) = view;
+    let tab = TABS
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case(section))
+        .ok_or_else(|| format!("unknown section {section}"))?;
+    let mut app = App::new(config, true);
+    app.go(tab);
+    app.selected = selected;
+    let (w, h) = size;
+    let mut t = Terminal::new(ratatui::backend::TestBackend::new(w, h)).map_err(|e| e.to_string())?;
+    t.draw(|f| draw(f, p, c, &app, path, theme))
+        .map_err(|e| e.to_string())?;
+    let buffer = t.backend().buffer();
+    Ok((0..h)
+        .map(|y| {
+            (0..w)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn draw(f: &mut Frame, p: &dyn Product, c: &Catalog, app: &App, path: &Path, th: Theme) {
     let area = f.area();
     if area.width < 50 || area.height < 12 {
         let message = match app.modal {
-            Modal::Quit => "VibeOS setup\nUnsaved changes: s save and quit / d discard / Esc return",
-            Modal::Preset(_) => "VibeOS setup\nReplace selection with preset? y load / n return",
-            Modal::Switch(_) => "VibeOS setup\nSwitch architecture and replace boards? y switch / n return",
-            _ => "VibeOS setup\nResize the terminal to at least 50 x 12.\nSelection preserved; Ctrl-S saves, q quits.",
+            Modal::Quit => "Unsaved changes: s save and quit / d discard / Esc return",
+            Modal::Preset(_) => "Replace selection with preset? y load / n return",
+            Modal::Switch(_) => "Switch target and replace boards? y switch / n return",
+            _ => "Resize the terminal to at least 50 x 12.\nSelection preserved; Ctrl-S saves, q quits.",
         };
+        let message = format!("{} setup\n{message}", p.name());
         f.render_widget(Paragraph::new(message).wrap(Wrap { trim: false }), area);
         return;
     }
@@ -796,10 +899,11 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
     ])
     .areas(area.inner(ratatui::layout::Margin::new(1, 0)));
 
-    draw_header(f, header, app, path, th);
+    draw_header(f, header, p.name(), app, path, th);
     draw_tabs(f, tabs, app, &problems, th);
     if app.tab == REVIEW {
         let lines = review(
+            p,
             c,
             app,
             &resolved,
@@ -887,6 +991,7 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
                         new.name
                     )
                 }
+                _ if new.image == Image::Product => format!("{} has its own image.", new.name),
                 _ => "The current board has its own image and is configured alone.".into(),
             };
             dialog(
@@ -895,7 +1000,10 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
                 " Switch target ",
                 vec![
                     Line::from(why),
-                    Line::from(th.span(Tone::Dim, "One kernel image has one architecture.")),
+                    Line::from(th.span(
+                        Tone::Dim,
+                        "One kernel image has one architecture and boards with their own image are configured alone.",
+                    )),
                     Line::default(),
                     Line::from(format!(
                         "Replace the selection with {} and its defaults?",
@@ -910,7 +1018,7 @@ fn draw(f: &mut Frame, c: &Catalog, app: &App, path: &Path, th: Theme) {
     }
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App, path: &Path, th: Theme) {
+fn draw_header(f: &mut Frame, area: Rect, name: &str, app: &App, path: &Path, th: Theme) {
     let (tone, state) = if app.dirty() {
         (Tone::Warn, "modified")
     } else if app.on_disk {
@@ -919,7 +1027,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, path: &Path, th: Theme) {
         (Tone::Warn, "not saved yet")
     };
     let state = format!("{} {state}", th.pick("●", "*"));
-    let room = (area.width as usize).saturating_sub(16 + state.chars().count() + 3);
+    let title = name.chars().count() + 7;
+    let room = (area.width as usize).saturating_sub(title.max(16) + state.chars().count() + 3);
     let shown = path.display().to_string();
     // Keep the file name: clip long paths from the left.
     let shown = if shown.chars().count() > room {
@@ -933,7 +1042,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, path: &Path, th: Theme) {
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            th.bold(Tone::Accent, "VibeOS"),
+            th.bold(Tone::Accent, name.to_owned()),
             Span::raw(" setup"),
         ])),
         area,
@@ -1254,7 +1363,7 @@ fn details(
 }
 
 /// One board's resolved closure: what is in, why, and what could not be.
-fn plan_lines(c: &Catalog, plan: &vibeos_config::BoardPlan, th: Theme) -> Vec<Line<'static>> {
+fn plan_lines(c: &Catalog, plan: &BoardPlan, th: Theme) -> Vec<Line<'static>> {
     let name = |id: &str| c.node(id).map_or(id.to_owned(), |n| n.name.clone());
     let mut out = Vec::new();
     let mut ids: Vec<&String> = plan.enabled.iter().collect();
@@ -1283,6 +1392,7 @@ fn plan_lines(c: &Catalog, plan: &vibeos_config::BoardPlan, th: Theme) -> Vec<Li
 }
 
 fn review(
+    p: &dyn Product,
     c: &Catalog,
     app: &App,
     resolved: &Result<Resolved>,
@@ -1309,7 +1419,7 @@ fn review(
                     "{} {}",
                     th.pick("✓", "+"),
                     match r.image {
-                        Image::Universal => "Ready to build",
+                        Image::Universal | Image::Product => "Ready to build",
                         Image::External => "Selection is consistent",
                     }
                 ),
@@ -1351,6 +1461,8 @@ fn review(
             "Output",
             format!("target/universal/{}/", clip(&r.digest, 13, th)),
         ));
+    }
+    if r.image != Image::External {
         out.extend(wrapped_field(th, "Features", r.features.iter(), width));
     }
     for (bid, plan) in &r.boards {
@@ -1368,27 +1480,13 @@ fn review(
     }
     out.push(Line::default());
     out.push(heading(th, "Next"));
-    let config = path.display();
-    let mut steps = Vec::new();
-    match r.image {
-        Image::Universal => {
-            steps.push((format!("./build.sh --config {config}"), "build the image"));
-            if r.boards.contains_key("qemu-virt") {
-                steps.push((format!("./run.sh --config {config}"), "boot it in QEMU"));
-            }
-        }
-        Image::External => {
-            // The image is linked by the product that pins this workspace.
-            for b in app.boards(c) {
-                out.push(Line::from(format!("  {}", b.build_hint)));
-            }
-        }
-    }
+    let steps = p.next_steps(c, r, path);
     for (command, what) in steps {
-        out.push(Line::from(vec![
-            Span::raw(format!("  {command}")),
-            th.span(Tone::Dim, format!("   {what}")),
-        ]));
+        let mut line = vec![Span::raw(format!("  {command}"))];
+        if !what.is_empty() {
+            line.push(th.span(Tone::Dim, format!("   {what}")));
+        }
+        out.push(Line::from(line));
     }
     out
 }
@@ -1585,12 +1683,29 @@ mod tests {
     fn catalog() -> Catalog {
         toml::from_str(include_str!("../../../configs/catalog.toml")).unwrap()
     }
+    const PRODUCT: Named = Named("VibeOS");
+    /// Draws like VibeOS; never saves.
+    struct Named(&'static str);
+    impl Product for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn save(&self, _: &Catalog, _: &Path, _: &Config, _: &Resolved) -> Result<()> {
+            Err("tests do not save".into())
+        }
+        fn next_steps(&self, c: &Catalog, r: &Resolved, path: &Path) -> Vec<(String, String)> {
+            VibeOs {
+                root: Path::new(""),
+            }
+            .next_steps(c, r, path)
+        }
+    }
     fn press(a: &mut App, c: &Catalog, code: KeyCode) -> Action {
         a.key(c, KeyEvent::new(code, KeyModifiers::NONE))
     }
     fn screen(c: &Catalog, a: &App, th: Theme, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, c, a, Path::new("vibeos.toml"), th))
+        t.draw(|f| draw(f, &PRODUCT, c, a, Path::new("vibeos.toml"), th))
             .unwrap();
         let buffer = t.backend().buffer();
         (0..h)

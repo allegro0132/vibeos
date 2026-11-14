@@ -164,6 +164,19 @@ they do not grant authority. On Mars, the existing DTB/SBI admission and SD data
 partition validation still run. Kernel startup prints its board, configuration
 digest, enabled components and reasons for unavailable components.
 
+## Product catalogs
+
+A product repository that pins VibeOS can reuse the resolver and this UI with its
+own catalog. Its boards use `image = "product"`: node and board `feature`s then
+name Cargo features of the product's firmware crate (checked with
+`Catalog::check_features_in`), and each such board is configured alone. A
+catalog may declare `[[presets]]` (`id`, `name`, `description`, `boards`,
+`components`, `drivers`); they replace the built-in default/minimal/per-board
+presets, and a preset whose id is a board id is what selecting that board loads.
+The product implements `ui::Product` (header name, how a valid selection is saved,
+the next commands) and calls `ui::run`; `ui::snapshot` renders a section to text
+for its tests.
+
 ## Build artifacts and checks
 
 Outputs are isolated under `target/universal/<configuration-digest>/`:

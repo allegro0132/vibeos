@@ -2604,7 +2604,10 @@ dependencies = [
 name = "vibeos-bsp-bpi-r4pro-4e"
 version = "0.1.0"
 dependencies = [
+ "vibeos-core",
+ "vibeos-ethernet",
  "vibeos-hal",
+ "vibeos-runtime-aarch64",
 ]
 
 [[package]]

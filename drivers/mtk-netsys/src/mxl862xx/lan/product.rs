@@ -3,7 +3,7 @@
 //! ownership record inactive and closes data gates; uncertain allocations are
 //! never freed/retried while hardware might still reference them.
 use super::*;
-const PHYSICAL: [u16; 5] = [1, 2, 3, 4, 9];
+const PHYSICAL: [u16; 6] = [1, 2, 3, 4, 9, 13];
 
 /// What a copper port is used for. LAN ports share one learning bridge with
 /// the CPU. A `Wan` port is isolated: it is outside that bridge's domain and
@@ -43,11 +43,12 @@ pub struct ProductLanBridge {
     roles: [PortRole; 4],
     vlans: [PortVlans; 4],
     wan_domain: Option<u16>,
+    sfp: Option<PortVlans>,
     stage: &'static str,
     started: bool,
     active: bool,
     domain: Option<u16>,
-    blocks: [Option<Allocation>; 6],
+    blocks: [Option<Allocation>; 8],
 }
 impl ProductLanBridge {
     pub const fn new(router_mac: [u8; 6]) -> Self {
@@ -60,11 +61,12 @@ impl ProductLanBridge {
             roles,
             vlans: [PortVlans::PLAIN; 4],
             wan_domain: None,
+            sfp: None,
             stage: "new",
             started: false,
             active: false,
             domain: None,
-            blocks: [None; 6],
+            blocks: [None; 8],
         }
     }
     /// Give isolated ports VLANs. A port of the LAN bridge takes none: the
@@ -73,6 +75,8 @@ impl ProductLanBridge {
         self.vlans = vlans;
         self
     }
+    /// SFP is isolated from copper; software bridges its configured networks.
+    pub const fn with_sfp(mut self, vlans: Option<PortVlans>) -> Self { self.sfp = vlans; self }
     pub fn vlans(&self) -> [PortVlans; 4] {
         self.vlans
     }
@@ -108,6 +112,7 @@ impl ProductLanBridge {
         if (0..4).any(|c| !self.vlans[c].valid() || (self.vlans[c] != PortVlans::PLAIN && self.roles[c] != PortRole::Wan)) {
             return Err(Error::InvalidState);
         }
+        if self.sfp.is_some_and(|v| !v.valid()) { return Err(Error::InvalidState); }
         self.started = true;
         // Even a failed qualification must not open a data path.
         let result = self.configure(hw);
@@ -149,7 +154,7 @@ impl ProductLanBridge {
         // Isolated ports never share an address table with the LAN. They may
         // share one among themselves: none learns, and none's map reaches another.
         let mut wan_id = id;
-        if self.roles.contains(&PortRole::Wan) {
+        if self.roles.contains(&PortRole::Wan) || self.sfp.is_some() {
             self.stage = "wan-domain-allocate";
             wan_id = hw.domain_alloc()?;
             if wan_id == 0 || wan_id == u16::MAX || wan_id == id {
@@ -164,7 +169,7 @@ impl ProductLanBridge {
             let count = match slot {
                 0..=3 => 3 + self.vlans[slot].count(),
                 4 => 10,
-                _ => 7 + tagged_ports,
+                _ => 7 + tagged_ports + self.sfp.map_or(0, |v| 1 + u16::from(v.count() != 0)),
             };
             self.stage = "vlan-allocate";
             let allocation = hw.alloc(count)?;
@@ -198,7 +203,8 @@ impl ProductLanBridge {
                 // The CPU reaches a port with that port's tag; a second tag
                 // behind it only towards a port that has VLANs.
                 let tagged = COPPER.into_iter().enumerate().filter(|(c, _)| self.vlans[*c].count() != 0).map(|(_, p)| Rule::ClassifyCpuTagged(p));
-                let rules = COPPER.into_iter().map(Rule::ClassifyCpu).chain(tagged)
+                let sfp_rules = self.sfp.into_iter().flat_map(|v| core::iter::once(Rule::ClassifyCpu(Port::Sfp)).chain((v.count() != 0).then_some(Rule::ClassifyCpuTagged(Port::Sfp))));
+                let rules = COPPER.into_iter().map(Rule::ClassifyCpu).chain(tagged).chain(sfp_rules)
                     .chain([Rule::DropAnyDoubleTagged, Rule::DropAnySingleTagged, Rule::DropUntagged]);
                 for (i, rule) in rules.enumerate() {
                     hw.rule(bid, i as u16, rule)?;
@@ -233,7 +239,7 @@ impl ProductLanBridge {
         // CPU ingress classifies tags to aliases 17..20; CPU egress is
         // transparent. Unclassified CPU traffic cannot use bridge 9's map.
         self.stage = "cpu-path";
-        hw.cpu_path(block(self.blocks[5].unwrap()), 7 + self.vlans.iter().filter(|v| v.count() != 0).count() as u16)?;
+        hw.cpu_path(block(self.blocks[5].unwrap()), 7 + self.vlans.iter().filter(|v| v.count() != 0).count() as u16 + self.sfp.map_or(0, |v| 1 + u16::from(v.count() != 0)))?;
         self.stage = "open-maps";
         let members = (0..4).filter(|c| self.roles[*c] == PortRole::Lan).fold(0u16, |bits, c| bits | 2 << c);
         for (i, p) in PORTS.into_iter().enumerate() {
@@ -247,6 +253,40 @@ impl ProductLanBridge {
             };
             hw.map(p, map(bits))?;
         }
+        if let Some(vlans) = self.sfp {
+            self.stage = "sfp-serdes";
+            hw.sfp_10g()?;
+            self.stage = "sfp-alias";
+            hw.alias(29)?;
+            hw.map(29, map(0))?;
+            for slot in 6..8 {
+                let count = if slot == 6 { 3 + vlans.count() } else { 4 };
+                let allocation = hw.alloc(count)?;
+                let bid = block(allocation);
+                if bid == u16::MAX || self.blocks.iter().flatten().any(|a| block(*a) == bid) { return Err(Error::InvalidResponse); }
+                self.blocks[slot] = Some(allocation);
+                if u16::from_le_bytes([allocation[0], allocation[1]]) < count { return Err(Error::InvalidResponse); }
+                if slot == 6 {
+                    let first = if vlans.untagged { Rule::PushUntagged(Port::Sfp) } else { Rule::DropUntagged };
+                    let listed = vlans.vids.into_iter().filter(|v| *v != 0).map(|v| Rule::PushTagged(Port::Sfp, v));
+                    for (i, rule) in core::iter::once(first).chain(listed).chain([Rule::DropAnyDoubleTagged, Rule::DropAnySingleTagged]).enumerate() {
+                        hw.rule(bid, i as u16, rule)?;
+                    }
+                } else {
+                    for (i, rule) in [Rule::PopOuter(Port::Sfp), Rule::PopOuterTagged(Port::Sfp), Rule::DropDoubleTagged, Rule::DropSingleTagged].into_iter().enumerate() {
+                        hw.rule(bid, i as u16, rule)?;
+                    }
+                }
+            }
+            for (port, dest) in [(13, 13), (29, 9)] {
+                hw.destination(port, dest)?;
+                hw.identity(port, wan_id, true, true, [0; 7])?;
+            }
+            hw.binding(13, true, (true, block(self.blocks[6].unwrap()), 3 + vlans.count()))?;
+            hw.binding(13, false, (true, block(self.blocks[7].unwrap()), 4))?;
+            hw.map(13, map(1 << 9))?;
+            hw.map(29, map(1 << 13))?;
+        }
         self.stage = "open-gates";
         hw.data(true)?;
         self.stage = "ready";
@@ -254,6 +294,7 @@ impl ProductLanBridge {
     }
 }
 trait ProductBackend: Backend {
+    fn sfp_10g(&mut self) -> Result<(), Error>;
     fn reset_qualify(&mut self) -> Result<(), Error>;
     fn data(&mut self, enable: bool) -> Result<(), Error>;
     fn alias(&mut self, id: u16) -> Result<(), Error>;
@@ -268,6 +309,14 @@ impl<I: Io> Mailbox<'_, I> {
     }
 }
 impl<I: Io> ProductBackend for Mailbox<'_, I> {
+    fn sfp_10g(&mut self) -> Result<(), Error> {
+        // Vendor SYS_MISC_SFP: SerDes 1 (physical port 13), fixed 10G XFI.
+        self.execute(0x190e, &mut [1, 1, 2, 0], false)?;
+        let mut got = [1, 0, 0, 0];
+        self.query(0x190d, &mut got)?;
+        if got[..3] != [1, 1, 2] { return Err(Error::ReadbackMismatch); }
+        Ok(())
+    }
     fn reset_qualify(&mut self) -> Result<(), Error> {
         let v = self.version()?;
         if (v.major, v.minor, v.revision, v.build) != (1, 0, 70, 70) {
@@ -385,6 +434,7 @@ mod tests {
         vlans: [PortVlans; 4],
         domains: u16,
         same_domain: bool,
+        sfp: Option<PortVlans>,
     }
     impl Model {
         fn new() -> Self {
@@ -426,6 +476,7 @@ mod tests {
                 vlans: [PortVlans::PLAIN; 4],
                 domains: 0,
                 same_domain: false,
+                sfp: None,
             }
         }
         fn done<T>(&mut self, value: T) -> Result<T, Error> {
@@ -442,7 +493,7 @@ mod tests {
             let lan: std::vec::Vec<u16> = (1..=4).filter(|p| self.roles[*p as usize - 1] == PortRole::Lan).collect();
             let all = lan.iter().fold(0u16, |bits, p| bits | 1 << p);
             let entry = if self.roles[0] == PortRole::Wan { lan.first().copied() } else { lan.first().map(|_| 1) };
-            assert_eq!(self.domains, if self.roles.contains(&PortRole::Wan) { 2 } else { 1 });
+            assert_eq!(self.domains, if self.roles.contains(&PortRole::Wan) || self.sfp.is_some() { 2 } else { 1 });
             for (i, p) in PORTS.into_iter().enumerate() {
                 let s = self.ports[&p];
                 let physical = if i < 4 { p } else { p - 16 };
@@ -487,6 +538,18 @@ mod tests {
                 }
             }
             assert_eq!(self.ports[&9].bridge.map, map(0));
+            if let Some(vlans) = self.sfp {
+                let physical = self.ports[&13].bridge;
+                let alias = self.ports[&29].bridge;
+                assert_eq!(physical.map, map(1 << 9));
+                assert_eq!(alias.map, map(1 << 13));
+                assert_eq!((physical.destination, alias.destination), (13, 9));
+                assert_ne!(physical.id, 6);
+                assert_eq!(physical.id, alias.id);
+                assert_eq!(physical.ingress_vlan.2, 3 + vlans.count());
+                assert!(matches!(self.blocks[&physical.egress_vlan.1][0], Rule::PopOuter(Port::Sfp)));
+                for p in PORTS { assert_eq!(self.ports[&p].bridge.map[0] & (1 << 13), 0); }
+            } else { assert_eq!(self.ports[&13].bridge.map, map(0)); }
         }
     }
     impl Backend for Model {
@@ -571,6 +634,7 @@ mod tests {
         }
     }
     impl ProductBackend for Model {
+        fn sfp_10g(&mut self) -> Result<(), Error> { self.done(()) }
         fn reset_qualify(&mut self) -> Result<(), Error> {
             self.done(())
         }
@@ -601,12 +665,13 @@ mod tests {
             }
             // A second tag behind the CPU tag only towards ports with VLANs.
             let tagged: Vec<u8> = (0..4u8).filter(|c| self.vlans[*c as usize].vids.iter().any(|v| *v != 0)).collect();
-            assert_eq!(rules.len(), 7 + tagged.len());
+            let sfp_count = self.sfp.map_or(0, |v| 1 + usize::from(v.count() != 0));
+            assert_eq!(rules.len(), 7 + tagged.len() + sfp_count);
             for (r, c) in rules[4..].iter().zip(&tagged) {
                 assert!(matches!(r, Rule::ClassifyCpuTagged(p) if p.dt_index() == *c));
             }
             assert!(matches!(
-                &rules[4 + tagged.len()..],
+                &rules[4 + tagged.len() + sfp_count..],
                 [
                     Rule::DropAnyDoubleTagged,
                     Rule::DropAnySingleTagged,
@@ -738,4 +803,20 @@ mod tests {
         assert!(o.acquire(&mut m).is_err());
         assert!(!o.active() && !m.enabled);
     }
+    #[test]
+    fn sfp_is_cpu_only_and_every_setup_failure_closes_gates() {
+        for vlans in [PortVlans::PLAIN, PortVlans { untagged: false, vids: [100, 200, 0, 0, 0] }] {
+            let mut model = Model::new(); model.sfp = Some(vlans);
+            let mut bridge = owner().with_sfp(Some(vlans));
+            bridge.acquire(&mut model).unwrap();
+            model.ready();
+            for fail in 1..=model.calls {
+                let mut broken = Model::new(); broken.sfp = Some(vlans); broken.fail_at = fail;
+                let mut bridge = owner().with_sfp(Some(vlans));
+                assert!(bridge.acquire(&mut broken).is_err(), "failure {fail}");
+                assert!(!bridge.active() && !broken.enabled);
+            }
+        }
+    }
+
 }

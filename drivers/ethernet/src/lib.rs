@@ -2,6 +2,8 @@
 //! Shared IEEE Clause 22 transactions. Register encodings belong to controllers.
 //! Poll bounds do not prove a wall-clock timeout; consumers provide the budget.
 pub mod phy;
+/// SFF-8472 module identification and checksum validation.
+pub mod sfp;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

@@ -1,11 +1,16 @@
 #![no_std]
-//! MT7988A BPI-R4 Pro 4E early-boot contract.
+//! MT7988A BPI-R4 Pro 4E boot contract and board peripheral mechanisms.
 //!
 //! Sources and physical observations: docs/BPI_R4PRO_4E.md.
 //! This deliberately does not implement the RISC-V-specific Board contract.
 //! Full RAM discovery must use the boot FDT, including every reserved region.
 
 use vibeos_hal::AddressRange;
+pub use vibeos_ethernet::sfp as sfp_identity;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+mod hardware;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub use hardware::{sfp, status_leds};
 
 pub const NAME: &str = "BPI-R4PRO-4E";
 pub const COMPATIBLE: &str = "bananapi,bpi-r4-pro-4e";

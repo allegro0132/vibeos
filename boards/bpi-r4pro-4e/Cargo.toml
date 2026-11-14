@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 vibeos-hal = { path = "../../hal" }
+vibeos-ethernet = { path = "../../drivers/ethernet" }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-runtime-aarch64 = { path = "../../runtime/aarch64" }

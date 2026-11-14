@@ -173,8 +173,10 @@ impl<const N: usize> TxRing<N> {
             // frame from a plain one; the submitting ring enforced each
             // variant's own bound, so this stage admits the larger.
             TxPort::Internal | TxPort::InternalTagged => (60, 1518, 1),
-            TxPort::Wan => (60, 1514, 2),
-            TxPort::ExternalTagged => (64, 1518, 15),
+            // One 802.1Q tag more than a plain frame on the SoC's own
+            // port, and behind the CPU tag towards the external switch.
+            TxPort::Wan => (60, 1518, 2),
+            TxPort::ExternalTagged => (64, 1522, 15),
         };
         if !(min..=max).contains(&length) {
             return Err(Error::Length);
@@ -609,8 +611,9 @@ mod tests {
         for (address, length, port, error) in [
             (0xfffffff0u64, 60, TxPort::Wan, Error::Address),
             (0x42000000, 59, TxPort::Wan, Error::Length),
-            (0x42000000, 1515, TxPort::Wan, Error::Length),
+            (0x42000000, 1519, TxPort::Wan, Error::Length),
             (0x42000000, 60, TxPort::ExternalTagged, Error::Length),
+            (0x42000000, 1523, TxPort::ExternalTagged, Error::Length),
         ] {
             assert_eq!(
                 unsafe { r.submit(&mut io, address, length, port) },

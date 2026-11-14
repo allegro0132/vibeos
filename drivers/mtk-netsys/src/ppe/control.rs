@@ -494,10 +494,11 @@ impl NaptBinding {
         let entry = StagedEntry::ipv4_napt_mxl_bridge(Protocol::Udp, original, translated, source_mac, destination_mac)?;
         Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::MxlToWan(ingress_mac) })
     }
-    /// Send a switch-ingress rule's frames out of the SoC's own port,
-    /// untagged. A rule entering through that port cannot leave by it.
+    /// Send a rule's frames out of the SoC's own port, untagged. A rule that
+    /// entered through that port may leave by it again: the caller does that
+    /// only between two VLANs of the port, and adds the tag with `with_vlan`.
     pub fn with_direct_egress(mut self) -> Result<Self, EncodeError> {
-        if !matches!(self.path, FlowPath::MxlToWan(_)) {
+        if !matches!(self.path, FlowPath::MxlToWan(_) | FlowPath::WanToMxl) {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
@@ -520,7 +521,7 @@ impl NaptBinding {
     /// a tag), as opposed to the untagged WAN port or the legacy fixture.
     fn inside_egress(&self) -> bool {
         let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
-        self.path == FlowPath::WanToMxl || (matches!(self.path, FlowPath::MxlToWan(_)) && port != 2)
+        matches!(self.path, FlowPath::WanToMxl | FlowPath::MxlToWan(_)) && port != 2
     }
     /// Select which copper index's CPU tag carries MxL egress: the one the
     /// switch owner reports as entering its LAN bridge (index 0 unless that
@@ -545,6 +546,42 @@ impl NaptBinding {
         self.entry.0[16..20].copy_from_slice(&((1u32 << 9) | (0xf << 20)).to_le_bytes());
         self.entry.0[44..46].copy_from_slice(&0u16.to_le_bytes());
         self.entry.0[46..48].copy_from_slice(&(1u16 << port).to_le_bytes());
+        Ok(self)
+    }
+    /// Put an 802.1Q tag of `vid` on this rule's frames, for a port where
+    /// the destination network is tagged. Call it last, after the egress
+    /// has been selected: out of the SoC's own port it is the one tag; to
+    /// the MxL it goes behind the CPU tag (two layers); to the built-in
+    /// switch the port tag carries it (bit 8 of the port word says so, as
+    /// that switch family's tag format defines). Hardware removes whatever
+    /// tag the frame arrived with either way. Format only.
+    pub fn with_vlan(mut self, vid: u16) -> Result<Self, EncodeError> {
+        if !(1..=4094).contains(&vid) {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
+        let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
+        let (layers, tagged) = (ib1 >> 14 & 7, ib1 & 1 << 18 != 0);
+        let plain = ib1 & !(7 << 14 | 1 << 18);
+        match (port, layers, tagged) {
+            (2, 0, false) => {
+                self.entry.0[..4].copy_from_slice(&(plain | 1 << 14 | 1 << 18).to_le_bytes());
+                self.entry.0[44..46].copy_from_slice(&vid.to_le_bytes());
+            }
+            (15, 1, true) => {
+                self.entry.0[..4].copy_from_slice(&(plain | 2 << 14 | 1 << 18).to_le_bytes());
+                self.entry.0[52..54].copy_from_slice(&vid.to_le_bytes());
+            }
+            (1, 1, false) => {
+                let ports = u16::from_le_bytes(self.entry.0[46..48].try_into().unwrap());
+                if ports & 1 << 8 != 0 {
+                    return Err(EncodeError::UnsupportedEgress);
+                }
+                self.entry.0[46..48].copy_from_slice(&(ports | 1 << 8).to_le_bytes());
+                self.entry.0[44..46].copy_from_slice(&vid.to_le_bytes());
+            }
+            _ => return Err(EncodeError::UnsupportedEgress),
+        }
         Ok(self)
     }
     /// Match the single rule's validated egress IP MTU. Hardware limits include
@@ -1555,7 +1592,10 @@ mod tests {
         assert_eq!((out.path, out.index()), (FlowPath::WanToMxl, napt_bucket(inside)));
         assert_ne!(out.entry.bytes()[4..16], out.entry.bytes()[20..32]);
         assert!(matches!(NaptBinding::wan_to_mxl_lan(inside, snat, mac, [2,0,0,0,0,9]), Err(EncodeError::Address)));
-        assert!(matches!(NaptBinding::direct_ingress(inside, snat, mac, [2,0,0,0,0,9]).unwrap().with_direct_egress(), Err(EncodeError::UnsupportedEgress)));
+        // It may also leave by the SoC's port again (another VLAN there).
+        let again = NaptBinding::direct_ingress(inside, snat, mac, [2,0,0,0,0,9]).unwrap().with_direct_egress().unwrap();
+        assert_eq!((again.path, u32::from_le_bytes(again.entry.bytes()[16..20].try_into().unwrap()) >> 9 & 0xf), (FlowPath::WanToMxl, 2));
+        assert!(matches!(NaptBinding::wan_to_lan(inside, inside, mac, [2,0,0,0,0,9]).unwrap().with_direct_egress(), Err(EncodeError::UnsupportedEgress)));
         // The answer arrives through the switch and leaves untagged by the
         // SoC's port, with the destination translated back.
         let back = NaptBinding::switch_ingress(reply, dnat, mac, mac, [2,0,0,0,0,8]).unwrap().with_direct_egress().unwrap();
@@ -1589,6 +1629,44 @@ mod tests {
         assert_eq!((moved.index(), moved.path), (plain.index(), FlowPath::WanToMxl));
         assert!(matches!(mxl_binding().with_builtin_port(6), Err(EncodeError::UnsupportedEgress)));
         assert!(matches!(outbound_binding().with_builtin_port(0), Err(EncodeError::UnsupportedEgress)));
+    }
+    #[test]
+    fn a_vlan_tag_is_added_in_the_form_each_egress_needs() {
+        const ORIGINAL_TUPLE: Tuple = Tuple { source: [192, 168, 20, 5], destination: [203, 0, 113, 5], source_port: 4000, destination_port: 53 };
+        let word = |b: &NaptBinding, at: usize| u32::from_le_bytes(b.entry.bytes()[at..at + 4].try_into().unwrap());
+        let half = |b: &NaptBinding, at: usize| u16::from_le_bytes(b.entry.bytes()[at..at + 2].try_into().unwrap());
+        let layers = |b: &NaptBinding| (word(b, 0) >> 14 & 7, word(b, 0) & 1 << 18 != 0);
+        // The SoC's own port: one 802.1Q layer carrying the ID.
+        let plain = outbound_binding();
+        let direct = outbound_binding().with_vlan(35).unwrap();
+        assert_eq!((layers(&plain), layers(&direct)), ((0, false), (1, true)));
+        assert_eq!((half(&direct, 44), half(&direct, 46), word(&direct, 16)), (35, 0x0800, word(&plain, 16)));
+        // The MxL: the CPU tag stays in front, the ID is the second layer.
+        let alias = mxl_binding().with_mxl_alias(2).unwrap();
+        let trunk = mxl_binding().with_mxl_alias(2).unwrap().with_vlan(20).unwrap();
+        assert_eq!((layers(&alias), layers(&trunk)), ((1, true), (2, true)));
+        assert_eq!((half(&trunk, 44), half(&trunk, 52), half(&alias, 52)), (0x0c02, 20, 0));
+        // The built-in switch: its port tag carries the ID, marked in the port word.
+        let builtin = mxl_binding().with_builtin_port(2).unwrap().with_vlan(4094).unwrap();
+        assert_eq!(layers(&builtin), (1, false));
+        assert_eq!((half(&builtin, 46), half(&builtin, 44)), (1 << 8 | 1 << 2, 4094));
+        // Nothing else of a rule changes: its match, translation, addresses, bucket.
+        for (with, without) in [(&direct, &plain), (&trunk, &alias)] {
+            assert_eq!((&with.entry.bytes()[4..44], &with.entry.bytes()[48..52], &with.entry.bytes()[54..], with.index(), with.path),
+                (&without.entry.bytes()[4..44], &without.entry.bytes()[48..52], &without.entry.bytes()[54..], without.index(), without.path));
+        }
+        // A rule of the SoC port's own table may leave by that port again,
+        // under another VLAN; it is then no longer one towards a switch.
+        let stick = NaptBinding::direct_ingress(ORIGINAL_TUPLE, ORIGINAL_TUPLE, [2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 9]).unwrap().with_direct_egress().unwrap().with_vlan(10).unwrap();
+        assert_eq!((layers(&stick), half(&stick, 44), word(&stick, 16), stick.path), ((1, true), 10, (2 << 9) | (0xf << 20), FlowPath::WanToMxl));
+        assert!(matches!(NaptBinding::direct_ingress(ORIGINAL_TUPLE, ORIGINAL_TUPLE, [2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 9]).unwrap().with_direct_egress().unwrap().with_mxl_alias(0), Err(EncodeError::UnsupportedEgress)));
+        // Refused: no ID, an ID out of range, a second tag.
+        for vid in [0, 4095, u16::MAX] {
+            assert!(matches!(outbound_binding().with_vlan(vid), Err(EncodeError::UnsupportedEgress)));
+        }
+        assert!(matches!(outbound_binding().with_vlan(5).unwrap().with_vlan(6), Err(EncodeError::UnsupportedEgress)));
+        assert!(matches!(mxl_binding().with_vlan(5).unwrap().with_vlan(6), Err(EncodeError::UnsupportedEgress)));
+        assert!(matches!(mxl_binding().with_builtin_port(0).unwrap().with_vlan(5).unwrap().with_vlan(6), Err(EncodeError::UnsupportedEgress)));
     }
     #[test]
     fn cutoff_returns_a_joined_builtin_switch_to_software_and_leaves_any_other_policy() {

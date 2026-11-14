@@ -10,7 +10,7 @@ pub use fdb::FdbEntry;
 mod lan;
 pub use binding::PortVlanLease;
 pub use domain::{DomainPolicy, DomainProbe, FloodMode, Learning};
-pub use lan::{LanBridgeLease, PortRole, ProductLanBridge};
+pub use lan::{LanBridgeLease, PortRole, PortVlans, ProductLanBridge};
 
 pub trait Io {
     fn read(&mut self, reg: u16) -> Result<u16, mdio::Error>;
@@ -545,6 +545,85 @@ mod tests {
             Mailbox::new(&mut io, 10).wake_copper(4),
             Err(Error::InvalidPort)
         );
+        assert_eq!(io.writes.len(), 1);
+    }
+
+    struct PhyMock {
+        regs: [u16; 96],
+        phy: std::collections::BTreeMap<(u8, u16), u16>,
+        writes: std::vec::Vec<(u8, u16, u16)>,
+        stuck: bool,
+    }
+    impl PhyMock {
+        fn new() -> Self {
+            let phy = [((0, 2), 0xc133), ((0, 3), 0x5528), ((0, 0), 0x3040), ((0, 1), 0x7949), ((0, 4), 0x0de1), ((0, 9), 0x0300), ((7, 0x20), 0x40a2)].into_iter().collect();
+            Self { regs: [0; 96], phy, writes: std::vec::Vec::new(), stuck: false }
+        }
+    }
+    impl Io for PhyMock {
+        fn now(&self) -> u64 {
+            0
+        }
+        fn read(&mut self, r: u16) -> Result<u16, mdio::Error> {
+            Ok(self.regs[r as usize])
+        }
+        fn write(&mut self, r: u16, v: u16) -> Result<(), mdio::Error> {
+            self.regs[r as usize] = v;
+            if r == 0 {
+                let cmd = v & 0x7fff;
+                assert_eq!((self.regs[1], self.regs[3] & 0xff), (6, 2), "six bytes, PHY index 2");
+                let key = ((self.regs[3] >> 8) as u8, self.regs[4]);
+                match cmd {
+                    0x1801 => self.regs[2] = self.phy[&key],
+                    0x1802 => {
+                        self.writes.push((key.0, key.1, self.regs[2]));
+                        if !self.stuck {
+                            // Restart is self-clearing.
+                            self.phy.insert(key, if key == (0, 0) { self.regs[2] & !0x0200 } else { self.regs[2] });
+                        }
+                    }
+                    _ => panic!("command"),
+                }
+                self.regs[0] = cmd;
+                self.regs[1] = 0;
+            }
+            Ok(())
+        }
+    }
+    #[test]
+    fn copper_speed_offers_one_speed_and_restarts_only_on_change() {
+        let mut io = PhyMock::new();
+        // Everything is on offer already: nothing is written.
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, None), Ok(false));
+        assert!(io.writes.is_empty());
+        // 1000 only: 10/100 and 2.5G withdrawn, pause bits and the rest kept.
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(1000)), Ok(true));
+        assert_eq!(io.writes, [(0, 4, 0x0c01), (0, 9, 0x0200), (7, 0x20, 0x4022), (0, 0, 0x3240)]);
+        io.writes.clear();
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(1000)), Ok(false));
+        assert!(io.writes.is_empty());
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(100)), Ok(true));
+        assert_eq!(io.writes, [(0, 4, 0x0d01), (0, 9, 0), (0, 0, 0x3240)]);
+        io.writes.clear();
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(2500)), Ok(true));
+        assert_eq!(io.writes, [(0, 4, 0x0c01), (7, 0x20, 0x40a2), (0, 0, 0x3240)]);
+        io.writes.clear();
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(10)), Ok(true));
+        assert_eq!(io.writes[..2], [(0, 4, 0x0c41), (7, 0x20, 0x4022)]);
+        io.writes.clear();
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, None), Ok(true));
+        assert_eq!(io.writes, [(0, 4, 0x0de1), (0, 9, 0x0200), (7, 0x20, 0x40a2), (0, 0, 0x3240)]);
+        // Refused without touching the PHY: a speed it does not have, a
+        // PHY that is not the identified one, a write that does not stick.
+        io.writes.clear();
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(5000)), Err(Error::InvalidPort));
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(4, None), Err(Error::InvalidPort));
+        io.phy.insert((0, 2), 0x1234);
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(100)), Err(Error::InvalidResponse));
+        assert!(io.writes.is_empty());
+        io.phy.insert((0, 2), 0xc133);
+        io.stuck = true;
+        assert_eq!(Mailbox::new(&mut io, 10).copper_speed(2, Some(100)), Err(Error::ReadbackMismatch));
         assert_eq!(io.writes.len(), 1);
     }
 
@@ -1322,6 +1401,52 @@ impl<'a, I: Io> Mailbox<'a, I> {
             return Ok(after);
         }
         Ok(values)
+    }
+    fn copper_register(&mut self, index: u8, mmd: u8, reg: u16) -> Result<u16, Error> {
+        let [lo, hi] = reg.to_le_bytes();
+        let mut data = [0, 0, index, mmd, lo, hi];
+        self.query(0x1801, &mut data)?;
+        Ok(u16::from_le_bytes([data[0], data[1]]))
+    }
+    fn set_copper_register(&mut self, index: u8, mmd: u8, reg: u16, value: u16) -> Result<(), Error> {
+        let ([lo, hi], [reg_lo, reg_hi]) = (value.to_le_bytes(), reg.to_le_bytes());
+        self.execute(0x1802, &mut [lo, hi, index, mmd, reg_lo, reg_hi], false)
+    }
+    /// Hold the identified copper PHY to one speed (10, 100, 1000 or 2500
+    /// Mbit/s, full duplex), or with `None` let it offer everything it has.
+    /// Negotiation stays on: the link partner is told the one speed. Only a
+    /// change restarts negotiation; the return value says whether one did.
+    pub fn copper_speed(&mut self, index: u8, speed: Option<u32>) -> Result<bool, Error> {
+        if !matches!(speed, None | Some(10 | 100 | 1000 | 2500)) {
+            return Err(Error::InvalidPort);
+        }
+        if self.copper_phy(index)?[..2] != [0xc133, 0x5528] {
+            return Err(Error::InvalidResponse);
+        }
+        // Clause 22 registers 4 and 9, and the 2.5G bit of 7.32.
+        let offers = |fixed: u32| speed.is_none_or(|speed| speed == fixed);
+        let wanted = [
+            (0u8, 4u16, 0x01e0u16, if speed.is_none() { 0x01e0 } else { u16::from(offers(10)) << 6 | u16::from(offers(100)) << 8 }),
+            (0, 9, if speed.is_none() { 0x0200 } else { 0x0300 }, u16::from(offers(1000)) << 9),
+            (7, 0x20, 0x0080, u16::from(offers(2500)) << 7),
+        ];
+        let mut changed = false;
+        for (mmd, reg, mask, bits) in wanted {
+            let old = self.copper_register(index, mmd, reg)?;
+            let new = (old & !mask) | bits;
+            if new != old {
+                self.set_copper_register(index, mmd, reg, new)?;
+                if self.copper_register(index, mmd, reg)? & mask != bits {
+                    return Err(Error::ReadbackMismatch);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            let control = self.copper_register(index, 0, 0)?;
+            self.set_copper_register(index, 0, 0, (control & !0x0800) | 0x1200)?;
+        }
+        Ok(changed)
     }
     /// Own the two per-port switch DMA enable bits; preserve all other bits.
     pub fn enable_port_data(&mut self, port: crate::mxl_tag::Port) -> Result<(), Error> {

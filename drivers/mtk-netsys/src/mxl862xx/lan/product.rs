@@ -17,9 +17,31 @@ pub enum PortRole {
     Off,
 }
 
+/// The VLANs an isolated port exchanges with the CPU: whether untagged
+/// frames pass, and which VLAN IDs do (0: an empty place). Every other
+/// frame is dropped at the port. A tagged frame reaches the CPU with the
+/// port's CPU tag in front of its own, and is sent the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortVlans {
+    pub untagged: bool,
+    pub vids: [u16; 5],
+}
+impl PortVlans {
+    /// Untagged frames only.
+    pub const PLAIN: Self = Self { untagged: true, vids: [0; 5] };
+    fn count(&self) -> u16 {
+        self.vids.iter().filter(|vid| **vid != 0).count() as u16
+    }
+    fn valid(&self) -> bool {
+        self.vids.iter().enumerate().all(|(i, vid)| *vid == 0
+            || ((1..=4094).contains(vid) && !(0xc00..=0xc0f).contains(vid) && !self.vids[..i].contains(vid)))
+    }
+}
+
 pub struct ProductLanBridge {
     router_mac: [u8; 6],
     roles: [PortRole; 4],
+    vlans: [PortVlans; 4],
     wan_domain: Option<u16>,
     stage: &'static str,
     started: bool,
@@ -36,6 +58,7 @@ impl ProductLanBridge {
         Self {
             router_mac,
             roles,
+            vlans: [PortVlans::PLAIN; 4],
             wan_domain: None,
             stage: "new",
             started: false,
@@ -43,6 +66,15 @@ impl ProductLanBridge {
             domain: None,
             blocks: [None; 6],
         }
+    }
+    /// Give isolated ports VLANs. A port of the LAN bridge takes none: the
+    /// switch's own bridge forwards untagged frames only.
+    pub const fn with_vlans(mut self, vlans: [PortVlans; 4]) -> Self {
+        self.vlans = vlans;
+        self
+    }
+    pub fn vlans(&self) -> [PortVlans; 4] {
+        self.vlans
     }
     pub fn stage(&self) -> &'static str {
         self.stage
@@ -71,6 +103,9 @@ impl ProductLanBridge {
     }
     fn acquire(&mut self, hw: &mut impl ProductBackend) -> Result<(), Error> {
         if self.started || self.router_mac == [0; 6] || self.router_mac[0] & 1 != 0 {
+            return Err(Error::InvalidState);
+        }
+        if (0..4).any(|c| !self.vlans[c].valid() || (self.vlans[c] != PortVlans::PLAIN && self.roles[c] != PortRole::Wan)) {
             return Err(Error::InvalidState);
         }
         self.started = true;
@@ -125,10 +160,11 @@ impl ProductLanBridge {
             hw.domain_set(wan_id)?;
         }
         for slot in 0..6 {
+            let tagged_ports = self.vlans.iter().filter(|v| v.count() != 0).count() as u16;
             let count = match slot {
-                0..=3 => 3,
+                0..=3 => 3 + self.vlans[slot].count(),
                 4 => 10,
-                _ => 7,
+                _ => 7 + tagged_ports,
             };
             self.stage = "vlan-allocate";
             let allocation = hw.alloc(count)?;
@@ -142,14 +178,13 @@ impl ProductLanBridge {
             }
             self.stage = "vlan-rules";
             if slot < 4 {
-                for (i, rule) in [
-                    Rule::PushUntagged(COPPER[slot]),
-                    Rule::DropAnyDoubleTagged,
-                    Rule::DropAnySingleTagged,
-                ]
-                .into_iter()
-                .enumerate()
-                {
+                // Untagged frames and each listed VLAN get the CPU tag;
+                // everything else is dropped here. A rule that names a VLAN
+                // comes before the ones for any tag.
+                let vlans = self.vlans[slot];
+                let first = if vlans.untagged { Rule::PushUntagged(COPPER[slot]) } else { Rule::DropUntagged };
+                let listed = vlans.vids.into_iter().filter(|vid| *vid != 0).map(|vid| Rule::PushTagged(COPPER[slot], vid));
+                for (i, rule) in core::iter::once(first).chain(listed).chain([Rule::DropAnyDoubleTagged, Rule::DropAnySingleTagged]).enumerate() {
                     hw.rule(bid, i as u16, rule)?;
                 }
             } else if slot == 4 {
@@ -160,12 +195,14 @@ impl ProductLanBridge {
                 hw.rule(bid, 8, Rule::DropDoubleTagged)?;
                 hw.rule(bid, 9, Rule::DropSingleTagged)?;
             } else {
-                for (i, p) in COPPER.into_iter().enumerate() {
-                    hw.rule(bid, i as u16, Rule::ClassifyCpu(p))?;
+                // The CPU reaches a port with that port's tag; a second tag
+                // behind it only towards a port that has VLANs.
+                let tagged = COPPER.into_iter().enumerate().filter(|(c, _)| self.vlans[*c].count() != 0).map(|(_, p)| Rule::ClassifyCpuTagged(p));
+                let rules = COPPER.into_iter().map(Rule::ClassifyCpu).chain(tagged)
+                    .chain([Rule::DropAnyDoubleTagged, Rule::DropAnySingleTagged, Rule::DropUntagged]);
+                for (i, rule) in rules.enumerate() {
+                    hw.rule(bid, i as u16, rule)?;
                 }
-                hw.rule(bid, 4, Rule::DropAnyDoubleTagged)?;
-                hw.rule(bid, 5, Rule::DropAnySingleTagged)?;
-                hw.rule(bid, 6, Rule::DropUntagged)?;
             }
         }
         self.stage = "fdb-find";
@@ -189,14 +226,14 @@ impl ProductLanBridge {
                 [0; 7],
             )?;
             if i < 4 {
-                hw.binding(p, true, (true, block(self.blocks[i].unwrap()), 3))?;
+                hw.binding(p, true, (true, block(self.blocks[i].unwrap()), 3 + self.vlans[i].count()))?;
                 hw.binding(p, false, (true, block(self.blocks[4].unwrap()), 10))?;
             }
         }
         // CPU ingress classifies tags to aliases 17..20; CPU egress is
         // transparent. Unclassified CPU traffic cannot use bridge 9's map.
         self.stage = "cpu-path";
-        hw.cpu_path(block(self.blocks[5].unwrap()), 7)?;
+        hw.cpu_path(block(self.blocks[5].unwrap()), 7 + self.vlans.iter().filter(|v| v.count() != 0).count() as u16)?;
         self.stage = "open-maps";
         let members = (0..4).filter(|c| self.roles[*c] == PortRole::Lan).fold(0u16, |bits, c| bits | 2 << c);
         for (i, p) in PORTS.into_iter().enumerate() {
@@ -345,6 +382,7 @@ mod tests {
         fail_at: usize,
         duplicate: bool,
         roles: [PortRole; 4],
+        vlans: [PortVlans; 4],
         domains: u16,
         same_domain: bool,
     }
@@ -385,6 +423,7 @@ mod tests {
                 fail_at: usize::MAX,
                 duplicate: false,
                 roles: [PortRole::Lan; 4],
+                vlans: [PortVlans::PLAIN; 4],
                 domains: 0,
                 same_domain: false,
             }
@@ -431,15 +470,19 @@ mod tests {
                 assert_eq!(s.learning.source_learning_disabled, i >= 4 || role != PortRole::Lan, "port {p}");
                 assert_eq!(s.learning.destination_lookup_disabled, i >= 4 && !entry_alias, "port {p}");
                 if i < 4 {
+                    // Stated independently: untagged frames pass unless the
+                    // port is tagged-only, then exactly its VLANs, then nothing.
                     let r = &self.blocks[&s.bridge.ingress_vlan.1];
-                    assert!(matches!(
-                        r.as_slice(),
-                        [
-                            Rule::PushUntagged(_),
-                            Rule::DropAnyDoubleTagged,
-                            Rule::DropAnySingleTagged
-                        ]
-                    ));
+                    let vlans = self.vlans[i];
+                    let listed: Vec<u16> = vlans.vids.into_iter().filter(|v| *v != 0).collect();
+                    assert_eq!((s.bridge.ingress_vlan.0, s.bridge.ingress_vlan.2 as usize), (true, r.len()));
+                    assert_eq!(r.len(), 3 + listed.len(), "port {p}");
+                    assert!(if vlans.untagged { matches!(r[0], Rule::PushUntagged(q) if q.dt_index() == i as u8) } else { matches!(r[0], Rule::DropUntagged) }, "port {p}");
+                    for (n, vid) in listed.iter().enumerate() {
+                        assert!(matches!(r[1 + n], Rule::PushTagged(q, v) if q.dt_index() == i as u8 && v == *vid), "port {p}");
+                    }
+                    assert!(matches!(r[1 + listed.len()..], [Rule::DropAnyDoubleTagged, Rule::DropAnySingleTagged]), "port {p}");
+                    assert!(listed.is_empty() || role == PortRole::Wan, "only an isolated port has VLANs");
                     assert_eq!(self.blocks[&s.bridge.egress_vlan.1].len(), 10);
                 }
             }
@@ -552,12 +595,18 @@ mod tests {
         }
         fn cpu_path(&mut self, block: u16, count: u16) -> Result<(), Error> {
             let rules = &self.blocks[&block];
-            assert_eq!(count, 7);
+            assert_eq!(count as usize, rules.len());
             for (i, r) in rules[..4].iter().enumerate() {
                 assert!(matches!(r,Rule::ClassifyCpu(p) if p.dt_index()==i as u8));
             }
+            // A second tag behind the CPU tag only towards ports with VLANs.
+            let tagged: Vec<u8> = (0..4u8).filter(|c| self.vlans[*c as usize].vids.iter().any(|v| *v != 0)).collect();
+            assert_eq!(rules.len(), 7 + tagged.len());
+            for (r, c) in rules[4..].iter().zip(&tagged) {
+                assert!(matches!(r, Rule::ClassifyCpuTagged(p) if p.dt_index() == *c));
+            }
             assert!(matches!(
-                &rules[4..],
+                &rules[4 + tagged.len()..],
                 [
                     Rule::DropAnyDoubleTagged,
                     Rule::DropAnySingleTagged,
@@ -630,6 +679,48 @@ mod tests {
         let mut o = ProductLanBridge::with_roles([2, 0x42, 0x70, 4, 0, 2], m.roles);
         assert!(o.acquire(&mut m).is_err());
         assert!(!o.active() && !m.enabled);
+    }
+    #[test]
+    fn isolated_ports_take_listed_vlans_and_nothing_else() {
+        use PortRole::*;
+        let mac = [2, 0x42, 0x70, 4, 0, 2];
+        let trunk = PortVlans { untagged: true, vids: [20, 30, 0, 0, 0] };
+        let only = PortVlans { untagged: false, vids: [0, 7, 0, 0, 4094] };
+        for (roles, vlans) in [
+            ([Wan, Lan, Lan, Lan], [trunk, PortVlans::PLAIN, PortVlans::PLAIN, PortVlans::PLAIN]),
+            ([Lan, Wan, Off, Wan], [PortVlans::PLAIN, only, PortVlans::PLAIN, trunk]),
+            ([Wan, Wan, Wan, Wan], [trunk, only, PortVlans::PLAIN, PortVlans { untagged: false, vids: [1, 2, 3, 4, 5] }]),
+        ] {
+            let mut m = Model::new();
+            (m.roles, m.vlans) = (roles, vlans);
+            let mut o = ProductLanBridge::with_roles(mac, roles).with_vlans(vlans);
+            o.acquire(&mut m).unwrap_or_else(|e| panic!("{roles:?}: {e:?} at {}", o.stage()));
+            assert!(o.active() && m.enabled && o.vlans() == vlans);
+            m.ready();
+            for fail in 1..=m.calls {
+                let mut broken = Model::new();
+                (broken.roles, broken.vlans, broken.fail_at) = (roles, vlans, fail);
+                let mut o = ProductLanBridge::with_roles(mac, roles).with_vlans(vlans);
+                assert!(o.acquire(&mut broken).is_err(), "{roles:?} call {fail}");
+                assert!(!o.active() && !broken.enabled, "{roles:?} call {fail}");
+            }
+        }
+        // Refused before anything is touched: VLANs on a port of the LAN
+        // bridge or on an unused one, an ID out of range, one of the CPU
+        // tags' own, the same ID twice.
+        for (roles, bad) in [
+            ([Lan, Lan, Lan, Lan], trunk),
+            ([Off, Lan, Lan, Lan], trunk),
+            ([Lan, Lan, Lan, Lan], PortVlans { untagged: false, vids: [0; 5] }),
+            ([Wan, Lan, Lan, Lan], PortVlans { untagged: true, vids: [4095, 0, 0, 0, 0] }),
+            ([Wan, Lan, Lan, Lan], PortVlans { untagged: true, vids: [0xc02, 0, 0, 0, 0] }),
+            ([Wan, Lan, Lan, Lan], PortVlans { untagged: true, vids: [9, 0, 9, 0, 0] }),
+        ] {
+            let mut m = Model::new();
+            let mut o = ProductLanBridge::with_roles(mac, roles).with_vlans([bad, PortVlans::PLAIN, PortVlans::PLAIN, PortVlans::PLAIN]);
+            assert!(o.acquire(&mut m).is_err(), "{roles:?} {bad:?}");
+            assert!(!o.active() && !m.enabled && m.calls == 0 && m.blocks.is_empty());
+        }
     }
     #[test]
     fn refuses_inherited_configuration_and_aliased_vlan_allocations() {

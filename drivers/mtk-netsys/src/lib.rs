@@ -274,8 +274,8 @@ impl<I: Io> Nic<I> {
         let (fport, min_frame, max_frame, padded_min) = match port {
             TxPort::Internal => (1, 14, 1514, 60),
             TxPort::InternalTagged => (1, 18, 1518, 64),
-            TxPort::Wan => (2, 14, 1514, 60),
-            TxPort::ExternalTagged => (15, 18, 1518, 64),
+            TxPort::Wan => (2, 14, 1518, 60),
+            TxPort::ExternalTagged => (15, 18, 1522, 64),
         };
         if !(min_frame..=max_frame).contains(&packet.len()) {
             return Err(Error::Length);
@@ -333,8 +333,8 @@ impl<I: Io> Nic<I> {
         let (fport, minimum, maximum, padded) = match port {
             TxPort::Internal => (1, 14, 1514, 60),
             TxPort::InternalTagged => (1, 18, 1518, 64),
-            TxPort::Wan => (2, 14, 1514, 60),
-            TxPort::ExternalTagged => (15, 18, 1518, 64),
+            TxPort::Wan => (2, 14, 1518, 60),
+            TxPort::ExternalTagged => (15, 18, 1522, 64),
         };
         if !(minimum..=maximum).contains(&length) {
             return Err(Error::Length);
@@ -478,8 +478,8 @@ impl<I: Io> Nic<I> {
                     TxPort::InternalTagged => (1, 18, 1518, 64),
                 TxPort::InternalTagged => (1, 18, 1518, 64),
             TxPort::InternalTagged => (1, 18, 1518, 64),
-                    TxPort::Wan => (2, 14, 1514, 60),
-                    TxPort::ExternalTagged => (15, 18, 1518, 64),
+                    TxPort::Wan => (2, 14, 1518, 60),
+                    TxPort::ExternalTagged => (15, 18, 1522, 64),
                 };
                 if !(minimum..=maximum).contains(&output) || output + offset > length.saturating_add(4 + self.rx_headroom) {
                     self.recycle_deferred(pending);
@@ -1158,7 +1158,7 @@ mod tests {
         assert_eq!(
             n.transmit_with(|_| RxAction::Transmit {
                 port: TxPort::Wan,
-                length: 1515
+                length: 1519
             }),
             Err(Error::Length)
         );
@@ -1262,7 +1262,7 @@ mod tests {
                     .all(|b| *b == 0));
             }
         }
-        assert_eq!(n.transmit_to(TxPort::Wan, &[0; 1515]), Err(Error::Length));
+        assert_eq!(n.transmit_to(TxPort::Wan, &[0; 1519]), Err(Error::Length));
         n.io.set_word(RX + 4, DONE | LAST | (60 << 8));
         n.io.set_word(RX + 16, 2 << 26);
         assert_eq!(
@@ -1301,9 +1301,9 @@ mod tests {
         assert_eq!(n.io.word(16), 15 << 16);
         assert_eq!(n.io.word(4), LAST | (64 << 8));
         assert_eq!(&n.io.dma[POOL + 46..POOL + 64], &[0; 18]);
-        n.transmit_to(TxPort::ExternalTagged, &[8; 1518]).unwrap();
+        n.transmit_to(TxPort::ExternalTagged, &[8; 1522]).unwrap();
         assert_eq!(
-            n.transmit_to(TxPort::ExternalTagged, &[0; 1519]),
+            n.transmit_to(TxPort::ExternalTagged, &[0; 1523]),
             Err(Error::Length)
         );
         // A later internal frame must not inherit a previous ring destination.

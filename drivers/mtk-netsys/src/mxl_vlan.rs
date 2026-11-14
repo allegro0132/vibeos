@@ -8,9 +8,14 @@ pub(crate) enum Rule {
     PushUntagged(Port),
     PushSingleTagged(Port),
     PushDoubleTagged(Port),
+    /// A frame with exactly one tag, of this VLAN ID, gets the port's CPU
+    /// tag in front of it.
+    PushTagged(Port, u16),
     PopOuter(Port),
     PopOuterTagged(Port),
     ClassifyCpu(Port),
+    /// As `ClassifyCpu`, for a frame with one more tag behind the CPU tag.
+    ClassifyCpuTagged(Port),
     DropUntagged,
     DropAnySingleTagged,
     DropAnyDoubleTagged,
@@ -45,17 +50,26 @@ impl Rule {
                 word(86, 2); // treatment DEI zero
                 b[65] = 1; // add outer VLAN
             }
-            Self::PopOuter(port) | Self::PopOuterTagged(port) | Self::ClassifyCpu(port) => {
+            Self::PushTagged(port, vid) => {
+                word(19, vid as u32);
+                word(23, 1); // filter TPID 802.1Q
+                word(78, port.vid() as u32);
+                word(82, 3); // treatment TPID 802.1Q
+                word(86, 2); // treatment DEI zero
+                b[18] = 1; // match outer VID
+                b[65] = 1; // add outer VLAN
+            }
+            Self::PopOuter(port) | Self::PopOuterTagged(port) | Self::ClassifyCpu(port) | Self::ClassifyCpuTagged(port) => {
                 word(19, port.vid() as u32);
                 word(23, 1); // filter TPID 802.1Q
                 if matches!(self, Self::PopOuter(_) | Self::PopOuterTagged(_)) {
                     word(57, 1);
                 }
-                if matches!(self, Self::PopOuterTagged(_)) {
+                if matches!(self, Self::PopOuterTagged(_) | Self::ClassifyCpuTagged(_)) {
                     word(31, 1);
                 }
                 b[18] = 1; // match outer VID
-                if matches!(self, Self::ClassifyCpu(_)) {
+                if matches!(self, Self::ClassifyCpu(_) | Self::ClassifyCpuTagged(_)) {
                     b[115] = 1;
                     b[116..118].copy_from_slice(&(port.dt_index() as u16 + 17).to_le_bytes());
                 }
@@ -94,10 +108,11 @@ impl Rule {
             Self::PushSingleTagged(p) | Self::PushDoubleTagged(p) => {
                 (1, false, 0, 0, 0, true, p.vid() as u32, 3, 2, false, 0)
             }
+            Self::PushTagged(p, vid) => (0, true, vid as u32, 1, 0, true, p.vid() as u32, 3, 2, false, 0),
             Self::PopOuter(p) | Self::PopOuterTagged(p) => {
                 (0, true, p.vid() as u32, 1, 1, false, 0, 0, 0, false, 0)
             }
-            Self::ClassifyCpu(p) => (
+            Self::ClassifyCpu(p) | Self::ClassifyCpuTagged(p) => (
                 0,
                 true,
                 p.vid() as u32,
@@ -122,7 +137,7 @@ impl Rule {
             && got.inner_filter
                 == if matches!(
                     self,
-                    Self::PushDoubleTagged(_) | Self::PopOuterTagged(_) | Self::DropDoubleTagged | Self::DropAnyDoubleTagged
+                    Self::PushDoubleTagged(_) | Self::PopOuterTagged(_) | Self::ClassifyCpuTagged(_) | Self::DropDoubleTagged | Self::DropAnyDoubleTagged
                 ) {
                     1
                 } else {
@@ -161,6 +176,18 @@ mod tests {
         let b = Rule::PopOuter(Port::Copper0).encode(4, 0);
         assert_eq!(&b[57..61], &[1, 0, 0, 0]);
         assert_eq!(b[65], 0);
+        // One tag of VLAN 20 on copper 2: matched by ID, CPU tag added in front.
+        let b = Rule::PushTagged(Port::Copper2, 20).encode(4, 1);
+        assert_eq!(&b[9..13], &[0, 0, 0, 0]);
+        assert_eq!(b[18], 1);
+        assert_eq!(&b[19..27], &[20, 0, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&b[31..35], &[3, 0, 0, 0]);
+        assert_eq!((b[57], b[65]), (0, 1));
+        assert_eq!(&b[78..90], &[2, 12, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0]);
+        let b = Rule::ClassifyCpuTagged(Port::Copper3).encode(4, 1);
+        assert_eq!(&b[19..27], &[3, 12, 0, 0, 1, 0, 0, 0]);
+        assert_eq!(&b[31..35], &[1, 0, 0, 0]);
+        assert_eq!(&b[115..118], &[1, 20, 0]);
         let b = Rule::DropSingleTagged.encode(4, 3);
         assert_eq!(b[9], 2);
         assert_eq!(b[57], 3);

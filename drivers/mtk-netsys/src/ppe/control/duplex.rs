@@ -13,6 +13,10 @@ struct Pair {
     wan: Session,
     lan: Session,
     wan_mac: [u8; 6],
+    /// The built-in switch's GDMA is a second ingress of the MxL table: it
+    /// was handing every frame to PDMA and carried the MxL ingress address
+    /// when the pair was prepared. Admitted and closed together with MxL.
+    internal: bool,
 }
 pub struct PausedPair(Pair);
 pub struct ActivePair(Pair);
@@ -86,7 +90,11 @@ impl Pair {
             && self.wan.path == FlowPath::WanToMxl
             && mac_matches(io, WAN, self.wan_mac)
             && mac_matches(io, 0x540, mac)
-            && super::internal_bypasses(io.read(0x500))
+            && if self.internal {
+                matches!(io.read(0x500), super::INTERNAL_CPU | super::INTERNAL_ADMIT) && mac_matches(io, 0x500, mac)
+            } else {
+                super::internal_bypasses(io.read(0x500))
+            }
             && spare.table_base == 0
             && spare.cache == 0
             && !spare.busy()
@@ -102,6 +110,7 @@ impl Pair {
         let lan = io.read(0x540);
         if wan != if wan_active { 0x20713000 } else { 0x20710000 }
             || lan != if lan_active { 0x20714000 } else { 0x20710000 }
+            || (self.internal && io.read(0x500) != if lan_active { super::INTERNAL_ADMIT } else { super::INTERNAL_CPU })
         {
             return false;
         }
@@ -183,11 +192,11 @@ pub unsafe fn prepare(
             Some(&wan),
         )
     } {
-        StartOutcome::Active(lan) => PrepareOutcome::Paused(PausedPair(Pair {
-            wan: wan.0,
-            lan,
-            wan_mac,
-        })),
+        StartOutcome::Active(lan) => {
+            let internal = matches!(lan.path, FlowPath::MxlToWan(mac)
+                if io.read(0x500) == super::INTERNAL_CPU && mac_matches(io, 0x500, mac));
+            PrepareOutcome::Paused(PausedPair(Pair { wan: wan.0, lan, wan_mac, internal }))
+        }
         StartOutcome::Failed(outcome) => {
             let (t, e) = failed_table(outcome);
             PrepareOutcome::Failed(PairOutcome::Quarantined(fail(io, [wan.0.table, t], e)))
@@ -195,6 +204,8 @@ pub unsafe fn prepare(
     }
 }
 impl PausedPair {
+    /// Whether the built-in switch's GDMA is admitted with the MxL ingress.
+    pub fn internal_joined(&self) -> bool { self.0.internal }
     pub fn initial_ticket(&self, direction: Direction) -> Option<RuleTicket> {
         match direction {
             Direction::Inbound => self.0.wan.initial_ticket(),
@@ -212,6 +223,7 @@ impl PausedPair {
         }
         let result = write_checked(io, WAN, 0x20713000)
             .and_then(|_| write_checked(io, 0x540, 0x20714000))
+            .and_then(|_| if self.0.internal { write_checked(io, 0x500, super::INTERNAL_ADMIT) } else { Ok(()) })
             .and_then(|_| {
                 if self.0.valid(io, true) {
                     Ok(())
@@ -233,7 +245,7 @@ impl PausedPair {
         if !self.0.valid(io, false) {
             return PairEditOutcome::Failed(fail(io, self.0.tables(), Error::Preconditions));
         }
-        let Pair { wan, lan, wan_mac } = self.0;
+        let Pair { wan, lan, wan_mac, internal } = self.0;
         let (selected, peer) = match direction {
             Direction::Inbound => (wan, lan),
             Direction::Outbound => (lan, wan),
@@ -243,11 +255,13 @@ impl PausedPair {
                 wan: selected,
                 lan: peer,
                 wan_mac,
+                internal,
             },
             Direction::Outbound => Pair {
                 wan: peer,
                 lan: selected,
                 wan_mac,
+                internal,
             },
         };
         match operation(PausedSession(selected), io) {
@@ -302,6 +316,45 @@ impl PausedPair {
                 PairEditOutcome::Failed(q)=>PairEditOutcome::Failed(q),
                 PairEditOutcome::Rejected(p,_)=>PairEditOutcome::Failed(fail(io,p.0.tables(),Error::Preconditions)),
             },
+        }
+    }
+    /// Publish both rules of a connection routed between two inside hosts:
+    /// both enter through the MxL-ingress table. As for `insert_connection`,
+    /// rejection of the second rolls the first back.
+    /// # Safety
+    /// Preserve the pair contract and validate both new directional authorities.
+    pub unsafe fn insert_inside_connection(
+        self, io: &mut impl Registers, timeout: u64,
+        one: &NaptBinding, other: &NaptBinding,
+    ) -> PairEditOutcome<[RuleTicket; 2]> {
+        let (paused, first) = match unsafe { self.insert_napt(io,timeout,Direction::Outbound,one) } {
+            PairEditOutcome::Updated(p,t)=>(p,t),
+            PairEditOutcome::Rejected(p,e)=>return PairEditOutcome::Rejected(p,e),
+            PairEditOutcome::Failed(q)=>return PairEditOutcome::Failed(q),
+        };
+        match unsafe {paused.insert_napt(io,timeout,Direction::Outbound,other)} {
+            PairEditOutcome::Updated(p,t)=>PairEditOutcome::Updated(p,[first,t]),
+            PairEditOutcome::Failed(q)=>PairEditOutcome::Failed(q),
+            PairEditOutcome::Rejected(p,e)=>match unsafe {p.remove_napt(io,timeout,Direction::Outbound,first)} {
+                PairEditOutcome::Updated(p,())=>PairEditOutcome::Rejected(p,e),
+                PairEditOutcome::Failed(q)=>PairEditOutcome::Failed(q),
+                PairEditOutcome::Rejected(p,_)=>PairEditOutcome::Failed(fail(io,p.0.tables(),Error::Preconditions)),
+            },
+        }
+    }
+    /// Reclaim both rules of one routed inside connection after pause/drain.
+    /// # Safety
+    /// As for `remove_connections`.
+    pub unsafe fn remove_inside_connection(
+        self, io: &mut impl Registers, timeout: u64, tickets: [RuleTicket;2],
+    ) -> PairEditOutcome<()> {
+        match unsafe {self.remove_napt(io,timeout,Direction::Outbound,tickets[0])} {
+            PairEditOutcome::Updated(p,())=>match unsafe {p.remove_napt(io,timeout,Direction::Outbound,tickets[1])} {
+                // Half a connection must not stay published.
+                PairEditOutcome::Rejected(p,_)=>PairEditOutcome::Failed(fail(io,p.0.tables(),Error::Preconditions)),
+                other=>other,
+            },
+            other=>other,
         }
     }
     /// Reclaim a bounded batch of complete connections after pause/drain.
@@ -936,6 +989,69 @@ mod tests {
         }
     }
     #[test]
+    fn routed_inside_connection_lives_in_the_mxl_table_beside_translated_ones() {
+        let mut io = Io::new();
+        let p = prepared(&mut io);
+        let tuple = Tuple { source: [192,168,79,100], destination: [192,168,20,50], source_port: 40000, destination_port: 53000 };
+        let back = Tuple { source: tuple.destination, destination: tuple.source, source_port: tuple.destination_port, destination_port: tuple.source_port };
+        let rules = [
+            NaptBinding::mxl_lan_to_inside(tuple, LAN_MAC, LAN_MAC, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap(),
+            NaptBinding::mxl_lan_to_inside(back, LAN_MAC, LAN_MAC, [2,0,0,0,0,8]).unwrap().with_mxl_alias(0).unwrap(),
+        ];
+        let PairEditOutcome::Updated(p, tickets) = (unsafe { p.insert_inside_connection(&mut io, 10, &rules[0], &rules[1]) }) else { panic!("insert") };
+        assert_ne!(tickets[0], tickets[1]);
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 3));
+        // The same tuple twice is refused whole, leaving nothing behind.
+        let PairEditOutcome::Rejected(p, _) = (unsafe { p.insert_inside_connection(&mut io, 10, &rules[1], &rules[0]) }) else { panic!("duplicate") };
+        assert_eq!(p.0.lan.table.nonzero_entries(), 3);
+        let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume") };
+        assert!(a.admitted(&mut io));
+        let PairPauseOutcome::Paused(p) = (unsafe { a.pause(&mut io, 10) }) else { panic!("pause") };
+        let PairEditOutcome::Updated(p, ()) = (unsafe { p.remove_inside_connection(&mut io, 10, tickets) }) else { panic!("remove") };
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 1));
+        // Stale tickets are refused before anything changes.
+        let PairEditOutcome::Rejected(p, _) = (unsafe { p.remove_inside_connection(&mut io, 10, tickets) }) else { panic!("stale") };
+        assert!(matches!(unsafe { p.stop(&mut io, 10) }, PairOutcome::Restored(_)));
+    }
+    #[test]
+    fn builtin_switch_joins_the_mxl_ingress_only_with_its_address_and_follows_admission() {
+        // Open to software without the MxL ingress address: left alone.
+        let mut io = Io::new();
+        io.regs.insert(0x500, 0xc0700000);
+        let p = prepared(&mut io);
+        assert!(!p.internal_joined());
+        let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume") };
+        assert!(a.admitted(&mut io));
+        assert_eq!(io.regs[&0x500], 0xc0700000);
+        assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(0x500, _))));
+        assert!(matches!(unsafe { a.stop(&mut io, 10) }, PairOutcome::Restored(_)));
+        // With it: admitted to PPE1 beside the MxL, closed with it, and any
+        // other value while the pair lives is a lost precondition.
+        let mut io = Io::new();
+        for (r, v) in [(0x500, 0xc0700000), (0x508, 0x70040002), (0x50c, 0x0242)] { io.regs.insert(r, v); }
+        let p = prepared(&mut io);
+        assert!(p.internal_joined());
+        assert_eq!(io.regs[&0x500], 0xc0700000);
+        let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume") };
+        assert_eq!((io.regs[&0x500], io.regs[&0x540], io.regs[&WAN]), (0xc1704000, 0x20714000, 0x20713000));
+        assert!(a.admitted(&mut io));
+        for bad in [0xc0700000, 0x20717777, 0xc0703000] {
+            io.regs.insert(0x500, bad);
+            assert!(!a.admitted(&mut io), "{bad:x}");
+        }
+        io.regs.insert(0x500, 0xc1704000);
+        let PairPauseOutcome::Paused(p) = (unsafe { a.pause(&mut io, 10) }) else { panic!("pause") };
+        assert_eq!((io.regs[&0x500], io.regs[&0x540], io.regs[&WAN]), (0xc0700000, 0x20710000, 0x20710000));
+        let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume again") };
+        assert_eq!(io.regs[&0x500], 0xc1704000);
+        assert!(matches!(unsafe { a.stop(&mut io, 10) }, PairOutcome::Restored(_)));
+        assert_eq!(io.regs[&0x500], 0xc0700000);
+        // A changed address after preparation is a lost precondition too.
+        let p = prepared(&mut io);
+        io.regs.insert(0x508, 0);
+        assert!(matches!(unsafe { p.resume(&mut io) }, ResumeOutcome::Failed(_)));
+    }
+    #[test]
     fn partial_resume_failure_closes_both_before_readbacks() {
         for failed in [1, 2] {
             let mut io = Io::new();
@@ -947,10 +1063,11 @@ mod tests {
             io.closed();
             assert!(q.cutoff_error.is_none());
             assert_eq!(
-                &io.ops[io.ops.len() - 5..],
+                &io.ops[io.ops.len() - 6..],
                 &[
                     Op::Write(WAN, 0x20710000),
                     Op::Write(0x540, 0x20710000),
+                    Op::Read(0x500),
                     Op::Barrier,
                     Op::Read(WAN),
                     Op::Read(0x540)
@@ -1080,10 +1197,11 @@ mod tests {
                 })
             );
             assert_eq!(
-                &io.ops[begin..begin + 3],
+                &io.ops[begin..begin + 4],
                 &[
                     Op::Write(WAN, 0x20710000),
                     Op::Write(0x540, 0x20710000),
+                    Op::Read(0x500),
                     Op::Barrier
                 ]
             );

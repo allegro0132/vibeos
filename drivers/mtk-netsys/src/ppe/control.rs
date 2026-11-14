@@ -30,6 +30,7 @@ pub fn configuration_register(offset: usize) -> bool {
     matches!(
         offset,
         0x1500
+            | 0x500
             | 0x540
             | 0x2200
             | 0x2204
@@ -96,18 +97,30 @@ impl IngressCutoff {
     pub unsafe fn close(self, io: &mut impl Registers) -> Result<(), CutoffFailure> {
         io.write(0x1500, self.wan);
         if let Some(value) = self.mxl { io.write(0x540, value); }
+        // A built-in switch that joined the MxL table returns to PDMA with
+        // it. Any other policy there is not this cutoff's to touch.
+        let internal = self.mxl.is_some() && io.read(0x500) == INTERNAL_ADMIT;
+        if internal { io.write(0x500, INTERNAL_CPU); }
         io.barrier();
         let wan = io.read(0x1500) != self.wan;
-        let mxl = self.mxl.is_some_and(|value| io.read(0x540) != value);
+        let mxl = self.mxl.is_some_and(|value| io.read(0x540) != value)
+            || (internal && io.read(0x500) != INTERNAL_CPU);
         if wan || mxl { Err(CutoffFailure { wan, mxl }) } else { Ok(()) }
     }
     /// Observe both selected CPU policies, without touching FOE memory.
     pub fn closed(self, io: &mut impl Registers) -> bool {
         let wan = io.read(0x1500) == self.wan;
-        let mxl = self.mxl.is_none_or(|value| io.read(0x540) == value);
+        let mxl = self.mxl.is_none_or(|value| {
+            let (mxl, internal) = (io.read(0x540), io.read(0x500));
+            mxl == value && internal != INTERNAL_ADMIT
+        });
         wan && mxl
     }
 }
+/// Built-in switch GDMA policy: every class to PDMA, and the same with the
+/// router's own unicast admitted to PPE1 beside the MxL ingress.
+pub(super) const INTERNAL_CPU: u32 = 0xc0700000;
+pub(super) const INTERNAL_ADMIT: u32 = 0xc1704000;
 
 /// Retains a permanent allocation after uncertain device state. There is no
 /// CPU storage accessor or recovery operation. Recovery requires a device
@@ -435,14 +448,54 @@ impl NaptBinding {
             crate::TxPort::Wan, source_mac, destination_mac)?;
         Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::MxlToWan(ingress_mac) })
     }
+    /// Plain routing between two hosts that are both behind the switches:
+    /// a rule of the MxL-ingress table (which a joined built-in switch feeds
+    /// too) that leaves towards a switch again. Nothing is translated. It is
+    /// staged with the MxL bridge tag; select the real egress with
+    /// `with_mxl_alias` or `with_builtin_port`. Format only: the caller owns
+    /// both hosts' location, the policy between their networks, and the
+    /// fact that every network feeding this table may reach the destination.
+    pub fn mxl_lan_to_inside(
+        original: Tuple,
+        ingress_mac: [u8; 6],
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+    ) -> Result<Self, EncodeError> {
+        if ingress_mac == [0; 6] || ingress_mac[0] & 1 != 0 {
+            return Err(EncodeError::Address);
+        }
+        let entry = StagedEntry::ipv4_napt_mxl_bridge(Protocol::Udp, original, original, source_mac, destination_mac)?;
+        Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::MxlToWan(ingress_mac) })
+    }
+    /// Whether this rule leaves towards a switch (PSE port GDM3 or GDM1 with
+    /// a tag), as opposed to the untagged WAN port or the legacy fixture.
+    fn inside_egress(&self) -> bool {
+        let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
+        self.path == FlowPath::WanToMxl || (matches!(self.path, FlowPath::MxlToWan(_)) && port != 2)
+    }
     /// Select which copper index's CPU tag carries MxL egress: the one the
     /// switch owner reports as entering its LAN bridge (index 0 unless that
     /// port is outside the bridge). Format only; the caller owns that policy.
     pub fn with_mxl_alias(mut self, copper: u8) -> Result<Self, EncodeError> {
-        if self.path != FlowPath::WanToMxl || copper > 3 {
+        if !self.inside_egress() || copper > 3 {
             return Err(EncodeError::UnsupportedEgress);
         }
         self.entry.0[44..46].copy_from_slice(&(0x0c00 | u16::from(copper)).to_le_bytes());
+        Ok(self)
+    }
+    /// Send this rule's frames to one port of the built-in switch instead of
+    /// the MxL: PSE port GDM1, with the switch's four-byte port tag (port
+    /// bitmap where the type would be, one tag layer, no 802.1Q insertion).
+    /// Format only; the caller owns the switch's CPU-port tag policy.
+    pub fn with_builtin_port(mut self, port: u8) -> Result<Self, EncodeError> {
+        if !self.inside_egress() || port > 5 {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
+        self.entry.0[..4].copy_from_slice(&((ib1 | 1 << 14) & !(1 << 18)).to_le_bytes());
+        self.entry.0[16..20].copy_from_slice(&((1u32 << 9) | (0xf << 20)).to_le_bytes());
+        self.entry.0[44..46].copy_from_slice(&0u16.to_le_bytes());
+        self.entry.0[46..48].copy_from_slice(&(1u16 << port).to_le_bytes());
         Ok(self)
     }
     /// Match the single rule's validated egress IP MTU. Hardware limits include
@@ -1115,7 +1168,7 @@ mod tests {
         let before = io.registers.clone();
         assert_eq!(unsafe { cutoff.close(&mut io) }, Ok(()));
         assert_eq!(io.ops, std::vec![Op::Write(WAN, 0x20710000),
-            Op::Write(0x540, 0x20710000), Op::Barrier,
+            Op::Write(0x540, 0x20710000), Op::Read(0x500), Op::Barrier,
             Op::Read(WAN), Op::Read(0x540)]);
         for (offset, value) in before {
             if offset != WAN && offset != 0x540 { assert_eq!(io.registers[&offset], value); }
@@ -1138,7 +1191,7 @@ mod tests {
             assert_eq!(io.writes, 2);
             assert_eq!(io.registers[&if failed_write == 1 { 0x540 } else { WAN }], 0x20710000);
             assert!(!cutoff.closed(&mut io));
-            assert_eq!(io.ops.iter().filter(|op| matches!(op, Op::Read(_))).count(), 4);
+            assert_eq!(io.ops.iter().filter(|op| matches!(op, Op::Read(_))).count(), 6);
         }
     }
     #[test]
@@ -1404,6 +1457,60 @@ mod tests {
             assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(0x500, _))));
         }
         assert!(internal_bypasses(0x20717777) && !internal_bypasses(0x20710000) && !internal_bypasses(0xc0703333));
+    }
+    #[test]
+    fn routed_inside_rule_keeps_the_tuple_and_takes_either_switch_egress() {
+        let tuple = Tuple { source: [192,168,79,100], destination: [192,168,20,50], source_port: 40000, destination_port: 53000 };
+        let ingress = [2,0x42,0x70,4,0,2];
+        let rule = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap();
+        // Untranslated, in the MxL-ingress table, leaving through GDM3 tagged.
+        assert_eq!(rule.path, FlowPath::MxlToWan(ingress));
+        assert_eq!(rule.entry.bytes()[4..16], rule.entry.bytes()[20..32]);
+        assert_eq!(rule.index(), napt_bucket(tuple));
+        let word = |b: &NaptBinding, at: usize| u32::from_le_bytes(b.entry.bytes()[at..at + 4].try_into().unwrap());
+        assert_eq!((word(&rule, 16), &rule.entry.bytes()[44..46]), ((15 << 9) | (0xf << 20), &0x0c00u16.to_le_bytes()[..]));
+        let tagged = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_mxl_alias(3).unwrap();
+        assert_eq!(tagged.entry.bytes()[44..46], 0x0c03u16.to_le_bytes());
+        let builtin = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap();
+        assert_eq!((word(&builtin, 16), &builtin.entry.bytes()[44..48]), ((1 << 9) | (0xf << 20), &[0u8, 0, 1, 0][..]));
+        assert!(matches!(builtin.path, FlowPath::MxlToWan(_)));
+        assert!(matches!(NaptBinding::mxl_lan_to_inside(tuple, [0; 6], ingress, [2,0,0,0,0,9]), Err(EncodeError::Address)));
+        // The rule towards the WAN port still takes no switch egress.
+        assert!(matches!(outbound_binding().with_mxl_alias(1), Err(EncodeError::UnsupportedEgress)));
+    }
+    #[test]
+    fn builtin_port_egress_carries_the_switch_port_tag_through_gdm1() {
+        let plain = mxl_binding();
+        let moved = mxl_binding().with_builtin_port(2).unwrap();
+        let word = |b: &NaptBinding, at: usize| u32::from_le_bytes(b.entry.bytes()[at..at + 4].try_into().unwrap());
+        // One tag layer, no 802.1Q insertion; PSE port 1; port bitmap as type.
+        assert_eq!(word(&moved, 0) & (7 << 14 | 1 << 18), 1 << 14);
+        assert_eq!(word(&moved, 0) & !(1 << 18), word(&plain, 0) & !(1 << 18));
+        assert_eq!(word(&moved, 16), (1 << 9) | (0xf << 20));
+        assert_eq!(moved.entry.bytes()[44..48], [0, 0, 4, 0]);
+        assert_eq!((&plain.entry.bytes()[4..16], &plain.entry.bytes()[20..44], &plain.entry.bytes()[48..]),
+            (&moved.entry.bytes()[4..16], &moved.entry.bytes()[20..44], &moved.entry.bytes()[48..]));
+        assert_eq!((moved.index(), moved.path), (plain.index(), FlowPath::WanToMxl));
+        assert!(matches!(mxl_binding().with_builtin_port(6), Err(EncodeError::UnsupportedEgress)));
+        assert!(matches!(outbound_binding().with_builtin_port(0), Err(EncodeError::UnsupportedEgress)));
+    }
+    #[test]
+    fn cutoff_returns_a_joined_builtin_switch_to_software_and_leaves_any_other_policy() {
+        let cutoff = IngressCutoff::new(0x20710000, Some(0x20710000)).unwrap();
+        for (before, after) in [(INTERNAL_ADMIT, INTERNAL_CPU), (INTERNAL_CPU, INTERNAL_CPU), (0x20717777, 0x20717777)] {
+            let mut io = Mock::new();
+            for (o, v) in [(WAN, 0x20713000), (0x540, 0x20714000), (0x500, before)] { io.registers.insert(o, v); }
+            assert!(!cutoff.closed(&mut io));
+            assert_eq!(unsafe { cutoff.close(&mut io) }, Ok(()));
+            assert_eq!((io.registers[&WAN], io.registers[&0x540], io.registers[&0x500]), (0x20710000, 0x20710000, after));
+            assert!(cutoff.closed(&mut io));
+            assert_eq!(io.ops.iter().filter(|op| matches!(op, Op::Write(0x500, _))).count(), usize::from(before != after));
+        }
+        // The WAN-only cutoff never looks at it.
+        let mut io = Mock::new();
+        io.registers.insert(0x500, INTERNAL_ADMIT);
+        assert_eq!(unsafe { IngressCutoff::new(0x20710000, None).unwrap().close(&mut io) }, Ok(()));
+        assert_eq!(io.registers[&0x500], INTERNAL_ADMIT);
     }
     #[test]
     fn mxl_alias_selects_only_the_bridge_tag_of_mxl_egress() {

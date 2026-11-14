@@ -1482,7 +1482,8 @@ impl<'a, I: Io> Mailbox<'a, I> {
     /// Read the SDK's packed physical-MAC counters. This optional command may
     /// be unsupported by older firmware; never substitutes for wire capture.
     pub fn mac_counters(&mut self, index: u8) -> Result<[u64; 17], Error> {
-        if !matches!(index, 1..=4 | 9) {
+        // Copper 1-4, the CPU port 9 and the SFP port 13.
+        if !matches!(index, 1..=4 | 9 | 13) {
             return Err(Error::InvalidPort);
         }
         let mut bytes = [0; 137];

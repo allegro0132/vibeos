@@ -523,14 +523,15 @@ impl NaptBinding {
         let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
         matches!(self.path, FlowPath::WanToMxl | FlowPath::MxlToWan(_)) && port != 2
     }
-    /// Select which copper index's CPU tag carries MxL egress: the one the
-    /// switch owner reports as entering its LAN bridge (index 0 unless that
-    /// port is outside the bridge). Format only; the caller owns that policy.
-    pub fn with_mxl_alias(mut self, copper: u8) -> Result<Self, EncodeError> {
-        if !self.inside_egress() || copper > 3 {
+    /// Select which switch port's CPU tag carries MxL egress: a copper index
+    /// (the one entering the LAN bridge, or an isolated port) or the SFP
+    /// port (DT index 12). The same tag software sends with
+    /// ([`crate::mxl_tag::Port::vid`]). Format only; the caller owns that policy.
+    pub fn with_mxl_alias(mut self, port: u8) -> Result<Self, EncodeError> {
+        let Some(port) = crate::mxl_tag::Port::from_dt(port).filter(|_| self.inside_egress()) else {
             return Err(EncodeError::UnsupportedEgress);
-        }
-        self.entry.0[44..46].copy_from_slice(&(0x0c00 | u16::from(copper)).to_le_bytes());
+        };
+        self.entry.0[44..46].copy_from_slice(&port.vid().to_le_bytes());
         Ok(self)
     }
     /// Send this rule's frames to one port of the built-in switch instead of
@@ -1571,6 +1572,12 @@ mod tests {
         assert_eq!((word(&rule, 16), &rule.entry.bytes()[44..46]), ((15 << 9) | (0xf << 20), &0x0c00u16.to_le_bytes()[..]));
         let tagged = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_mxl_alias(3).unwrap();
         assert_eq!(tagged.entry.bytes()[44..46], 0x0c03u16.to_le_bytes());
+        // The SFP port's alias, as software tags it; indexes between are no port.
+        let sfp = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_mxl_alias(12).unwrap();
+        assert_eq!(sfp.entry.bytes()[44..46], 0x0c0cu16.to_le_bytes());
+        for absent in [4, 11, 13, 15] {
+            assert!(matches!(NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_mxl_alias(absent), Err(EncodeError::UnsupportedEgress)));
+        }
         let builtin = NaptBinding::mxl_lan_to_inside(tuple, ingress, ingress, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap();
         assert_eq!((word(&builtin, 16), &builtin.entry.bytes()[44..48]), ((1 << 9) | (0xf << 20), &[0u8, 0, 1, 0][..]));
         assert!(matches!(builtin.path, FlowPath::MxlToWan(_)));

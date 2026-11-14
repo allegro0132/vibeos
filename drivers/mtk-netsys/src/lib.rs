@@ -17,6 +17,9 @@ mod mxl_vlan;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxPort {
     Internal,
+    /// Internal switch with its four-byte CPU port tag in the frame: the
+    /// caller selects destination ports, the switch removes the tag.
+    InternalTagged,
     /// Independent GMAC1/GDM2 path; no MxL CPU tag.
     Wan,
     ExternalTagged,
@@ -270,6 +273,7 @@ impl<I: Io> Nic<I> {
         }
         let (fport, min_frame, max_frame, padded_min) = match port {
             TxPort::Internal => (1, 14, 1514, 60),
+            TxPort::InternalTagged => (1, 18, 1518, 64),
             TxPort::Wan => (2, 14, 1514, 60),
             TxPort::ExternalTagged => (15, 18, 1518, 64),
         };
@@ -328,6 +332,7 @@ impl<I: Io> Nic<I> {
         };
         let (fport, minimum, maximum, padded) = match port {
             TxPort::Internal => (1, 14, 1514, 60),
+            TxPort::InternalTagged => (1, 18, 1518, 64),
             TxPort::Wan => (2, 14, 1514, 60),
             TxPort::ExternalTagged => (15, 18, 1518, 64),
         };
@@ -470,6 +475,9 @@ impl<I: Io> Nic<I> {
                 let offset = explicit_offset;
                 let (fport, minimum, maximum, padded) = match port {
                     TxPort::Internal => (1, 14, 1514, 60),
+                    TxPort::InternalTagged => (1, 18, 1518, 64),
+                TxPort::InternalTagged => (1, 18, 1518, 64),
+            TxPort::InternalTagged => (1, 18, 1518, 64),
                     TxPort::Wan => (2, 14, 1514, 60),
                     TxPort::ExternalTagged => (15, 18, 1518, 64),
                 };

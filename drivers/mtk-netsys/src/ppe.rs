@@ -131,7 +131,7 @@ impl StagedEntry {
         let port = match egress {
             crate::TxPort::Internal => 1,
             crate::TxPort::Wan => 2,
-            crate::TxPort::ExternalTagged => return Err(EncodeError::UnsupportedEgress),
+            crate::TxPort::ExternalTagged | crate::TxPort::InternalTagged => return Err(EncodeError::UnsupportedEgress),
         };
         let mut entry = Self([0; ENTRY_BYTES]);
         // HNAPT packet type = 0; INVALID state = 0. TTL rewrite and cache policy

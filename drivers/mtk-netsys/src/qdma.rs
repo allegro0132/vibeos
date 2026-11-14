@@ -169,7 +169,10 @@ impl<const N: usize> TxRing<N> {
             return Err(Error::Corrupt);
         }
         let (min, max, fport) = match port {
-            TxPort::Internal => (60, 1514, 1),
+            // The descriptor's forward port cannot tell a tagged internal
+            // frame from a plain one; the submitting ring enforced each
+            // variant's own bound, so this stage admits the larger.
+            TxPort::Internal | TxPort::InternalTagged => (60, 1518, 1),
             TxPort::Wan => (60, 1514, 2),
             TxPort::ExternalTagged => (64, 1518, 15),
         };

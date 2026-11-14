@@ -7,6 +7,7 @@ pub mod bare;
 pub mod gic;
 pub mod mmu;
 pub mod crypto;
+pub mod smp;
 
 /// Integer prefix is stable; crypto images append complete SIMD/FP state.
 #[repr(C)]

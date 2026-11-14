@@ -9,7 +9,7 @@
 extern crate alloc;
 
 use alloc::collections::{TryReserveError, VecDeque};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const MAX_HARTS: usize = 4;
 
@@ -22,6 +22,7 @@ pub const MAX_HARTS: usize = 4;
 pub struct ReadyHint {
     queued: [AtomicUsize; MAX_HARTS],
     stealable: AtomicUsize,
+    stealing_enabled: AtomicBool,
 }
 
 impl ReadyHint {
@@ -29,6 +30,7 @@ impl ReadyHint {
         Self {
             queued: [const { AtomicUsize::new(0) }; MAX_HARTS],
             stealable: AtomicUsize::new(0),
+            stealing_enabled: AtomicBool::new(true),
         }
     }
 
@@ -37,7 +39,8 @@ impl ReadyHint {
     /// entry, so the global stealable count suffices.
     pub fn hart_idle(&self, hart: HartId) -> bool {
         self.queued[hart.index()].load(Ordering::Acquire) == 0
-            && self.stealable.load(Ordering::Acquire) == 0
+            && (!self.stealing_enabled.load(Ordering::Acquire)
+                || self.stealable.load(Ordering::Acquire) == 0)
     }
 
     pub fn queued_on(&self, hart: HartId) -> usize {
@@ -122,6 +125,7 @@ pub struct RunQueues<T> {
     dispatches: [u64; MAX_HARTS],
     steals: [u64; MAX_HARTS],
     hint: &'static ReadyHint,
+    stealing_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +146,7 @@ impl<T> RunQueues<T> {
             dispatches: [0; MAX_HARTS],
             steals: [0; MAX_HARTS],
             hint,
+            stealing_enabled: true,
         }
     }
 
@@ -174,9 +179,18 @@ impl<T> RunQueues<T> {
         self.queues[hart.index()].len()
     }
 
-    /// A hart is idle only when it has no local work and cannot steal any
-    /// remote work. This is the predicate an M5.2 IPI gate can sample.
+    /// Cold-boot policy: explicit placement keeps device-affine child tasks
+    /// on their parent's CPU even when their ordinary task kind is stealable.
+    pub fn set_work_stealing(&mut self, enabled: bool) {
+        self.stealing_enabled = enabled;
+        self.hint.stealing_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// A hart is idle when it has no local work and no permitted remote work.
     pub fn hart_idle(&self, hart: HartId) -> bool {
+        if !self.stealing_enabled {
+            return self.queues[hart.index()].is_empty();
+        }
         let local = hart.index();
         self.queues[local].is_empty()
             && self
@@ -265,6 +279,7 @@ impl<T: Copy + Eq> RunQueues<T> {
             });
         }
 
+        if !self.stealing_enabled { return None; }
         for offset in 1..MAX_HARTS {
             let source_index = (executor_index + offset) % MAX_HARTS;
             let candidate = self.queues[source_index]

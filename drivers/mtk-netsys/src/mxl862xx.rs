@@ -10,7 +10,7 @@ pub use fdb::FdbEntry;
 mod lan;
 pub use binding::PortVlanLease;
 pub use domain::{DomainPolicy, DomainProbe, FloodMode, Learning};
-pub use lan::LanBridgeLease;
+pub use lan::{LanBridgeLease, ProductLanBridge};
 
 pub trait Io {
     fn read(&mut self, reg: u16) -> Result<u16, mdio::Error>;
@@ -834,6 +834,7 @@ mod tests {
     fn vlan_readback_checks_packet_stage_for_every_treatment() {
         use crate::{mxl_tag::Port, mxl_vlan::Rule};
         for treatment in [
+            Rule::DropUntagged,
             Rule::PushUntagged(Port::Copper0),
             Rule::PushSingleTagged(Port::Copper0),
             Rule::PushDoubleTagged(Port::Copper0),

@@ -11,6 +11,7 @@ pub(crate) enum Rule {
     PopOuter(Port),
     PopOuterTagged(Port),
     ClassifyCpu(Port),
+    DropUntagged,
     DropAnySingleTagged,
     DropAnyDoubleTagged,
     DropSingleTagged,
@@ -24,6 +25,7 @@ impl Rule {
         let mut word = |off, value: u32| b[off..off + 4].copy_from_slice(&value.to_le_bytes());
         word(31, 3); // inner NO_TAG
         match self {
+            Self::DropUntagged => { word(9, 3); word(57, 3); }
             Self::PushUntagged(port)
             | Self::PushSingleTagged(port)
             | Self::PushDoubleTagged(port) => {
@@ -87,6 +89,7 @@ impl Rule {
             reassign,
             bridge,
         ) = match self {
+            Self::DropUntagged => (3, false, 0, 0, 3, false, 0, 0, 0, false, 0),
             Self::PushUntagged(p) => (3, false, 0, 0, 0, true, p.vid() as u32, 3, 2, false, 0),
             Self::PushSingleTagged(p) | Self::PushDoubleTagged(p) => {
                 (1, false, 0, 0, 0, true, p.vid() as u32, 3, 2, false, 0)

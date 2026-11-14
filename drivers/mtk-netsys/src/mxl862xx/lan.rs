@@ -1,5 +1,8 @@
 //! Reversible four-copper LAN bridge. The caller owns switch configuration and
 //! must quiesce CPU-port TX while applying/restoring. No PHY/CTP reset is issued.
+mod product;
+pub use product::ProductLanBridge;
+
 use super::{Bridge, DomainPolicy, Error, FdbEntry, FloodMode, Io, Learning, Mailbox};
 use crate::{mxl_tag::Port, mxl_vlan::Rule};
 

@@ -13,6 +13,7 @@ fn config() -> Config {
         wan_ip: WAN,
         lan_ip: [192, 168, 79, 1],
         lan_prefix: 24,
+        extra: [None; EXTRA_INSIDE],
     }
 }
 fn egress() -> Egress {
@@ -1917,4 +1918,36 @@ fn flow_listing_reports_live_flows_without_refreshing_them() {
     // Listing is read-only: expiry still happens on the original deadline.
     assert_eq!(t.flows(10 + UDP_MS).count(), 1);
     assert_eq!(t.flows(20 + UDP_MS).count(), 0);
+}
+
+#[test]
+fn further_inside_networks_translate_like_the_lan_and_are_never_remote() {
+    const GUEST: [u8; 4] = [192, 168, 20, 7];
+    let mut c = config();
+    c.extra[0] = Some(([192, 168, 20, 1], 24));
+    c.extra[2] = Some(([10, 9, 0, 1], 16));
+    let mut t = Table::<4, 8>::new(c, 1).unwrap();
+    // A host of a further network is translated out and its answer returns to it.
+    let (r, f) = send(&mut t, OUT, udp(GUEST, REMOTE, 4000, 53), 0);
+    assert!(r.is_ok());
+    assert_eq!(&f[26..30], &WAN);
+    let port = word(&f, 34);
+    let (r, f) = send(&mut t, IN, udp(REMOTE, WAN, 53, port), 1);
+    assert!(r.is_ok());
+    assert_eq!((&f[30..34], word(&f, 36)), (&GUEST[..], 4000));
+    // The router's address there, and the network and broadcast addresses, are not hosts.
+    for bad in [[192, 168, 20, 1], [192, 168, 20, 0], [192, 168, 20, 255], [10, 9, 255, 255], [10, 9, 0, 1]] {
+        assert!(send(&mut t, OUT, udp(bad, REMOTE, 1, 2), 2).0.is_err(), "{bad:?}");
+    }
+    // Traffic between inside networks is not this table's business.
+    assert!(send(&mut t, OUT, udp(LAN, GUEST, 1, 2), 2).0.is_err());
+    assert!(send(&mut t, OUT, udp([10, 9, 3, 4], LAN, 1, 2), 2).0.is_err());
+    // A WAN packet cannot claim an inside source.
+    assert!(send(&mut t, IN, udp(GUEST, WAN, 53, port), 3).0.is_err());
+    // Overlapping, WAN-containing or malformed further networks are refused.
+    for extra in [([192, 168, 79, 129], 25), ([192, 168, 78, 9], 24), ([192, 168, 20, 0], 24), ([192, 168, 0, 1], 16), ([192, 168, 20, 1], 31), ([10, 9, 200, 1], 24)] {
+        let mut bad = c;
+        bad.extra[1] = Some(extra);
+        assert!(Table::<4, 8>::new(bad, 1).is_err(), "{extra:?}");
+    }
 }

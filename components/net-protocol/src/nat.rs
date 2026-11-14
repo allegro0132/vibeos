@@ -192,29 +192,63 @@ pub enum Error {
     GenerationExhausted,
     Packet(ipv4::Error),
 }
+/// Further inside networks: (router address, prefix length) each.
+pub const EXTRA_INSIDE: usize = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Config {
     pub wan_ip: [u8; 4],
     pub lan_ip: [u8; 4],
     pub lan_prefix: u8,
+    /// Inside networks besides the LAN. Their hosts are translated exactly
+    /// like LAN hosts; which of them may reach the WAN at all is the
+    /// caller's policy, decided before a packet is offered here.
+    pub extra: [Option<([u8; 4], u8)>; EXTRA_INSIDE],
 }
 impl Config {
-    fn mask(self) -> u32 {
-        u32::MAX << (32 - self.lan_prefix)
+    /// The LAN and every further inside network, as (router address, prefix).
+    fn inside(self) -> impl Iterator<Item = ([u8; 4], u8)> {
+        core::iter::once((self.lan_ip, self.lan_prefix)).chain(self.extra.into_iter().flatten())
+    }
+    fn mask(prefix: u8) -> u32 {
+        u32::MAX << (32 - u32::from(prefix.clamp(1, 32)))
+    }
+    fn within(ip: [u8; 4], (router, prefix): ([u8; 4], u8)) -> bool {
+        u32::from_be_bytes(ip) & Self::mask(prefix) == u32::from_be_bytes(router) & Self::mask(prefix)
     }
     fn on_lan(self, ip: [u8; 4]) -> bool {
-        u32::from_be_bytes(ip) & self.mask() == u32::from_be_bytes(self.lan_ip) & self.mask()
+        self.inside().any(|net| Self::within(ip, net))
     }
+    /// A host of an inside network: not its network or broadcast address
+    /// and not the router's own address there.
     fn lan_host(self, ip: [u8; 4]) -> bool {
-        let host = u32::from_be_bytes(ip) & !self.mask();
-        unicast(ip) && self.on_lan(ip) && host != 0 && host != !self.mask() && ip != self.lan_ip
+        unicast(ip) && self.inside().any(|(router, prefix)| {
+            let host = u32::from_be_bytes(ip) & !Self::mask(prefix);
+            Self::within(ip, (router, prefix)) && host != 0 && host != !Self::mask(prefix) && ip != router
+        })
     }
-    fn valid(self) -> bool {
-        if !(1..=30).contains(&self.lan_prefix) || !unicast(self.lan_ip) || !unicast(self.wan_ip) {
+    /// Whether a table accepts this configuration: usable addresses, inside
+    /// networks that do not overlap each other, and a WAN address outside them.
+    pub fn valid(self) -> bool {
+        if !unicast(self.wan_ip) {
             return false;
         }
-        let host = u32::from_be_bytes(self.lan_ip) & !self.mask();
-        host != 0 && host != !self.mask() && !self.on_lan(self.wan_ip)
+        let nets = [Some((self.lan_ip, self.lan_prefix)), self.extra[0], self.extra[1], self.extra[2], self.extra[3]];
+        for (i, net) in nets.iter().enumerate() {
+            let Some((router, prefix)) = *net else { continue };
+            let host = u32::from_be_bytes(router) & !Self::mask(prefix);
+            if !(1..=30).contains(&prefix) || !unicast(router) || host == 0 || host == !Self::mask(prefix)
+                || Self::within(self.wan_ip, (router, prefix))
+            {
+                return false;
+            }
+            // Inside networks are disjoint: neither contains the other's router.
+            for other in nets[..i].iter().flatten() {
+                if Self::within(router, *other) || Self::within(other.0, (router, prefix)) {
+                    return false;
+                }
+            }
+        }
+        true
     }
     fn remote(self, ip: [u8; 4]) -> bool {
         unicast(ip) && !self.on_lan(ip) && ip != self.wan_ip

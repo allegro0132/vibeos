@@ -29,6 +29,7 @@ impl Config {
             wan_ip: self.interfaces[0].ip,
             lan_ip: self.interfaces[1].ip,
             lan_prefix: self.interfaces[1].prefix,
+            extra: [None; nat::EXTRA_INSIDE],
         }
     }
     /// WAN CIDR, WAN gateway (or "none"), LAN CIDR. Strict dotted decimal.

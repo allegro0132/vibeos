@@ -6,8 +6,10 @@ use super::*;
 const PHYSICAL: [u16; 5] = [1, 2, 3, 4, 9];
 
 /// What a copper port is used for. LAN ports share one learning bridge with
-/// the CPU. The WAN port has a bridge domain of its own and can only exchange
-/// frames with the CPU. An unused port forwards nothing in either direction.
+/// the CPU. A `Wan` port is isolated: it is outside that bridge's domain and
+/// can only exchange frames with the CPU, whatever the CPU then uses it for
+/// (the uplink, or a network of its own); any number of ports may be. An
+/// unused port forwards nothing in either direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortRole {
     Lan,
@@ -29,7 +31,7 @@ impl ProductLanBridge {
     pub const fn new(router_mac: [u8; 6]) -> Self {
         Self::with_roles(router_mac, [PortRole::Lan; 4])
     }
-    /// `roles[n]` is the use of copper port n (DT index). At most one WAN.
+    /// `roles[n]` is the use of copper port n (DT index).
     pub const fn with_roles(router_mac: [u8; 6], roles: [PortRole; 4]) -> Self {
         Self {
             router_mac,
@@ -68,9 +70,7 @@ impl ProductLanBridge {
         }
     }
     fn acquire(&mut self, hw: &mut impl ProductBackend) -> Result<(), Error> {
-        if self.started || self.router_mac == [0; 6] || self.router_mac[0] & 1 != 0
-            || self.roles.iter().filter(|r| **r == PortRole::Wan).count() > 1
-        {
+        if self.started || self.router_mac == [0; 6] || self.router_mac[0] & 1 != 0 {
             return Err(Error::InvalidState);
         }
         self.started = true;
@@ -111,7 +111,8 @@ impl ProductLanBridge {
         self.domain = Some(id);
         self.stage = "domain-policy";
         hw.domain_set(id)?;
-        // The WAN port never shares an address table with the LAN.
+        // Isolated ports never share an address table with the LAN. They may
+        // share one among themselves: none learns, and none's map reaches another.
         let mut wan_id = id;
         if self.roles.contains(&PortRole::Wan) {
             self.stage = "wan-domain-allocate";
@@ -418,11 +419,13 @@ mod tests {
                     _ => 1 << physical,
                 };
                 assert_eq!(s.bridge.map, map(expected), "port {p}");
-                // No map lets the WAN port and a LAN port reach each other.
+                // A map reaches another copper port only from the LAN to the LAN,
+                // or from an isolated port's own CPU alias to that port.
                 for q in 1..=4u16 {
                     let other = self.roles[q as usize - 1];
                     if expected & 1 << q != 0 {
-                        assert!(other != PortRole::Off && (other == PortRole::Wan) == (role == PortRole::Wan), "port {p} reaches {q}");
+                        assert!(other != PortRole::Off, "port {p} reaches unused {q}");
+                        assert!(if other == PortRole::Wan { i >= 4 && q == physical } else { role == PortRole::Lan || entry_alias }, "port {p} reaches {q}");
                     }
                 }
                 assert_eq!(s.learning.source_learning_disabled, i >= 4 || role != PortRole::Lan, "port {p}");
@@ -601,15 +604,9 @@ mod tests {
         let mut layouts = 0;
         for code in 0..81usize {
             let roles: [PortRole; 4] = core::array::from_fn(|i| [Lan, Wan, Off][code / 3usize.pow(i as u32) % 3]);
-            let wans = roles.iter().filter(|r| **r == Wan).count();
             let mut m = Model::new();
             m.roles = roles;
             let mut o = ProductLanBridge::with_roles([2, 0x42, 0x70, 4, 0, 2], roles);
-            if wans > 1 {
-                assert!(o.acquire(&mut m).is_err());
-                assert!(!o.active() && !m.enabled && m.calls == 0);
-                continue;
-            }
             layouts += 1;
             o.acquire(&mut m).unwrap_or_else(|e| panic!("{roles:?}: {e:?} at {}", o.stage()));
             assert!(o.active() && m.enabled);
@@ -625,7 +622,7 @@ mod tests {
                 assert!(!o.active() && !broken.enabled, "{roles:?} call {fail}");
             }
         }
-        assert_eq!(layouts, 16 + 4 * 8);
+        assert_eq!(layouts, 81);
         // A WAN domain that is not distinct from the LAN's is refused.
         let mut m = Model::new();
         m.roles = [Lan, Lan, Lan, Wan];

@@ -86,7 +86,7 @@ impl Pair {
             && self.wan.path == FlowPath::WanToMxl
             && mac_matches(io, WAN, self.wan_mac)
             && mac_matches(io, 0x540, mac)
-            && io.read(0x500) == 0x20717777
+            && super::internal_bypasses(io.read(0x500))
             && spare.table_base == 0
             && spare.cache == 0
             && !spare.busy()
@@ -741,6 +741,11 @@ mod tests {
             assert!(!a.admitted(&mut io), "register {reg:x}");
             if let Some(old)=old {io.regs.insert(reg,old);} else {io.regs.remove(&reg);}
             assert!(a.admitted(&mut io));
+        }
+        // The built-in switch may be closed or software-only, never PPE-fed.
+        for (value,ok) in [(0xc0700000,true),(0xc0703333,false),(0x20710000,false),(0x20717777,true)] {
+            io.regs.insert(0x500,value);
+            assert_eq!(a.admitted(&mut io),ok,"{value:x}");
         }
         assert_eq!(io.writes,writes);
         assert!(matches!(unsafe {a.stop(&mut io,10)},PairOutcome::Restored(_)));

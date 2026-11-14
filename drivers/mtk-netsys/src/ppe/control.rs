@@ -322,13 +322,19 @@ impl FlowPath {
                 return false;
             }
         }
-        let (internal, peer_register, peer_value) = match self {
-            Self::WanToInternal => (0xc0700000, 0x540, 0x20717777),
-            Self::WanToMxl => (0x20717777, 0x540, 0x20710000),
-            Self::MxlToWan(_) => (0x20717777, WAN, 0x20710000),
+        let (peer_register, peer_value) = match self {
+            Self::WanToInternal => return io.read(0x500) == 0xc0700000 && io.read(0x540) == 0x20717777,
+            Self::WanToMxl => (0x540, 0x20710000),
+            Self::MxlToWan(_) => (WAN, 0x20710000),
         };
-        io.read(0x500) == internal && io.read(peer_register) == peer_value
+        internal_bypasses(io.read(0x500)) && io.read(peer_register) == peer_value
     }
+}
+/// The built-in switch's GDMA stays out of an MxL session's tables: closed, or
+/// handing every frame to PDMA. Its hosts are then software-forwarded only;
+/// the routing owner must never publish a rule whose LAN host is behind it.
+pub(super) fn internal_bypasses(policy: u32) -> bool {
+    matches!(policy, 0x20717777 | 0xc0700000)
 }
 fn napt_bucket(original: Tuple) -> usize {
     // Hash-mode 1 chooses destination/source bits using the port word,
@@ -428,6 +434,16 @@ impl NaptBinding {
         let entry = StagedEntry::ipv4_napt(Protocol::Udp, original, translated,
             crate::TxPort::Wan, source_mac, destination_mac)?;
         Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::MxlToWan(ingress_mac) })
+    }
+    /// Select which copper index's CPU tag carries MxL egress: the one the
+    /// switch owner reports as entering its LAN bridge (index 0 unless that
+    /// port is outside the bridge). Format only; the caller owns that policy.
+    pub fn with_mxl_alias(mut self, copper: u8) -> Result<Self, EncodeError> {
+        if self.path != FlowPath::WanToMxl || copper > 3 {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        self.entry.0[44..46].copy_from_slice(&(0x0c00 | u16::from(copper)).to_le_bytes());
+        Ok(self)
     }
     /// Match the single rule's validated egress IP MTU. Hardware limits include
     /// Ethernet/VLAN headers; oversized packets must take the CPU slow path.
@@ -1379,8 +1395,29 @@ mod tests {
         assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(WAN, _))));
     }
     #[test]
+    fn mxl_sessions_accept_the_builtin_switch_handed_to_software_only() {
+        for binding in [mxl_binding(), outbound_binding()] {
+            let mut io = mxl_mock(); io.registers.insert(0x500, 0xc0700000);
+            let StartOutcome::Active(active) = (unsafe { start_single_napt(&mut io, table(), 10, &binding) }) else { panic!("start") };
+            assert!(matches!(unsafe { active.stop(&mut io, 10) }, Outcome::Restored(_)));
+            assert_eq!(io.registers[&0x500], 0xc0700000);
+            assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(0x500, _))));
+        }
+        assert!(internal_bypasses(0x20717777) && !internal_bypasses(0x20710000) && !internal_bypasses(0xc0703333));
+    }
+    #[test]
+    fn mxl_alias_selects_only_the_bridge_tag_of_mxl_egress() {
+        let plain = mxl_binding();
+        let moved = mxl_binding().with_mxl_alias(2).unwrap();
+        assert_eq!(moved.entry.bytes()[44..46], 0x0c02u16.to_le_bytes());
+        assert_eq!((&plain.entry.bytes()[..44], &plain.entry.bytes()[46..]), (&moved.entry.bytes()[..44], &moved.entry.bytes()[46..]));
+        assert_eq!(mxl_binding().with_mxl_alias(0).unwrap().entry, plain.entry);
+        assert!(matches!(mxl_binding().with_mxl_alias(4), Err(EncodeError::UnsupportedEgress)));
+        assert!(matches!(outbound_binding().with_mxl_alias(0), Err(EncodeError::UnsupportedEgress)));
+    }
+    #[test]
     fn outbound_rejects_foreign_ingress_and_mixed_direction_without_writes() {
-        for (offset, value) in [(WAN,0x20713333),(0x500,0xc0700000),(0x540,0x20713333),(0x540,0x20717777),(0x548,0x70040099),(0x54c,0x0342)] {
+        for (offset, value) in [(WAN,0x20713333),(0x500,0xc0703333),(0x500,0x20710000),(0x540,0x20713333),(0x540,0x20717777),(0x548,0x70040099),(0x54c,0x0342)] {
             let mut io = mxl_mock(); io.registers.insert(offset,value);
             assert!(matches!(unsafe { start_single_napt(&mut io,table(),10,&outbound_binding()) },
                 StartOutcome::Failed(Outcome::Rejected(_,Error::Preconditions))));

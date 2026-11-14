@@ -10,7 +10,7 @@ pub use fdb::FdbEntry;
 mod lan;
 pub use binding::PortVlanLease;
 pub use domain::{DomainPolicy, DomainProbe, FloodMode, Learning};
-pub use lan::{LanBridgeLease, ProductLanBridge};
+pub use lan::{LanBridgeLease, PortRole, ProductLanBridge};
 
 pub trait Io {
     fn read(&mut self, reg: u16) -> Result<u16, mdio::Error>;

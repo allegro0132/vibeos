@@ -5,8 +5,20 @@
 use super::*;
 const PHYSICAL: [u16; 5] = [1, 2, 3, 4, 9];
 
+/// What a copper port is used for. LAN ports share one learning bridge with
+/// the CPU. The WAN port has a bridge domain of its own and can only exchange
+/// frames with the CPU. An unused port forwards nothing in either direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortRole {
+    Lan,
+    Wan,
+    Off,
+}
+
 pub struct ProductLanBridge {
     router_mac: [u8; 6],
+    roles: [PortRole; 4],
+    wan_domain: Option<u16>,
     stage: &'static str,
     started: bool,
     active: bool,
@@ -15,8 +27,14 @@ pub struct ProductLanBridge {
 }
 impl ProductLanBridge {
     pub const fn new(router_mac: [u8; 6]) -> Self {
+        Self::with_roles(router_mac, [PortRole::Lan; 4])
+    }
+    /// `roles[n]` is the use of copper port n (DT index). At most one WAN.
+    pub const fn with_roles(router_mac: [u8; 6], roles: [PortRole; 4]) -> Self {
         Self {
             router_mac,
+            roles,
+            wan_domain: None,
             stage: "new",
             started: false,
             active: false,
@@ -33,8 +51,26 @@ impl ProductLanBridge {
     pub fn domain(&self) -> Option<u16> {
         self.domain
     }
+    pub fn roles(&self) -> [PortRole; 4] {
+        self.roles
+    }
+    /// Copper index whose CPU tag (`Port::vid`) enters the LAN bridge with
+    /// address lookup and flooding instead of leaving through that one port.
+    /// Index 0 unless that port is the WAN, then the first LAN port. None
+    /// without LAN ports. Every other tag is directed at its own port.
+    pub fn injection(&self) -> Option<u8> {
+        if !self.roles.contains(&PortRole::Lan) {
+            None
+        } else if self.roles[0] != PortRole::Wan {
+            Some(0)
+        } else {
+            self.roles.iter().position(|r| *r == PortRole::Lan).map(|i| i as u8)
+        }
+    }
     fn acquire(&mut self, hw: &mut impl ProductBackend) -> Result<(), Error> {
-        if self.started || self.router_mac == [0; 6] || self.router_mac[0] & 1 != 0 {
+        if self.started || self.router_mac == [0; 6] || self.router_mac[0] & 1 != 0
+            || self.roles.iter().filter(|r| **r == PortRole::Wan).count() > 1
+        {
             return Err(Error::InvalidState);
         }
         self.started = true;
@@ -75,6 +111,18 @@ impl ProductLanBridge {
         self.domain = Some(id);
         self.stage = "domain-policy";
         hw.domain_set(id)?;
+        // The WAN port never shares an address table with the LAN.
+        let mut wan_id = id;
+        if self.roles.contains(&PortRole::Wan) {
+            self.stage = "wan-domain-allocate";
+            wan_id = hw.domain_alloc()?;
+            if wan_id == 0 || wan_id == u16::MAX || wan_id == id {
+                return Err(Error::InvalidResponse);
+            }
+            self.wan_domain = Some(wan_id);
+            self.stage = "wan-domain-policy";
+            hw.domain_set(wan_id)?;
+        }
         for slot in 0..6 {
             let count = match slot {
                 0..=3 => 3,
@@ -126,9 +174,19 @@ impl ProductLanBridge {
         self.stage = "fdb-add";
         hw.fdb_add(id, self.router_mac)?;
         self.stage = "port-config";
+        let injection = self.injection().map(usize::from);
         for (i, p) in PORTS.into_iter().enumerate() {
+            let (role, alias) = (self.roles[i % 4], i >= 4);
             hw.destination(p, if i < 4 { p as u8 } else { 9 })?;
-            hw.identity(p, id, i > 4, i >= 4, [0; 7])?;
+            // Only the injection alias consults the address table; only LAN
+            // copper ports learn. The WAN port floods everything to the CPU.
+            hw.identity(
+                p,
+                if role == PortRole::Wan { wan_id } else { id },
+                alias && injection != Some(i % 4),
+                alias || role != PortRole::Lan,
+                [0; 7],
+            )?;
             if i < 4 {
                 hw.binding(p, true, (true, block(self.blocks[i].unwrap()), 3))?;
                 hw.binding(p, false, (true, block(self.blocks[4].unwrap()), 10))?;
@@ -139,13 +197,15 @@ impl ProductLanBridge {
         self.stage = "cpu-path";
         hw.cpu_path(block(self.blocks[5].unwrap()), 7)?;
         self.stage = "open-maps";
+        let members = (0..4).filter(|c| self.roles[*c] == PortRole::Lan).fold(0u16, |bits, c| bits | 2 << c);
         for (i, p) in PORTS.into_iter().enumerate() {
-            let bits = if i < 4 {
-                0x21e & !(1 << p)
-            } else if i == 4 {
-                0x1e
-            } else {
-                1 << (p - 16)
+            let bits = match (i >= 4, self.roles[i % 4]) {
+                // The other members and the CPU; never back out the ingress port.
+                (false, PortRole::Lan) => (members | 0x200) & !(1 << p),
+                (false, PortRole::Wan) => 0x200,
+                (true, _) if injection == Some(i % 4) => members,
+                (_, PortRole::Off) => 0,
+                (true, _) => 1 << (p - 16),
             };
             hw.map(p, map(bits))?;
         }
@@ -283,6 +343,9 @@ mod tests {
         calls: usize,
         fail_at: usize,
         duplicate: bool,
+        roles: [PortRole; 4],
+        domains: u16,
+        same_domain: bool,
     }
     impl Model {
         fn new() -> Self {
@@ -320,6 +383,9 @@ mod tests {
                 calls: 0,
                 fail_at: usize::MAX,
                 duplicate: false,
+                roles: [PortRole::Lan; 4],
+                domains: 0,
+                same_domain: false,
             }
         }
         fn done<T>(&mut self, value: T) -> Result<T, Error> {
@@ -332,22 +398,35 @@ mod tests {
         }
         fn ready(&self) {
             assert!(self.cpu && self.gateway);
+            // Stated independently of the driver: per role, who may reach whom.
+            let lan: std::vec::Vec<u16> = (1..=4).filter(|p| self.roles[*p as usize - 1] == PortRole::Lan).collect();
+            let all = lan.iter().fold(0u16, |bits, p| bits | 1 << p);
+            let entry = if self.roles[0] == PortRole::Wan { lan.first().copied() } else { lan.first().map(|_| 1) };
+            assert_eq!(self.domains, if self.roles.contains(&PortRole::Wan) { 2 } else { 1 });
             for (i, p) in PORTS.into_iter().enumerate() {
                 let s = self.ports[&p];
-                assert_eq!(s.bridge.id, 6);
+                let physical = if i < 4 { p } else { p - 16 };
+                let role = self.roles[physical as usize - 1];
+                let entry_alias = i >= 4 && entry == Some(physical);
+                assert_eq!(s.bridge.id, if role == PortRole::Wan { 7 } else { 6 }, "port {p}");
                 assert_eq!(s.bridge.destination, if i < 4 { p as u8 } else { 9 });
-                assert_eq!(
-                    s.bridge.map,
-                    map(if i < 4 {
-                        0x21e & !(1 << p)
-                    } else if i == 4 {
-                        0x1e
-                    } else {
-                        1 << (p - 16)
-                    })
-                );
-                assert_eq!(s.learning.source_learning_disabled, i >= 4);
-                assert_eq!(s.learning.destination_lookup_disabled, i > 4);
+                let expected = match role {
+                    _ if entry_alias => all,
+                    PortRole::Off => 0,
+                    PortRole::Lan if i < 4 => (all | 0x200) & !(1 << p),
+                    PortRole::Wan if i < 4 => 0x200,
+                    _ => 1 << physical,
+                };
+                assert_eq!(s.bridge.map, map(expected), "port {p}");
+                // No map lets the WAN port and a LAN port reach each other.
+                for q in 1..=4u16 {
+                    let other = self.roles[q as usize - 1];
+                    if expected & 1 << q != 0 {
+                        assert!(other != PortRole::Off && (other == PortRole::Wan) == (role == PortRole::Wan), "port {p} reaches {q}");
+                    }
+                }
+                assert_eq!(s.learning.source_learning_disabled, i >= 4 || role != PortRole::Lan, "port {p}");
+                assert_eq!(s.learning.destination_lookup_disabled, i >= 4 && !entry_alias, "port {p}");
                 if i < 4 {
                     let r = &self.blocks[&s.bridge.ingress_vlan.1];
                     assert!(matches!(
@@ -377,10 +456,12 @@ mod tests {
             self.done(())
         }
         fn domain_alloc(&mut self) -> Result<u16, Error> {
-            self.done(6)
+            self.domains += 1;
+            assert!(self.domains <= 2);
+            self.done(if self.same_domain { 6 } else { 5 + self.domains })
         }
         fn domain_set(&mut self, id: u16) -> Result<(), Error> {
-            assert_eq!(id, 6);
+            assert_eq!(id, 5 + self.domains);
             self.done(())
         }
         fn domain_free(&mut self, _: u16) -> Result<(), Error> {
@@ -425,6 +506,7 @@ mod tests {
         ) -> Result<(), Error> {
             assert!(!self.enabled);
             let s = self.ports.get_mut(&p).unwrap();
+            assert!(id == 6 || id == 7 && self.domains == 2);
             s.bridge.id = id;
             s.learning.destination_lookup_disabled = lookup;
             s.learning.source_learning_disabled = learn;
@@ -512,6 +594,45 @@ mod tests {
             assert!(o.acquire(&mut m).is_err());
             assert_eq!(m.calls, calls);
         }
+    }
+    #[test]
+    fn every_role_assignment_isolates_wan_from_lan_and_fails_closed() {
+        use PortRole::*;
+        let mut layouts = 0;
+        for code in 0..81usize {
+            let roles: [PortRole; 4] = core::array::from_fn(|i| [Lan, Wan, Off][code / 3usize.pow(i as u32) % 3]);
+            let wans = roles.iter().filter(|r| **r == Wan).count();
+            let mut m = Model::new();
+            m.roles = roles;
+            let mut o = ProductLanBridge::with_roles([2, 0x42, 0x70, 4, 0, 2], roles);
+            if wans > 1 {
+                assert!(o.acquire(&mut m).is_err());
+                assert!(!o.active() && !m.enabled && m.calls == 0);
+                continue;
+            }
+            layouts += 1;
+            o.acquire(&mut m).unwrap_or_else(|e| panic!("{roles:?}: {e:?} at {}", o.stage()));
+            assert!(o.active() && m.enabled);
+            m.ready();
+            let lan = roles.iter().position(|r| *r == Lan).map(|i| i as u8);
+            assert_eq!(o.injection(), if roles[0] == Wan { lan } else { lan.map(|_| 0) });
+            for fail in 1..=m.calls {
+                let mut broken = Model::new();
+                broken.roles = roles;
+                broken.fail_at = fail;
+                let mut o = ProductLanBridge::with_roles([2, 0x42, 0x70, 4, 0, 2], roles);
+                assert!(o.acquire(&mut broken).is_err(), "{roles:?} call {fail}");
+                assert!(!o.active() && !broken.enabled, "{roles:?} call {fail}");
+            }
+        }
+        assert_eq!(layouts, 16 + 4 * 8);
+        // A WAN domain that is not distinct from the LAN's is refused.
+        let mut m = Model::new();
+        m.roles = [Lan, Lan, Lan, Wan];
+        m.same_domain = true;
+        let mut o = ProductLanBridge::with_roles([2, 0x42, 0x70, 4, 0, 2], m.roles);
+        assert!(o.acquire(&mut m).is_err());
+        assert!(!o.active() && !m.enabled);
     }
     #[test]
     fn refuses_inherited_configuration_and_aliased_vlan_allocations() {

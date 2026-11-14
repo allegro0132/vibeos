@@ -6339,6 +6339,15 @@ fn waker_for(id: TaskId) -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(id.0 as *const (), &VTABLE)) }
 }
 
+/// Configure placement before releasing any secondary executor. Explicit
+/// placement preserves device affinity for ordinary descendant tasks; remote
+/// `spawn_on`/`spawn_pinned_on` still run on their chosen CPU.
+/// # Safety
+/// No executor may be polling or asleep while changing this boot-only policy.
+pub unsafe fn set_work_stealing(enabled: bool) {
+    SCHED.lock().ready.set_work_stealing(enabled);
+}
+
 /// Drive tasks forever. Sleeps the hart in `wfi` whenever nothing is runnable,
 /// which is what makes an idle VibeOS box draw no CPU.
 pub fn run() -> ! {

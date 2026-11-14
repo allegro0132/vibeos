@@ -1,4 +1,4 @@
-//! EL1 primitives for an integer-only, single-CPU bootstrap.
+//! EL1 primitives for the shared AArch64 runtime.
 use core::arch::asm;
 
 pub fn counter() -> u64 {
@@ -115,12 +115,33 @@ pub fn fence_ipi() {
         asm!("dsb sy", options(nostack));
     }
 }
-/// No SGI delivery is admitted by the current single-CPU runtime.
-pub fn send_ipi(_hart: usize) -> Result<(), vibeos_hal::arch::IpiError> {
-    Err(vibeos_hal::arch::IpiError::NotSupported)
+/// Target one physical MPIDR affinity using Group-1 SGI 1.
+pub fn send_ipi(hart: usize) -> Result<(), vibeos_hal::arch::IpiError> {
+    let value = crate::smp::sgi_target(hart as u64, crate::smp::IPI_INTID)
+        .ok_or(vibeos_hal::arch::IpiError::NotSupported)?;
+    unsafe {
+        asm!("dsb ishst", "msr ICC_SGI1R_EL1, {}", "isb", in(reg) value, options(nostack));
+    }
+    Ok(())
 }
 pub fn clear_software_interrupt() {
-    panic!("SGI handling is not installed on the single-CPU ARM runtime");
+    // ICC_IAR1_EL1 already moved this SGI from pending to active. Do not clear
+    // GICR_ICPENDR0 here: that could erase a newer kick. The IRQ dispatcher
+    // EOIs after consuming the mailbox; active+pending then redelivers.
+}
+
+/// Publish boot records/page tables to a CPU entering with caches disabled.
+/// # Safety
+/// The identity-mapped range is valid normal RAM owned by the caller. No
+/// concurrent writer may modify the published records before CPU_ON returns.
+pub unsafe fn clean_to_poc(start: usize, end: usize) {
+    let ctr: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)); }
+    let line = 4usize << ((ctr >> 16) & 15);
+    for address in ((start & !(line - 1))..end).step_by(line) {
+        unsafe { asm!("dc cvac, {}", in(reg) address, options(nostack)); }
+    }
+    unsafe { asm!("dsb sy", options(nostack)); }
 }
 pub fn reboot() -> ! {
     system_reset(0x8400_0009)

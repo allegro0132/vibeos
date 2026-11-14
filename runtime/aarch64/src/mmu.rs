@@ -292,10 +292,11 @@ pub unsafe fn protect_data_page(root: usize, page: usize, read_only: bool) {
         assert_eq!(old & ADDRESS_MASK, page as u64);
         assert_eq!(old & !ADDRESS_MASK & !RO, Permission::Data.bits());
         let new = if read_only { old | RO } else { old & !RO };
-        // Break-before-make, with synchronous local TLB invalidation. No
-        // other CPU is online in this contract; SMP must add shootdown first.
+        // Break-before-make with inner-shareable broadcast invalidation.
+        // All CPUs share these inner-shareable tables; DSB ISH waits for
+        // completion on the participating CPUs before publishing the leaf.
         write_volatile(slot, 0);
-        asm!("dsb ishst", "tlbi vaae1, {}", "dsb ish", "isb", in(reg) page >> 12, options(nostack));
+        asm!("dsb ishst", "tlbi vaae1is, {}", "dsb ish", "isb", in(reg) page >> 12, options(nostack));
         write_volatile(slot, new);
         asm!("dsb ishst", "isb", options(nostack));
     }

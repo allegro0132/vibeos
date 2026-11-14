@@ -1,4 +1,4 @@
-//! GICv3 Group-1 physical timer interrupt setup for one boot CPU.
+//! GICv3 Group-1 physical timer and SGI setup.
 //! No global distributor reset: preserve secure firmware-owned interrupts.
 use crate::bare;
 use core::{
@@ -35,7 +35,7 @@ unsafe fn wait_clear(base: usize, offset: usize, bits: u32) -> Result<(), Error>
 }
 
 /// # Safety
-/// IRQs must be masked, caller owns this CPU's PPI30 configuration. Both
+/// IRQs must be masked, caller owns this CPU's PPI30 and SGI1 configuration. Both
 /// apertures must be mapped Device-nGnRnE and described by the selected BSP.
 /// Firmware must permit EL1 GIC system registers (ICC_SRE_EL2/EL3).
 pub unsafe fn init_timer(
@@ -43,6 +43,17 @@ pub unsafe fn init_timer(
     redistributors: usize,
     end: usize,
 ) -> Result<usize, Error> {
+    unsafe { init_cpu(distributor, redistributors, end, true) }
+}
+
+/// Initialize only this secondary CPU; never touch shared distributor state.
+/// # Safety
+/// Same aperture/IRQ requirements as `init_timer`; boot CPU initialized GICD.
+pub unsafe fn init_secondary(distributor: usize, redistributors: usize, end: usize) -> Result<usize, Error> {
+    unsafe { init_cpu(distributor, redistributors, end, false) }
+}
+
+unsafe fn init_cpu(distributor: usize, redistributors: usize, end: usize, boot: bool) -> Result<usize, Error> {
     if distributor & 0xffff != 0 || redistributors & 0xffff != 0 || end <= redistributors {
         return Err(Error::InvalidRange);
     }
@@ -68,16 +79,21 @@ pub unsafe fn init_timer(
         // Enable Group 1 with affinity routing. In the single-security-state
         // (DS=1) view Group 1 uses bit 1; the NS alias also has G1/G1A
         // enables. Preserve firmware state and enable both NS aliases.
-        write(distributor, 0, read(distributor, 0) | (1 << 4) | 3);
-        wait_clear(distributor, 0, 1 << 31)?;
+        if boot {
+            write(distributor, 0, read(distributor, 0) | (1 << 4) | 3);
+            wait_clear(distributor, 0, 1 << 31)?;
+        }
         let sgi = redist + 0x10000;
-        write(sgi, 0x180, 1 << 30); // ICENABLER0
+        let owned = (1 << 30) | (1 << crate::smp::IPI_INTID);
+        write(sgi, 0x180, owned); // ICENABLER0
         wait_clear(redist, 0, 1 << 3)?;
-        write(sgi, 0x80, read(sgi, 0x80) | (1 << 30)); // IGROUPR0
-        write(sgi, 0x280, 1 << 30); // ICPENDR0
-        write(sgi, 0x380, 1 << 30); // ICACTIVER0
+        write(sgi, 0x80, read(sgi, 0x80) | owned); // IGROUPR0
+        write(sgi, 0xd00, read(sgi, 0xd00) & !owned); // IGRPMODR0
+        write(sgi, 0x280, owned); // ICPENDR0
+        write(sgi, 0x380, owned); // ICACTIVER0
                                     // Timer PPI is level-sensitive; preserve other PPI configuration.
         write(sgi, 0xc04, read(sgi, 0xc04) & !(3 << 28));
+        write_volatile((sgi + 0x400 + crate::smp::IPI_INTID as usize) as *mut u8, 0x80);
         write_volatile((sgi + 0x400 + 30) as *mut u8, 0x80);
         let sre: u64;
         asm!("mrs {0}, ICC_SRE_EL1", "orr {0}, {0}, #1", "msr ICC_SRE_EL1, {0}", "isb",
@@ -92,7 +108,7 @@ pub unsafe fn init_timer(
         asm!("msr ICC_CTLR_EL1, {control}", "msr ICC_PMR_EL1, {pmr}",
             "msr ICC_BPR1_EL1, xzr", "msr ICC_IGRPEN1_EL1, {one}", "isb",
             control = in(reg) control, pmr = in(reg) 0xffu64, one = in(reg) 1u64, options(nostack));
-        write(sgi, 0x100, 1 << 30); // ISENABLER0
+        write(sgi, 0x100, owned); // ISENABLER0
         wait_clear(redist, 0, 1 << 3)?;
         asm!("dsb sy", "isb", options(nostack));
     }
@@ -157,4 +173,27 @@ pub unsafe fn enable_level_spi(distributor: usize, id: u32) -> Result<(), Error>
         asm!("dsb sy", "isb", options(nostack));
     }
     Ok(())
+}
+
+/// Enumerate physical affinities from the qualified redistributor aperture.
+/// # Safety
+/// `start..end` is a mapped GICR Device aperture supplied by the BSP.
+pub unsafe fn affinities(start: usize, end: usize, out: &mut [usize]) -> Result<usize, Error> {
+    if start & 0xffff != 0 || end <= start { return Err(Error::InvalidRange); }
+    let mut address = start;
+    let mut count = 0;
+    loop {
+        if address.checked_add(0x20000).filter(|a| *a <= end).is_none() || count == out.len() {
+            return Err(Error::InvalidRange);
+        }
+        let typer = unsafe { read_volatile((address + 8) as *const u64) };
+        let affinity = typer >> 32;
+        let mpidr = (affinity & 0x00ff_ffff) | ((affinity & 0xff00_0000) << 8);
+        if crate::smp::sgi_target(mpidr, crate::smp::IPI_INTID).is_none()
+            || out[..count].contains(&(mpidr as usize)) { return Err(Error::InvalidRange); }
+        out[count] = mpidr as usize;
+        count += 1;
+        if typer & (1 << 4) != 0 { return Ok(count); }
+        address += if typer & 2 != 0 { 0x40000 } else { 0x20000 };
+    }
 }

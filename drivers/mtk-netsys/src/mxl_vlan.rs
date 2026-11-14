@@ -16,6 +16,8 @@ pub(crate) enum Rule {
     ClassifyCpu(Port),
     /// As `ClassifyCpu`, for a frame with one more tag behind the CPU tag.
     ClassifyCpuTagged(Port),
+    KeepSingleTagged,
+    KeepDoubleTagged,
     DropUntagged,
     DropAnySingleTagged,
     DropAnyDoubleTagged,
@@ -74,9 +76,21 @@ impl Rule {
                     b[116..118].copy_from_slice(&(port.dt_index() as u16 + 17).to_le_bytes());
                 }
             }
+            Self::KeepSingleTagged | Self::KeepDoubleTagged => {
+                word(9, 1);
+                if matches!(self, Self::KeepDoubleTagged) {
+                    word(31, 1);
+                }
+            }
+            Self::DropUntagged => {
+                word(9, 3);
+                word(57, 3);
+            }
             Self::DropAnySingleTagged | Self::DropAnyDoubleTagged => {
                 word(9, 1); // Any outer tag; this does not match an absent tag.
-                if matches!(self, Self::DropAnyDoubleTagged) { word(31, 1); }
+                if matches!(self, Self::DropAnyDoubleTagged) {
+                    word(31, 1);
+                }
                 word(57, 3);
             }
             Self::DropSingleTagged | Self::DropDoubleTagged => {
@@ -125,8 +139,13 @@ impl Rule {
                 true,
                 p.dt_index() as u16 + 17,
             ),
-            Self::DropAnySingleTagged | Self::DropAnyDoubleTagged =>
-                (1, false, 0, 0, 3, false, 0, 0, 0, false, 0),
+            Self::KeepSingleTagged | Self::KeepDoubleTagged => {
+                (1, false, 0, 0, 0, false, 0, 0, 0, false, 0)
+            }
+            Self::DropUntagged => (3, false, 0, 0, 3, false, 0, 0, 0, false, 0),
+            Self::DropAnySingleTagged | Self::DropAnyDoubleTagged => {
+                (1, false, 0, 0, 3, false, 0, 0, 0, false, 0)
+            }
             Self::DropSingleTagged | Self::DropDoubleTagged => {
                 (2, false, 0, 0, 3, false, 0, 0, 0, false, 0)
             }
@@ -137,7 +156,12 @@ impl Rule {
             && got.inner_filter
                 == if matches!(
                     self,
-                    Self::PushDoubleTagged(_) | Self::PopOuterTagged(_) | Self::ClassifyCpuTagged(_) | Self::DropDoubleTagged | Self::DropAnyDoubleTagged
+                    Self::PushDoubleTagged(_)
+                        | Self::PopOuterTagged(_)
+                        | Self::ClassifyCpuTagged(_)
+                        | Self::KeepDoubleTagged
+                        | Self::DropDoubleTagged
+                        | Self::DropAnyDoubleTagged
                 ) {
                     1
                 } else {

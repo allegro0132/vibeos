@@ -3,6 +3,8 @@
 //! BPI-Router-Linux ccaea3d9c05167978e003fbfaf3ac4a5a65e4ad9.
 //! Exclusive ownership spans the whole mailbox transaction, not each MDIO op.
 use crate::mdio;
+mod cold;
+pub use cold::ColdLanLease;
 mod alias;
 pub use alias::BridgePortLease;
 mod binding;

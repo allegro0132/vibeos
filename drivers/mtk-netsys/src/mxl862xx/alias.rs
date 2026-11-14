@@ -20,6 +20,9 @@ impl BridgePortLease {
     pub fn id(&self) -> Option<u16> {
         self.id
     }
+    pub(super) fn uncertain_allocation(&self) -> bool {
+        self.attempted && self.id.is_none()
+    }
     pub fn released(&self) -> bool {
         self.released
     }

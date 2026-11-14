@@ -121,6 +121,29 @@ impl<'a> Builder<'a> {
         }
         Ok(())
     }
+    /// Map `[start, end)` read-only and cacheable onto the pages at
+    /// `physical`, in addition to wherever those pages are mapped already.
+    /// For reading memory that is otherwise mapped non-cacheable: the reader
+    /// must invalidate the lines it is about to read, because nothing else
+    /// keeps this view coherent with writes made through the other mapping.
+    pub fn map_read_alias(&mut self, start: usize, end: usize, physical: usize) -> Result<(), Error> {
+        if start % PAGE_SIZE != 0 || end % PAGE_SIZE != 0 || physical % PAGE_SIZE != 0 {
+            return Err(Error::Alignment);
+        }
+        if start == 0 || start >= end || end > (1usize << 39) || physical == 0 || physical + (end - start) > (1usize << 39) {
+            return Err(Error::Range);
+        }
+        for page in (start..end).step_by(PAGE_SIZE) {
+            let l2 = self.child(0, (page >> 30) & 511)?;
+            let l3 = self.child(l2, (page >> 21) & 511)?;
+            let entry = &mut self.storage.tables[l3].0[(page >> 12) & 511];
+            if *entry != 0 {
+                return Err(Error::Overlap);
+            }
+            *entry = ((physical + (page - start)) as u64) | Permission::ReadOnly.bits();
+        }
+        Ok(())
+    }
     /// Identity-map whole 2 MiB level-2 blocks. Large regions cost no level-3
     /// tables; the range must not share a 2 MiB block with any page mapping.
     /// Blocks carry the same permission bits as pages and are never changed
@@ -217,6 +240,20 @@ mod tests {
             map.map(0x40080000, 0x40081000, Permission::Data),
             Err(Error::Overlap)
         );
+    }
+    #[test]
+    fn read_alias_points_at_other_pages_read_only() {
+        let mut tables = Tables::new();
+        let mut map = Builder::new(&mut tables);
+        map.map(0x4000_0000, 0x4000_2000, Permission::Dma).unwrap();
+        map.map_read_alias(0x40_4000_0000, 0x40_4000_2000, 0x4000_0000).unwrap();
+        let alias = map.descriptor(0x40_4000_1000).unwrap();
+        assert_eq!(alias & ADDRESS_MASK, 0x4000_1000);
+        assert_ne!(alias & RO, 0);
+        assert_eq!(alias & 0x1c, 0); // MAIR normal write-back.
+        assert_ne!(alias & PXN, 0);
+        assert_eq!(map.map_read_alias(0x40_4000_0000, 0x40_4000_1000, 0x4000_0000), Err(Error::Overlap));
+        assert_eq!(map.map_read_alias(0x40_5000_0000, 0x40_5000_1000, 0x4000_0800), Err(Error::Alignment));
     }
     #[test]
     fn blocks_use_no_leaf_tables_and_never_overlap_pages() {

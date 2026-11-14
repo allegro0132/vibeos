@@ -461,11 +461,60 @@ impl NaptBinding {
         source_mac: [u8; 6],
         destination_mac: [u8; 6],
     ) -> Result<Self, EncodeError> {
+        Self::switch_ingress(original, original, ingress_mac, source_mac, destination_mac)
+    }
+    /// A rule of the table the SoC's own port feeds, whatever it does to the
+    /// addresses: translate the source, the destination, or nothing. Which
+    /// network is behind that port is the caller's business. Staged with
+    /// the MxL bridge tag; select the real egress with `with_mxl_alias` or
+    /// `with_builtin_port`. Format only, as for every constructor here.
+    pub fn direct_ingress(
+        original: Tuple,
+        translated: Tuple,
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+    ) -> Result<Self, EncodeError> {
+        let entry = StagedEntry::ipv4_napt_mxl_bridge(Protocol::Udp, original, translated, source_mac, destination_mac)?;
+        Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::WanToMxl })
+    }
+    /// A rule of the table the switches feed (frames for `ingress_mac`),
+    /// whatever it does to the addresses. Staged with the MxL bridge tag;
+    /// select the real egress with `with_mxl_alias`, `with_builtin_port` or
+    /// `with_direct_egress`.
+    pub fn switch_ingress(
+        original: Tuple,
+        translated: Tuple,
+        ingress_mac: [u8; 6],
+        source_mac: [u8; 6],
+        destination_mac: [u8; 6],
+    ) -> Result<Self, EncodeError> {
         if ingress_mac == [0; 6] || ingress_mac[0] & 1 != 0 {
             return Err(EncodeError::Address);
         }
-        let entry = StagedEntry::ipv4_napt_mxl_bridge(Protocol::Udp, original, original, source_mac, destination_mac)?;
+        let entry = StagedEntry::ipv4_napt_mxl_bridge(Protocol::Udp, original, translated, source_mac, destination_mac)?;
         Ok(Self { entry, index: napt_bucket(original), mtu: 1500, path: FlowPath::MxlToWan(ingress_mac) })
+    }
+    /// Send a switch-ingress rule's frames out of the SoC's own port,
+    /// untagged. A rule entering through that port cannot leave by it.
+    pub fn with_direct_egress(mut self) -> Result<Self, EncodeError> {
+        if !matches!(self.path, FlowPath::MxlToWan(_)) {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
+        self.entry.0[..4].copy_from_slice(&(ib1 & !(7 << 14 | 1 << 18)).to_le_bytes());
+        self.entry.0[16..20].copy_from_slice(&((2u32 << 9) | (0xf << 20)).to_le_bytes());
+        self.entry.0[44..46].copy_from_slice(&0u16.to_le_bytes());
+        self.entry.0[46..48].copy_from_slice(&0x0800u16.to_le_bytes());
+        Ok(self)
+    }
+    /// Stands for a table's ingress and MTU where no rule exists yet.
+    fn template(path: FlowPath, mtu: u16) -> Result<Self, EncodeError> {
+        let tuple = Tuple { source: [192, 0, 2, 1], destination: [192, 0, 2, 2], source_port: 1, destination_port: 1 };
+        let rule = match path {
+            FlowPath::MxlToWan(mac) => Self::switch_ingress(tuple, tuple, mac, mac, mac)?,
+            _ => Self::direct_ingress(tuple, tuple, [2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2])?,
+        };
+        rule.with_mtu(mtu)
     }
     /// Whether this rule leaves towards a switch (PSE port GDM3 or GDM1 with
     /// a tag), as opposed to the untagged WAN port or the legacy fixture.
@@ -588,6 +637,20 @@ unsafe fn start_table(
     engine: Engine,
     peer: Option<&PausedSession>,
 ) -> StartOutcome {
+    unsafe { start_table_with(io, table, timeout, binding, true, admit, engine, peer) }
+}
+/// `start_table`; with `publish` false the binding only names the table's
+/// ingress and MTU and the table starts without a rule.
+unsafe fn start_table_with(
+    io: &mut impl Registers,
+    mut table: CpuTable<'static>,
+    timeout: u64,
+    binding: Option<&NaptBinding>,
+    publish: bool,
+    admit: bool,
+    engine: Engine,
+    peer: Option<&PausedSession>,
+) -> StartOutcome {
     let before = Snapshot::read(engine, |o| io.read(o));
     let path = binding.map_or(FlowPath::WanToInternal, |b| b.path);
     let ingress_cpu = io.read(path.admission_register());
@@ -616,7 +679,7 @@ unsafe fn start_table(
     // Reserve all ownership metadata before any register write.
     let mut rules = Rules::new();
     let mut initial = None;
-    if let Some(binding) = binding {
+    if let Some(binding) = binding.filter(|_| publish) {
         let slot = rules.free_way(binding.index);
         let Some(ticket) = slot.and_then(ticket) else {
             return StartOutcome::Failed(Outcome::Rejected(table, Error::Preconditions));
@@ -1477,6 +1540,39 @@ mod tests {
         assert!(matches!(NaptBinding::mxl_lan_to_inside(tuple, [0; 6], ingress, [2,0,0,0,0,9]), Err(EncodeError::Address)));
         // The rule towards the WAN port still takes no switch egress.
         assert!(matches!(outbound_binding().with_mxl_alias(1), Err(EncodeError::UnsupportedEgress)));
+    }
+    #[test]
+    fn rules_of_either_table_take_any_translation_and_every_other_egress() {
+        let inside = Tuple { source: [192,168,79,100], destination: [203,0,113,5], source_port: 40000, destination_port: 443 };
+        let snat = Tuple { source: [198,51,100,7], source_port: 50001, ..inside };
+        let reply = Tuple { source: inside.destination, destination: snat.source, source_port: 443, destination_port: 50001 };
+        let dnat = Tuple { destination: inside.source, destination_port: 40000, ..reply };
+        let mac = [2,0x42,0x70,4,0,2];
+        let word = |b: &NaptBinding, at: usize| u32::from_le_bytes(b.entry.bytes()[at..at + 4].try_into().unwrap());
+        // The SoC's port as an inside port: source translation on the way
+        // to an uplink behind a switch, which the old shapes refused.
+        let out = NaptBinding::direct_ingress(inside, snat, mac, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap();
+        assert_eq!((out.path, out.index()), (FlowPath::WanToMxl, napt_bucket(inside)));
+        assert_ne!(out.entry.bytes()[4..16], out.entry.bytes()[20..32]);
+        assert!(matches!(NaptBinding::wan_to_mxl_lan(inside, snat, mac, [2,0,0,0,0,9]), Err(EncodeError::Address)));
+        assert!(matches!(NaptBinding::direct_ingress(inside, snat, mac, [2,0,0,0,0,9]).unwrap().with_direct_egress(), Err(EncodeError::UnsupportedEgress)));
+        // The answer arrives through the switch and leaves untagged by the
+        // SoC's port, with the destination translated back.
+        let back = NaptBinding::switch_ingress(reply, dnat, mac, mac, [2,0,0,0,0,8]).unwrap().with_direct_egress().unwrap();
+        assert_eq!(back.path, FlowPath::MxlToWan(mac));
+        assert_eq!(word(&back, 0) & (7 << 14 | 1 << 18), 0);
+        assert_eq!((word(&back, 16), &back.entry.bytes()[44..48]), ((2 << 9) | (0xf << 20), &[0u8, 0, 0, 8][..]));
+        // Identical to the qualified outbound format when nothing else differs.
+        let old = NaptBinding::mxl_lan_to_wan(inside, snat, mac, mac, [2,0,0,0,0,8]).unwrap();
+        let new = NaptBinding::switch_ingress(inside, snat, mac, mac, [2,0,0,0,0,8]).unwrap().with_direct_egress().unwrap();
+        assert_eq!(old.entry, new.entry);
+        // Once it leaves by the SoC's port it takes no switch tag.
+        assert!(matches!(new.with_mxl_alias(0), Err(EncodeError::UnsupportedEgress)));
+        // Both ends behind switches, translated: the uplink on one of them.
+        let both = NaptBinding::switch_ingress(reply, dnat, mac, mac, [2,0,0,0,0,8]).unwrap().with_mxl_alias(2).unwrap();
+        assert_eq!(both.entry.bytes()[44..46], 0x0c02u16.to_le_bytes());
+        let template = NaptBinding::template(FlowPath::MxlToWan(mac), 1492).unwrap();
+        assert_eq!((template.path, template.mtu), (FlowPath::MxlToWan(mac), 1492));
     }
     #[test]
     fn builtin_port_egress_carries_the_switch_port_tag_through_gdm1() {

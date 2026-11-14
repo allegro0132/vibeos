@@ -128,6 +128,26 @@ impl Pair {
     }
 }
 
+/// Prepare both tables without a rule and without opening either ingress:
+/// the session's first connection is then published like every later one,
+/// into whichever tables its two rules belong. `mtus` are the IP MTUs of the
+/// table the SoC's own port feeds and of the one the switches feed.
+/// # Safety
+/// As for `prepare`, without its directional receipts.
+pub unsafe fn prepare_empty(
+    io: &mut impl Registers,
+    tables: [CpuTable<'static>; 2],
+    timeout: u64,
+    wan_mac: [u8; 6],
+    lan_mac: [u8; 6],
+    mtus: [u16; 2],
+) -> PrepareOutcome {
+    let templates = (NaptBinding::template(FlowPath::WanToMxl, mtus[0]), NaptBinding::template(FlowPath::MxlToWan(lan_mac), mtus[1]));
+    let (Ok(inbound), Ok(outbound)) = templates else {
+        return PrepareOutcome::Failed(PairOutcome::Rejected(tables, Error::Preconditions));
+    };
+    unsafe { prepare_with(io, tables, timeout, &inbound, &outbound, wan_mac, false) }
+}
 /// Prepare both tables without opening either ingress. Table order is inbound,
 /// outbound. A private owned-peer proof permits the second publication without
 /// weakening public single-engine preconditions.
@@ -148,6 +168,17 @@ pub unsafe fn prepare(
     outbound: &NaptBinding,
     wan_mac: [u8; 6],
 ) -> PrepareOutcome {
+    unsafe { prepare_with(io, tables, timeout, inbound, outbound, wan_mac, true) }
+}
+unsafe fn prepare_with(
+    io: &mut impl Registers,
+    tables: [CpuTable<'static>; 2],
+    timeout: u64,
+    inbound: &NaptBinding,
+    outbound: &NaptBinding,
+    wan_mac: [u8; 6],
+    publish: bool,
+) -> PrepareOutcome {
     let a = tables[0].region();
     let b = tables[1].region();
     if inbound.path != FlowPath::WanToMxl
@@ -162,11 +193,12 @@ pub unsafe fn prepare(
     }
     let [wan_table, lan_table] = tables;
     let wan = match unsafe {
-        start_table(
+        start_table_with(
             io,
             wan_table,
             timeout,
             Some(inbound),
+            publish,
             false,
             Engine::Ppe0,
             None,
@@ -182,11 +214,12 @@ pub unsafe fn prepare(
         }
     };
     match unsafe {
-        start_table(
+        start_table_with(
             io,
             lan_table,
             timeout,
             Some(outbound),
+            publish,
             false,
             Engine::Ppe1,
             Some(&wan),
@@ -318,38 +351,39 @@ impl PausedPair {
             },
         }
     }
-    /// Publish both rules of a connection routed between two inside hosts:
-    /// both enter through the MxL-ingress table. As for `insert_connection`,
-    /// rejection of the second rolls the first back.
+    /// Publish the two rules of one connection, each into the table its
+    /// ingress names (`Inbound`: the table the SoC's own port feeds;
+    /// `Outbound`: the one the switches feed). Both may be in the same table.
+    /// Rejection of the second rolls the first back before returning.
     /// # Safety
     /// Preserve the pair contract and validate both new directional authorities.
-    pub unsafe fn insert_inside_connection(
-        self, io: &mut impl Registers, timeout: u64,
-        one: &NaptBinding, other: &NaptBinding,
+    pub unsafe fn insert_rules(
+        self, io: &mut impl Registers, timeout: u64, rules: [(Direction, &NaptBinding); 2],
     ) -> PairEditOutcome<[RuleTicket; 2]> {
-        let (paused, first) = match unsafe { self.insert_napt(io,timeout,Direction::Outbound,one) } {
+        let (paused, first) = match unsafe { self.insert_napt(io,timeout,rules[0].0,rules[0].1) } {
             PairEditOutcome::Updated(p,t)=>(p,t),
             PairEditOutcome::Rejected(p,e)=>return PairEditOutcome::Rejected(p,e),
             PairEditOutcome::Failed(q)=>return PairEditOutcome::Failed(q),
         };
-        match unsafe {paused.insert_napt(io,timeout,Direction::Outbound,other)} {
+        match unsafe {paused.insert_napt(io,timeout,rules[1].0,rules[1].1)} {
             PairEditOutcome::Updated(p,t)=>PairEditOutcome::Updated(p,[first,t]),
             PairEditOutcome::Failed(q)=>PairEditOutcome::Failed(q),
-            PairEditOutcome::Rejected(p,e)=>match unsafe {p.remove_napt(io,timeout,Direction::Outbound,first)} {
+            PairEditOutcome::Rejected(p,e)=>match unsafe {p.remove_napt(io,timeout,rules[0].0,first)} {
                 PairEditOutcome::Updated(p,())=>PairEditOutcome::Rejected(p,e),
                 PairEditOutcome::Failed(q)=>PairEditOutcome::Failed(q),
                 PairEditOutcome::Rejected(p,_)=>PairEditOutcome::Failed(fail(io,p.0.tables(),Error::Preconditions)),
             },
         }
     }
-    /// Reclaim both rules of one routed inside connection after pause/drain.
+    /// Reclaim the two rules of one connection after pause/drain, each from
+    /// the table it was published into.
     /// # Safety
     /// As for `remove_connections`.
-    pub unsafe fn remove_inside_connection(
-        self, io: &mut impl Registers, timeout: u64, tickets: [RuleTicket;2],
+    pub unsafe fn remove_rules(
+        self, io: &mut impl Registers, timeout: u64, tickets: [(Direction, RuleTicket); 2],
     ) -> PairEditOutcome<()> {
-        match unsafe {self.remove_napt(io,timeout,Direction::Outbound,tickets[0])} {
-            PairEditOutcome::Updated(p,())=>match unsafe {p.remove_napt(io,timeout,Direction::Outbound,tickets[1])} {
+        match unsafe {self.remove_napt(io,timeout,tickets[0].0,tickets[0].1)} {
+            PairEditOutcome::Updated(p,())=>match unsafe {p.remove_napt(io,timeout,tickets[1].0,tickets[1].1)} {
                 // Half a connection must not stay published.
                 PairEditOutcome::Rejected(p,_)=>PairEditOutcome::Failed(fail(io,p.0.tables(),Error::Preconditions)),
                 other=>other,
@@ -998,19 +1032,60 @@ mod tests {
             NaptBinding::mxl_lan_to_inside(tuple, LAN_MAC, LAN_MAC, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap(),
             NaptBinding::mxl_lan_to_inside(back, LAN_MAC, LAN_MAC, [2,0,0,0,0,8]).unwrap().with_mxl_alias(0).unwrap(),
         ];
-        let PairEditOutcome::Updated(p, tickets) = (unsafe { p.insert_inside_connection(&mut io, 10, &rules[0], &rules[1]) }) else { panic!("insert") };
+        let both = |a, b| [(Direction::Outbound, a), (Direction::Outbound, b)];
+        let PairEditOutcome::Updated(p, tickets) = (unsafe { p.insert_rules(&mut io, 10, both(&rules[0], &rules[1])) }) else { panic!("insert") };
         assert_ne!(tickets[0], tickets[1]);
         assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 3));
         // The same tuple twice is refused whole, leaving nothing behind.
-        let PairEditOutcome::Rejected(p, _) = (unsafe { p.insert_inside_connection(&mut io, 10, &rules[1], &rules[0]) }) else { panic!("duplicate") };
+        let PairEditOutcome::Rejected(p, _) = (unsafe { p.insert_rules(&mut io, 10, both(&rules[1], &rules[0])) }) else { panic!("duplicate") };
         assert_eq!(p.0.lan.table.nonzero_entries(), 3);
+        // A rule offered to the table it does not belong to is refused.
+        let PairEditOutcome::Rejected(p, EditError::Egress) = (unsafe { p.insert_rules(&mut io, 10, [(Direction::Inbound, &rules[0]), (Direction::Outbound, &rules[1])]) }) else { panic!("wrong table") };
         let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume") };
         assert!(a.admitted(&mut io));
         let PairPauseOutcome::Paused(p) = (unsafe { a.pause(&mut io, 10) }) else { panic!("pause") };
-        let PairEditOutcome::Updated(p, ()) = (unsafe { p.remove_inside_connection(&mut io, 10, tickets) }) else { panic!("remove") };
+        let held = [(Direction::Outbound, tickets[0]), (Direction::Outbound, tickets[1])];
+        let PairEditOutcome::Updated(p, ()) = (unsafe { p.remove_rules(&mut io, 10, held) }) else { panic!("remove") };
         assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 1));
         // Stale tickets are refused before anything changes.
-        let PairEditOutcome::Rejected(p, _) = (unsafe { p.remove_inside_connection(&mut io, 10, tickets) }) else { panic!("stale") };
+        let PairEditOutcome::Rejected(p, _) = (unsafe { p.remove_rules(&mut io, 10, held) }) else { panic!("stale") };
+        assert!(matches!(unsafe { p.stop(&mut io, 10) }, PairOutcome::Restored(_)));
+    }
+    #[test]
+    fn a_session_starts_without_a_rule_and_takes_connections_of_any_shape() {
+        let mut io = Io::new();
+        let PrepareOutcome::Paused(p) = (unsafe { prepare_empty(&mut io, tables(false), 10, WAN_MAC, LAN_MAC, [1500, 1500]) }) else { panic!("prepare") };
+        assert!(p.initial_ticket(Direction::Inbound).is_none() && p.initial_ticket(Direction::Outbound).is_none());
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (0, 0));
+        // The uplink behind a switch, the inside host on the SoC's port:
+        // source translation enters there, the answer enters by the switch.
+        let host = Tuple { source: [192,168,79,100], destination: [203,0,113,5], source_port: 40000, destination_port: 443 };
+        let snat = Tuple { source: [198,51,100,7], source_port: 50001, ..host };
+        let reply = Tuple { source: host.destination, destination: snat.source, source_port: 443, destination_port: 50001 };
+        let dnat = Tuple { destination: host.source, destination_port: 40000, ..reply };
+        let out = NaptBinding::direct_ingress(host, snat, LAN_MAC, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap();
+        let back = NaptBinding::switch_ingress(reply, dnat, LAN_MAC, LAN_MAC, [2,0,0,0,0,8]).unwrap().with_direct_egress().unwrap();
+        let PairEditOutcome::Updated(p, crossed) = (unsafe { p.insert_rules(&mut io, 10, [(Direction::Outbound, &back), (Direction::Inbound, &out)]) }) else { panic!("crossed") };
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 1));
+        // Uplink and host both behind switches: two rules in one table.
+        let (host2, snat2) = (Tuple { source_port: 40001, ..host }, Tuple { source_port: 50002, ..snat });
+        let (reply2, dnat2) = (Tuple { destination_port: 50002, ..reply }, Tuple { destination_port: 40001, ..dnat });
+        let rules = [
+            NaptBinding::switch_ingress(reply2, dnat2, LAN_MAC, LAN_MAC, [2,0,0,0,0,8]).unwrap().with_mxl_alias(1).unwrap(),
+            NaptBinding::switch_ingress(host2, snat2, LAN_MAC, LAN_MAC, [2,0,0,0,0,9]).unwrap().with_builtin_port(0).unwrap(),
+        ];
+        let PairEditOutcome::Updated(p, same) = (unsafe { p.insert_rules(&mut io, 10, [(Direction::Outbound, &rules[0]), (Direction::Outbound, &rules[1])]) }) else { panic!("same table") };
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (1, 3));
+        let ResumeOutcome::Active(a) = (unsafe { p.resume(&mut io) }) else { panic!("resume") };
+        assert!(a.admitted(&mut io));
+        let PairPauseOutcome::Paused(p) = (unsafe { a.pause(&mut io, 10) }) else { panic!("pause") };
+        let PairEditOutcome::Updated(p, ()) = (unsafe { p.remove_rules(&mut io, 10, [(Direction::Outbound, crossed[0]), (Direction::Inbound, crossed[1])]) }) else { panic!("remove crossed") };
+        let PairEditOutcome::Updated(p, ()) = (unsafe { p.remove_rules(&mut io, 10, [(Direction::Outbound, same[0]), (Direction::Outbound, same[1])]) }) else { panic!("remove same") };
+        assert_eq!((p.0.wan.table.nonzero_entries(), p.0.lan.table.nonzero_entries()), (0, 0));
+        assert!(matches!(unsafe { p.stop(&mut io, 10) }, PairOutcome::Restored(_)));
+        // A rule whose MTU is not its table's is refused, as before.
+        let PrepareOutcome::Paused(p) = (unsafe { prepare_empty(&mut io, tables(false), 10, WAN_MAC, LAN_MAC, [1500, 1492]) }) else { panic!("prepare") };
+        let PairEditOutcome::Rejected(p, EditError::Mtu) = (unsafe { p.insert_rules(&mut io, 10, [(Direction::Outbound, &back), (Direction::Inbound, &out)]) }) else { panic!("mtu") };
         assert!(matches!(unsafe { p.stop(&mut io, 10) }, PairOutcome::Restored(_)));
     }
     #[test]

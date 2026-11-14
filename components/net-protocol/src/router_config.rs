@@ -15,8 +15,10 @@ impl Config {
         {
             return Err("invalid interface address, prefix, MAC or gateway");
         }
-        if wan.mac == lan.mac || lan.gateway.is_some() {
-            return Err("distinct MACs and no LAN default gateway required");
+        // The two sides are separate link segments: they may carry the same
+        // router address (an uplink on a switch port shares the inside one).
+        if lan.gateway.is_some() {
+            return Err("no LAN default gateway allowed");
         }
         let mask = u32::MAX << (32 - wan.prefix.min(lan.prefix));
         if u32::from_be_bytes(wan.ip) & mask == u32::from_be_bytes(lan.ip) & mask {
@@ -82,7 +84,10 @@ mod tests {
             ["192.168.78.1/24/24", "none", "192.168.79.1/24"],
         ] { assert!(Config::parse(&args, MACS).is_err(), "{args:?}"); }
         assert!(Config::parse(&[], MACS).is_err());
-        assert!(Config::parse(&["192.168.78.1/24", "none", "192.168.79.1/24"], [MACS[0]; 2]).is_err());
+        // One router address on both sides is a valid arrangement: they
+        // are separate link segments.
+        assert!(Config::parse(&["192.168.78.1/24", "none", "192.168.79.1/24"], [MACS[0]; 2]).is_ok());
+        assert!(Config::parse(&["192.168.78.1/24", "none", "192.168.79.1/24"], [MACS[0], [0; 6]]).is_err());
     }
 }
 

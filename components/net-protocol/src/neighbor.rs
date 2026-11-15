@@ -10,7 +10,7 @@ const RETRY_MS: u64 = 1000;
 const PACE_MS: u64 = 100;
 const PENDING_MS: u64 = 5000;
 const COOLDOWN_MS: u64 = 10_000;
-const REACHABLE_MS: u64 = 30_000;
+pub const REACHABLE_MS: u64 = 30_000;
 const REFRESH_MS: u64 = 5000;
 const ATTEMPTS: u8 = 3;
 
@@ -82,9 +82,21 @@ impl Interface {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Refresh {
+pub struct Refresh {
     attempts: u8,
     next_at: u64,
+}
+impl Refresh {
+    pub fn new(now: u64) -> Self { Self { attempts: 0, next_at: now } }
+    /// ARP and NDP share the retry budget; probes never extend reachability.
+    pub fn due(self, now: u64, until: u64) -> bool {
+        self.attempts < ATTEMPTS && now >= self.next_at && now < until
+    }
+    /// Called only after the probe is submitted to the NIC.
+    pub fn sent(&mut self, now: u64) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_at = now.saturating_add(RETRY_MS);
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -202,10 +214,7 @@ impl<const N: usize> Table<N> {
                 // Traffic requests a refresh while the old binding is still
                 // valid. Neither lookup nor failed probes extend its lifetime.
                 if now < *until && now >= until.saturating_sub(REFRESH_MS) && refresh.is_none() {
-                    *refresh = Some(Refresh {
-                        attempts: 0,
-                        next_at: now,
-                    });
+                    *refresh = Some(Refresh::new(now));
                 }
             }
         }
@@ -249,7 +258,7 @@ impl<const N: usize> Table<N> {
         if found {
             if let State::Reachable { until, refresh, .. } = &mut self.entries[slot].as_mut().unwrap().state {
                 if now < *until && refresh.is_none() {
-                    *refresh = Some(Refresh { attempts: 0, next_at: now });
+                    *refresh = Some(Refresh::new(now));
                     self.last_now = now;
                     return Ok(true);
                 }
@@ -322,7 +331,7 @@ impl<const N: usize> Table<N> {
             if let Some((attempts, next_at, deadline)) =
                 self.entries[i].and_then(Entry::probe_schedule)
             {
-                if attempts < ATTEMPTS && now >= next_at && now < deadline {
+                if (Refresh { attempts, next_at }).due(now, deadline) {
                     return Ok(Some(Probe {
                         table: self,
                         slot: i,
@@ -424,8 +433,7 @@ impl<const N: usize> Probe<'_, N> {
             State::Reachable {
                 refresh: Some(r), ..
             } => {
-                r.attempts += 1;
-                r.next_at = self.now + RETRY_MS;
+                r.sent(self.now);
             }
             State::Reachable { refresh: None, .. } => unreachable!("probe owns scheduled entry"),
         }

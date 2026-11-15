@@ -123,7 +123,7 @@ impl Pair {
                         == ENABLE
                     && io.read(reg(0x2320)) == 0
                     && io.read(reg(TABLE_CONFIG)) == TABLE_CONFIG_VALUE
-                    && io.read(reg(0x2204)) == 0x200e
+                    && io.read(reg(0x2204)) == FLOW_CONFIG_VALUE
             })
     }
 }
@@ -1569,4 +1569,19 @@ mod tests {
             assert!(t.iter().all(CpuTable::is_zero));
         }
     }
+    #[test]
+    fn mixed_ipv4_ipv6_transactional_pair_and_exact_removal() {
+        let mut io=Io::new();let mut p=prepared(&mut io);
+        let tuple=crate::ppe::Tuple6 {source:"2001:db8::10".parse::<core::net::Ipv6Addr>().unwrap().octets(),destination:"2001:db8:1::20".parse::<core::net::Ipv6Addr>().unwrap().octets(),source_port:12345,destination_port:443};
+        let a=NaptBinding::ipv6_route(tuple,None,LAN_MAC,[2,0,0,0,0,4]).unwrap();
+        let reverse=crate::ppe::Tuple6 {source:tuple.destination,destination:tuple.source,source_port:tuple.destination_port,destination_port:tuple.source_port};
+        let b=NaptBinding::ipv6_route(reverse,Some(LAN_MAC),WAN_MAC,[2,0,0,0,0,3]).unwrap().with_direct_egress().unwrap();
+        let PairEditOutcome::Updated(next,tickets)=(unsafe {p.insert_rules(&mut io,10,[(Direction::Inbound,&a),(Direction::Outbound,&b)])}) else {panic!("mixed insert")};p=next;
+        let PairEditOutcome::Rejected(next,EditError::Duplicate)=(unsafe {p.insert_rules(&mut io,10,[(Direction::Inbound,&a),(Direction::Outbound,&b)])}) else {panic!("duplicate")};p=next;
+        let PairEditOutcome::Updated(next,())=(unsafe {p.remove_rules(&mut io,10,[(Direction::Inbound,tickets[0]),(Direction::Outbound,tickets[1])])}) else {panic!("remove")};p=next;
+        assert_eq!(p.0.wan.rules.len(),1);assert_eq!(p.0.lan.rules.len(),1);
+        let PairEditOutcome::Rejected(next,EditError::Stale)=(unsafe {p.remove_rules(&mut io,10,[(Direction::Inbound,tickets[0]),(Direction::Outbound,tickets[1])])}) else {panic!("stale")};
+        let PairOutcome::Restored(tables)=(unsafe {next.stop(&mut io,10)}) else {panic!("stop")};assert!(tables.iter().all(|t|t.is_zero()));
+    }
+
 }

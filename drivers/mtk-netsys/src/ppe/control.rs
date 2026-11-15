@@ -3,7 +3,7 @@
 //! lookup with WAN-only ingress. A separate unsafe entry point permits one
 //! authorized TCP/UDP diagnostic rule with mandatory caller-owned revocation.
 //! Engine-selected diagnostics additionally qualify isolated PPE1 outbound use.
-use super::{table::CpuTable, EncodeError, Engine, Protocol, Snapshot, StagedEntry, Tuple};
+use super::{table::CpuTable, EncodeError, Engine, Protocol, Snapshot, StagedEntry, Tuple, Tuple6};
 use core::{
     num::NonZeroU64,
     sync::atomic::{AtomicU64, Ordering},
@@ -191,7 +191,7 @@ pub unsafe fn probe(io: &mut impl Registers, mut table: CpuTable<'static>, timeo
     if timeout == 0
         || timeout >= 1 << 63
         || !inherited_empty
-        || before.flow & ((1 << 12) | (1 << 13)) != 0
+        || before.flow & ((1 << 9) | (1 << 12) | (1 << 13)) != 0
         || !table.is_zero()
     {
         return Outcome::Rejected(table, Error::Preconditions);
@@ -243,6 +243,8 @@ pub struct Session {
 /// Size field 4 selects 16K entries, 5 selects 32K; hash mode 1, v2/v3 entry
 /// format, search miss to CPU. No scan, keepalive, auto-build or age writers.
 pub(super) const TABLE_CONFIG_VALUE: u32 = 0x0010_4020 | if cfg!(feature = "ppe-32k") { 5 } else { 4 };
+// IPv4 NAPT plus IPv6 5T only; no 3T, tunnel, fragment or flow-label hashing.
+pub(super) const FLOW_CONFIG_VALUE: u32 = 0x220e;
 static RULE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuleTicket {
@@ -385,8 +387,23 @@ impl NaptBinding {
     pub fn protocol(&self) -> Protocol {
         if self.entry.0[3] & 0x40 != 0 { Protocol::Udp } else { Protocol::Tcp }
     }
-    fn key(&self) -> (Protocol, [u8; 12]) {
-        (self.protocol(), self.entry.bytes()[4..16].try_into().unwrap())
+    fn key(&self) -> (Protocol, [u8; 37]) {
+        let mut key=[0;37];
+        let n=if self.entry.is_ipv6() {key[36]=6;36} else {key[36]=4;12};
+        key[..n].copy_from_slice(&self.entry.bytes()[4..4+n]);
+        (self.protocol(),key)
+    }
+    /// Native IPv6 routing; `switch_mac` selects the switch ingress table,
+    /// otherwise the direct ingress table. Publication requires product receipts.
+    pub fn ipv6_route(tuple: Tuple6, switch_mac: Option<[u8;6]>, source_mac:[u8;6], destination_mac:[u8;6]) -> Result<Self,EncodeError> {
+        if switch_mac.is_some_and(|m|m==[0;6] || m[0]&1!=0) {return Err(EncodeError::Address);}
+        let word=|a:[u8;16],i:usize|u32::from_be_bytes(a[i*4..i*4+4].try_into().unwrap());
+        let a=word(tuple.source,3)^word(tuple.destination,3)^((u32::from(tuple.source_port)<<16)|u32::from(tuple.destination_port));
+        let b=word(tuple.source,2)^word(tuple.destination,2)^word(tuple.destination,0);
+        let c=word(tuple.source,1)^word(tuple.destination,1)^word(tuple.source,0);
+        let mixed=((a&b)|(!a&c)).rotate_left(8)^a^b^c;
+        let index=(((mixed^(mixed>>16)) as usize)&(super::table::ENTRIES/4-1))<<2;
+        Ok(Self {entry:StagedEntry::ipv6_route(Protocol::Udp,tuple,source_mac,destination_mac)?,index,mtu:1500,path:switch_mac.map_or(FlowPath::WanToMxl,FlowPath::MxlToWan)})
     }
 
     pub fn wan_to_lan(
@@ -498,14 +515,16 @@ impl NaptBinding {
     /// entered through that port may leave by it again: the caller does that
     /// only between two VLANs of the port, and adds the tag with `with_vlan`.
     pub fn with_direct_egress(mut self) -> Result<Self, EncodeError> {
+        let ib2 = self.entry.ib2_offset(); let l2 = self.entry.l2_offset();
         if !matches!(self.path, FlowPath::MxlToWan(_) | FlowPath::WanToMxl) {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
         self.entry.0[..4].copy_from_slice(&(ib1 & !(7 << 14 | 1 << 18)).to_le_bytes());
-        self.entry.0[16..20].copy_from_slice(&((2u32 << 9) | (0xf << 20)).to_le_bytes());
-        self.entry.0[44..46].copy_from_slice(&0u16.to_le_bytes());
-        self.entry.0[46..48].copy_from_slice(&0x0800u16.to_le_bytes());
+        self.entry.0[ib2..ib2+4].copy_from_slice(&((2u32 << 9) | (0xf << 20)).to_le_bytes());
+        self.entry.0[l2..l2+2].copy_from_slice(&0u16.to_le_bytes());
+        let ethertype = if self.entry.is_ipv6() {0x86ddu16} else {0x0800u16};
+        self.entry.0[l2+2..l2+4].copy_from_slice(&ethertype.to_le_bytes());
         Ok(self)
     }
     /// Stands for a table's ingress and MTU where no rule exists yet.
@@ -520,7 +539,8 @@ impl NaptBinding {
     /// Whether this rule leaves towards a switch (PSE port GDM3 or GDM1 with
     /// a tag), as opposed to the untagged WAN port or the legacy fixture.
     fn inside_egress(&self) -> bool {
-        let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
+        let ib2 = self.entry.ib2_offset();
+        let port = u32::from_le_bytes(self.entry.0[ib2..ib2+4].try_into().unwrap()) >> 9 & 0xf;
         matches!(self.path, FlowPath::WanToMxl | FlowPath::MxlToWan(_)) && port != 2
     }
     /// Select which switch port's CPU tag carries MxL egress: a copper index
@@ -528,10 +548,11 @@ impl NaptBinding {
     /// port (DT index 12). The same tag software sends with
     /// ([`crate::mxl_tag::Port::vid`]). Format only; the caller owns that policy.
     pub fn with_mxl_alias(mut self, port: u8) -> Result<Self, EncodeError> {
+        let l2 = self.entry.l2_offset();
         let Some(port) = crate::mxl_tag::Port::from_dt(port).filter(|_| self.inside_egress()) else {
             return Err(EncodeError::UnsupportedEgress);
         };
-        self.entry.0[44..46].copy_from_slice(&port.vid().to_le_bytes());
+        self.entry.0[l2..l2+2].copy_from_slice(&port.vid().to_le_bytes());
         Ok(self)
     }
     /// Send this rule's frames to one port of the built-in switch instead of
@@ -539,14 +560,15 @@ impl NaptBinding {
     /// bitmap where the type would be, one tag layer, no 802.1Q insertion).
     /// Format only; the caller owns the switch's CPU-port tag policy.
     pub fn with_builtin_port(mut self, port: u8) -> Result<Self, EncodeError> {
+        let ib2 = self.entry.ib2_offset(); let l2 = self.entry.l2_offset();
         if !self.inside_egress() || port > 5 {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
         self.entry.0[..4].copy_from_slice(&((ib1 | 1 << 14) & !(1 << 18)).to_le_bytes());
-        self.entry.0[16..20].copy_from_slice(&((1u32 << 9) | (0xf << 20)).to_le_bytes());
-        self.entry.0[44..46].copy_from_slice(&0u16.to_le_bytes());
-        self.entry.0[46..48].copy_from_slice(&(1u16 << port).to_le_bytes());
+        self.entry.0[ib2..ib2+4].copy_from_slice(&((1u32 << 9) | (0xf << 20)).to_le_bytes());
+        self.entry.0[l2..l2+2].copy_from_slice(&0u16.to_le_bytes());
+        self.entry.0[l2+2..l2+4].copy_from_slice(&(1u16 << port).to_le_bytes());
         Ok(self)
     }
     /// Put an 802.1Q tag of `vid` on this rule's frames, for a port where
@@ -557,29 +579,30 @@ impl NaptBinding {
     /// that switch family's tag format defines). Hardware removes whatever
     /// tag the frame arrived with either way. Format only.
     pub fn with_vlan(mut self, vid: u16) -> Result<Self, EncodeError> {
+        let ib2 = self.entry.ib2_offset(); let l2 = self.entry.l2_offset();
         if !(1..=4094).contains(&vid) {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
-        let port = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap()) >> 9 & 0xf;
+        let port = u32::from_le_bytes(self.entry.0[ib2..ib2+4].try_into().unwrap()) >> 9 & 0xf;
         let (layers, tagged) = (ib1 >> 14 & 7, ib1 & 1 << 18 != 0);
         let plain = ib1 & !(7 << 14 | 1 << 18);
         match (port, layers, tagged) {
             (2, 0, false) => {
                 self.entry.0[..4].copy_from_slice(&(plain | 1 << 14 | 1 << 18).to_le_bytes());
-                self.entry.0[44..46].copy_from_slice(&vid.to_le_bytes());
+                self.entry.0[l2..l2+2].copy_from_slice(&vid.to_le_bytes());
             }
             (15, 1, true) => {
                 self.entry.0[..4].copy_from_slice(&(plain | 2 << 14 | 1 << 18).to_le_bytes());
-                self.entry.0[52..54].copy_from_slice(&vid.to_le_bytes());
+                self.entry.0[l2+8..l2+10].copy_from_slice(&vid.to_le_bytes());
             }
             (1, 1, false) => {
-                let ports = u16::from_le_bytes(self.entry.0[46..48].try_into().unwrap());
+                let ports = u16::from_le_bytes(self.entry.0[l2+2..l2+4].try_into().unwrap());
                 if ports & 1 << 8 != 0 {
                     return Err(EncodeError::UnsupportedEgress);
                 }
-                self.entry.0[46..48].copy_from_slice(&(ports | 1 << 8).to_le_bytes());
-                self.entry.0[44..46].copy_from_slice(&vid.to_le_bytes());
+                self.entry.0[l2+2..l2+4].copy_from_slice(&(ports | 1 << 8).to_le_bytes());
+                self.entry.0[l2..l2+2].copy_from_slice(&vid.to_le_bytes());
             }
             _ => return Err(EncodeError::UnsupportedEgress),
         }
@@ -588,7 +611,7 @@ impl NaptBinding {
     /// Match the single rule's validated egress IP MTU. Hardware limits include
     /// Ethernet/VLAN headers; oversized packets must take the CPU slow path.
     pub fn with_mtu(mut self, mtu: u16) -> Result<Self, EncodeError> {
-        if !(576..=1500).contains(&mtu) {
+        if !(if self.entry.is_ipv6() {1280} else {576}..=1500).contains(&mtu) {
             return Err(EncodeError::Mtu);
         }
         self.mtu = mtu;
@@ -708,7 +731,7 @@ unsafe fn start_table_with(
         || timeout == 0
         || timeout >= 1 << 63
         || !table.has_zero_proof()
-        || before.flow & ((1 << 12) | (1 << 13)) != 0
+        || before.flow & ((1 << 9) | (1 << 12) | (1 << 13)) != 0
         || ingress_cpu != 0x20710000
         || !path.ingress_matches(io)
     {
@@ -754,7 +777,7 @@ unsafe fn start_table_with(
         for (offset, value) in AUX.into_iter().zip(limits) {
             write_checked(io, ppe_reg(engine, offset), value)?;
         }
-        write_checked(io, ppe_reg(engine, 0x2204), 0x200e)?;
+        write_checked(io, ppe_reg(engine, 0x2204), FLOW_CONFIG_VALUE)?;
         write_checked(io, ppe_reg(engine, GLOBAL), before.global | ENABLE)?;
         // NETSYS-v3 PPE0 port is 3, not the v1 port 4. Ingress is last.
         if admit { write_checked(io, path.admission_register(), path.admission_value(ingress_cpu, engine))?; }
@@ -805,7 +828,7 @@ impl PausedSession {
             || io.read(ppe_reg(engine, GLOBAL)) & (ENABLE | BUSY) != ENABLE
             || io.read(ppe_reg(engine, 0x2320)) != 0
             || io.read(ppe_reg(engine, TABLE_CONFIG)) != TABLE_CONFIG_VALUE
-            || io.read(ppe_reg(engine, 0x2204)) != 0x200e
+            || io.read(ppe_reg(engine, 0x2204)) != FLOW_CONFIG_VALUE
         {
             return Err(Error::Preconditions);
         }
@@ -969,7 +992,7 @@ impl Session {
             && io.read(ppe_reg(engine, GLOBAL)) & ENABLE != 0
             && io.read(ppe_reg(engine, 0x2320)) == 0
             && io.read(ppe_reg(engine, TABLE_CONFIG)) == TABLE_CONFIG_VALUE
-            && io.read(ppe_reg(engine, 0x2204)) == 0x200e;
+            && io.read(ppe_reg(engine, 0x2204)) == FLOW_CONFIG_VALUE;
         if !valid || !unsafe { self.table.retire_napt_state(ticket.index, record.key.0) } {
             return RetireOutcome::Failed(Outcome::Quarantined(Quarantine {
                 _table: self.table, error: Error::Preconditions,
@@ -1339,7 +1362,7 @@ mod tests {
             Some((WAN, 0x20713333))
         );
         assert_eq!(io.registers[&TABLE_CONFIG], TABLE_CONFIG_VALUE);
-        assert_eq!(io.registers[&0x2204], 0x200e);
+        assert_eq!(io.registers[&0x2204], 0x220e);
         let first_stop = io.ops.len();
         let Outcome::Restored(table) = (unsafe { active.stop(&mut io, 10) }) else {
             panic!("stop")
@@ -2654,4 +2677,36 @@ mod tests {
         };
         assert!(matches!(unsafe { paused.stop(&mut io, 10) }, Outcome::Restored(t) if t.is_zero()));
     }
+    #[test]
+    fn ipv6_five_tuple_layout_hash_and_egress_modifiers() {
+        let addr=|s:&str|s.parse::<core::net::Ipv6Addr>().unwrap().octets();
+        let tuple=Tuple6 {source:addr("2001:db8:1::2"),destination:addr("2001:db8:2::3"),source_port:12345,destination_port:443};
+        let rule=||NaptBinding::ipv6_route(tuple,None,[2,0,0,0,0,1],[2,0,0,0,0,2]).unwrap();
+        let b=rule();assert_eq!(b.index(),0x2ab4);
+        let bytes=b.entry.bytes();let word=|at|u32::from_le_bytes(bytes[at..at+4].try_into().unwrap());
+        assert_eq!(word(0),0x42d44000);assert_eq!(word(4),0x20010db8);assert_eq!(word(8),0x00010000);assert_eq!(word(16),2);
+        assert_eq!(word(20),0x20010db8);assert_eq!(word(24),0x00020000);assert_eq!(word(32),3);assert_eq!(word(36),0x303901bb);
+        assert_eq!(word(56),0x00f01e00);assert_eq!(word(60),0x86dd0c00);assert_eq!(word(64),0x02000000);assert_eq!(word(68),0x00020000);
+        assert_eq!(word(72),0x02000000);assert_eq!(word(76),0x00010000);assert!(bytes[80..].iter().all(|b|*b==0));
+        let d=rule().with_direct_egress().unwrap().with_vlan(123).unwrap();assert_eq!(&d.entry.0[60..64],&[123,0,0xdd,0x86]);assert_eq!(&d.entry.0[4..40],&bytes[4..40]);
+        let m=rule().with_mxl_alias(2).unwrap().with_vlan(456).unwrap();assert_eq!(&m.entry.0[68..70],&456u16.to_le_bytes());
+        let g=rule().with_builtin_port(1).unwrap().with_vlan(789).unwrap();assert_eq!(&g.entry.0[60..64],&[0x15,3,2,1]);assert_eq!(&g.entry.0[4..40],&bytes[4..40]);
+        assert!(rule().with_mtu(1279).is_err());assert_ne!(rule().key(),rule().with_protocol(Protocol::Tcp).key());
+        let other=Tuple6 {source:addr("2001:db8:abcd:1234:5678:9abc:def0:1234"),destination:addr("2606:4700:4700::1111"),source_port:65535,destination_port:53};
+        assert_eq!(NaptBinding::ipv6_route(other,None,[2;6],[4;6]).unwrap().index(),0x39b0);
+    }
+    #[test]
+    fn ipv6_publication_preserves_type_and_stop_clears_table() {
+        let tuple=Tuple6 {source:"2001:db8::1".parse::<core::net::Ipv6Addr>().unwrap().octets(),destination:"2001:db8:1::2".parse::<core::net::Ipv6Addr>().unwrap().octets(),source_port:443,destination_port:12345};
+        for protocol in [Protocol::Tcp,Protocol::Udp] {
+            let b=NaptBinding::ipv6_route(tuple,None,[2,0,0,0,0,1],[2,0,0,0,0,2]).unwrap().with_protocol(protocol);
+            let mut io=mxl_mock();
+            let StartOutcome::Active(active)=(unsafe {start_single_napt(&mut io,table(),10,&b)}) else {panic!("IPv6 start")};
+            let ib1=u32::from_le_bytes(active.table.entry(b.index()).unwrap()[..4].try_into().unwrap());
+            assert_eq!(ib1>>23&31,5);assert_eq!(ib1>>28&3,2);assert_eq!(ib1>>30&1,u32::from(protocol==Protocol::Udp));assert_eq!(ib1&(1<<20),0);
+            assert_eq!(io.registers[&0x2204],0x220e);
+            let Outcome::Restored(table)=(unsafe {active.stop(&mut io,10)}) else {panic!("IPv6 stop")};assert!(table.is_zero());
+        }
+    }
+
 }

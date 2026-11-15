@@ -18,6 +18,8 @@ extern crate alloc;
 pub mod command;
 pub mod arp;
 pub mod ipv4;
+pub mod ipv6;
+pub mod dhcpv6;
 pub mod icmp_error;
 pub mod icmp_nat;
 pub mod nat;

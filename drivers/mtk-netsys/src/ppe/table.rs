@@ -89,7 +89,7 @@ impl<'a> CpuTable<'a> {
         // bits remain lifecycle-owned rather than copied from staging.
         let tags = u32::from_le_bytes(entry.bytes()[..4].try_into().unwrap())
             & ((7 << 14) | (1 << 18));
-        let protocol = u32::from_le_bytes(entry.bytes()[..4].try_into().unwrap()) & (1 << 30);
+        let protocol = u32::from_le_bytes(entry.bytes()[..4].try_into().unwrap()) & ((1 << 30) | (31 << 23));
         let ib1 = protocol | (2 << 28) | (1 << 22) | tags | u32::from(timestamp);
         self.bytes[index * ENTRY_BYTES..index * ENTRY_BYTES + 4]
             .copy_from_slice(&ib1.to_le_bytes());

@@ -19,13 +19,13 @@ pub const MAX_RULES: usize = ENTRIES - 1;
 #[derive(Clone, Copy)]
 pub(in crate::ppe) struct RuleRecord {
     pub ticket: RuleTicket,
-    pub key: (Protocol, [u8; 12]),
+    pub key: (Protocol, [u8; 37]),
     pub retiring: bool,
     /// Transient duplicate detection inside one batch validation.
     marked: bool,
 }
 impl RuleRecord {
-    pub fn new(ticket: RuleTicket, key: (Protocol, [u8; 12])) -> Self {
+    pub fn new(ticket: RuleTicket, key: (Protocol, [u8; 37])) -> Self {
         Self { ticket, key, retiring: false, marked: false }
     }
 }
@@ -98,7 +98,7 @@ impl Rules {
         }
     }
     /// A key always hashes to the same bucket, so its four ways are complete.
-    pub fn contains_key(&self, bucket: usize, key: &(Protocol, [u8; 12])) -> bool {
+    pub fn contains_key(&self, bucket: usize, key: &(Protocol, [u8; 37])) -> bool {
         #[cfg(not(feature = "ppe-32k"))]
         {
             let _ = bucket;

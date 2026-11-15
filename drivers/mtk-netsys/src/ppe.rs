@@ -82,6 +82,14 @@ pub struct Tuple {
     pub source_port: u16,
     pub destination_port: u16,
 }
+/// Native IPv6 five-tuple (no address translation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tuple6 {
+    pub source: [u8; 16],
+    pub destination: [u8; 16],
+    pub source_port: u16,
+    pub destination_port: u16,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EncodeError {
     Mtu,
@@ -188,6 +196,30 @@ impl StagedEntry {
         entry.half(44, 0x0c00);
         Ok(entry)
     }
+    /// NETSYS-v3 IPv6 5T routing. Linux v6.12 mtk_foe_ipv6 layout:
+    /// IB1 0, source 4, destination 20, ports 36, IB2 56, L2 60.
+    /// INVALID-only staging, with a switch tag ready for explicit egress selection.
+    pub fn ipv6_route(protocol: Protocol, tuple: Tuple6, source_mac: [u8;6], destination_mac: [u8;6]) -> Result<Self, EncodeError> {
+        let global = |a: [u8;16]| a[0] & 0xe0 == 0x20 || a[0] & 0xfe == 0xfc;
+        if !global(tuple.source) || !global(tuple.destination) || [source_mac,destination_mac].iter().any(|m| *m==[0;6] || m[0]&1!=0) { return Err(EncodeError::Address); }
+        if tuple.source_port==0 || tuple.destination_port==0 { return Err(EncodeError::Port); }
+        let mut entry = Self([0;ENTRY_BYTES]);
+        entry.word(0, (5 << 23) | (1 << 22) | (1 << 20) | (1 << 14) | (1 << 18) | if protocol==Protocol::Udp {1 << 30} else {0});
+        for (offset,address) in [(4,tuple.source),(20,tuple.destination)] {
+            for (i,word) in address.chunks_exact(4).enumerate() { entry.word(offset+i*4,u32::from_be_bytes(word.try_into().unwrap())); }
+        }
+        entry.word(36,(u32::from(tuple.source_port)<<16)|u32::from(tuple.destination_port));
+        entry.word(56,(15<<9)|(0xf<<20));
+        entry.half(60,0x0c00); entry.half(62,0x86dd);
+        entry.word(64,u32::from_be_bytes(destination_mac[..4].try_into().unwrap()));
+        entry.half(70,u16::from_be_bytes(destination_mac[4..].try_into().unwrap()));
+        entry.word(72,u32::from_be_bytes(source_mac[..4].try_into().unwrap()));
+        entry.half(78,u16::from_be_bytes(source_mac[4..].try_into().unwrap()));
+        Ok(entry)
+    }
+    fn is_ipv6(&self) -> bool { (u32::from_le_bytes(self.0[..4].try_into().unwrap()) >> 23) & 31 == 5 }
+    fn ib2_offset(&self) -> usize { if self.is_ipv6() {56} else {16} }
+    fn l2_offset(&self) -> usize { if self.is_ipv6() {60} else {44} }
     fn word(&mut self, offset: usize, value: u32) {
         self.0[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }

@@ -44,9 +44,10 @@ pub struct UdpTuple {
     pub source_port: u16,
     pub destination_port: u16,
 }
-/// Receipt from a successfully committed software UDP forward. Private fields
-/// prevent constructing authority from unvalidated packet hints. Copies retain
-/// their original deadline; traffic or a newer receipt cannot extend them.
+/// Receipt rooted in a successfully committed software UDP flow, either its
+/// submitted direction or the exact reverse derived by that NAT owner. Private
+/// fields prevent constructing authority from unvalidated packet hints. Copies
+/// retain their original deadline; traffic or a newer receipt cannot extend them.
 ///
 /// This is not a self-validating hardware capability: the same NAT owner must
 /// revalidate it immediately before publication. Hardware must enforce ingress
@@ -434,6 +435,19 @@ impl<const M: usize, const F: usize> Table<M, F> {
             && flow.remote == permit.remote
             && flow.state == State::Datagram
             && flow.until >= permit.until
+    }
+    /// The exact reverse UDP tuple is already permitted by a committed NAT
+    /// flow. Derive its directional receipt without inventing a received reply,
+    /// extending expiry or modifying mapping/flow state. Route, neighbor and
+    /// policy authority must still be checked independently by the caller.
+    pub fn reverse_udp_permit(&self, permit: &UdpPermit, now: u64) -> Option<UdpPermit> {
+        self.validate_udp_permit(permit, permit.direction, now).then(|| UdpPermit {
+            direction: match permit.direction {
+                Direction::LanToWan => Direction::WanToLan,
+                Direction::WanToLan => Direction::LanToWan,
+            },
+            ..*permit
+        })
     }
     /// Forward an exact previously committed UDP flow without mutating NAT
     /// mappings, remote permissions, expiry or the table clock. No new receipt

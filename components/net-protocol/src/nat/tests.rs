@@ -1127,6 +1127,29 @@ fn permit<const M: usize, const F: usize>(
 }
 
 #[test]
+fn one_way_udp_derives_only_its_live_exact_reverse_without_refreshing() {
+    let mut table = Table::<1, 8>::new(config(), 42).unwrap();
+    let (out, _) = permit(&mut table, OUT, udp(LAN, REMOTE, 12345, 53), 10);
+    let back = table.reverse_udp_permit(&out, 11).unwrap();
+    assert_eq!(back.direction(), IN);
+    assert_eq!(back.expires_at(), out.expires_at());
+    assert!(table.validate_udp_permit(&back, IN, 11));
+    assert!(!table.validate_udp_permit(&back, OUT, 11));
+    let mut reply = udp(REMOTE, WAN, 53, PORT_BASE);
+    assert!(table.forward_permitted_udp(&back, IN,
+        Packet::parse(&mut reply, MAC).unwrap(), egress(), 11).is_ok());
+    let mut stranger = udp(OTHER, WAN, 53, PORT_BASE);
+    assert!(table.forward_permitted_udp(&back, IN,
+        Packet::parse(&mut stranger, MAC).unwrap(), egress(), 12).is_err());
+    assert_eq!(table.reverse_udp_permit(&back, 12), Some(out));
+    assert!(table.reverse_udp_permit(&out, out.expires_at()).is_none());
+    let other_owner = Table::<1, 8>::new(config(), 42).unwrap();
+    assert!(other_owner.reverse_udp_permit(&out, 12).is_none());
+    table.reconfigure(config()).unwrap();
+    assert!(table.reverse_udp_permit(&out, 12).is_none());
+}
+
+#[test]
 fn udp_permits_match_committed_bytes_and_are_direction_specific() {
     let mut table = Table::<1, 8>::new(config(), 42).unwrap();
     let (out, bytes) = permit(&mut table, OUT, udp(LAN, REMOTE, 12345, 53), 10);

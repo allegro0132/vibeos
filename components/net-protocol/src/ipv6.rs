@@ -114,16 +114,11 @@ impl<'a> Packet<'a> {
     }
 }
 pub fn checksum(source: Address, destination: Address, next: u8, payload: &[u8]) -> u16 {
-    let mut sum = payload.len() as u32 + u32::from(next);
-    for bytes in [&source[..], &destination[..], payload] {
-        for pair in bytes.chunks(2) {
-            sum += u32::from(pair[0]) * 256 + u32::from(*pair.get(1).unwrap_or(&0));
-        }
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 65535) + (sum >> 16)
-    }
-    !(sum as u16)
+    let sum = payload.len() as u32 + u32::from(next)
+        + crate::checksum::sum(&source)
+        + crate::checksum::sum(&destination)
+        + crate::checksum::sum(payload);
+    !crate::checksum::fold(sum)
 }
 pub fn frame(
     mac: [u8; 6],
@@ -206,6 +201,37 @@ mod tests {
         f[62] ^= 1;
         assert!(Packet::parse(&f).unwrap().udp().is_none());
         assert!(Packet::parse(&f[..54]).is_none());
+    }
+    #[test]
+    fn shared_checksum_matches_ipv6_pseudoheader_oracle() {
+        let source = [0x23; 16];
+        let destination = [0xfe; 16];
+        let mut data = alloc::vec![0u8; 65535 + 8];
+        for (i, b) in data.iter_mut().enumerate() { *b = (i * 73 + (i >> 4) * 31) as u8; }
+        for fill in [None, Some(0), Some(255)] {
+            if let Some(byte) = fill { data.fill(byte); }
+            for offset in 0..8 {
+                for length in (0..=80).chain([1396, 1459, 1460, 1500, 65534, 65535]) {
+                    let payload = &data[offset..offset + length];
+                    for next in [6, 17, 58] {
+                        // Independent byte-wise pseudoheader, including its
+                        // 32-bit length and padding, accumulated in u64.
+                        let mut pseudo = source.to_vec();
+                        pseudo.extend_from_slice(&destination);
+                        pseudo.extend_from_slice(&(length as u32).to_be_bytes());
+                        pseudo.extend_from_slice(&[0, 0, 0, next]);
+                        pseudo.extend_from_slice(payload);
+                        let mut sum = 0u64;
+                        for (i, byte) in pseudo.iter().enumerate() {
+                            sum += u64::from(*byte) << if i & 1 == 0 { 8 } else { 0 };
+                        }
+                        while sum > 65535 { sum = (sum & 65535) + (sum >> 16); }
+                        assert_eq!(checksum(source, destination, next, payload), !(sum as u16),
+                            "offset={offset} length={length} next={next}");
+                    }
+                }
+            }
+        }
     }
     #[test]
     fn prefixes_and_bad_options() {

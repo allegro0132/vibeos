@@ -1,4 +1,4 @@
-//! Bounded DHCPv6 prefix-delegation client (Solicit/Advertise/Request/Reply,
+//! Bounded DHCPv6 prefix-delegation client (Rapid Commit or four-message exchange,
 //! Renew/Rebind). No IA_NA is needed to route a delegated prefix over link-local.
 use super::ipv6::{self, Address};
 use alloc::vec::Vec;
@@ -143,6 +143,9 @@ impl Client {
             self.transaction as u8
         ];
         put(&mut out, 1, &self.duid);
+        if self.state == State::Solicit {
+            put(&mut out, 14, &[]); // Rapid Commit; Advertise remains a supported fallback.
+        }
         if matches!(self.state, State::Request | State::Renew) {
             put(&mut out, 2, &self.server);
         }
@@ -185,12 +188,18 @@ impl Client {
             return false;
         }
         let expected = if self.state == State::Solicit { 2 } else { 7 };
-        if self.state == State::Bound || bytes[0] != expected {
+        let rapid_commit = self.state == State::Solicit && bytes[0] == 7;
+        if self.state == State::Bound || bytes[0] != expected && !rapid_commit {
             return false;
         }
         let Some(opts) = options(&bytes[4..]) else {
             return false;
         };
+        // A direct Reply is authoritative only when the server explicitly
+        // commits the lease in response to our Rapid Commit Solicit.
+        if rapid_commit && one(&opts, 14) != Some(&[][..]) {
+            return false;
+        }
         if one(&opts, 1) != Some(&self.duid[..]) || !success(&opts) {
             return false;
         }
@@ -312,6 +321,28 @@ mod tests {
         put(&mut ia, 26, &p);
         put(&mut b, 25, &ia);
         b
+    }
+    #[test]
+    fn rapid_commit_requires_explicit_unique_empty_option() {
+        let mut c = Client::new([2; 6], 7, 0);
+        let query = c.transmit(1000).unwrap();
+        assert_eq!(one(&options(&query[4..]).unwrap(), 14), Some(&[][..]));
+        let plain = response(&c, 7, 100);
+        assert!(!c.receive(&plain, 1000));
+        let mut malformed = plain.clone();
+        put(&mut malformed, 14, &[0]);
+        assert!(!c.receive(&malformed, 1000));
+        let mut committed = plain.clone();
+        put(&mut committed, 14, &[]);
+        let mut duplicate = committed.clone();
+        put(&mut duplicate, 14, &[]);
+        assert!(!c.receive(&duplicate, 1000));
+        assert!(c.receive(&committed, 1000));
+        assert_eq!(c.state(), State::Bound);
+        assert!(c.lease().is_some());
+        let renew = c.transmit(51_000).unwrap();
+        assert_eq!(renew[0], 5);
+        assert_eq!(one(&options(&renew[4..]).unwrap(), 14), None);
     }
     #[test]
     fn acquisition_renew_rebind_expiry() {

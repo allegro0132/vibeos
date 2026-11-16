@@ -8,6 +8,7 @@ extern crate alloc;
 #[cfg(any(test, feature = "qdma-test"))]
 pub mod qdma;
 pub mod mdio;
+pub mod offload;
 pub mod ppe;
 pub mod mxl862xx;
 pub mod mxl_tag;
@@ -98,6 +99,8 @@ pub trait Io {
     fn notify_transmit(&mut self, end: usize) -> Result<(), Error> {
         self.set_reg(0x6808, end as u32); Ok(())
     }
+    /// Only QDMA backends may accept NETSYS v3 TX offload metadata.
+    fn tx_offload_supported(&self) -> bool { false }
     fn pdma_enable(&self) -> u32 { 0x45 }
     fn start_transmit(&mut self) -> Result<(), Error> { Ok(()) }
     fn prepare_transmit(&mut self) -> Result<(), Error> { Ok(()) }
@@ -304,12 +307,15 @@ impl<I: Io> Nic<I> {
             self.io.dma_address() as u32 + self.tx_buffers[self.tx] as u32,
         );
         self.io.set_word(descriptor + 16, fport << 16);
+        self.io.set_word(descriptor + 20, 0);
+        self.io.set_word(descriptor + 24, 0);
         for i in 0..length {
             self.io.set_byte(
                 self.tx_buffers[self.tx] + i,
                 packet.get(i).copied().unwrap_or(0),
             );
         }
+        let length = self.prepare_tx_offload(descriptor, self.tx_buffers[self.tx], 0, length, port);
         self.io.barrier();
         self.io
             .set_word(descriptor + 4, LAST | ((length as u32) << 8));
@@ -318,6 +324,55 @@ impl<I: Io> Nic<I> {
         self.notify_transmit()?;
         Ok(())
     }
+    // Called only while the caller owns both the buffer and TX shadow.
+    // Software checksums remain valid on fallback. Never interpret CPU tags as VLANs.
+    fn prepare_tx_offload(&mut self, descriptor: usize, buffer: usize, offset: usize, length: usize, port: TxPort) -> usize {
+        #[cfg(feature = "tx-offload")]
+        if self.io.tx_offload_supported() && matches!(port, TxPort::Internal | TxPort::Wan) {
+            let bytes = unsafe { self.io.buffer_mut(buffer) };
+            if let Some((length, meta)) = offload::prepare_ordinary(&mut bytes[offset..offset + length], port) {
+                self.io.set_word(descriptor + 20, meta.word5);
+                self.io.set_word(descriptor + 24, meta.word6);
+                return length;
+            }
+        }
+        let _ = (descriptor, buffer, offset, port);
+        length
+    }
+
+    /// Copy and submit an explicitly offloaded packet. TSO input is bounded by
+    /// BUFFER; larger contiguous DMA packets use qdma::TxRing::submit_offloaded.
+    /// Rejected requests never publish a descriptor or modify the caller's bytes.
+    pub fn transmit_offloaded(
+        &mut self, port: TxPort, packet: &[u8], options: offload::TxOffload,
+    ) -> Result<(), Error> {
+        if !self.ready || !self.io.tx_offload_supported() { return Err(Error::NotReady); }
+        if packet.len() > BUFFER { return Err(Error::Length); }
+        let descriptor = self.tx * 32;
+        if self.io.word(descriptor + 4) & DONE == 0 {
+            self.poll_transmit()?;
+            if self.io.word(descriptor + 4) & DONE == 0 { return Err(Error::Busy); }
+        }
+        self.io.barrier();
+        let buffer = self.tx_buffers[self.tx];
+        let meta = unsafe {
+            let bytes = self.io.buffer_mut(buffer);
+            bytes[..packet.len()].copy_from_slice(packet);
+            options.prepare(&mut bytes[..packet.len()], port)?
+        };
+        let length = packet.len().max(60);
+        unsafe { self.io.buffer_mut(buffer)[packet.len()..length].fill(0); }
+        self.io.set_word(descriptor, self.io.dma_address() as u32 + buffer as u32);
+        self.io.set_word(descriptor + 16, match port { TxPort::Internal => 1 << 16, _ => 2 << 16 });
+        self.io.set_word(descriptor + 20, meta.word5);
+        self.io.set_word(descriptor + 24, meta.word6);
+        self.io.barrier();
+        self.io.set_word(descriptor + 4, LAST | ((length as u32) << 8));
+        self.io.barrier();
+        self.tx = (self.tx + 1) % RING;
+        self.notify_transmit()
+    }
+
     /// Reserve a completed TX buffer before calling a synchronous producer.
     /// Busy never invokes it, so queued NAT packets can commit state exactly
     /// once. Drop leaves the descriptor CPU-owned. Initialize every output byte;
@@ -364,6 +419,9 @@ impl<I: Io> Nic<I> {
         self.io
             .set_word(descriptor, self.io.dma_address() as u32 + buffer as u32);
         self.io.set_word(descriptor + 16, fport << 16);
+        self.io.set_word(descriptor + 20, 0);
+        self.io.set_word(descriptor + 24, 0);
+        let wire_length = self.prepare_tx_offload(descriptor, buffer, 0, wire_length, port);
         self.io.barrier();
         self.io
             .set_word(descriptor + 4, LAST | ((wire_length as u32) << 8));
@@ -519,6 +577,9 @@ impl<I: Io> Nic<I> {
                 self.io
                     .set_word(tx_descriptor, self.io.dma_address() as u32 + buffer as u32 + offset as u32);
                 self.io.set_word(tx_descriptor + 16, fport << 16);
+                self.io.set_word(tx_descriptor + 20, 0);
+                self.io.set_word(tx_descriptor + 24, 0);
+                let wire_length = self.prepare_tx_offload(tx_descriptor, buffer, offset, wire_length, port);
                 self.io.barrier();
                 self.io
                     .set_word(tx_descriptor + 4, LAST | ((wire_length as u32) << 8));
@@ -619,6 +680,8 @@ impl Mmio {
 impl Io for Mmio {
 
     #[cfg(feature = "qdma-test")]
+    fn tx_offload_supported(&self) -> bool { self.qdma.is_some() }
+    #[cfg(feature = "qdma-test")]
     fn pdma_enable(&self) -> u32 { if self.qdma.is_some() {4} else {0x45} }
     #[cfg(feature = "qdma-test")]
     fn prepare_transmit(&mut self) -> Result<(), Error> {
@@ -690,6 +753,7 @@ mod tests {
     use core::cell::Cell;
     struct Mock {
         physical: u64,
+        offload: bool,
         regs: std::vec::Vec<u32>,
         dma: std::vec::Vec<u8>,
         ticks: Cell<u64>,
@@ -700,6 +764,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 physical: 0x40800000,
+                offload: false,
                 regs: std::vec![0; 0x14000 / 4],
                 dma: std::vec![0; ARENA_SIZE],
                 ticks: Cell::new(0),
@@ -709,6 +774,7 @@ mod tests {
         }
     }
     impl Io for Mock {
+        fn tx_offload_supported(&self) -> bool { self.offload }
         fn dma_address(&self) -> u64 {
             self.physical
         }
@@ -761,6 +827,69 @@ mod tests {
             t
         }
     }
+    #[cfg(feature = "tx-offload")]
+    #[test]
+    fn receive_forwarding_offloads_vlan_without_losing_buffer_ownership() {
+        let mut n = Nic::new(Mock::new());
+        n.initialize(100).unwrap();
+        n.io.offload = true;
+        let plain = offload::tests::tcp(false, 20);
+        let mut tagged = plain[..12].to_vec();
+        tagged.extend_from_slice(&[0x81, 0, 0xb0, 100]);
+        tagged.extend_from_slice(&plain[12..]);
+        let buffer = n.rx_buffers[0];
+        let replacement = n.tx_buffers[0];
+        n.io.dma[buffer..buffer + tagged.len()].copy_from_slice(&tagged);
+        n.io.set_word(RX + 4, DONE | LAST | ((tagged.len() as u32) << 8));
+        assert!(n.receive_in_place(|_, _| RxAction::Transmit {
+            port: TxPort::Wan, length: tagged.len(),
+        }).unwrap().unwrap().transmitted);
+        assert_eq!(n.tx_buffers[0], buffer);
+        assert_eq!(n.rx_buffers[0], replacement);
+        assert_eq!(n.io.word(20), 0x70000000);
+        assert_eq!(n.io.word(24), 0x1b064);
+        assert_eq!(n.io.word(4), LAST | ((plain.len() as u32) << 8));
+        assert_eq!(&n.io.dma[buffer..buffer + plain.len()], &plain);
+    }
+
+    #[test]
+    fn explicit_offload_requires_backend_and_clears_on_plain_reuse() {
+        let mut n = Nic::new(Mock::new());
+        n.initialize(100).unwrap();
+        let packet = offload::tests::tcp(false, 1800);
+        let options = offload::TxOffload { checksum: true, vlan: Some(100), tso_mss: Some(1000) };
+        assert_eq!(n.transmit_offloaded(TxPort::Wan, &packet, options), Err(Error::NotReady));
+        n.io.offload = true;
+        n.transmit_offloaded(TxPort::Wan, &packet, options).unwrap();
+        assert_eq!(n.io.word(20), 0xf0000000);
+        assert_eq!(n.io.word(24), 0x10064);
+        let buffer = n.tx_buffers[0];
+        assert_eq!(&n.io.dma[buffer + 50..buffer + 52], &1000u16.to_be_bytes());
+        for _ in 1..RING { n.transmit(&[0; 60]).unwrap(); }
+        n.io.set_word(4, DONE);
+        n.transmit(&[0; 60]).unwrap();
+        assert_eq!(n.io.word(20), 0);
+        assert_eq!(n.io.word(24), 0);
+    }
+
+    #[cfg(feature = "tx-offload")]
+    #[test]
+    fn ordinary_tx_uses_offload_only_on_capable_backend() {
+        for capable in [false, true] {
+            let mut n = Nic::new(Mock::new());
+            n.initialize(100).unwrap();
+            n.io.offload = capable;
+            let packet = offload::tests::tcp(false, 20);
+            n.transmit_to(TxPort::Wan, &packet).unwrap();
+            assert_eq!(n.io.word(20), if capable { 0x70000000 } else { 0 });
+            n.transmit_with(|bytes| {
+                bytes[..packet.len()].copy_from_slice(&packet);
+                RxAction::Transmit { port: TxPort::Wan, length: packet.len() }
+            }).unwrap();
+            assert_eq!(n.io.word(32 + 20), if capable { 0x70000000 } else { 0 });
+        }
+    }
+
     #[test]
     fn producer_batch_publishes_half_rings_and_partial_work() {
         let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();

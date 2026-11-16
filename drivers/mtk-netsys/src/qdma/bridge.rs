@@ -65,9 +65,17 @@ impl Bridge {
                 15 => TxPort::ExternalTagged,
                 _ => return Err(Error::Malformed),
             };
+            let word5 = dma.word(slot * 32 + 20);
+            let word6 = dma.word(slot * 32 + 24);
+            if word5 & !0xf0000000 != 0 || word6 & !0x1ffff != 0
+                || (word5 | word6 != 0 && !matches!(port, TxPort::Internal | TxPort::Wan)) {
+                return Err(Error::Malformed);
+            }
+            let metadata = (word5 | word6 != 0).then_some(crate::offload::Prepared {
+                length: length as usize, port, word5, word6,
+            });
             let descriptor = unsafe {
-                self.ring
-                    .stage(queue, address as u64, length as usize, port)
+                self.ring.stage_offloaded(queue, address as u64, length as usize, port, metadata)
             }
             .map_err(|_| Error::Malformed)?;
             if self.owners[descriptor].is_some() {
@@ -211,6 +219,22 @@ mod tests {
         }
         (Bridge::new(ring), q, d)
     }
+    #[test]
+    fn forwards_offload_words_without_confusing_destination() {
+        let (mut b, mut q, mut d) = setup();
+        d.stage(0, 0);
+        d.words[1] = (1 << 30) | (2048 << 8);
+        d.words[5] = 0xf0000000;
+        d.words[6] = 0x1b064;
+        unsafe { b.notify(&mut q, &mut d, 1).unwrap(); }
+        assert_eq!(q.words[0][3], (1 << 30) | (2 << 8));
+        assert_eq!(q.words[0][4], 0xf0000000);
+        assert_eq!(q.words[0][5], 0x1b064);
+        q.done(0);
+        b.poll(&mut q, &mut d).unwrap();
+        assert_ne!(d.words[1] & (1 << 31), 0);
+    }
+
     #[test]
     fn two_half_ring_batches_publish_twice_and_reclaim_every_shadow() {
         let (mut b, mut q, mut d) = setup();

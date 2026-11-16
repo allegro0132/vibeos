@@ -1,7 +1,7 @@
 //! Experimental NETSYS v3 QDMA TX ownership; gated by the board test feature.
 //!
 //! Layout/protocol reference: Linux v6.12 mtk_eth_soc.c, mtk_tx_alloc,
-//! mtk_tx_set_dma_desc_v2 and mtk_poll_tx_qdma. No checksum/VLAN/TSO offload.
+//! mtk_tx_set_dma_desc_v2 and mtk_poll_tx_qdma. Offload metadata is validated by offload::TxOffload.
 //! Unlike PDMA, a release chain can have a different order from submission.
 //! Both the forward tail and the last release descriptor remain reserved.
 
@@ -153,6 +153,20 @@ impl<const N: usize> TxRing<N> {
         self.publish(io)
     }
 
+    /// Submit a packet validated by `TxOffload::prepare`, including TSO packets
+    /// up to 65535 bytes in a single contiguous DMA buffer.
+    /// # Safety
+    /// Same DMA ownership requirements as submit. `prepared` must describe the
+    /// exact bytes at address, unchanged since prepare. The prepared extent
+    /// must include Ethernet padding and contain at least 60 bytes.
+    pub unsafe fn submit_offloaded(
+        &mut self, io: &mut impl Io, address: u64,
+        prepared: crate::offload::Prepared,
+    ) -> Result<(), Error> {
+        unsafe { self.stage_offloaded(io, address, prepared.length, prepared.port, Some(prepared))?; }
+        self.publish(io)
+    }
+
     /// Reserve and fill a descriptor without advancing the hardware endpoint.
     /// The buffer is reserved until completion even before publish is called.
     /// Returns the software-selected descriptor slot for private owner mapping.
@@ -165,9 +179,14 @@ impl<const N: usize> TxRing<N> {
         length: usize,
         port: TxPort,
     ) -> Result<usize, Error> {
-        if self.poisoned {
-            return Err(Error::Corrupt);
-        }
+        unsafe { self.stage_offloaded(io, address, length, port, None) }
+    }
+
+    pub(crate) unsafe fn stage_offloaded(
+        &mut self, io: &mut impl Io, address: u64, length: usize,
+        port: TxPort, offload: Option<crate::offload::Prepared>,
+    ) -> Result<usize, Error> {
+        if self.poisoned { return Err(Error::Corrupt); }
         let (min, max, fport) = match port {
             // The descriptor's forward port cannot tell a tagged internal
             // frame from a plain one; the submitting ring enforced each
@@ -178,6 +197,10 @@ impl<const N: usize> TxRing<N> {
             TxPort::Wan => (60, 1518, 2),
             TxPort::ExternalTagged => (64, 1522, 15),
         };
+        let (min, max) = if let Some(meta) = offload {
+            if meta.port != port || meta.length != length { return Err(Error::Length); }
+            (60, if meta.word5 & (1 << 31) != 0 { 65535 } else { 1518 })
+        } else { (min, max) };
         if !(min..=max).contains(&length) {
             return Err(Error::Length);
         }
@@ -206,6 +229,10 @@ impl<const N: usize> TxRing<N> {
         io.write(slot, 3, (1 << 30) | (fport << 8)); // SWC, queue 0
         for word in 4..8 {
             io.write(slot, word, 0);
+        }
+        if let Some(meta) = offload {
+            io.write(slot, 4, meta.word5);
+            io.write(slot, 5, meta.word6);
         }
         io.barrier();
         io.write(slot, 2, LAST | ((length as u32) << 8));
@@ -402,6 +429,27 @@ mod tests {
                 .unwrap();
         }
     }
+    #[test]
+    fn offload_descriptor_words_and_normal_reuse() {
+        let (mut ring, mut io) = setup::<4>();
+        let mut packet = crate::offload::tests::tcp(false, 8000);
+        let meta = crate::offload::TxOffload { checksum: true, vlan: Some(100), tso_mss: Some(1460) }
+            .prepare(&mut packet, TxPort::Wan).unwrap();
+        unsafe { ring.submit_offloaded(&mut io, 0x43000000, meta).unwrap(); }
+        assert_eq!(io.words[0][4], 0xf0000000);
+        assert_eq!(io.words[0][5], 0x10064);
+        assert_eq!(io.words[0][2], LAST | ((packet.len() as u32) << 8));
+        io.complete(3, 0);
+        ring.reclaim(&mut io).unwrap();
+        for (anchor, slot) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+            send(&mut ring, &mut io, slot as u32);
+            assert_eq!(io.words[slot][4], 0);
+            assert_eq!(io.words[slot][5], 0);
+            io.complete(anchor, slot);
+            ring.reclaim(&mut io).unwrap();
+        }
+    }
+
     #[test]
     fn reclaim_batch_respects_output_bound_and_out_of_order_chain() {
         let (mut r, mut io) = setup::<8>();

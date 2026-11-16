@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod qdma;
 pub mod mdio;
 pub mod offload;
+pub mod rx_offload;
 pub mod ppe;
 pub mod mxl862xx;
 pub mod mxl_tag;
@@ -30,10 +31,11 @@ pub struct Received {
     pub length: usize,
     pub source_port: u8,
     descriptor_word5: u32,
+    pub offload: rx_offload::Metadata,
 }
 impl Received {
     fn decode(length: usize, word5: u32) -> Self {
-        Self { length, source_port: ((word5 >> 26) & 15) as u8, descriptor_word5: word5 }
+        Self { length, source_port: ((word5 >> 26) & 15) as u8, descriptor_word5: word5, offload: rx_offload::Metadata::decode(0,0,0) }
     }
     /// NETSYS v3 RXD5 CPU reason. Diagnostic metadata only: it is not a
     /// validated protocol, installation ticket or authorization to forward.
@@ -70,9 +72,11 @@ pub struct Processed {
 // Match the shared PacketDevice's advertised maximum burst.
 pub const RING: usize = 32;
 pub const BUFFER: usize = 2048;
-pub const ARENA_SIZE: usize = RING * 64 + 2 * RING * BUFFER;
+pub const RX_QUEUES: usize = if cfg!(feature = "rx-rss") { 4 } else { 1 };
+const RX_TOTAL: usize = RX_QUEUES * RING;
+pub const ARENA_SIZE: usize = POOL + (RING + RX_TOTAL) * BUFFER;
 const RX: usize = RING * 32;
-const POOL: usize = RING * 64;
+const POOL: usize = ((RING + RX_TOTAL) * 32 + BUFFER - 1) & !(BUFFER - 1);
 const DONE: u32 = 1 << 31;
 const LAST: u32 = 1 << 30;
 const CFG: usize = 0x6a04;
@@ -123,7 +127,9 @@ pub struct Nic<I: Io> {
     rx: usize,
     ready: bool,
     tx_buffers: [usize; RING],
-    rx_buffers: [usize; RING],
+    rx_buffers: [usize; RX_TOTAL],
+    rx_heads: [usize; RX_QUEUES],
+    rss: bool,
     rx_headroom: usize,
 }
 /// A synchronous RX/TX burst. Drop publishes all completed descriptors before
@@ -135,7 +141,7 @@ pub struct ReceiveBatch<'a, I: Io> {
     count: usize,
 }
 #[derive(Default)]
-struct Notifications { tx: bool, rx: Option<usize> }
+struct Notifications { tx: bool, rx: [Option<usize>; RX_QUEUES] }
 impl<I: Io> ReceiveBatch<'_, I> {
     /// Queue producer output with the same ownership rules as Nic::transmit_with.
     /// Publish at half-ring, on backpressure/error, or when this guard drops.
@@ -186,6 +192,8 @@ impl<I: Io> Nic<I> {
             tx_buffers: core::array::from_fn(|i| POOL + i * BUFFER),
             rx_buffers: core::array::from_fn(|i| POOL + (RING + i) * BUFFER),
             rx_headroom: 0,
+            rx_heads: [0; RX_QUEUES],
+            rss: false,
         }
     }
     /// Reserve four bytes before every received frame for a CPU switch tag.
@@ -194,6 +202,23 @@ impl<I: Io> Nic<I> {
         let mut nic = Self::new(io);
         nic.rx_headroom = 4;
         nic
+    }
+    /// Configure before initialization. Each ring has a separate descriptor
+    /// head and doorbell; this owner currently polls them fairly on one CPU.
+    /// The proxy workers retain their existing per-connection CPU affinity.
+    #[cfg(feature = "rx-rss")]
+    pub fn with_rss(mut self) -> Self { self.rss = true; self }
+    fn receive_queues(&self) -> usize { if self.rss { RX_QUEUES } else { 1 } }
+    fn select_receive(&mut self) {
+        // A deferred head stays selected until consumed, preserving the
+        // caller's pause-before-mutation contract across fast/slow paths.
+        if self.io.word(RX + self.rx * 32 + 4) & DONE != 0 { return; }
+        let first = self.rx / RING;
+        for step in 0..self.receive_queues() {
+            let queue = (first + step) % self.receive_queues();
+            let index = queue * RING + self.rx_heads[queue];
+            if self.io.word(RX + index * 32 + 4) & DONE != 0 { self.rx = index; return; }
+        }
     }
     /// Arena is permanent Normal-NC memory with identical CPU/DMA addresses.
     /// Caller enables the CPU bridge only after successful initialization.
@@ -219,18 +244,23 @@ impl<I: Io> Nic<I> {
             }
         }
         // Preserve lower configuration bits, clear old ring mode bits.
-        self.io.set_reg(CFG, self.io.reg(CFG) & 0xffff);
+        self.io.set_reg(CFG, self.io.reg(CFG) & 0xfeff);
+        // No large-buffer receive rings are published by this driver. Never
+        // inherit a bootloader's LRO aggregation mode into 2 KiB buffers.
+        self.io.set_reg(0x6c08, 0);
         self.io.set_reg(0x124, self.io.reg(0x124) | 0x10);
         for offset in (0..ARENA_SIZE).step_by(4) {
             self.io.set_word(offset, 0);
         }
         for i in 0..RING {
             self.tx_buffers[i] = POOL + i * BUFFER;
-            self.rx_buffers[i] = POOL + (RING + i) * BUFFER;
             self.io
                 .set_word(i * 32, physical as u32 + (POOL + i * BUFFER) as u32);
             self.io.set_word(i * 32 + 4, DONE | LAST);
             self.io.set_word(i * 32 + 16, 1 << 16); // GDM1
+        }
+        for i in 0..RX_TOTAL {
+            self.rx_buffers[i] = POOL + (RING + i) * BUFFER;
             self.io.set_word(
                 RX + i * 32,
                 physical as u32 + (POOL + (RING + i) * BUFFER + self.rx_headroom) as u32,
@@ -241,10 +271,17 @@ impl<I: Io> Nic<I> {
         self.io.set_reg(0x6800, physical as u32);
         self.io.set_reg(0x6804, RING as u32);
         self.io.set_reg(0x6808, 0);
-        self.io.set_reg(0x6900, physical as u32 + RX as u32);
-        self.io.set_reg(0x6904, RING as u32);
-        self.io.set_reg(0x6908, RING as u32 - 1);
-        self.io.set_reg(0x6a08, 0x10001);
+        // Disable inherited RSS before publishing a new queue topology.
+        rx_offload::disable_rss(&mut self.io);
+        for queue in 0..RX_QUEUES {
+            let base = 0x6900 + queue * 16;
+            self.io.set_reg(base, physical as u32 + (RX + queue * RING * 32) as u32);
+            self.io.set_reg(base + 4, if queue < self.receive_queues() { RING as u32 } else { 0 });
+            self.io.set_reg(base + 8, RING as u32 - 1);
+        }
+        self.io.set_reg(0x6a08, 1 | (((1 << self.receive_queues()) - 1) << 16));
+        self.rx_heads = [0; RX_QUEUES];
+        if self.rss { rx_offload::enable_rss(&mut self.io); }
         self.tx = 0;
         self.rx = 0;
         self.io.barrier();
@@ -256,7 +293,7 @@ impl<I: Io> Nic<I> {
     }
     /// Inspect ownership without consuming a frame, for IRQ rearm decisions.
     pub fn has_receive(&self) -> bool {
-        self.ready && self.io.word(RX + self.rx * 32 + 4) & DONE != 0
+        self.ready && (0..self.receive_queues()).any(|q| self.io.word(RX + (q * RING + self.rx_heads[q]) * 32 + 4) & DONE != 0)
     }
 
     /// Reclaim completed TX buffers before checking drain or reserving TX.
@@ -333,9 +370,12 @@ impl<I: Io> Nic<I> {
             if let Some((length, meta)) = offload::prepare_ordinary(&mut bytes[offset..offset + length], port) {
                 self.io.set_word(descriptor + 20, meta.word5);
                 self.io.set_word(descriptor + 24, meta.word6);
+                offload::record(Some(meta));
                 return length;
             }
         }
+        #[cfg(feature = "tx-offload")]
+        offload::record(None);
         let _ = (descriptor, buffer, offset, port);
         length
     }
@@ -366,6 +406,7 @@ impl<I: Io> Nic<I> {
         self.io.set_word(descriptor + 16, match port { TxPort::Internal => 1 << 16, _ => 2 << 16 });
         self.io.set_word(descriptor + 20, meta.word5);
         self.io.set_word(descriptor + 24, meta.word6);
+        offload::record(Some(meta));
         self.io.barrier();
         self.io.set_word(descriptor + 4, LAST | ((length as u32) << 8));
         self.io.barrier();
@@ -440,6 +481,7 @@ impl<I: Io> Nic<I> {
         discard: impl FnOnce(Received, &[u8]) -> bool,
     ) -> Result<Option<Received>, Error> {
         if !self.ready { return Err(Error::NotReady); }
+        self.select_receive();
         let descriptor = RX + self.rx * 32;
         let status = self.io.word(descriptor + 4);
         if status & DONE == 0 { return Ok(None); }
@@ -449,7 +491,8 @@ impl<I: Io> Nic<I> {
             self.recycle_receive();
             return Err(Error::Malformed);
         }
-        let received = Received::decode(length, self.io.word(descriptor + 16));
+        let mut received = Received::decode(length, self.io.word(descriptor + 16));
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
         let buffer = self.rx_buffers[self.rx];
         if !discard(received, unsafe { &self.io.buffer_mut(buffer)[self.rx_headroom..self.rx_headroom + length] }) {
             return Ok(None);
@@ -494,13 +537,13 @@ impl<I: Io> Nic<I> {
     }
 
     fn publish_notifications(&mut self, pending: &mut Notifications) {
-        if !pending.tx && pending.rx.is_none() { return; }
+        if !pending.tx && pending.rx.iter().all(Option::is_none) { return; }
         // Each pending descriptor already has its post-publication barrier in
         // receive_deferred/recycle_deferred. No DMA write follows that barrier;
         // PDMA can notify directly; QDMA publishes its separate descriptors
         // and performs its own barriers before notifying that engine.
         if pending.tx { self.notify_transmit().expect("TX publication failed; retain DMA storage"); }
-        if let Some(rx) = pending.rx { self.io.set_reg(0x6908, rx as u32); }
+        for (queue, rx) in pending.rx.iter().enumerate() { if let Some(rx) = rx { self.io.set_reg(0x6908 + queue * 16, *rx as u32); } }
         *pending = Notifications::default();
     }
 
@@ -511,6 +554,7 @@ impl<I: Io> Nic<I> {
         if !self.ready {
             return Err(Error::NotReady);
         }
+        self.select_receive();
         let descriptor = RX + self.rx * 32;
         let status = self.io.word(descriptor + 4);
         if status & DONE == 0 {
@@ -528,7 +572,8 @@ impl<I: Io> Nic<I> {
             if self.io.word(tx_descriptor + 4) & DONE == 0 { return Err(Error::Busy); }
         }
         self.io.barrier();
-        let received = Received::decode(length, self.io.word(descriptor + 16));
+        let mut received = Received::decode(length, self.io.word(descriptor + 16));
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
         let buffer = self.rx_buffers[self.rx];
         // Both descriptors are CPU-owned; the mapping comes only from our
         // private permutation, never from device-written descriptor pointers.
@@ -608,11 +653,18 @@ impl<I: Io> Nic<I> {
             descriptor,
             self.io.dma_address() as u32 + (self.rx_buffers[self.rx] + self.rx_headroom) as u32,
         );
+        // Clear completion-only facts before returning ownership. A later
+        // short/error completion must never inherit a previous checksum proof.
+        for offset in (8..32).step_by(4) { self.io.set_word(descriptor + offset, 0); }
         self.io.barrier();
         self.io.set_word(descriptor + 4, ((BUFFER - self.rx_headroom) as u32) << 8);
         self.io.barrier();
-        pending.rx = Some(self.rx);
-        self.rx = (self.rx + 1) % RING;
+        let queue = self.rx / RING;
+        pending.rx[queue] = Some(self.rx % RING);
+        self.rx_heads[queue] = (self.rx % RING + 1) % RING;
+        rx_offload::record_queue(queue);
+        let next = (queue + 1) % self.receive_queues();
+        self.rx = next * RING + self.rx_heads[next];
     }
 
     /// Copies a single completed frame, then returns ownership to DMA even
@@ -627,6 +679,7 @@ impl<I: Io> Nic<I> {
         if !self.ready {
             return Err(Error::NotReady);
         }
+        self.select_receive();
         let descriptor = RX + self.rx * 32;
         let status = self.io.word(descriptor + 4);
         if status & DONE == 0 {
@@ -634,7 +687,8 @@ impl<I: Io> Nic<I> {
         }
         self.io.barrier();
         let length = ((status >> 8) & 0xffff) as usize;
-        let received = Received::decode(length, self.io.word(descriptor + 16));
+        let mut received = Received::decode(length, self.io.word(descriptor + 16));
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
         let valid = (14..=BUFFER - self.rx_headroom).contains(&length) && length <= out.len() && status & LAST != 0;
         if valid {
             for (i, b) in out[..length].iter_mut().enumerate() {
@@ -800,7 +854,7 @@ mod tests {
             // final ring state: no two live descriptors may share a buffer.
             if self.regs[CFG / 4] & 0x45 == 0x45 && o < POOL && o % 32 == 4 && v & DONE == 0 {
                 let mut owned = std::collections::BTreeSet::new();
-                for descriptor in (0..POOL).step_by(32) {
+                for descriptor in (0..(RING + RX_TOTAL) * 32).step_by(32) {
                     if self.word(descriptor + 4) & DONE == 0 {
                         let pointer = self.word(descriptor);
                         assert!(
@@ -828,6 +882,75 @@ mod tests {
         }
     }
     #[cfg(feature = "tx-offload")]
+    #[test]
+    #[cfg(feature = "rx-rss")]
+    fn rss_wrap_preserves_buffer_ownership_and_queue_local_doorbells() {
+        let mut n = Nic::new_with_rx_headroom(Mock::new()).with_rss();
+        n.initialize(100).unwrap();
+        for round in 0..RING * 3 {
+            for q in 0..RX_QUEUES {
+                let slot = q * RING + round % RING;
+                let descriptor = RX + slot * 32;
+                n.io.set_word(descriptor + 8, 4);
+                n.io.set_word(descriptor + 4, DONE | LAST | (60 << 8));
+            }
+            for q in 0..RX_QUEUES {
+                n.io.set_word(n.tx * 32 + 4, DONE);
+                let mut batch = n.receive_batch();
+                assert!(batch.receive_with_headroom(|received,offset,_| {
+                    assert_eq!(usize::from(received.offload.queue()),q);
+                    RxAction::TransmitFrom {port:TxPort::Wan,length:60,offset}
+                }).unwrap().unwrap().transmitted);
+            }
+            for q in 0..RX_QUEUES { assert_eq!(n.io.reg(0x6908 + q * 16), (round % RING) as u32); }
+            assert!(!n.has_receive());
+        }
+        let mut buffers = std::vec::Vec::from(n.tx_buffers);
+        buffers.extend(n.rx_buffers); buffers.sort_unstable(); buffers.dedup();
+        assert_eq!(buffers.len(), RING + RX_TOTAL);
+    }
+
+    #[test]
+    #[cfg(feature = "rx-rss")]
+    fn rss_preserves_deferred_heads_and_publishes_each_queue() {
+        let mut n = Nic::new(Mock::new()).with_rss();
+        n.initialize(100).unwrap();
+        assert_eq!(n.io.reg(0x7000) & 5, 1);
+        assert_eq!(n.io.reg(0x7050), 0xe4e4e4e4);
+        for q in 0..4 {
+            let d = RX + q * RING * 32;
+            n.io.set_word(d + 8, 4);
+            n.io.set_word(d + 24, 0xdeadbeef);
+            n.io.set_word(d + 4, DONE | LAST | (60 << 8));
+        }
+        let mut seen = std::vec::Vec::new();
+        for q in 0..4 {
+            assert!(n.has_receive());
+            assert_eq!(n.receive_in_place(|packet, _| {
+                assert_eq!(packet.offload.queue(), q);
+                assert!(packet.offload.l4_valid_bit());
+                RxAction::Defer
+            }), Ok(None));
+            let d = RX + usize::from(q) * RING * 32;
+            assert_ne!(n.io.word(d + 4) & DONE, 0);
+            n.receive_batch().receive_with_headroom(|packet,_,_| {
+                seen.push(packet.offload.queue()); RxAction::Drop
+            }).unwrap();
+            assert_eq!(n.io.reg(0x6908 + usize::from(q) * 16), 0);
+            assert_eq!(n.io.word(d + 8), 0);
+            assert_eq!(n.io.word(d + 24), 0);
+        }
+        assert_eq!(seen, [0,1,2,3]);
+        assert!(!n.has_receive());
+        // One busy ring cannot starve an already completed different ring.
+        for q in [1,3] {
+            n.io.set_word(RX + (q * RING + 1) * 32 + 4, DONE | LAST | (60 << 8));
+        }
+        let mut out = [0; 60];
+        assert_eq!(n.receive_from(&mut out).unwrap().unwrap().offload.queue(), 1);
+        assert_eq!(n.receive_from(&mut out).unwrap().unwrap().offload.queue(), 3);
+    }
+
     #[test]
     fn receive_forwarding_offloads_vlan_without_losing_buffer_ownership() {
         let mut n = Nic::new(Mock::new());
@@ -1038,7 +1161,7 @@ mod tests {
             all.sort_unstable();
             assert_eq!(
                 all,
-                (0..2 * RING)
+                (0..RING + RX_TOTAL)
                     .map(|i| POOL + i * BUFFER)
                     .collect::<std::vec::Vec<_>>()
             );

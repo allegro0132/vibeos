@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+rx-rss = []
 qdma-test = []
 # Opportunistic TX checksum and VLAN insertion on untagged CPU paths.
 tx-offload = ["qdma-test"]

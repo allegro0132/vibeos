@@ -3,6 +3,19 @@
 //! CPU tags, fragments, IPv6 extension headers and tunnels stay in software.
 use crate::{Error, TxPort};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+static COUNTERS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Submitted checksum, VLAN, TSO requests and ordinary software fallbacks.
+/// Counts requests, not proof of on-wire hardware completion.
+pub fn counters() -> [u64; 4] { core::array::from_fn(|i| COUNTERS[i].load(Ordering::Relaxed)) }
+pub(crate) fn record(meta: Option<Prepared>) {
+    if let Some(meta) = meta {
+        for (i, used) in [meta.word5 & (7 << 28) != 0, meta.word6 & (1 << 16) != 0, meta.word5 & (1 << 31) != 0].into_iter().enumerate() {
+            if used { COUNTERS[i].fetch_add(1, Ordering::Relaxed); }
+        }
+    } else { COUNTERS[3].fetch_add(1, Ordering::Relaxed); }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxOffload {
     pub checksum: bool,

@@ -123,7 +123,7 @@ pub struct Nic<I: Io> {
     rx_buffers: [usize; RING],
     rx_headroom: usize,
 }
-/// A synchronous receive burst. Drop publishes all completed descriptors before
+/// A synchronous RX/TX burst. Drop publishes all completed descriptors before
 /// the NIC can be used again. Never hold this across a wait or scheduler yield.
 #[must_use]
 pub struct ReceiveBatch<'a, I: Io> {
@@ -134,6 +134,17 @@ pub struct ReceiveBatch<'a, I: Io> {
 #[derive(Default)]
 struct Notifications { tx: bool, rx: Option<usize> }
 impl<I: Io> ReceiveBatch<'_, I> {
+    /// Queue producer output with the same ownership rules as Nic::transmit_with.
+    /// Publish at half-ring, on backpressure/error, or when this guard drops.
+    pub fn transmit_with(&mut self, produce: impl FnOnce(&mut [u8]) -> RxAction) -> Result<bool,Error> {
+        let result=self.nic.transmit_deferred(produce,&mut self.pending);
+        self.count+=1;
+        if self.count>=RING/2 || !matches!(result,Ok(true)) {
+            self.nic.publish_notifications(&mut self.pending);
+            self.count=0;
+        }
+        result
+    }
     pub fn receive_in_place(
         &mut self, process: impl FnOnce(Received, &mut [u8]) -> RxAction,
     ) -> Result<Option<Processed>, Error> {
@@ -315,6 +326,13 @@ impl<I: Io> Nic<I> {
         &mut self,
         produce: impl FnOnce(&mut [u8]) -> RxAction,
     ) -> Result<bool, Error> {
+        let mut pending=Notifications::default();
+        let result=self.transmit_deferred(produce,&mut pending);
+        if pending.tx {self.notify_transmit()?;}
+        result
+    }
+    fn transmit_deferred(&mut self, produce:impl FnOnce(&mut [u8])->RxAction,
+        pending:&mut Notifications)->Result<bool,Error> {
         if !self.ready {
             return Err(Error::NotReady);
         }
@@ -351,7 +369,7 @@ impl<I: Io> Nic<I> {
             .set_word(descriptor + 4, LAST | ((wire_length as u32) << 8));
         self.io.barrier();
         self.tx = (self.tx + 1) % RING;
-        self.notify_transmit()?;
+        pending.tx=true;
         Ok(true)
     }
 
@@ -409,6 +427,8 @@ impl<I: Io> Nic<I> {
     pub fn receive_batch(&mut self) -> ReceiveBatch<'_, I> {
         ReceiveBatch { nic: self, pending: Notifications::default(), count: 0 }
     }
+    /// A synchronous producer burst; drop before any wait or scheduler yield.
+    pub fn transmit_batch(&mut self) -> ReceiveBatch<'_,I> { self.receive_batch() }
 
     fn notify_transmit(&mut self) -> Result<(), Error> {
         if let Err(error)=self.io.notify_transmit(self.tx) {self.ready=false;return Err(error);}
@@ -739,6 +759,44 @@ mod tests {
             let t = self.ticks.get();
             self.ticks.set(t + 1);
             t
+        }
+    }
+    #[test]
+    fn producer_batch_publishes_half_rings_and_partial_work() {
+        let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();
+        for lap in 0..3 {
+            for slot in 0..RING {n.io.set_word(slot*32+4,DONE);}
+            n.io.doorbells.clear();
+            {
+                let mut batch=n.transmit_batch();
+                for slot in 0..RING {
+                    assert_eq!(batch.transmit_with(|bytes| {
+                        bytes[..60].fill((lap*RING+slot) as u8);
+                        RxAction::Transmit {port:TxPort::Wan,length:60}
+                    }),Ok(true));
+                    assert_eq!(batch.nic.io.doorbells.len(),(slot+1)/(RING/2));
+                }
+            }
+            assert_eq!(n.io.doorbells,[(0x6808,16),(0x6808,0)]);
+        }
+    }
+    #[test]
+    fn producer_batch_flushes_on_drop_defer_invalid_and_busy() {
+        for stop in 0..4 {
+            let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();n.io.doorbells.clear();
+            {
+                let mut batch=n.transmit_batch();
+                assert_eq!(batch.transmit_with(|b| {b[..60].fill(9);RxAction::Transmit {port:TxPort::Wan,length:60}}),Ok(true));
+                assert!(batch.nic.io.doorbells.is_empty());
+                match stop {
+                    0=>{},
+                    1=>assert_eq!(batch.transmit_with(|_|RxAction::Defer),Ok(false)),
+                    2=>assert_eq!(batch.transmit_with(|_|RxAction::Transmit {port:TxPort::Wan,length:0}),Err(Error::Length)),
+                    _=>{batch.nic.io.dma[36..40].copy_from_slice(&0u32.to_le_bytes());assert_eq!(batch.transmit_with(|_|panic!("busy producer")),Err(Error::Busy));}
+                }
+            }
+            assert_eq!(n.io.doorbells,[(0x6808,1)]);
+            assert_eq!(n.tx,1);
         }
     }
     #[test]

@@ -10,6 +10,8 @@ pub mod qdma;
 pub mod mdio;
 pub mod offload;
 pub mod rx_offload;
+#[cfg(feature="rx-multicore")]
+pub mod rx_queue;
 pub mod ppe;
 pub mod mxl862xx;
 pub mod mxl_tag;
@@ -69,11 +71,13 @@ pub struct Processed {
     pub transmitted: bool,
 }
 
-// Match the shared PacketDevice's advertised maximum burst.
+// Independent RX consumers share a core with TLS work; absorb scheduling bursts.
+// Poll budgets remain bounded independently of descriptor capacity.
 pub const RING: usize = 32;
+pub const RX_RING: usize = if cfg!(feature = "rx-multicore") { 128 } else { 32 };
 pub const BUFFER: usize = 2048;
-pub const RX_QUEUES: usize = if cfg!(feature = "rx-rss") { 4 } else { 1 };
-const RX_TOTAL: usize = RX_QUEUES * RING;
+pub const RX_QUEUES: usize = if cfg!(feature = "rx-multicore") { 5 } else if cfg!(feature = "rx-rss") { 4 } else { 1 };
+const RX_TOTAL: usize = RX_QUEUES * RX_RING;
 pub const ARENA_SIZE: usize = POOL + (RING + RX_TOTAL) * BUFFER;
 const RX: usize = RING * 32;
 const POOL: usize = ((RING + RX_TOTAL) * 32 + BUFFER - 1) & !(BUFFER - 1);
@@ -130,6 +134,8 @@ pub struct Nic<I: Io> {
     rx_buffers: [usize; RX_TOTAL],
     rx_heads: [usize; RX_QUEUES],
     rss: bool,
+    detached: u8,
+    software_tail: usize,
     rx_headroom: usize,
 }
 /// A synchronous RX/TX burst. Drop publishes all completed descriptors before
@@ -194,6 +200,8 @@ impl<I: Io> Nic<I> {
             rx_headroom: 0,
             rx_heads: [0; RX_QUEUES],
             rss: false,
+            detached: 0,
+            software_tail: 0,
         }
     }
     /// Reserve four bytes before every received frame for a CPU switch tag.
@@ -212,17 +220,51 @@ impl<I: Io> Nic<I> {
     fn select_receive(&mut self) {
         // A deferred head stays selected until consumed, preserving the
         // caller's pause-before-mutation contract across fast/slow paths.
-        if self.io.word(RX + self.rx * 32 + 4) & DONE != 0 { return; }
-        let first = self.rx / RING;
+        if self.detached & (1 << (self.rx / RX_RING)) == 0 && self.io.word(RX + self.rx * 32 + 4) & DONE != 0 { return; }
+        let first = self.rx / RX_RING;
         for step in 0..self.receive_queues() {
             let queue = (first + step) % self.receive_queues();
-            let index = queue * RING + self.rx_heads[queue];
+            if self.detached & (1 << queue) != 0 { continue; }
+            let index = queue * RX_RING + self.rx_heads[queue];
             if self.io.word(RX + index * 32 + 4) & DONE != 0 { self.rx = index; return; }
         }
+        self.rx = self.rx_heads[0];
+    }
+    /// Permanently transfer one hardware RX queue. Its buffers may no longer
+    /// participate in this NIC's TX exchange. Reinitialization is forbidden.
+    #[cfg(feature="rx-multicore")]
+    pub(crate) fn detach_rx(&mut self, queue: usize) -> Result<rx_queue::Queue, Error> {
+        if !self.ready || !self.rss || !(1..4).contains(&queue) || self.detached & (1 << queue) != 0 {
+            return Err(Error::NotReady);
+        }
+        self.detached |= 1 << queue;
+        self.rx = self.rx_heads[0];
+        Ok(rx_queue::Queue::new(queue, self.rx_heads[queue],
+            core::array::from_fn(|i| self.rx_buffers[queue * RX_RING + i]), self.rx_headroom))
+    }
+    /// Copy a remote consumer's unmodified exception into a CPU-only ring.
+    /// Hardware ring 4 is disabled; it is never present in the RSS table.
+    #[cfg(feature="rx-multicore")]
+    pub fn inject_received(&mut self, packet: Received, bytes: &[u8]) -> Result<bool, Error> {
+        if !self.ready || !self.rss { return Err(Error::NotReady); }
+        if bytes.len() != packet.length || !(14..=BUFFER-self.rx_headroom).contains(&bytes.len()) { return Err(Error::Length); }
+        let slot = 4 * RX_RING + self.software_tail;
+        let descriptor = RX + slot * 32;
+        if self.io.word(descriptor + 4) & DONE != 0 { return Ok(false); }
+        unsafe { self.io.buffer_mut(self.rx_buffers[slot])[self.rx_headroom..self.rx_headroom+bytes.len()].copy_from_slice(bytes); }
+        self.io.set_word(descriptor + 8, packet.offload.word3());
+        self.io.set_word(descriptor + 16, packet.descriptor_word5);
+        self.io.set_word(descriptor + 24, packet.offload.raw_word7());
+        self.io.barrier();
+        self.io.set_word(descriptor + 4, DONE | LAST | ((bytes.len() as u32) << 8));
+        self.io.barrier();
+        self.software_tail = (self.software_tail + 1) % RX_RING;
+        Ok(true)
     }
     /// Arena is permanent Normal-NC memory with identical CPU/DMA addresses.
     /// Caller enables the CPU bridge only after successful initialization.
     pub fn initialize(&mut self, timeout_ticks: u64) -> Result<(), Error> {
+        if self.detached != 0 { return Err(Error::Busy); }
         let physical = self.io.dma_address();
         if physical == 0
             || physical & 63 != 0
@@ -275,12 +317,13 @@ impl<I: Io> Nic<I> {
         rx_offload::disable_rss(&mut self.io);
         for queue in 0..RX_QUEUES {
             let base = 0x6900 + queue * 16;
-            self.io.set_reg(base, physical as u32 + (RX + queue * RING * 32) as u32);
-            self.io.set_reg(base + 4, if queue < self.receive_queues() { RING as u32 } else { 0 });
-            self.io.set_reg(base + 8, RING as u32 - 1);
+            self.io.set_reg(base, physical as u32 + (RX + queue * RX_RING * 32) as u32);
+            self.io.set_reg(base + 4, if queue < self.receive_queues().min(4) { RX_RING as u32 } else { 0 });
+            self.io.set_reg(base + 8, RX_RING as u32 - 1);
         }
-        self.io.set_reg(0x6a08, 1 | (((1 << self.receive_queues()) - 1) << 16));
+        self.io.set_reg(0x6a08, 1 | (((1 << self.receive_queues().min(4)) - 1) << 16));
         self.rx_heads = [0; RX_QUEUES];
+        self.software_tail = 0;
         if self.rss { rx_offload::enable_rss(&mut self.io); }
         self.tx = 0;
         self.rx = 0;
@@ -293,7 +336,7 @@ impl<I: Io> Nic<I> {
     }
     /// Inspect ownership without consuming a frame, for IRQ rearm decisions.
     pub fn has_receive(&self) -> bool {
-        self.ready && (0..self.receive_queues()).any(|q| self.io.word(RX + (q * RING + self.rx_heads[q]) * 32 + 4) & DONE != 0)
+        self.ready && (0..self.receive_queues()).any(|q| self.detached & (1 << q) == 0 && self.io.word(RX + (q * RX_RING + self.rx_heads[q]) * 32 + 4) & DONE != 0)
     }
 
     /// Reclaim completed TX buffers before checking drain or reserving TX.
@@ -492,7 +535,7 @@ impl<I: Io> Nic<I> {
             return Err(Error::Malformed);
         }
         let mut received = Received::decode(length, self.io.word(descriptor + 16));
-        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RX_RING) as u8);
         let buffer = self.rx_buffers[self.rx];
         if !discard(received, unsafe { &self.io.buffer_mut(buffer)[self.rx_headroom..self.rx_headroom + length] }) {
             return Ok(None);
@@ -543,7 +586,7 @@ impl<I: Io> Nic<I> {
         // PDMA can notify directly; QDMA publishes its separate descriptors
         // and performs its own barriers before notifying that engine.
         if pending.tx { self.notify_transmit().expect("TX publication failed; retain DMA storage"); }
-        for (queue, rx) in pending.rx.iter().enumerate() { if let Some(rx) = rx { self.io.set_reg(0x6908 + queue * 16, *rx as u32); } }
+        for (queue, rx) in pending.rx.iter().enumerate() { if queue < 4 { if let Some(rx) = rx { self.io.set_reg(0x6908 + queue * 16, *rx as u32); } } }
         *pending = Notifications::default();
     }
 
@@ -573,7 +616,7 @@ impl<I: Io> Nic<I> {
         }
         self.io.barrier();
         let mut received = Received::decode(length, self.io.word(descriptor + 16));
-        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RX_RING) as u8);
         let buffer = self.rx_buffers[self.rx];
         // Both descriptors are CPU-owned; the mapping comes only from our
         // private permutation, never from device-written descriptor pointers.
@@ -659,12 +702,12 @@ impl<I: Io> Nic<I> {
         self.io.barrier();
         self.io.set_word(descriptor + 4, ((BUFFER - self.rx_headroom) as u32) << 8);
         self.io.barrier();
-        let queue = self.rx / RING;
-        pending.rx[queue] = Some(self.rx % RING);
-        self.rx_heads[queue] = (self.rx % RING + 1) % RING;
-        rx_offload::record_queue(queue);
+        let queue = self.rx / RX_RING;
+        pending.rx[queue] = Some(self.rx % RX_RING);
+        self.rx_heads[queue] = (self.rx % RX_RING + 1) % RX_RING;
+        if queue < 4 { rx_offload::record_queue(queue); }
         let next = (queue + 1) % self.receive_queues();
-        self.rx = next * RING + self.rx_heads[next];
+        self.rx = next * RX_RING + self.rx_heads[next];
     }
 
     /// Copies a single completed frame, then returns ownership to DMA even
@@ -688,7 +731,7 @@ impl<I: Io> Nic<I> {
         self.io.barrier();
         let length = ((status >> 8) & 0xffff) as usize;
         let mut received = Received::decode(length, self.io.word(descriptor + 16));
-        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RING) as u8);
+        received.offload = rx_offload::Metadata::decode(self.io.word(descriptor + 8), self.io.word(descriptor + 24), (self.rx / RX_RING) as u8);
         let valid = (14..=BUFFER - self.rx_headroom).contains(&length) && length <= out.len() && status & LAST != 0;
         if valid {
             for (i, b) in out[..length].iter_mut().enumerate() {
@@ -883,18 +926,69 @@ mod tests {
     }
     #[cfg(feature = "tx-offload")]
     #[test]
+    #[cfg(feature="rx-multicore")]
+    fn remote_backpressure_and_corrupt_descriptor_never_cross_queue_ownership() {
+        let mut n=Nic::new(Mock::new()).with_rss();n.initialize(100).unwrap();
+        let mut remote=n.detach_rx(2).unwrap();let d=RX+2*RX_RING*32;
+        n.io.set_word(d,0xffff_ffff);n.io.set_word(d+8,4);n.io.set_word(d+4,DONE|LAST|(60<<8));
+        let mut packet=None;
+        remote.receive(&mut n.io,|p,_|{packet=Some(p);false}).unwrap();
+        assert_ne!(n.io.word(d+4)&DONE,0);assert_eq!(n.io.word(d+8),4);
+        let packet=packet.unwrap();let bytes=[7;60];
+        for _ in 0..RX_RING {assert!(n.inject_received(packet,&bytes).unwrap());}
+        assert!(!n.inject_received(packet,&bytes).unwrap());
+        let mut out=[0;60];for _ in 0..RX_RING {assert!(n.receive_from(&mut out).unwrap().is_some());assert_eq!(out,bytes);}
+        assert!(!n.has_receive());
+        assert_eq!(remote.receive(&mut n.io,|_,_|true),Ok(Some(true)));
+        assert_eq!(n.io.word(d),n.io.physical as u32+n.rx_buffers[2*RX_RING] as u32);
+        assert_eq!(n.io.word(d+8),0);
+        assert!(n.inject_received(packet,&bytes).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature="rx-multicore")]
+    fn detached_consumers_and_native_injection_keep_disjoint_ownership() {
+        let mut n=Nic::new_with_rx_headroom(Mock::new()).with_rss();n.initialize(100).unwrap();
+        let mut queues:[rx_queue::Queue;3]=core::array::from_fn(|i|n.detach_rx(i+1).unwrap());
+        assert!(n.detach_rx(1).is_err());assert_eq!(n.initialize(100),Err(Error::Busy));
+        for round in 0..RX_RING*3 {
+            for (q,queue) in queues.iter_mut().enumerate() {
+                let slot=(q+1)*RX_RING+round%RX_RING;let d=RX+slot*32;
+                let buffer=n.rx_buffers[slot];n.io.dma[buffer+4..buffer+64].fill((q+round) as u8);
+                n.io.set_word(d+16,2<<26);n.io.set_word(d+8,4);n.io.set_word(d+4,DONE|LAST|(60<<8));
+                assert!(!n.has_receive(),"CPU0 must not consume a detached descriptor");
+                assert_eq!(queue.receive(&mut n.io,|_,_|false),Ok(Some(false)));
+                let mut saved=None;
+                queue.receive(&mut n.io,|packet,bytes| {saved=Some((packet,bytes.to_vec()));true}).unwrap();
+                let (packet,bytes)=saved.unwrap();assert_eq!(packet.offload.queue(),(q+1) as u8);
+                assert!(n.inject_received(packet,&bytes).unwrap());assert!(n.has_receive());
+                n.io.set_word(n.tx*32+4,DONE);
+                n.receive_batch().receive_with_headroom(|p,offset,pool| {
+                    assert_eq!(p.source_port,2);assert!(p.offload.l4_valid_bit());
+                    assert_eq!(&pool[offset..offset+60],&bytes);
+                    RxAction::TransmitFrom {port:TxPort::Wan,length:60,offset}
+                }).unwrap();
+                assert!(!n.has_receive());
+                assert_eq!(n.io.word(d+8),0);
+            }
+        }
+        assert_eq!(n.io.reg(0x6944),0,"synthetic ring must not be DMA-enabled");
+        assert_eq!(n.io.reg(0x6948),(RX_RING-1) as u32,"no hardware doorbell for software exceptions");
+    }
+
+    #[test]
     #[cfg(feature = "rx-rss")]
     fn rss_wrap_preserves_buffer_ownership_and_queue_local_doorbells() {
         let mut n = Nic::new_with_rx_headroom(Mock::new()).with_rss();
         n.initialize(100).unwrap();
-        for round in 0..RING * 3 {
-            for q in 0..RX_QUEUES {
-                let slot = q * RING + round % RING;
+        for round in 0..RX_RING * 3 {
+            for q in 0..RX_QUEUES.min(4) {
+                let slot = q * RX_RING + round % RX_RING;
                 let descriptor = RX + slot * 32;
                 n.io.set_word(descriptor + 8, 4);
                 n.io.set_word(descriptor + 4, DONE | LAST | (60 << 8));
             }
-            for q in 0..RX_QUEUES {
+            for q in 0..RX_QUEUES.min(4) {
                 n.io.set_word(n.tx * 32 + 4, DONE);
                 let mut batch = n.receive_batch();
                 assert!(batch.receive_with_headroom(|received,offset,_| {
@@ -902,7 +996,7 @@ mod tests {
                     RxAction::TransmitFrom {port:TxPort::Wan,length:60,offset}
                 }).unwrap().unwrap().transmitted);
             }
-            for q in 0..RX_QUEUES { assert_eq!(n.io.reg(0x6908 + q * 16), (round % RING) as u32); }
+            for q in 0..RX_QUEUES.min(4) { assert_eq!(n.io.reg(0x6908 + q * 16), (round % RX_RING) as u32); }
             assert!(!n.has_receive());
         }
         let mut buffers = std::vec::Vec::from(n.tx_buffers);
@@ -918,7 +1012,7 @@ mod tests {
         assert_eq!(n.io.reg(0x7000) & 5, 1);
         assert_eq!(n.io.reg(0x7050), 0xe4e4e4e4);
         for q in 0..4 {
-            let d = RX + q * RING * 32;
+            let d = RX + q * RX_RING * 32;
             n.io.set_word(d + 8, 4);
             n.io.set_word(d + 24, 0xdeadbeef);
             n.io.set_word(d + 4, DONE | LAST | (60 << 8));
@@ -931,7 +1025,7 @@ mod tests {
                 assert!(packet.offload.l4_valid_bit());
                 RxAction::Defer
             }), Ok(None));
-            let d = RX + usize::from(q) * RING * 32;
+            let d = RX + usize::from(q) * RX_RING * 32;
             assert_ne!(n.io.word(d + 4) & DONE, 0);
             n.receive_batch().receive_with_headroom(|packet,_,_| {
                 seen.push(packet.offload.queue()); RxAction::Drop
@@ -944,7 +1038,7 @@ mod tests {
         assert!(!n.has_receive());
         // One busy ring cannot starve an already completed different ring.
         for q in [1,3] {
-            n.io.set_word(RX + (q * RING + 1) * 32 + 4, DONE | LAST | (60 << 8));
+            n.io.set_word(RX + (q * RX_RING + 1) * 32 + 4, DONE | LAST | (60 << 8));
         }
         let mut out = [0; 60];
         assert_eq!(n.receive_from(&mut out).unwrap().unwrap().offload.queue(), 1);
@@ -1055,11 +1149,11 @@ mod tests {
     fn receive_batch_coalesces_notifications_across_wrap_without_aliasing() {
         let mut n = Nic::new(Mock::new());
         n.initialize(100).unwrap();
-        for lap in 0..3 {
+        for lap in 0..3 * RX_RING / RING {
             for slot in 0..RING {
                 n.io.set_word(slot * 32 + 4, DONE);
-                n.io.set_word(RX + slot * 32 + 4, DONE | LAST | (60 << 8));
-                let buffer = n.rx_buffers[slot];
+                n.io.set_word(RX + ((lap * RING + slot) % RX_RING) * 32 + 4, DONE | LAST | (60 << 8));
+                let buffer = n.rx_buffers[(lap * RING + slot) % RX_RING];
                 unsafe { n.io.buffer_mut(buffer)[0] = (lap * RING + slot) as u8; }
             }
             n.io.doorbells.clear();
@@ -1074,8 +1168,8 @@ mod tests {
                     assert_eq!(batch.nic.io.doorbells.len(), (slot + 1) / (RING / 2) * 2);
                 }
             }
-            assert_eq!(n.io.doorbells, [(0x6808,16), (0x6908,15), (0x6808,0), (0x6908,31)]);
-            assert_eq!((n.tx,n.rx), (0,0));
+            assert_eq!(n.io.doorbells, [(0x6808,16), (0x6908,((lap * RING + 15) % RX_RING) as u32), (0x6808,0), (0x6908,((lap * RING + 31) % RX_RING) as u32)]);
+            assert_eq!((n.tx,n.rx), (0,(lap + 1) * RING % RX_RING));
         }
     }
 
@@ -1111,7 +1205,7 @@ mod tests {
     fn in_place_permutation_wrap_padding_and_copy_interoperation() {
         let mut n = Nic::new(Mock::new());
         n.initialize(100).unwrap();
-        for sequence in 0..RING * 3 {
+        for sequence in 0..RX_RING * 3 {
             let rx = n.rx;
             let tx = n.tx;
             let buffer = n.rx_buffers[rx];
@@ -1537,7 +1631,7 @@ mod tests {
         let mut out = [0; BUFFER];
         assert!(!n.has_receive());
         assert_eq!(n.receive(&mut out), Ok(None));
-        for i in 0..RING {
+        for i in 0..RX_RING {
             n.io.set_word(RX + i * 32, 0xdeadbeef); // ignored, fixed backing allocation
             n.io.set_word(RX + i * 32 + 4, DONE | LAST | (60 << 8));
             n.io.set_byte(POOL + (RING + i) * BUFFER, i as u8);

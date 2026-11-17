@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 rx-rss = []
+rx-multicore = ["rx-rss"]
 qdma-test = []
 # Opportunistic TX checksum and VLAN insertion on untagged CPU paths.
 tx-offload = ["qdma-test"]

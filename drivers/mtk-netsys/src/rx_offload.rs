@@ -17,6 +17,7 @@ impl Metadata {
         }
     }
     /// A hardware observation, not a blanket permission to skip validation.
+    pub(crate) fn word3(self) -> u32 { self.word3 }
     pub fn l4_valid_bit(self) -> bool {
         self.word3 & (1 << 2) != 0
     }
@@ -116,11 +117,6 @@ pub(crate) fn disable_rss(io: &mut impl crate::Io) {
 }
 pub(crate) fn enable_rss(io: &mut impl crate::Io) {
     // MediaTek's NETSYS v3 Toeplitz key, packed as little-endian MMIO words.
-    const KEY: [u8; 40] = [
-        0xfa, 0x01, 0xac, 0xbe, 0x3b, 0xb7, 0x42, 0x6a, 0x0c, 0xf2, 0x30, 0x80, 0xa3, 0x2d, 0xcb,
-        0x77, 0xb4, 0x30, 0x7b, 0xae, 0xcb, 0x2b, 0xca, 0xd0, 0xb0, 0x8f, 0xa3, 0x43, 0x3d, 0x25,
-        0x67, 0x41, 0xc2, 0x0e, 0x5b, 0x25, 0xda, 0x56, 0x5a, 0x6d,
-    ];
     let value = (io.reg(RSS) & !5) | (7 << 8) | (7 << 12);
     io.set_reg(RSS, value);
     for (i, word) in KEY.chunks_exact(4).enumerate() {
@@ -138,4 +134,70 @@ pub(crate) fn enable_rss(io: &mut impl crate::Io) {
     io.set_reg(RSS, value | 5);
     io.set_reg(RSS, value | 1);
     io.barrier();
+}
+
+const KEY: [u8; 40] = [
+        0xfa, 0x01, 0xac, 0xbe, 0x3b, 0xb7, 0x42, 0x6a, 0x0c, 0xf2, 0x30, 0x80, 0xa3, 0x2d, 0xcb,
+        0x77, 0xb4, 0x30, 0x7b, 0xae, 0xcb, 0x2b, 0xca, 0xd0, 0xb0, 0x8f, 0xa3, 0x43, 0x3d, 0x25,
+        0x67, 0x41, 0xc2, 0x0e, 0x5b, 0x25, 0xda, 0x56, 0x5a, 0x6d,
+    ];
+
+/// Predict the hardware queue for an incoming plain TCP tuple. The programmed
+/// key registers are traversed from the last byte to the first by NETSYS v3.
+/// Qualified against physical IPv4/IPv6 tuples; the table is bucket % 4.
+pub fn tcp_queue(source:&[u8],destination:&[u8],source_port:u16,destination_port:u16)->Option<u8> {
+    if source.len()!=destination.len() || !matches!(source.len(),4|16) {return None;}
+    let bit=|i:usize|u32::from((KEY[39-i/8]>>(7-i%8))&1);
+    let mut window=0u32;for i in 0..32 {window=(window<<1)|bit(i);}
+    let mut hash=0u32;let mut index=0;
+    for byte in source.iter().chain(destination).copied().chain(source_port.to_be_bytes()).chain(destination_port.to_be_bytes()) {
+        for shift in (0..8).rev() {
+            if byte&(1<<shift)!=0 {hash^=window;}
+            window=(window<<1)|bit(index+32);index+=1;
+        }
+    }
+    Some((hash&3) as u8)
+}
+
+#[cfg(test)]
+mod affinity_tests {
+ use super::*;
+ #[test]
+ fn hardware_qualified_tcp_vectors() {
+ let source=[192, 168, 1, 25];let destination=[192, 168, 1, 9];
+ assert_eq!(tcp_queue(&source,&destination,19444,33001),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19443,34567),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19444,40123),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19443,45000),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19444,48999),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19443,36001),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19444,37819),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19443,41017),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19444,34031),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19443,32769),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19444,40003),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19443,45679),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19444,47001),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19443,48021),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19444,38113),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19443,43007),Some(3));
+ let source=[36, 14, 3, 5, 24, 151, 255, 0, 4, 241, 17, 231, 118, 193, 151, 10];let destination=[36, 14, 3, 5, 24, 151, 255, 0, 0, 66, 112, 255, 254, 4, 0, 1];
+ assert_eq!(tcp_queue(&source,&destination,19444,33001),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19443,34567),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19444,40123),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19443,45000),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19444,48999),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19443,36001),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19444,37819),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19443,41017),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19444,34031),Some(0));
+ assert_eq!(tcp_queue(&source,&destination,19443,32769),Some(3));
+ assert_eq!(tcp_queue(&source,&destination,19444,40003),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19443,45679),Some(1));
+ assert_eq!(tcp_queue(&source,&destination,19444,47001),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19443,48021),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19444,38113),Some(2));
+ assert_eq!(tcp_queue(&source,&destination,19443,43007),Some(3));
+ assert_eq!(tcp_queue(&[0;4],&[0;16],1,2),None);
+ }
 }

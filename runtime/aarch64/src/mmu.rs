@@ -10,7 +10,8 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const RO: u64 = 1 << 7;
 const AF: u64 = 1 << 10;
-const TABLE_COUNT: usize = 32;
+// Full-capacity NETSYS RX arena plus its read alias needs more than 32 tables.
+const TABLE_COUNT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
@@ -242,6 +243,29 @@ mod tests {
         );
     }
     #[test]
+    fn full_board_map_with_two_megabyte_rx_arena_fits() {
+        let mut tables=Tables::new();let mut map=Builder::new(&mut tables);
+        // Full-capacity board shape, including separate cached RX alias,
+        // QDMA, high heap, capability pages, SD DMA and every MMIO window.
+        for (a,b) in [(0x40080000,0x40b70000),(0x40b70000,0x40d70000),
+            (0x42000000,0x42821000),(0x44a00000,0x44e00000),(0x45800000,0x45841000)] {
+            map.map(a,b,Permission::Dma).unwrap();
+        }
+        map.map_read_alias(0x4040b70000,0x4040d70000,0x40b70000).unwrap();
+        for (a,b) in [(0x44000000,0x44800000),(0x45000000,0x45800000),(0x45a00000,0x140000000)] {
+            map.map_blocks(a,b,Permission::Data).unwrap();
+        }
+        for (a,b) in [(0x15000000,0x15001000),(0x0f0f0000,0x0f0f1000),
+            (0x0f100000,0x0f120000),(0x11d10000,0x11d11000),(0x10080000,0x10082000),
+            (0x11f20000,0x11f30000),(0x15100000,0x15114000),(0x15020000,0x15028000),
+            (0x1001f000,0x10020000),(0x1001b000,0x1001d000),(0x11f00000,0x11f01000),
+            (0x11f40000,0x11f41000),(0x11000000,0x11001000),(0x11230000,0x11231000),
+            (0x0c000000,0x0c010000),(0x0c080000,0x0c280000)] {
+            map.map(a,b,Permission::Device).unwrap();
+        }
+        assert!(map.table_count()<TABLE_COUNT);
+    }
+    #[test]
     fn read_alias_points_at_other_pages_read_only() {
         let mut tables = Tables::new();
         let mut map = Builder::new(&mut tables);
@@ -291,12 +315,12 @@ mod tests {
             map.map(1 << 39, (1 << 39) + 4096, Permission::Data),
             Err(Error::Range)
         );
-        for i in 1..16 {
+        for i in 1..TABLE_COUNT / 2 {
             map.map(i << 30, (i << 30) + 4096, Permission::Data)
                 .unwrap();
         }
         assert_eq!(
-            map.map(16 << 30, (16 << 30) + 4096, Permission::Data),
+            map.map((TABLE_COUNT / 2) << 30, ((TABLE_COUNT / 2) << 30) + 4096, Permission::Data),
             Err(Error::Exhausted)
         );
     }

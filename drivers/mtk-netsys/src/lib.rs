@@ -78,7 +78,9 @@ pub const RX_RING: usize = if cfg!(feature = "rx-multicore") { 128 } else { 32 }
 pub const BUFFER: usize = 2048;
 pub const RX_QUEUES: usize = if cfg!(feature = "rx-multicore") { 5 } else if cfg!(feature = "rx-rss") { 4 } else { 1 };
 const RX_TOTAL: usize = RX_QUEUES * RX_RING;
-pub const ARENA_SIZE: usize = POOL + (RING + RX_TOTAL) * BUFFER;
+const LARGE_POOL: usize = POOL + (RING + RX_TOTAL) * BUFFER;
+pub const TX_LARGE: usize = 16384 + 16;
+pub const ARENA_SIZE: usize = LARGE_POOL + if cfg!(feature="tx-offload") { RING * TX_LARGE } else { 0 };
 const RX: usize = RING * 32;
 const POOL: usize = ((RING + RX_TOTAL) * 32 + BUFFER - 1) & !(BUFFER - 1);
 const DONE: u32 = 1 << 31;
@@ -101,6 +103,8 @@ pub trait Io {
     /// and must end the borrow before publishing it to DMA. Implementations
     /// return exactly BUFFER initialized bytes at the specified pool offset.
     unsafe fn buffer_mut(&mut self, offset: usize) -> &mut [u8];
+    /// Exclusive permanent large TX slot; never shared with RX.
+    unsafe fn large_tx_mut(&mut self, _slot:usize)-> &mut [u8] { panic!("large TX unavailable") }
     fn barrier(&self);
     fn now(&self) -> u64;
     fn poll_transmit(&mut self) -> Result<(), Error> { Ok(()) }
@@ -125,7 +129,11 @@ pub enum Error {
     Timeout,
 }
 
+/// Submission identity; success only transfers ownership, not completion.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub struct TxReceipt { slot:usize, generation:u64 }
 pub struct Nic<I: Io> {
+    tx_generation:[u64;RING],
     io: I,
     tx: usize,
     rx: usize,
@@ -149,6 +157,15 @@ pub struct ReceiveBatch<'a, I: Io> {
 #[derive(Default)]
 struct Notifications { tx: bool, rx: [Option<usize>; RX_QUEUES] }
 impl<I: Io> ReceiveBatch<'_, I> {
+    /// Submit a fully staged frame. Completion is checked on Nic after this
+    /// batch publishes; the caller retains its owner token until then.
+    pub fn submit_tracked(&mut self, port:TxPort, packet:&[u8], options:Option<offload::TxOffload>) -> Result<TxReceipt,Error> {
+        let result=self.nic.stage_tracked(port,packet,options);
+        if result.is_ok() {self.pending.tx=true;self.count+=1;}
+        if self.count>=RING/2 || result.is_err() {self.nic.publish_notifications(&mut self.pending);self.count=0;}
+        result
+    }
+
     /// Queue producer output with the same ownership rules as Nic::transmit_with.
     /// Publish at half-ring, on backpressure/error, or when this guard drops.
     pub fn transmit_with(&mut self, produce: impl FnOnce(&mut [u8]) -> RxAction) -> Result<bool,Error> {
@@ -189,10 +206,40 @@ impl<I: Io> Drop for ReceiveBatch<'_, I> {
     fn drop(&mut self) { self.nic.publish_notifications(&mut self.pending); }
 }
 impl<I: Io> Nic<I> {
+    /// True only after the QDMA bridge has observed its release endpoint and
+    /// descriptor ownership (or the slot was necessarily completed and reused).
+    pub fn tx_completed(&self, receipt:TxReceipt)->bool {
+        self.tx_generation[receipt.slot]>receipt.generation ||
+            (self.tx_generation[receipt.slot]==receipt.generation && self.io.word(receipt.slot*32+4)&DONE!=0)
+    }
+    fn stage_tracked(&mut self,port:TxPort,packet:&[u8],options:Option<offload::TxOffload>)->Result<TxReceipt,Error> {
+        if !self.ready {return Err(Error::NotReady);}
+        let large=packet.len()>BUFFER;
+        if !(14..=TX_LARGE).contains(&packet.len()) || (large && options.is_none()) {return Err(Error::Length);}
+        if options.is_some() && !self.io.tx_offload_supported() {return Err(Error::NotReady);}
+        let slot=self.tx;let d=slot*32;
+        if self.io.word(d+4)&DONE==0 {self.poll_transmit()?;if self.io.word(d+4)&DONE==0 {return Err(Error::Busy);}}
+        self.io.barrier();
+        let buffer=if large {LARGE_POOL+slot*TX_LARGE}else{self.tx_buffers[slot]};
+        let length=packet.len().max(60);
+        let meta=unsafe {
+            let out=if large {self.io.large_tx_mut(slot)}else{self.io.buffer_mut(buffer)};
+            out[..packet.len()].copy_from_slice(packet);out[packet.len()..length].fill(0);
+            match options {Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>None}
+        };
+        let generation=self.tx_generation[slot].checked_add(1).ok_or(Error::Malformed)?;
+        self.tx_generation[slot]=generation;
+        self.io.set_word(d,self.io.dma_address() as u32+buffer as u32);
+        self.io.set_word(d+16,match port {TxPort::Internal=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16});
+        self.io.set_word(d+20,meta.map_or(0,|m|m.word5));self.io.set_word(d+24,meta.map_or(0,|m|m.word6));
+        offload::record(meta);self.io.barrier();self.io.set_word(d+4,LAST|((length as u32)<<8));self.io.barrier();
+        self.tx=(slot+1)%RING;Ok(TxReceipt{slot,generation})
+    }
     pub fn new(io: I) -> Self {
         Self {
             io,
             tx: 0,
+            tx_generation:[0;RING],
             rx: 0,
             ready: false,
             tx_buffers: core::array::from_fn(|i| POOL + i * BUFFER),
@@ -832,6 +879,10 @@ impl Io for Mmio {
     unsafe fn buffer_mut(&mut self, offset: usize) -> &mut [u8] {
         assert!((POOL..=ARENA_SIZE - BUFFER).contains(&offset) && (offset - POOL) % BUFFER == 0);
         unsafe { core::slice::from_raw_parts_mut((self.arena + offset) as *mut u8, BUFFER) }
+    }
+    unsafe fn large_tx_mut(&mut self,slot:usize)->&mut [u8] {
+        assert!(cfg!(feature="tx-offload") && slot<RING);
+        unsafe {core::slice::from_raw_parts_mut((self.arena+LARGE_POOL+slot*TX_LARGE) as *mut u8,TX_LARGE)}
     }
     fn barrier(&self) {
         unsafe {

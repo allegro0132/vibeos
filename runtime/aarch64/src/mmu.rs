@@ -10,7 +10,9 @@ const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 const RO: u64 = 1 << 7;
 const AF: u64 = 1 << 10;
-const TABLE_COUNT: usize = 32;
+// Larger persistent crypto DMA arenas can cross another 2 MiB boundary.
+// Leave table capacity for their page mappings without weakening guards.
+const TABLE_COUNT: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Permission {
@@ -291,12 +293,12 @@ mod tests {
             map.map(1 << 39, (1 << 39) + 4096, Permission::Data),
             Err(Error::Range)
         );
-        for i in 1..16 {
+        for i in 1..TABLE_COUNT / 2 {
             map.map(i << 30, (i << 30) + 4096, Permission::Data)
                 .unwrap();
         }
         assert_eq!(
-            map.map(16 << 30, (16 << 30) + 4096, Permission::Data),
+            map.map((TABLE_COUNT / 2) << 30, ((TABLE_COUNT / 2) << 30) + 4096, Permission::Data),
             Err(Error::Exhausted)
         );
     }

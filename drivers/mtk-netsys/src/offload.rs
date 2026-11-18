@@ -36,7 +36,7 @@ pub struct Prepared {
 }
 
 /// MxL86252 standalone port tags supported by the board. Only QDMA
-/// insertion on plain IPv4 TSO input is qualified for the external GDMA.
+/// insertion on plain TCP TSO input is supported on the external GDMA.
 pub(crate) fn mxl_tso_tag(tci: u16) -> bool {
     matches!(tci, 0xc00..=0xc03 | 0xc0c)
 }
@@ -56,7 +56,11 @@ impl TxOffload {
     /// into DMA storage. Only the TSO checksum-field patch needs a DMA write.
     pub(crate) fn validate(self, packet: &[u8], port: TxPort) -> Result<(Prepared, Option<(usize, u16)>), Error> {
         let mxl = port == TxPort::ExternalTagged && self.checksum && self.tso_mss.is_some()
-            && self.vlan.is_some_and(mxl_tso_tag) && packet.get(12..14) == Some(&[8, 0]);
+            && self.vlan.is_some_and(mxl_tso_tag) && match packet.get(12..14) {
+                Some([8, 0]) => true,
+                Some([0x86, 0xdd]) => packet.len() <= crate::BUFFER,
+                _ => false,
+            };
         if !matches!(port, TxPort::Wan | TxPort::Internal) && !mxl {
             return Err(Error::Malformed);
         }
@@ -310,7 +314,7 @@ pub(crate) mod tests {
         .is_err());
     }
     #[test]
-    fn external_gdma_requires_one_mxl_port_tag_on_plain_ipv4_tso() {
+    fn external_gdma_requires_one_mxl_port_tag_on_plain_tcp_tso() {
         let mut packet = tcp(false, 8192);
         for tci in [0xc00, 0xc03, 0xc0c] {
             let opts = TxOffload { checksum: true, vlan: Some(tci), tso_mss: Some(1448) };
@@ -318,7 +322,12 @@ pub(crate) mod tests {
             assert_eq!(meta.word5, 0xf0000000);
             assert_eq!(meta.word6, 0x10000 | u32::from(tci));
             assert_eq!(be16(&packet, 50), 1448);
-            assert!(opts.prepare(&mut tcp(true, 8192), TxPort::ExternalTagged).is_err());
+            let v6 = TxOffload { tso_mss: Some(1440), ..opts };
+            let mut small = tcp(true, crate::BUFFER - 74);
+            let meta = v6.prepare(&mut small, TxPort::ExternalTagged).unwrap();
+            assert_eq!(meta.word6, 0x10000 | u32::from(tci));
+            assert_eq!(be16(&small, 70), 1440);
+            assert!(v6.prepare(&mut tcp(true, crate::BUFFER - 73), TxPort::ExternalTagged).is_err());
             let mut tagged = packet.clone();
             tagged[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
             assert!(opts.prepare(&mut tagged, TxPort::ExternalTagged).is_err());

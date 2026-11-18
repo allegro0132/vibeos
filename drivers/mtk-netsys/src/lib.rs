@@ -17,6 +17,17 @@ pub mod mxl862xx;
 pub mod mxl_tag;
 mod mxl_vlan;
 
+// Inclusive CPU costs in architectural timer ticks, not DMA flight latency.
+static TX_COST:[core::sync::atomic::AtomicU64;3]=[const{core::sync::atomic::AtomicU64::new(0)};3];
+fn tx_clock()->u64 {
+    #[cfg(all(target_arch="aarch64",target_os="none"))] {let t;unsafe{core::arch::asm!("mrs {t}, cntpct_el0",t=out(reg)t,options(nomem,nostack,preserves_flags));}t}
+    #[cfg(not(all(target_arch="aarch64",target_os="none")))] {0}
+}
+fn tx_cost(index:usize,start:u64){TX_COST[index].fetch_add(tx_clock().wrapping_sub(start),core::sync::atomic::Ordering::Relaxed);}
+/// DMA copy, preparation/descriptor writes, QDMA completion polling. The
+/// submission cost includes copy/prepare; callers must not add nested totals.
+pub fn tx_costs()->[u64;3]{core::array::from_fn(|i|TX_COST[i].load(core::sync::atomic::Ordering::Relaxed))}
+
 /// NETSYS v3 PSE port numbers: GMAC2 uses GDM3/FPORT 15, not 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxPort {
@@ -132,6 +143,7 @@ pub enum Error {
 /// Submission identity; success only transfers ownership, not completion.
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct TxReceipt { slot:usize, generation:u64 }
+pub mod packet_copy;
 pub struct Nic<I: Io> {
     tx_generation:[u64;RING],
     io: I,
@@ -157,6 +169,16 @@ pub struct ReceiveBatch<'a, I: Io> {
 #[derive(Default)]
 struct Notifications { tx: bool, rx: [Option<usize>; RX_QUEUES] }
 impl<I: Io> ReceiveBatch<'_, I> {
+    /// Reserve opportunity under the sole NIC owner. No other submission may
+    /// intervene before the caller's submit_tracked. Busy avoids GSO advancement.
+    pub fn tx_available(&mut self)->Result<bool,Error> {
+        if !self.nic.ready {return Err(Error::NotReady);}
+        if self.nic.io.word(self.nic.tx*32+4)&DONE!=0 {return Ok(true);}
+        self.nic.publish_notifications(&mut self.pending);self.count=0;
+        self.nic.poll_transmit()?;
+        Ok(self.nic.io.word(self.nic.tx*32+4)&DONE!=0)
+    }
+
     /// Submit a fully staged frame. Completion is checked on Nic after this
     /// batch publishes; the caller retains its owner token until then.
     pub fn submit_tracked(&mut self, port:TxPort, packet:&[u8], options:Option<offload::TxOffload>) -> Result<TxReceipt,Error> {
@@ -164,6 +186,28 @@ impl<I: Io> ReceiveBatch<'_, I> {
         if result.is_ok() {self.pending.tx=true;self.count+=1;}
         if self.count>=RING/2 || result.is_err() {self.nic.publish_notifications(&mut self.pending);self.count=0;}
         result
+    }
+
+    /// Process a CPU-owned RSS exception without injecting it into a fake DMA
+    /// RX ring. Busy is checked before the callback; on Pending the caller
+    /// retains this buffer. Forwarded output is copied once to permanent TX.
+    pub fn receive_external(&mut self, packet:Received, offset:usize, buffer:&mut [u8],
+        process:impl FnOnce(Received,usize,&mut [u8])->RxAction)->Result<Option<Processed>,Error> {
+        if offset.checked_add(packet.length).is_none_or(|end|end>buffer.len()) || packet.length<14 {return Err(Error::Length);}
+        if !self.tx_available()? {return Err(Error::Busy);}
+        let action=process(packet,offset,buffer);
+        let (port,length,start)=match action {
+            RxAction::Defer=>return Ok(None),
+            RxAction::Drop=>return Ok(Some(Processed{received:packet,transmitted:false})),
+            RxAction::Transmit{port,length}=>(port,length,offset),
+            RxAction::TransmitShifted{port,length}=>(port,length,offset+4),
+            RxAction::TransmitFrom{port,length,offset}=>(port,length,offset),
+        };
+        let (min,max)=match port {TxPort::Internal=>(14,1514),TxPort::InternalTagged=>(18,1518),TxPort::Wan=>(14,1518),TxPort::ExternalTagged=>(18,1522)};
+        if !(min..=max).contains(&length) || start%4!=0 {return Err(Error::Length);}
+        let bytes=buffer.get(start..start+length).ok_or(Error::Length)?;
+        self.submit_tracked(port,bytes,None)?;
+        Ok(Some(Processed{received:packet,transmitted:true}))
     }
 
     /// Queue producer output with the same ownership rules as Nic::transmit_with.
@@ -221,19 +265,27 @@ impl<I: Io> Nic<I> {
         if self.io.word(d+4)&DONE==0 {self.poll_transmit()?;if self.io.word(d+4)&DONE==0 {return Err(Error::Busy);}}
         self.io.barrier();
         let buffer=if large {LARGE_POOL+slot*TX_LARGE}else{self.tx_buffers[slot]};
-        let length=packet.len().max(60);
+        let mut length=packet.len().max(if matches!(port,TxPort::InternalTagged|TxPort::ExternalTagged){64}else{60});
+        let start=tx_clock();
+        let prepared;
         let meta=unsafe {
             let out=if large {self.io.large_tx_mut(slot)}else{self.io.buffer_mut(buffer)};
-            out[..packet.len()].copy_from_slice(packet);out[packet.len()..length].fill(0);
-            match options {Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>None}
+            packet_copy::copy(&mut out[..packet.len()],packet);out[packet.len()..length].fill(0);
+            tx_cost(0,start);prepared=tx_clock();
+            match options {Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>{
+                #[cfg(feature="tx-offload")]
+                {let prepared=offload::prepare_ordinary(&mut out[..length],port);if let Some((n,_))=prepared {length=n;}prepared.map(|(_,m)|m)}
+                #[cfg(not(feature="tx-offload"))]
+                {None}
+            }}
         };
         let generation=self.tx_generation[slot].checked_add(1).ok_or(Error::Malformed)?;
         self.tx_generation[slot]=generation;
         self.io.set_word(d,self.io.dma_address() as u32+buffer as u32);
-        self.io.set_word(d+16,match port {TxPort::Internal=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16});
+        self.io.set_word(d+16,match port {TxPort::Internal|TxPort::InternalTagged=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16});
         self.io.set_word(d+20,meta.map_or(0,|m|m.word5));self.io.set_word(d+24,meta.map_or(0,|m|m.word6));
         offload::record(meta);self.io.barrier();self.io.set_word(d+4,LAST|((length as u32)<<8));self.io.barrier();
-        self.tx=(slot+1)%RING;Ok(TxReceipt{slot,generation})
+        self.tx=(slot+1)%RING;tx_cost(1,prepared);Ok(TxReceipt{slot,generation})
     }
     pub fn new(io: I) -> Self {
         Self {
@@ -388,7 +440,8 @@ impl<I: Io> Nic<I> {
 
     /// Reclaim completed TX buffers before checking drain or reserving TX.
     pub fn poll_transmit(&mut self) -> Result<(), Error> {
-        if let Err(error) = self.io.poll_transmit() { self.ready=false; return Err(error); }
+        let start=tx_clock();let result=self.io.poll_transmit();tx_cost(2,start);
+        if let Err(error) = result { self.ready=false; return Err(error); }
         Ok(())
     }
     /// All submitted TX descriptors have returned to CPU ownership. This is
@@ -968,6 +1021,7 @@ mod tests {
         unsafe fn buffer_mut(&mut self, offset: usize) -> &mut [u8] {
             &mut self.dma[offset..offset + BUFFER]
         }
+        unsafe fn large_tx_mut(&mut self,slot:usize)->&mut [u8]{let at=LARGE_POOL+slot*TX_LARGE;&mut self.dma[at..at+TX_LARGE]}
         fn barrier(&self) { self.dma_dirty.set(false); }
         fn now(&self) -> u64 {
             let t = self.ticks.get();
@@ -994,6 +1048,26 @@ mod tests {
         assert_eq!(n.io.word(d),n.io.physical as u32+n.rx_buffers[2*RX_RING] as u32);
         assert_eq!(n.io.word(d+8),0);
         assert!(n.inject_received(packet,&bytes).unwrap());
+    }
+
+    #[test]
+    fn external_rx_keeps_buffer_on_backpressure_without_fake_rx_dma() {
+        let mut n=Nic::new_with_rx_headroom(Mock::new());n.initialize(100).unwrap();
+        let packet=Received::decode(60,2<<26);let mut frame=[7u8;68];
+        let snapshot=frame;
+        n.io.set_word(n.tx*32+4,0);
+        let busy=n.receive_batch().receive_external(packet,8,&mut frame,|_,_,_|panic!("must reserve before invoking callback"));
+        assert_eq!(busy,Err(Error::Busy));assert_eq!(frame,snapshot);
+        n.io.set_word(n.tx*32+4,DONE);
+        assert_eq!(n.receive_batch().receive_external(packet,8,&mut frame,|_,_,_|RxAction::Defer),Ok(None));
+        assert_eq!(frame,snapshot);assert!(!n.has_receive());
+        let result=n.receive_batch().receive_external(packet,8,&mut frame,|p,offset,b|{
+            assert_eq!(p,packet);assert_eq!(offset,8);b[offset]=9;
+            RxAction::TransmitFrom{port:TxPort::Wan,length:60,offset}
+        }).unwrap().unwrap();
+        assert!(result.transmitted);assert!(!n.has_receive());
+        assert_eq!(n.io.dma[n.tx_buffers[0]],9);
+        assert_eq!(&n.io.dma[n.tx_buffers[0]+1..n.tx_buffers[0]+60],&snapshot[9..]);
     }
 
     #[test]
@@ -1096,6 +1170,44 @@ mod tests {
         assert_eq!(n.receive_from(&mut out).unwrap().unwrap().offload.queue(), 3);
     }
 
+    #[test]
+    fn tracked_switch_tag_short_frames_have_complete_wire_padding() {
+        for port in [TxPort::InternalTagged,TxPort::ExternalTagged] {
+            let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();
+            let r=n.transmit_batch().submit_tracked(port,&[0x55;58],None).unwrap();
+            assert_eq!((n.io.word(4)>>8)&0xffff,64);
+            assert_eq!(&n.io.dma[n.tx_buffers[0]+58..n.tx_buffers[0]+64],&[0;6]);
+            assert!(!n.tx_completed(r));
+        }
+    }
+    #[test]
+    fn tracked_submission_is_not_completion_and_receipts_survive_wrap() {
+        let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();
+        let packet=[0x5a;60];let mut receipts=std::vec::Vec::new();
+        for _ in 0..RING {let receipt=n.transmit_batch().submit_tracked(TxPort::Wan,&packet,None).unwrap();assert!(!n.tx_completed(receipt));receipts.push(receipt);}
+        assert_eq!(n.transmit_batch().submit_tracked(TxPort::Wan,&packet,None),Err(Error::Busy));
+        for r in &receipts {assert!(!n.tx_completed(*r));}
+        // Device release, not submission or a CPU queue pop, returns ownership.
+        n.io.set_word(4,n.io.word(4)|DONE);assert!(n.tx_completed(receipts[0]));
+        let newer=n.transmit_batch().submit_tracked(TxPort::Wan,&packet,None).unwrap();
+        assert!(n.tx_completed(receipts[0]));assert!(!n.tx_completed(newer));
+        assert!(!n.tx_completed(receipts[1]));
+    }
+    #[test]
+    #[cfg(feature="tx-offload")]
+    fn large_tso_uses_disjoint_pool_and_preserves_original_until_completion() {
+        for v6 in [false,true] {
+            let mut n=Nic::new(Mock::new());n.initialize(100).unwrap();n.io.offload=true;
+            let original=offload::tests::tcp(v6,16000);let packet=original.clone();
+            let rx=n.rx_buffers;let tx=n.tx_buffers;
+            let r=n.transmit_batch().submit_tracked(TxPort::Wan,&packet,Some(offload::TxOffload{checksum:true,vlan:None,tso_mss:Some(1400)})).unwrap();
+            assert_eq!(n.io.word(0),n.io.physical as u32+LARGE_POOL as u32);
+            assert_eq!(n.io.word(20),0xf0000000);assert!(!n.tx_completed(r));
+            assert_eq!(packet,original);assert_eq!(n.rx_buffers,rx);assert_eq!(n.tx_buffers,tx);
+            assert!(ARENA_SIZE<=2*1024*1024);
+            n.io.set_word(4,n.io.word(4)|DONE);assert!(n.tx_completed(r));
+        }
+    }
     #[test]
     fn receive_forwarding_offloads_vlan_without_losing_buffer_ownership() {
         let mut n = Nic::new(Mock::new());

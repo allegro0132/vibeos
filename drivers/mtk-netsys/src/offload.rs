@@ -58,7 +58,7 @@ impl TxOffload {
         let mxl = port == TxPort::ExternalTagged && self.checksum && self.tso_mss.is_some()
             && self.vlan.is_some_and(mxl_tso_tag) && match packet.get(12..14) {
                 Some([8, 0]) => true,
-                Some([0x86, 0xdd]) => packet.len() <= crate::BUFFER,
+                Some([0x86, 0xdd]) => packet.len() <= crate::IPV6_TSO_WINDOW,
                 _ => false,
             };
         if !matches!(port, TxPort::Wan | TxPort::Internal) && !mxl {
@@ -323,11 +323,11 @@ pub(crate) mod tests {
             assert_eq!(meta.word6, 0x10000 | u32::from(tci));
             assert_eq!(be16(&packet, 50), 1448);
             let v6 = TxOffload { tso_mss: Some(1440), ..opts };
-            let mut small = tcp(true, crate::BUFFER - 74);
+            let mut small = tcp(true, crate::IPV6_TSO_WINDOW - 74);
             let meta = v6.prepare(&mut small, TxPort::ExternalTagged).unwrap();
             assert_eq!(meta.word6, 0x10000 | u32::from(tci));
             assert_eq!(be16(&small, 70), 1440);
-            assert!(v6.prepare(&mut tcp(true, crate::BUFFER - 73), TxPort::ExternalTagged).is_err());
+            assert!(v6.prepare(&mut tcp(true, crate::IPV6_TSO_WINDOW - 73), TxPort::ExternalTagged).is_err());
             let mut tagged = packet.clone();
             tagged[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
             assert!(opts.prepare(&mut tagged, TxPort::ExternalTagged).is_err());

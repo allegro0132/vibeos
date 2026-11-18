@@ -90,6 +90,9 @@ pub const BUFFER: usize = 2048;
 pub const RX_QUEUES: usize = if cfg!(feature = "rx-multicore") { 5 } else if cfg!(feature = "rx-rss") { 4 } else { 1 };
 const RX_TOTAL: usize = RX_QUEUES * RX_RING;
 const LARGE_POOL: usize = POOL + (RING + RX_TOTAL) * BUFFER;
+/// Largest plain IPv6 TSO request staged within a single aligned DMA page.
+pub const IPV6_TSO_WINDOW: usize = 4096;
+const _: () = assert!(2 * IPV6_TSO_WINDOW - 1 <= TX_LARGE);
 pub const TX_LARGE: usize = 16384 + 16;
 pub const ARENA_SIZE: usize = LARGE_POOL + if cfg!(feature="tx-offload") { RING * TX_LARGE } else { 0 };
 const RX: usize = RING * 32;
@@ -264,19 +267,32 @@ impl<I: Io> Nic<I> {
         let slot=self.tx;let d=slot*32;
         if self.io.word(d+4)&DONE==0 {self.poll_transmit()?;if self.io.word(d+4)&DONE==0 {return Err(Error::Busy);}}
         self.io.barrier();
-        let buffer=if large {LARGE_POOL+slot*TX_LARGE}else{self.tx_buffers[slot]};
+        let slot_base=if large {LARGE_POOL+slot*TX_LARGE}else{self.tx_buffers[slot]};
+        // Keep bounded IPv6 TSO reads inside one physical page. Each ring slot
+        // owns TX_LARGE bytes, including the alignment padding.
+        let page_offset = if large && packet.len() <= IPV6_TSO_WINDOW
+            && options.is_some_and(|o| o.tso_mss.is_some()) && packet.get(12..14) == Some(&[0x86, 0xdd]) {
+            (self.io.dma_address() as usize + slot_base).wrapping_neg() & (IPV6_TSO_WINDOW - 1)
+        } else { 0 };
+        let buffer=slot_base+page_offset;
         let mut length=packet.len().max(if options.is_none() && matches!(port,TxPort::InternalTagged|TxPort::ExternalTagged){64}else{60});
         let start=tx_clock();
         let prepared;
-        // A checksum-only request does not modify any bytes. Validate the
-        // cached producer view before copying it into the non-cacheable slot.
-        let checksum_only = options.filter(|o| o.checksum && o.tso_mss.is_none() && o.vlan.is_none())
-            .map(|o| o.validate(packet, port).map(|(meta, _)| meta)).transpose()?;
+        // Parse the cacheable producer view. TSO only needs one two-byte MSS
+        // write after copying; rereading headers from Normal-NC DMA is costly.
+        let explicit = options.map(|o| o.validate(packet, port)).transpose()?;
         let meta=unsafe {
-            let out=if large {self.io.large_tx_mut(slot)}else{self.io.buffer_mut(buffer)};
+            let out=if large {&mut self.io.large_tx_mut(slot)[page_offset..]}else{self.io.buffer_mut(buffer)};
             packet_copy::copy(&mut out[..packet.len()],packet);out[packet.len()..length].fill(0);
             tx_cost(0,start);prepared=tx_clock();
-            match options {Some(_) if checksum_only.is_some()=>checksum_only, Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>{
+            match explicit {
+                Some((metadata, field)) => {
+                    if let Some((offset, mss)) = field {
+                        out[offset..offset + 2].copy_from_slice(&mss.to_be_bytes());
+                    }
+                    Some(metadata)
+                }
+                None=>{
                 #[cfg(feature="tx-offload")]
                 {let prepared=offload::prepare_ordinary(&mut out[..length],port);if let Some((n,_))=prepared {length=n;}prepared.map(|(_,m)|m)}
                 #[cfg(not(feature="tx-offload"))]
@@ -1188,6 +1204,26 @@ mod tests {
             assert_eq!(packet,original);assert_eq!(n.rx_buffers,rx);assert_eq!(n.tx_buffers,tx);
             assert!(ARENA_SIZE<=2*1024*1024);
             n.io.set_word(4,n.io.word(4)|DONE);assert!(n.tx_completed(r));
+        }
+    }
+    #[test]
+    #[cfg(feature="tx-offload")]
+    fn ipv6_tso_page_is_inside_each_owned_slot() {
+        let mut n=Nic::new(Mock::new());
+        n.io.physical+=64;
+        n.initialize(100).unwrap();
+        n.io.offload=true;
+        let packet=offload::tests::tcp(true, IPV6_TSO_WINDOW-74);
+        let options=offload::TxOffload{checksum:true,vlan:None,tso_mss:Some(1440)};
+        for slot in 0..RING {
+            n.transmit_batch().submit_tracked(TxPort::Wan,&packet,Some(options)).unwrap();
+            let addr=n.io.word(slot*32) as usize;
+            let offset=addr-n.io.physical as usize;
+            let base=LARGE_POOL+slot*TX_LARGE;
+            assert_eq!(addr % IPV6_TSO_WINDOW,0);
+            assert!(offset>=base && offset+packet.len()<=base+TX_LARGE);
+            assert_eq!(&n.io.dma[offset+70..offset+72],&1440u16.to_be_bytes());
+            assert_eq!(&n.io.dma[offset+72..offset+packet.len()],&packet[72..]);
         }
     }
     #[test]

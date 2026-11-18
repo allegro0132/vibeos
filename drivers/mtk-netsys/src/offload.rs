@@ -35,12 +35,20 @@ pub struct Prepared {
     pub(crate) word6: u32,
 }
 
+/// MxL86252 standalone port tags supported by the board. Only QDMA
+/// insertion on plain IPv4 TSO input is qualified for the external GDMA.
+pub(crate) fn mxl_tso_tag(tci: u16) -> bool {
+    matches!(tci, 0xc00..=0xc03 | 0xc0c)
+}
+
 impl TxOffload {
     /// Validate before modifying any bytes. On success TSO replaces TCP's
     /// checksum with the big-endian MSS expected by NETSYS. The caller must
     /// submit that exact packet and retain it until DMA completion.
     pub fn prepare(self, packet: &mut [u8], port: TxPort) -> Result<Prepared, Error> {
-        if !matches!(port, TxPort::Wan | TxPort::Internal) {
+        let mxl = port == TxPort::ExternalTagged && self.checksum && self.tso_mss.is_some()
+            && self.vlan.is_some_and(mxl_tso_tag) && packet.get(12..14) == Some(&[8, 0]);
+        if !matches!(port, TxPort::Wan | TxPort::Internal) && !mxl {
             return Err(Error::Malformed);
         }
         if packet.len() < 14 || packet.len() > u16::MAX as usize {
@@ -292,6 +300,26 @@ pub(crate) mod tests {
         .prepare(&mut p, TxPort::Wan)
         .is_err());
     }
+    #[test]
+    fn external_gdma_requires_one_mxl_port_tag_on_plain_ipv4_tso() {
+        let mut packet = tcp(false, 8192);
+        for tci in [0xc00, 0xc03, 0xc0c] {
+            let opts = TxOffload { checksum: true, vlan: Some(tci), tso_mss: Some(1448) };
+            let meta = opts.prepare(&mut packet, TxPort::ExternalTagged).unwrap();
+            assert_eq!(meta.word5, 0xf0000000);
+            assert_eq!(meta.word6, 0x10000 | u32::from(tci));
+            assert_eq!(be16(&packet, 50), 1448);
+            assert!(opts.prepare(&mut tcp(true, 8192), TxPort::ExternalTagged).is_err());
+            let mut tagged = packet.clone();
+            tagged[12..14].copy_from_slice(&0x8100u16.to_be_bytes());
+            assert!(opts.prepare(&mut tagged, TxPort::ExternalTagged).is_err());
+        }
+        for vlan in [None, Some(0), Some(42), Some(0xc04), Some(0xec00)] {
+            assert!(TxOffload { checksum: true, vlan, tso_mss: Some(1448) }
+                .prepare(&mut packet, TxPort::ExternalTagged).is_err());
+        }
+    }
+
     #[test]
     fn rejects_truncated_headers_fragments_extensions_and_reserved_vid() {
         for ipv6 in [false, true] {

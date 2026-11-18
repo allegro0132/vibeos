@@ -67,8 +67,10 @@ impl Bridge {
             };
             let word5 = dma.word(slot * 32 + 20);
             let word6 = dma.word(slot * 32 + 24);
+            let mxl_tso = port == TxPort::ExternalTagged && word5 == 0xf0000000
+                && word6 >> 16 == 1 && crate::offload::mxl_tso_tag(word6 as u16);
             if word5 & !0xf0000000 != 0 || word6 & !0x1ffff != 0
-                || (word5 | word6 != 0 && !matches!(port, TxPort::Internal | TxPort::Wan)) {
+                || (word5 | word6 != 0 && !matches!(port, TxPort::Internal | TxPort::Wan) && !mxl_tso) {
                 return Err(Error::Malformed);
             }
             let metadata = (word5 | word6 != 0).then_some(crate::offload::Prepared {

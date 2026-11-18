@@ -265,7 +265,7 @@ impl<I: Io> Nic<I> {
         if self.io.word(d+4)&DONE==0 {self.poll_transmit()?;if self.io.word(d+4)&DONE==0 {return Err(Error::Busy);}}
         self.io.barrier();
         let buffer=if large {LARGE_POOL+slot*TX_LARGE}else{self.tx_buffers[slot]};
-        let mut length=packet.len().max(if matches!(port,TxPort::InternalTagged|TxPort::ExternalTagged){64}else{60});
+        let mut length=packet.len().max(if options.is_none() && matches!(port,TxPort::InternalTagged|TxPort::ExternalTagged){64}else{60});
         let start=tx_clock();
         let prepared;
         let meta=unsafe {
@@ -531,29 +531,7 @@ impl<I: Io> Nic<I> {
     ) -> Result<(), Error> {
         if !self.ready || !self.io.tx_offload_supported() { return Err(Error::NotReady); }
         if packet.len() > BUFFER { return Err(Error::Length); }
-        let descriptor = self.tx * 32;
-        if self.io.word(descriptor + 4) & DONE == 0 {
-            self.poll_transmit()?;
-            if self.io.word(descriptor + 4) & DONE == 0 { return Err(Error::Busy); }
-        }
-        self.io.barrier();
-        let buffer = self.tx_buffers[self.tx];
-        let meta = unsafe {
-            let bytes = self.io.buffer_mut(buffer);
-            bytes[..packet.len()].copy_from_slice(packet);
-            options.prepare(&mut bytes[..packet.len()], port)?
-        };
-        let length = packet.len().max(60);
-        unsafe { self.io.buffer_mut(buffer)[packet.len()..length].fill(0); }
-        self.io.set_word(descriptor, self.io.dma_address() as u32 + buffer as u32);
-        self.io.set_word(descriptor + 16, match port { TxPort::Internal => 1 << 16, _ => 2 << 16 });
-        self.io.set_word(descriptor + 20, meta.word5);
-        self.io.set_word(descriptor + 24, meta.word6);
-        offload::record(Some(meta));
-        self.io.barrier();
-        self.io.set_word(descriptor + 4, LAST | ((length as u32) << 8));
-        self.io.barrier();
-        self.tx = (self.tx + 1) % RING;
+        self.stage_tracked(port, packet, Some(options))?;
         self.notify_transmit()
     }
 

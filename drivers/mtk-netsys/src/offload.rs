@@ -46,6 +46,15 @@ impl TxOffload {
     /// checksum with the big-endian MSS expected by NETSYS. The caller must
     /// submit that exact packet and retain it until DMA completion.
     pub fn prepare(self, packet: &mut [u8], port: TxPort) -> Result<Prepared, Error> {
+        let (prepared, field) = self.validate(packet, port)?;
+        if let Some((offset, mss)) = field {
+            packet[offset..offset + 2].copy_from_slice(&mss.to_be_bytes());
+        }
+        Ok(prepared)
+    }
+    /// Inspect cacheable producer bytes before the tracked TX path copies them
+    /// into DMA storage. Only the TSO checksum-field patch needs a DMA write.
+    pub(crate) fn validate(self, packet: &[u8], port: TxPort) -> Result<(Prepared, Option<(usize, u16)>), Error> {
         let mxl = port == TxPort::ExternalTagged && self.checksum && self.tso_mss.is_some()
             && self.vlan.is_some_and(mxl_tso_tag) && packet.get(12..14) == Some(&[8, 0]);
         if !matches!(port, TxPort::Wan | TxPort::Internal) && !mxl {
@@ -141,17 +150,17 @@ impl TxOffload {
         } else if packet.len() + usize::from(self.vlan.is_some()) * 4 > wire_header + 1500 {
             return Err(Error::Length);
         }
-        if let Some(mss) = self.tso_mss {
-            let offset = tcp.ok_or(Error::Malformed)? + 16;
-            packet[offset..offset + 2].copy_from_slice(&mss.to_be_bytes());
-        }
-        Ok(Prepared {
+        let field = match self.tso_mss {
+            Some(mss) => Some((tcp.ok_or(Error::Malformed)? + 16, mss)),
+            None => None,
+        };
+        Ok((Prepared {
             length: packet.len(),
             port,
             word5: if self.checksum { 7 << 28 } else { 0 }
                 | if self.tso_mss.is_some() { 1 << 31 } else { 0 },
             word6: self.vlan.map_or(0, |tci| (1 << 16) | u32::from(tci)),
-        })
+        }, field))
     }
 }
 fn be16(bytes: &[u8], offset: usize) -> u16 {

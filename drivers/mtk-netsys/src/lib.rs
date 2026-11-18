@@ -268,11 +268,15 @@ impl<I: Io> Nic<I> {
         let mut length=packet.len().max(if options.is_none() && matches!(port,TxPort::InternalTagged|TxPort::ExternalTagged){64}else{60});
         let start=tx_clock();
         let prepared;
+        // A checksum-only request does not modify any bytes. Validate the
+        // cached producer view before copying it into the non-cacheable slot.
+        let checksum_only = options.filter(|o| o.checksum && o.tso_mss.is_none() && o.vlan.is_none())
+            .map(|o| o.validate(packet, port).map(|(meta, _)| meta)).transpose()?;
         let meta=unsafe {
             let out=if large {self.io.large_tx_mut(slot)}else{self.io.buffer_mut(buffer)};
             packet_copy::copy(&mut out[..packet.len()],packet);out[packet.len()..length].fill(0);
             tx_cost(0,start);prepared=tx_clock();
-            match options {Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>{
+            match options {Some(_) if checksum_only.is_some()=>checksum_only, Some(o)=>Some(o.prepare(&mut out[..packet.len()],port)?),None=>{
                 #[cfg(feature="tx-offload")]
                 {let prepared=offload::prepare_ordinary(&mut out[..length],port);if let Some((n,_))=prepared {length=n;}prepared.map(|(_,m)|m)}
                 #[cfg(not(feature="tx-offload"))]

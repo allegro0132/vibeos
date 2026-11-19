@@ -59,27 +59,34 @@ impl Bridge {
             }
             let address = dma.word(slot * 32);
             let length = ((status >> 8) & 0xffff) as u16;
-            let port = match dma.word(slot * 32 + 16) >> 16 {
-                1 => TxPort::Internal,
-                2 => TxPort::Wan,
-                15 => TxPort::ExternalTagged,
-                _ => return Err(Error::Malformed),
-            };
-            let word5 = dma.word(slot * 32 + 20);
-            let word6 = dma.word(slot * 32 + 24);
-            let mxl_tso = port == TxPort::ExternalTagged && word5 == 0xf0000000
-                && word6 >> 16 == 1 && crate::offload::mxl_tso_tag(word6 as u16);
-            if word5 & !0xf0000000 != 0 || word6 & !0x1ffff != 0
-                || (word5 | word6 != 0 && !matches!(port, TxPort::Internal | TxPort::Wan) && !mxl_tso) {
-                return Err(Error::Malformed);
-            }
-            let metadata = (word5 | word6 != 0).then_some(crate::offload::Prepared {
-                length: length as usize, port, word5, word6,
-            });
-            let descriptor = unsafe {
-                self.ring.stage_offloaded(queue, address as u64, length as usize, port, metadata)
-            }
-            .map_err(|_| Error::Malformed)?;
+            let destination = dma.word(slot * 32 + 16) >> 16;
+            let descriptor = if destination == 4 {
+                if dma.word(slot * 32 + 20) != 0 || dma.word(slot * 32 + 24) != 0 {
+                    return Err(Error::Malformed);
+                }
+                unsafe { self.ring.stage_ppe1(queue, address as u64, length as usize) }
+            } else {
+                let port = match destination {
+                    1 => TxPort::Internal,
+                    2 => TxPort::Wan,
+                    15 => TxPort::ExternalTagged,
+                    _ => return Err(Error::Malformed),
+                };
+                let word5 = dma.word(slot * 32 + 20);
+                let word6 = dma.word(slot * 32 + 24);
+                let mxl_tso = port == TxPort::ExternalTagged && word5 == 0xf0000000
+                    && word6 >> 16 == 1 && crate::offload::mxl_tso_tag(word6 as u16);
+                if word5 & !0xf0000000 != 0 || word6 & !0x1ffff != 0
+                    || (word5 | word6 != 0 && !matches!(port, TxPort::Internal | TxPort::Wan) && !mxl_tso) {
+                    return Err(Error::Malformed);
+                }
+                let metadata = (word5 | word6 != 0).then_some(crate::offload::Prepared {
+                    length: length as usize, port, word5, word6,
+                });
+                unsafe {
+                    self.ring.stage_offloaded(queue, address as u64, length as usize, port, metadata)
+                }
+            }.map_err(|_| Error::Malformed)?;
             if self.owners[descriptor].is_some() {
                 return Err(Error::Malformed);
             }
@@ -235,6 +242,19 @@ mod tests {
         q.done(0);
         b.poll(&mut q, &mut d).unwrap();
         assert_ne!(d.words[1] & (1 << 31), 0);
+    }
+
+    #[test]
+    fn qdma_return_uses_ppe1_without_checksum_or_tag_insertion() {
+        let (mut bridge, mut queue, mut dma) = setup();
+        dma.stage(0, 0);
+        dma.words[4] = 4 << 16;
+        unsafe { bridge.notify(&mut queue, &mut dma, 1).unwrap(); }
+        assert_eq!(queue.words[0][3], (1 << 30) | (4 << 8));
+        assert_eq!(&queue.words[0][4..8], &[0; 4]);
+        queue.done(0);
+        bridge.poll(&mut queue, &mut dma).unwrap();
+        assert_ne!(dma.words[1] & (1 << 31), 0);
     }
 
     #[test]

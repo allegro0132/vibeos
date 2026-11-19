@@ -193,6 +193,23 @@ impl<I: Io> ReceiveBatch<'_, I> {
         result
     }
 
+    /// Submit one verified Ethernet/IP frame to the QDMA PPE1 forwarding port.
+    /// The route owner must retain the exclusive table until QDMA release and PPE drain.
+    pub unsafe fn reinject_ppe1(&mut self, frame: &[u8], timeout: u64) -> Result<(), Error> {
+        if !self.nic.io.tx_offload_supported() { return Err(Error::NotReady); }
+        if !(14..=1514).contains(&frame.len()) || timeout == 0 { return Err(Error::Length); }
+        self.nic.publish_notifications(&mut self.pending);
+        self.count = 0;
+        let receipt = self.nic.stage_packet(TxPort::Internal, frame, None, true)?;
+        self.nic.notify_transmit()?;
+        let start = self.nic.io.now();
+        loop {
+            self.nic.poll_transmit()?;
+            if self.nic.tx_completed(receipt) { return Ok(()); }
+            if self.nic.io.now().wrapping_sub(start) >= timeout { return Err(Error::Timeout); }
+        }
+    }
+
     /// Process a CPU-owned RSS exception without injecting it into a fake DMA
     /// RX ring. Busy is checked before the callback; on Pending the caller
     /// retains this buffer. Forwarded output is copied once to permanent TX.
@@ -262,6 +279,9 @@ impl<I: Io> Nic<I> {
             (self.tx_generation[receipt.slot]==receipt.generation && self.io.word(receipt.slot*32+4)&DONE!=0)
     }
     fn stage_tracked(&mut self,port:TxPort,packet:&[u8],options:Option<offload::TxOffload>)->Result<TxReceipt,Error> {
+        self.stage_packet(port, packet, options, false)
+    }
+    fn stage_packet(&mut self,port:TxPort,packet:&[u8],options:Option<offload::TxOffload>,reinject:bool)->Result<TxReceipt,Error> {
         if !self.ready {return Err(Error::NotReady);}
         let large=packet.len()>BUFFER;
         if !(14..=TX_LARGE).contains(&packet.len()) || (large && options.is_none()) {return Err(Error::Length);}
@@ -294,6 +314,7 @@ impl<I: Io> Nic<I> {
                     }
                     Some(metadata)
                 }
+                None if reinject => None,
                 None=>{
                 #[cfg(feature="tx-offload")]
                 {let prepared=offload::prepare_ordinary(&mut out[..length],port);if let Some((n,_))=prepared {length=n;}prepared.map(|(_,m)|m)}
@@ -304,7 +325,7 @@ impl<I: Io> Nic<I> {
         let generation=self.tx_generation[slot].checked_add(1).ok_or(Error::Malformed)?;
         self.tx_generation[slot]=generation;
         self.io.set_word(d,self.io.dma_address() as u32+buffer as u32);
-        self.io.set_word(d+16,match port {TxPort::Internal|TxPort::InternalTagged=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16});
+        self.io.set_word(d+16,if reinject {4<<16} else {match port {TxPort::Internal|TxPort::InternalTagged=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16}});
         self.io.set_word(d+20,meta.map_or(0,|m|m.word5));self.io.set_word(d+24,meta.map_or(0,|m|m.word6));
         offload::record(meta);self.io.barrier();self.io.set_word(d+4,LAST|((length as u32)<<8));self.io.barrier();
         self.advance_tx();tx_cost(1,prepared);Ok(TxReceipt{slot,generation})

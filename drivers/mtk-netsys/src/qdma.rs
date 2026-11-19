@@ -186,7 +186,6 @@ impl<const N: usize> TxRing<N> {
         &mut self, io: &mut impl Io, address: u64, length: usize,
         port: TxPort, offload: Option<crate::offload::Prepared>,
     ) -> Result<usize, Error> {
-        if self.poisoned { return Err(Error::Corrupt); }
         let (min, max, fport) = match port {
             // The descriptor's forward port cannot tell a tagged internal
             // frame from a plain one; the submitting ring enforced each
@@ -201,6 +200,17 @@ impl<const N: usize> TxRing<N> {
             if meta.port != port || meta.length != length { return Err(Error::Length); }
             (60, if meta.word5 & (1 << 31) != 0 { 65535 } else { 1518 })
         } else { (min, max) };
+        unsafe { self.stage_descriptor(io, address, length, fport, min, max, offload) }
+    }
+
+    /// Same buffer ownership contract as stage. The caller owns PPE1 through completion.
+    pub(crate) unsafe fn stage_ppe1(&mut self, io: &mut impl Io, address: u64, length: usize) -> Result<usize, Error> {
+        unsafe { self.stage_descriptor(io, address, length, 4, 60, 1514, None) }
+    }
+
+    unsafe fn stage_descriptor(&mut self, io: &mut impl Io, address: u64, length: usize,
+        fport: u32, min: usize, max: usize, offload: Option<crate::offload::Prepared>) -> Result<usize, Error> {
+        if self.poisoned { return Err(Error::Corrupt); }
         if !(min..=max).contains(&length) {
             return Err(Error::Length);
         }

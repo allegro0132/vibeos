@@ -320,7 +320,7 @@ pub unsafe fn start_empty(
 /// One owned topology and ingress direction per table. MxL uses its qualified bridge alias,
 /// never an arbitrary customer VLAN or a physical-port selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlowPath { WanToInternal, WanToMxl, MxlToWan([u8; 6]) }
+enum FlowPath { QdmaToMxl, WanToInternal, WanToMxl, MxlToWan([u8; 6]) }
 impl FlowPath {
     fn admission_register(self) -> usize {
         match self { Self::MxlToWan(_) => 0x540, _ => WAN }
@@ -329,6 +329,7 @@ impl FlowPath {
         // GDMA MYMAC is bits 15:12; broadcast/multicast/other unicast stay
         // with PDMA for the bounded outbound diagnostic. v3 ports: PPE0=3, PPE1=4.
         let port = match engine { Engine::Ppe0 => 3, Engine::Ppe1 => 4, Engine::Ppe2 => 12 };
+        if self == Self::QdmaToMxl { return cpu; }
         (cpu & !0xffff) | if matches!(self, Self::MxlToWan(_)) { port << 12 } else { port * 0x1111 }
     }
     fn ingress_matches(self, io: &mut impl Registers) -> bool {
@@ -340,7 +341,7 @@ impl FlowPath {
         }
         let (peer_register, peer_value) = match self {
             Self::WanToInternal => return io.read(0x500) == 0xc0700000 && io.read(0x540) == 0x20717777,
-            Self::WanToMxl => (0x540, 0x20710000),
+            Self::QdmaToMxl | Self::WanToMxl => (0x540, 0x20710000),
             Self::MxlToWan(_) => (WAN, 0x20710000),
         };
         internal_bypasses(io.read(0x500)) && io.read(peer_register) == peer_value
@@ -445,6 +446,17 @@ impl NaptBinding {
         binding.path = FlowPath::WanToMxl;
         Ok(binding)
     }
+    /// Install on PPE1 with physical MAC admission left on the CPU.
+    pub fn with_qdma_ingress(mut self) -> Result<Self, EncodeError> {
+        if self.path != FlowPath::WanToMxl || !self.inside_egress() {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        self.path = FlowPath::QdmaToMxl;
+        Ok(self)
+    }
+
+    pub fn qdma_ingress(&self) -> bool { self.path == FlowPath::QdmaToMxl }
+
     /// Experimental outbound SNAT format. Only source address/port may change.
     /// This does not authorize opening MxL ingress. Publication requires owned
     /// bridge/tag policy, validated outbound receipt and WAN next-hop authority.
@@ -752,8 +764,9 @@ unsafe fn start_table_with(
             .map_or(0, |p| p.0.table.region().base());
         s.table_base == expected && s.cache == 0 && !s.busy()
     });
-    if engine == Engine::Ppe2
-        || (engine == Engine::Ppe1 && !matches!(path, FlowPath::MxlToWan(_)))
+    if path == FlowPath::QdmaToMxl && (engine != Engine::Ppe1 || peer.is_some() || !publish)
+        || engine == Engine::Ppe2
+        || (engine == Engine::Ppe1 && !matches!(path, FlowPath::MxlToWan(_) | FlowPath::QdmaToMxl))
         || !peer_valid || (pppoe && (peer.is_some() || !publish))
         || peer.is_some_and(|p| p.0.pppoe)
         || !empty
@@ -852,6 +865,13 @@ fn removal_check(session: &mut Session, tickets: impl Iterator<Item = RuleTicket
 
 impl PausedSession {
     pub fn initial_ticket(&self) -> Option<RuleTicket> { self.0.initial_ticket() }
+    /// Finish a CPU submission after the QDMA release descriptor was reclaimed.
+    pub fn drain_qdma(&self, io: &mut impl Registers, timeout: u64) -> Result<(), Error> {
+        if self.0.path != FlowPath::QdmaToMxl { return Err(Error::Preconditions); }
+        io.barrier();
+        idle_on(io, self.0.engine, timeout)?;
+        self.edit_check(io)
+    }
     fn edit_check(&self, io: &mut impl Registers) -> Result<(), Error> {
         let engine = self.0.engine;
         if !self.0.path.ingress_matches(io)
@@ -2571,6 +2591,22 @@ mod tests {
         assert!(matches!(fault.error, Error::Readback { offset: WAN }));
         assert_eq!(fault._table.nonzero_entries(), 1);
         assert!(!fault._table.all_invalid());
+    }
+    #[test]
+    fn qdma_return_keeps_all_physical_ingress_on_cpu() {
+        let binding = mxl_binding().with_qdma_ingress().unwrap();
+        let mut io = mxl_mock();
+        let original = io.registers.clone();
+        let PauseOutcome::Paused(session) = (unsafe {
+            prepare_single_napt_on(&mut io, table(), 10, &binding, Engine::Ppe1)
+        }) else { panic!("prepare QDMA ingress") };
+        session.drain_qdma(&mut io, 10).unwrap();
+        let StartOutcome::Active(session) = (unsafe { session.resume(&mut io) }) else { panic!("resume") };
+        let Outcome::Restored(_) = (unsafe { session.stop(&mut io, 10) }) else { panic!("stop") };
+        assert!(io.ops.iter().all(|op| match op {
+            Op::Write(offset, value) if [0x500, WAN, 0x540].contains(offset) => Some(value) == original.get(offset),
+            _ => true,
+        }));
     }
     #[test]
     fn ppe1_outbound_lifecycle_keeps_other_engines_untouched() {

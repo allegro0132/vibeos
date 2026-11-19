@@ -612,7 +612,7 @@ impl NaptBinding {
     fn has_pppoe(&self) -> bool {
         u32::from_le_bytes(self.entry.0[..4].try_into().unwrap()) & super::IB1_PPPOE != 0
     }
-    /// Encode PPPoE session insertion for an IPv4 NAPT rule from the switch
+    /// Encode PPPoE session insertion for an IPv4 NAPT or IPv6 5-tuple rule from the switch
     /// to the untagged direct MAC. The caller owns the negotiated session,
     /// peer MAC and IP MTU for the entire publication interval. This field
     /// controls egress encapsulation. It does not match an ingress SID.
@@ -621,16 +621,18 @@ impl NaptBinding {
             return Err(EncodeError::Address);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
-        let ib2 = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap());
+        let ib2 = self.entry.ib2_offset();
+        let port = (u32::from_le_bytes(self.entry.0[ib2..ib2 + 4].try_into().unwrap()) >> 9) & 0xf;
         if !matches!(self.path, FlowPath::MxlToWan(_))
-            || self.entry.is_ipv6() || (ib2 >> 9) & 0xf != 2
+            || port != 2
             || ib1 & ((7 << 14) | super::IB1_PPPOE | (1 << 18)) != 0
         {
             return Err(EncodeError::UnsupportedEgress);
         }
+        let l2 = self.entry.l2_offset();
         self.entry.word(0, ib1 | super::IB1_PPPOE);
-        self.entry.half(46, 0x8864);
-        self.entry.half(60, sid);
+        self.entry.half(l2 + 2, 0x8864);
+        self.entry.half(l2 + 16, sid);
         Ok(self)
     }
     /// Match the single rule's validated egress IP MTU. Hardware limits include
@@ -1602,6 +1604,27 @@ mod tests {
         assert!(table.is_zero());
         assert_eq!(io.registers[&0x540], 0x20710000);
         assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(WAN, _))));
+    }
+    #[test]
+    fn ipv6_tcp_pppoe_rule_uses_ipv6_l2_offsets() {
+        let mac = [2, 0x42, 0x70, 4, 0, 2];
+        let tuple = Tuple6 {
+            source: [0x20; 16], destination: [0x21; 16],
+            source_port: 54000, destination_port: 443,
+        };
+        let binding = NaptBinding::ipv6_route(tuple, Some(mac), [2; 6], [4; 6])
+            .unwrap().with_direct_egress().unwrap().with_mtu(1492).unwrap()
+            .with_pppoe_session(0x4912).unwrap().with_protocol(Protocol::Tcp);
+        let mut io = mxl_mock();
+        io.registers.insert(0x10, 0x34);
+        let PauseOutcome::Paused(paused) =
+            (unsafe { prepare_single_napt(&mut io, table(), 10, &binding) })
+        else { panic!("prepare") };
+        let bytes = paused.0.table.entry(paused.initial_ticket().unwrap().index()).unwrap();
+        assert_eq!(&bytes[..4], &0x22c20034u32.to_le_bytes());
+        assert_eq!(&bytes[60..64], &[0, 0, 0x64, 0x88]);
+        assert_eq!(&bytes[76..80], &[0x12, 0x49, 2, 2]);
+        assert!(matches!(unsafe { paused.stop(&mut io, 10) }, Outcome::Restored(_)));
     }
     #[test]
     fn outbound_prepare_resume_retire_edit_stop_owns_only_mxl_admission() {

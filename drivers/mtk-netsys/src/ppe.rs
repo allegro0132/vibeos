@@ -10,6 +10,7 @@ pub mod table;
 pub mod capacity;
 
 pub const ENTRY_BYTES: usize = 128;
+const IB1_PPPOE: u32 = 1 << 17;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     Ppe0,

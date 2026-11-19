@@ -1,7 +1,7 @@
 //! CPU-owned FOE storage. Public staging is INVALID-only; the control module
 //! may prepare a TCP/UDP BIND entry while the device is disabled. The experimental
 //! retirement primitive touches only an aligned IB1 word while published.
-use super::{StagedEntry, ENTRY_BYTES};
+use super::{StagedEntry, ENTRY_BYTES, IB1_PPPOE};
 /// 16K qualification geometry, or the full 32K table with `ppe-32k`.
 pub const ENTRIES: usize = if cfg!(feature = "ppe-32k") { 32768 } else { 16384 };
 pub const TABLE_BYTES: usize = ENTRIES * ENTRY_BYTES;
@@ -88,7 +88,7 @@ impl<'a> CpuTable<'a> {
         // Preserve only the validated L2 tag recipe; cache/static/type/state
         // bits remain lifecycle-owned rather than copied from staging.
         let tags = u32::from_le_bytes(entry.bytes()[..4].try_into().unwrap())
-            & ((7 << 14) | (1 << 18));
+            & ((7 << 14) | IB1_PPPOE | (1 << 18));
         let protocol = u32::from_le_bytes(entry.bytes()[..4].try_into().unwrap()) & ((1 << 30) | (31 << 23));
         let ib1 = protocol | (2 << 28) | (1 << 22) | tags | u32::from(timestamp);
         self.bytes[index * ENTRY_BYTES..index * ENTRY_BYTES + 4]

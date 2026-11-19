@@ -237,6 +237,7 @@ pub struct Session {
     auxiliary: [u32; 7],
     ingress_cpu: u32,
     mtu: u16,
+    pppoe: bool,
     path: FlowPath,
     rules: Rules,
 }
@@ -516,7 +517,7 @@ impl NaptBinding {
     /// only between two VLANs of the port, and adds the tag with `with_vlan`.
     pub fn with_direct_egress(mut self) -> Result<Self, EncodeError> {
         let ib2 = self.entry.ib2_offset(); let l2 = self.entry.l2_offset();
-        if !matches!(self.path, FlowPath::MxlToWan(_) | FlowPath::WanToMxl) {
+        if self.has_pppoe() || !matches!(self.path, FlowPath::MxlToWan(_) | FlowPath::WanToMxl) {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
@@ -580,7 +581,7 @@ impl NaptBinding {
     /// tag the frame arrived with either way. Format only.
     pub fn with_vlan(mut self, vid: u16) -> Result<Self, EncodeError> {
         let ib2 = self.entry.ib2_offset(); let l2 = self.entry.l2_offset();
-        if !(1..=4094).contains(&vid) {
+        if self.has_pppoe() || !(1..=4094).contains(&vid) {
             return Err(EncodeError::UnsupportedEgress);
         }
         let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
@@ -606,6 +607,30 @@ impl NaptBinding {
             }
             _ => return Err(EncodeError::UnsupportedEgress),
         }
+        Ok(self)
+    }
+    fn has_pppoe(&self) -> bool {
+        u32::from_le_bytes(self.entry.0[..4].try_into().unwrap()) & super::IB1_PPPOE != 0
+    }
+    /// Encode PPPoE session insertion for an IPv4 NAPT rule from the switch
+    /// to the untagged direct MAC. The caller owns the negotiated session,
+    /// peer MAC and IP MTU for the entire publication interval. This field
+    /// controls egress encapsulation. It does not match an ingress SID.
+    pub fn with_pppoe_session(mut self, sid: u16) -> Result<Self, EncodeError> {
+        if sid == 0 || sid == u16::MAX {
+            return Err(EncodeError::Address);
+        }
+        let ib1 = u32::from_le_bytes(self.entry.0[..4].try_into().unwrap());
+        let ib2 = u32::from_le_bytes(self.entry.0[16..20].try_into().unwrap());
+        if !matches!(self.path, FlowPath::MxlToWan(_))
+            || self.entry.is_ipv6() || (ib2 >> 9) & 0xf != 2
+            || ib1 & ((7 << 14) | super::IB1_PPPOE | (1 << 18)) != 0
+        {
+            return Err(EncodeError::UnsupportedEgress);
+        }
+        self.entry.word(0, ib1 | super::IB1_PPPOE);
+        self.entry.half(46, 0x8864);
+        self.entry.half(60, sid);
         Ok(self)
     }
     /// Match the single rule's validated egress IP MTU. Hardware limits include
@@ -714,6 +739,7 @@ unsafe fn start_table_with(
 ) -> StartOutcome {
     let before = Snapshot::read(engine, |o| io.read(o));
     let path = binding.map_or(FlowPath::WanToInternal, |b| b.path);
+    let pppoe = binding.is_some_and(NaptBinding::has_pppoe);
     let ingress_cpu = io.read(path.admission_register());
     // Only the private duplex coordinator can supply an owned paused peer.
     // Public single-engine entry points always require every table detached.
@@ -726,7 +752,8 @@ unsafe fn start_table_with(
     });
     if engine == Engine::Ppe2
         || (engine == Engine::Ppe1 && !matches!(path, FlowPath::MxlToWan(_)))
-        || !peer_valid
+        || !peer_valid || (pppoe && (peer.is_some() || !publish))
+        || peer.is_some_and(|p| p.0.pppoe)
         || !empty
         || timeout == 0
         || timeout >= 1 << 63
@@ -764,7 +791,9 @@ unsafe fn start_table_with(
         // Same framing convention as Linux mtk_ppe_update_mtu: IP MTU +
         // 14-byte Ethernet header, then 0..3 VLAN headers. Do not inherit a
         // bootloader jumbo limit or MTU-drop policy. Exceptions go to CPU.
-        let base = u32::from(binding.map_or(1500, |b| b.mtu)) + 14;
+        // Reserve the PPPoE header and PPP protocol bytes against the limit
+        // until the egress MTU accounting has been qualified on the board.
+        let base = u32::from(binding.map_or(1500, |b| b.mtu)) + 14 - if pppoe { 8 } else { 0 };
         let limits = [
             u32::MAX,
             0,
@@ -792,6 +821,7 @@ unsafe fn start_table_with(
             auxiliary,
             ingress_cpu,
             mtu: binding.map_or(1500, |b| b.mtu),
+            pppoe,
             path,
             rules,
         }),
@@ -860,7 +890,7 @@ impl PausedSession {
         timeout: u64,
         binding: &NaptBinding,
     ) -> EditOutcome<RuleTicket> {
-        if binding.path != self.0.path {
+        if binding.path != self.0.path || binding.has_pppoe() || self.0.pppoe {
             return EditOutcome::Rejected(self, EditError::Egress);
         }
         if binding.mtu != self.0.mtu {
@@ -1538,6 +1568,40 @@ mod tests {
             assert!(matches!(NaptBinding::mxl_lan_to_wan(original, translated,
                 [2,0x42,0x70,4,0,2], [2,0,0,0,0,1], [2,0,0,0,0,2]), Err(EncodeError::Address)));
         }
+    }
+    #[test]
+    fn single_pppoe_outbound_binding_publishes_session_and_keeps_wan_rx_on_cpu() {
+        for sid in [0, u16::MAX] {
+            assert!(outbound_binding().with_pppoe_session(sid).is_err());
+        }
+        assert!(mxl_binding().with_pppoe_session(0x1234).is_err());
+        assert!(outbound_binding().with_vlan(42).unwrap().with_pppoe_session(0x1234).is_err());
+        assert!(outbound_binding().with_pppoe_session(0x1234).unwrap().with_vlan(42).is_err());
+
+        let mut io = mxl_mock();
+        io.registers.insert(0x10, 0x34);
+        let binding = outbound_binding().with_mtu(1492).unwrap().with_pppoe_session(0x1234).unwrap();
+        let PauseOutcome::Paused(paused) =
+            (unsafe { prepare_single_napt(&mut io, table(), 10, &binding) })
+        else { panic!("prepare") };
+        let slot = paused.initial_ticket().unwrap().index();
+        let bytes = paused.0.table.entry(slot).unwrap();
+        assert_eq!(&bytes[..4], &0x60420034u32.to_le_bytes());
+        assert_eq!(&bytes[44..48], &[0, 0, 0x64, 0x88]);
+        assert_eq!(&bytes[60..64], &[0x34, 0x12, 1, 0]);
+        assert_eq!(io.registers[&0x230c], 1498 | (1502 << 16));
+        let EditOutcome::Rejected(paused, EditError::Egress) =
+            (unsafe { paused.insert_napt(&mut io, 10, &outbound_binding()) })
+        else { panic!("mixed encapsulation") };
+        let StartOutcome::Active(active) = (unsafe { paused.resume(&mut io) })
+        else { panic!("resume") };
+        assert_eq!(io.registers[&0x540], 0x20713000);
+        assert_eq!(io.registers[&WAN], 0x20710000);
+        let Outcome::Restored(table) = (unsafe { active.stop(&mut io, 10) })
+        else { panic!("stop") };
+        assert!(table.is_zero());
+        assert_eq!(io.registers[&0x540], 0x20710000);
+        assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(WAN, _))));
     }
     #[test]
     fn outbound_prepare_resume_retire_edit_stop_owns_only_mxl_admission() {

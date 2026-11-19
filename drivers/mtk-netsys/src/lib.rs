@@ -85,6 +85,7 @@ pub struct Processed {
 // Independent RX consumers share a core with TLS work; absorb scheduling bursts.
 // Poll budgets remain bounded independently of descriptor capacity.
 pub const RING: usize = 32;
+const _: () = assert!(RING <= u32::BITS as usize);
 pub const RX_RING: usize = if cfg!(feature = "rx-multicore") { 128 } else { 32 };
 pub const BUFFER: usize = 2048;
 pub const RX_QUEUES: usize = if cfg!(feature = "rx-multicore") { 5 } else if cfg!(feature = "rx-rss") { 4 } else { 1 };
@@ -149,6 +150,7 @@ pub struct TxReceipt { slot:usize, generation:u64 }
 pub mod packet_copy;
 pub struct Nic<I: Io> {
     tx_generation:[u64;RING],
+    outstanding_tx: core::sync::atomic::AtomicU32,
     io: I,
     tx: usize,
     rx: usize,
@@ -305,13 +307,14 @@ impl<I: Io> Nic<I> {
         self.io.set_word(d+16,match port {TxPort::Internal|TxPort::InternalTagged=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16});
         self.io.set_word(d+20,meta.map_or(0,|m|m.word5));self.io.set_word(d+24,meta.map_or(0,|m|m.word6));
         offload::record(meta);self.io.barrier();self.io.set_word(d+4,LAST|((length as u32)<<8));self.io.barrier();
-        self.tx=(slot+1)%RING;tx_cost(1,prepared);Ok(TxReceipt{slot,generation})
+        self.advance_tx();tx_cost(1,prepared);Ok(TxReceipt{slot,generation})
     }
     pub fn new(io: I) -> Self {
         Self {
             io,
             tx: 0,
             tx_generation:[0;RING],
+            outstanding_tx: core::sync::atomic::AtomicU32::new(0),
             rx: 0,
             ready: false,
             tx_buffers: core::array::from_fn(|i| POOL + i * BUFFER),
@@ -445,6 +448,7 @@ impl<I: Io> Nic<I> {
         self.software_tail = 0;
         if self.rss { rx_offload::enable_rss(&mut self.io); }
         self.tx = 0;
+        *self.outstanding_tx.get_mut() = 0;
         self.rx = 0;
         self.io.barrier();
         self.io.set_reg(CFG, self.io.reg(CFG) | self.io.pdma_enable());
@@ -464,12 +468,28 @@ impl<I: Io> Nic<I> {
         if let Err(error) = result { self.ready=false; return Err(error); }
         Ok(())
     }
+    fn advance_tx(&mut self) {
+        *self.outstanding_tx.get_mut() |= 1 << self.tx;
+        self.tx = (self.tx + 1) % RING;
+    }
     /// All submitted TX descriptors have returned to CPU ownership. This is
     /// DMA completion, not proof that every frame has left the physical MAC.
     pub fn transmit_drained(&self) -> bool {
         if !self.ready { return false; }
+        use core::sync::atomic::Ordering::Relaxed;
+        let mask = self.outstanding_tx.load(Relaxed);
+        if mask == 0 { return true; }
         self.io.barrier();
-        (0..RING).all(|slot| self.io.word(slot * 32 + 4) & DONE != 0)
+        let mut pending = mask;
+        while pending != 0 {
+            let slot = pending.trailing_zeros() as usize;
+            if self.io.word(slot * 32 + 4) & DONE == 0 { break; }
+            pending &= pending - 1;
+        }
+        // Only the exclusive producer can publish a slot again. Concurrent
+        // observers can safely remove bits for completions they have seen.
+        if pending != mask { self.outstanding_tx.fetch_and(!(mask ^ pending), Relaxed); }
+        pending == 0
     }
 
     /// Terminal backend stop. No buffer release or successful-delivery promise.
@@ -520,7 +540,7 @@ impl<I: Io> Nic<I> {
         self.io
             .set_word(descriptor + 4, LAST | ((length as u32) << 8));
         self.io.barrier();
-        self.tx = (self.tx + 1) % RING;
+        self.advance_tx();
         self.notify_transmit()?;
         Ok(())
     }
@@ -608,7 +628,7 @@ impl<I: Io> Nic<I> {
         self.io
             .set_word(descriptor + 4, LAST | ((wire_length as u32) << 8));
         self.io.barrier();
-        self.tx = (self.tx + 1) % RING;
+        self.advance_tx();
         pending.tx=true;
         Ok(true)
     }
@@ -770,7 +790,7 @@ impl<I: Io> Nic<I> {
                 self.io
                     .set_word(tx_descriptor + 4, LAST | ((wire_length as u32) << 8));
                 self.io.barrier();
-                self.tx = (self.tx + 1) % RING;
+                self.advance_tx();
                 pending.tx = true;
                 true
             }
@@ -981,7 +1001,7 @@ mod tests {
             self.regs[o / 4]
         }
         fn set_reg(&mut self, o: usize, v: u32) {
-            if o == 0x6808 || o == 0x6908 {
+            if matches!(o, 0x6808 | 0x6908 | 0x6918 | 0x6928 | 0x6938) {
                 if self.regs[CFG / 4] & 0x45 == 0x45 {
                     assert!(!self.dma_dirty.get(), "doorbell before DMA publication barrier");
                 }
@@ -1035,14 +1055,14 @@ mod tests {
         let mut remote=n.detach_rx(2).unwrap();let d=RX+2*RX_RING*32;
         n.io.set_word(d,0xffff_ffff);n.io.set_word(d+8,4);n.io.set_word(d+4,DONE|LAST|(60<<8));
         let mut packet=None;
-        remote.receive(&mut n.io,|p,_|{packet=Some(p);false}).unwrap();
+        assert_eq!(remote.drain(&mut n.io, 1, |p,_|{packet=Some(p);false}), 0);
         assert_ne!(n.io.word(d+4)&DONE,0);assert_eq!(n.io.word(d+8),4);
         let packet=packet.unwrap();let bytes=[7;60];
         for _ in 0..RX_RING {assert!(n.inject_received(packet,&bytes).unwrap());}
         assert!(!n.inject_received(packet,&bytes).unwrap());
         let mut out=[0;60];for _ in 0..RX_RING {assert!(n.receive_from(&mut out).unwrap().is_some());assert_eq!(out,bytes);}
         assert!(!n.has_receive());
-        assert_eq!(remote.receive(&mut n.io,|_,_|true),Ok(Some(true)));
+        assert_eq!(remote.drain(&mut n.io, 1, |_,_|true), 1);
         assert_eq!(n.io.word(d),n.io.physical as u32+n.rx_buffers[2*RX_RING] as u32);
         assert_eq!(n.io.word(d+8),0);
         assert!(n.inject_received(packet,&bytes).unwrap());
@@ -1068,6 +1088,32 @@ mod tests {
         assert_eq!(&n.io.dma[n.tx_buffers[0]+1..n.tx_buffers[0]+60],&snapshot[9..]);
     }
 
+    #[cfg(feature = "rx-multicore")]
+    #[test]
+    fn detached_batch_publishes_only_the_accepted_prefix() {
+        let mut nic = Nic::new_with_rx_headroom(Mock::new()).with_rss();
+        nic.initialize(100).unwrap();
+        let mut queue = nic.detach_rx(1).unwrap();
+        let base = RX + RX_RING * 32;
+        for slot in 0..5 {
+            let size = if slot == 1 { 1 } else { 60 };
+            nic.io.set_word(base + slot * 32 + 4, DONE | LAST | (size << 8));
+        }
+        nic.io.doorbells.clear();
+        let mut offered = 0;
+        assert_eq!(queue.drain(&mut nic.io, 32, |_, _| {
+            offered += 1;
+            offered < 3
+        }), 3);
+        assert_eq!(nic.io.doorbells, [(0x6918, 2)]);
+        assert_ne!(nic.io.word(base + 3 * 32 + 4) & DONE, 0);
+        assert_eq!(queue.drain(&mut nic.io, 0, |_, _| panic!()), 0);
+        assert_eq!(queue.drain(&mut nic.io, 1, |_, _| true), 1);
+        assert_eq!(queue.drain(&mut nic.io, 32, |_, _| true), 1);
+        assert_eq!(queue.drain(&mut nic.io, 32, |_, _| panic!()), 0);
+        assert_eq!(nic.io.doorbells, [(0x6918, 2), (0x6918, 3), (0x6918, 4)]);
+    }
+
     #[test]
     #[cfg(feature="rx-multicore")]
     fn detached_consumers_and_native_injection_keep_disjoint_ownership() {
@@ -1080,9 +1126,9 @@ mod tests {
                 let buffer=n.rx_buffers[slot];n.io.dma[buffer+4..buffer+64].fill((q+round) as u8);
                 n.io.set_word(d+16,2<<26);n.io.set_word(d+8,4);n.io.set_word(d+4,DONE|LAST|(60<<8));
                 assert!(!n.has_receive(),"CPU0 must not consume a detached descriptor");
-                assert_eq!(queue.receive(&mut n.io,|_,_|false),Ok(Some(false)));
+                assert_eq!(queue.drain(&mut n.io, 32, |_,_|false), 0);
                 let mut saved=None;
-                queue.receive(&mut n.io,|packet,bytes| {saved=Some((packet,bytes.to_vec()));true}).unwrap();
+                assert_eq!(queue.drain(&mut n.io, 32, |packet,bytes| {saved=Some((packet,bytes.to_vec()));true}), 1);
                 let (packet,bytes)=saved.unwrap();assert_eq!(packet.offload.queue(),(q+1) as u8);
                 assert!(n.inject_received(packet,&bytes).unwrap());assert!(n.has_receive());
                 n.io.set_word(n.tx*32+4,DONE);
@@ -1786,6 +1832,12 @@ mod tests {
         n.transmit(&[0x43; 60]).unwrap();
         assert!(!n.transmit_drained());
         n.io.set_word(4, DONE);
+        assert!(n.transmit_drained());
+        let receipt = n.transmit_batch().submit_tracked(TxPort::Wan, &[0x44; 60], None).unwrap();
+        n.transmit_with(|_| RxAction::Transmit { port: TxPort::Wan, length: 60 }).unwrap();
+        n.io.set_word((receipt.slot + 1) * 32 + 4, DONE);
+        assert!(!n.transmit_drained(), "a later completion cannot retire the earlier slot");
+        n.io.set_word(receipt.slot * 32 + 4, DONE);
         assert!(n.transmit_drained());
     }
     #[test]

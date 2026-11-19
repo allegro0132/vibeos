@@ -246,7 +246,7 @@ impl<I: Io> ReceiveBatch<'_, I> {
     pub fn receive_in_place(
         &mut self, process: impl FnOnce(Received, &mut [u8]) -> RxAction,
     ) -> Result<Option<Processed>, Error> {
-        let result = self.nic.receive_deferred(process, &mut self.pending, false);
+        let result = self.nic.receive_deferred(process, &mut self.pending, false, false);
         self.finish(result)
     }
     /// Expose the whole buffer plus the received frame's starting offset.
@@ -255,7 +255,24 @@ impl<I: Io> ReceiveBatch<'_, I> {
         &mut self, process: impl FnOnce(Received, usize, &mut [u8]) -> RxAction,
     ) -> Result<Option<Processed>, Error> {
         let offset = self.nic.rx_headroom;
-        let result = self.nic.receive_deferred(|packet, buffer| process(packet, offset, buffer), &mut self.pending, true);
+        let result = self.nic.receive_deferred(|packet, buffer| process(packet, offset, buffer), &mut self.pending, true, false);
+        self.finish(result)
+    }
+    /// Transfer the owned RX buffer directly to PPE1. Returning None from select
+    /// defers the original descriptor and requires leaving the frame intact.
+    /// # Safety
+    /// Retain the isolated PPE1 table and all flow authority through completion
+    /// of all TX in this batch and the subsequent PPE drain.
+    pub unsafe fn receive_ppe1(&mut self, select: impl FnOnce(Received, usize, &mut [u8]) -> Option<(usize, usize)>)
+        -> Result<Option<Processed>, Error> {
+        if !self.nic.io.tx_offload_supported() { return Err(Error::NotReady); }
+        let start = self.nic.rx_headroom;
+        let result = self.nic.receive_deferred(|packet, buffer| {
+            match select(packet, start, buffer) {
+                Some((offset, length)) => RxAction::TransmitFrom { port: TxPort::Internal, offset, length },
+                None => RxAction::Defer,
+            }
+        }, &mut self.pending, true, true);
         self.finish(result)
     }
     fn finish(&mut self, result: Result<Option<Processed>, Error>) -> Result<Option<Processed>, Error> {
@@ -700,7 +717,7 @@ impl<I: Io> Nic<I> {
         process: impl FnOnce(Received, &mut [u8]) -> RxAction,
     ) -> Result<Option<Processed>, Error> {
         let mut pending = Notifications::default();
-        let result = self.receive_deferred(process, &mut pending, false);
+        let result = self.receive_deferred(process, &mut pending, false, false);
         self.publish_notifications(&mut pending);
         result
     }
@@ -731,7 +748,7 @@ impl<I: Io> Nic<I> {
 
     fn receive_deferred(
         &mut self, process: impl FnOnce(Received, &mut [u8]) -> RxAction,
-        pending: &mut Notifications, expose_headroom: bool,
+        pending: &mut Notifications, expose_headroom: bool, reinject: bool,
     ) -> Result<Option<Processed>, Error> {
         if !self.ready {
             return Err(Error::NotReady);
@@ -778,13 +795,15 @@ impl<I: Io> Nic<I> {
             | RxAction::TransmitShifted { port, length: output }
             | RxAction::TransmitFrom { port, length: output, .. } => {
                 let offset = explicit_offset;
-                let (fport, minimum, maximum, padded) = match port {
-                    TxPort::Internal => (1, 14, 1514, 60),
-                    TxPort::InternalTagged => (1, 18, 1518, 64),
-                TxPort::InternalTagged => (1, 18, 1518, 64),
-            TxPort::InternalTagged => (1, 18, 1518, 64),
-                    TxPort::Wan => (2, 14, 1518, 60),
-                    TxPort::ExternalTagged => (15, 18, 1522, 64),
+                let (fport, minimum, maximum, padded) = if reinject {
+                    (4, 14, 1514, 60)
+                } else {
+                    match port {
+                        TxPort::Internal => (1, 14, 1514, 60),
+                        TxPort::InternalTagged => (1, 18, 1518, 64),
+                        TxPort::Wan => (2, 14, 1518, 60),
+                        TxPort::ExternalTagged => (15, 18, 1522, 64),
+                    }
                 };
                 if !(minimum..=maximum).contains(&output) || output + offset > length.saturating_add(4 + self.rx_headroom) {
                     self.recycle_deferred(pending);
@@ -806,7 +825,9 @@ impl<I: Io> Nic<I> {
                 self.io.set_word(tx_descriptor + 16, fport << 16);
                 self.io.set_word(tx_descriptor + 20, 0);
                 self.io.set_word(tx_descriptor + 24, 0);
-                let wire_length = self.prepare_tx_offload(tx_descriptor, buffer, offset, wire_length, port);
+                let wire_length = if reinject { wire_length } else {
+                    self.prepare_tx_offload(tx_descriptor, buffer, offset, wire_length, port)
+                };
                 self.io.barrier();
                 self.io
                     .set_word(tx_descriptor + 4, LAST | ((wire_length as u32) << 8));
@@ -1600,6 +1621,25 @@ mod tests {
             RxAction::Transmit {port:TxPort::Wan,length:60}
         }).unwrap();
         assert_eq!(n.io.word(tx*32),n.io.physical as u32+base as u32+4);
+    }
+
+    #[test]
+    fn ppe1_batch_defers_or_transfers_the_owned_rx_buffer() {
+        let mut n = Nic::new_with_rx_headroom(Mock::new());
+        n.initialize(100).unwrap();
+        let base = n.rx_buffers[0];
+        let spare = n.tx_buffers[0];
+        n.io.set_word(RX + 4, DONE | LAST | (72 << 8));
+        assert_eq!(unsafe { n.receive_batch().receive_ppe1(|_, _, _| panic!()) }, Err(Error::NotReady));
+        n.io.offload = true;
+        assert_eq!(unsafe { n.receive_batch().receive_ppe1(|_, _, _| None) }, Ok(None));
+        assert_eq!((n.rx, n.tx), (0, 0));
+        assert!(unsafe { n.receive_batch().receive_ppe1(|_, start, _| Some((start + 8, 64))) }
+            .unwrap().unwrap().transmitted);
+        assert_eq!((n.rx_buffers[0], n.tx_buffers[0]), (spare, base));
+        assert_eq!(n.io.word(0), n.io.physical as u32 + base as u32 + 12);
+        assert_eq!(n.io.word(16), 4 << 16);
+        assert_eq!((n.io.word(20), n.io.word(24)), (0, 0));
     }
 
     #[test]

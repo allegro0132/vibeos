@@ -210,6 +210,19 @@ impl<I: Io> ReceiveBatch<'_, I> {
         }
     }
 
+    /// Publish all staged descriptors and wait for their release before the
+    /// routing owner drains the PPE or processes a control-plane exception.
+    pub fn drain_transmit(&mut self, timeout: u64) -> Result<(), Error> {
+        self.nic.publish_notifications(&mut self.pending);
+        self.count = 0;
+        let start = self.nic.io.now();
+        while !self.nic.transmit_drained() {
+            self.nic.poll_transmit()?;
+            if self.nic.io.now().wrapping_sub(start) >= timeout { return Err(Error::Timeout); }
+        }
+        Ok(())
+    }
+
     /// Process a CPU-owned RSS exception without injecting it into a fake DMA
     /// RX ring. Busy is checked before the callback; on Pending the caller
     /// retains this buffer. Forwarded output is copied once to permanent TX.

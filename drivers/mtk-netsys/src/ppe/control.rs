@@ -869,15 +869,21 @@ impl PausedSession {
     pub fn drain_qdma(&self, io: &mut impl Registers, timeout: u64) -> Result<(), Error> {
         if self.0.path != FlowPath::QdmaToMxl { return Err(Error::Preconditions); }
         io.barrier();
-        idle_on(io, self.0.engine, timeout)?;
-        self.edit_check(io)
+        // QDMA release can precede the last lookup entering the PPE. BUSY
+        // can reassert between MMIO reads even after an initial idle sample.
+        // Validate ownership separately, then allow the engine time to drain.
+        self.check_configuration(io, ENABLE)?;
+        idle_on(io, self.0.engine, timeout)
     }
     fn edit_check(&self, io: &mut impl Registers) -> Result<(), Error> {
+        self.check_configuration(io, ENABLE | BUSY)
+    }
+    fn check_configuration(&self, io: &mut impl Registers, global_mask: u32) -> Result<(), Error> {
         let engine = self.0.engine;
         if !self.0.path.ingress_matches(io)
             || io.read(self.0.path.admission_register()) != self.0.ingress_cpu
             || io.read(ppe_reg(engine, TABLE_BASE)) != self.0.table.region().base()
-            || io.read(ppe_reg(engine, GLOBAL)) & (ENABLE | BUSY) != ENABLE
+            || io.read(ppe_reg(engine, GLOBAL)) & global_mask != ENABLE
             || io.read(ppe_reg(engine, 0x2320)) != 0
             || io.read(ppe_reg(engine, TABLE_CONFIG)) != TABLE_CONFIG_VALUE
             || io.read(ppe_reg(engine, 0x2204)) != FLOW_CONFIG_VALUE
@@ -2601,6 +2607,12 @@ mod tests {
             prepare_single_napt_on(&mut io, table(), 10, &binding, Engine::Ppe1)
         }) else { panic!("prepare QDMA ingress") };
         session.drain_qdma(&mut io, 10).unwrap();
+        io.busy_after = Some(io.writes);
+        assert_eq!(session.drain_qdma(&mut io, 10), Err(Error::Timeout));
+        io.busy_after = None;
+        io.registers.insert(0x540, 0);
+        assert_eq!(session.drain_qdma(&mut io, 10), Err(Error::Preconditions));
+        io.registers.insert(0x540, original[&0x540]);
         let StartOutcome::Active(session) = (unsafe { session.resume(&mut io) }) else { panic!("resume") };
         let Outcome::Restored(_) = (unsafe { session.stop(&mut io, 10) }) else { panic!("stop") };
         assert!(io.ops.iter().all(|op| match op {

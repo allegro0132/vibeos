@@ -85,10 +85,37 @@ pub(crate) fn unicast_ip(ip: &[u8]) -> bool {
     ip.len() == 4 && ip[0] != 0 && ip[0] != 127 && ip[0] < 224
 }
 
+/// Validated fields needed to match a read-only Ethernet frame to a route.
+pub struct Inspected {
+    pub source: [u8; 4],
+    pub destination: [u8; 4],
+    pub transport: Transport,
+    pub ttl: u8,
+    pub ip_length: usize,
+}
+
+/// Apply the same address, protocol, fragmentation and checksum checks as
+/// Packet::parse without requiring a writable mapping of the packet.
+pub fn inspect(frame: &[u8], ingress_mac: [u8; 6]) -> Result<Inspected, Error> {
+    let (length, transport) = Packet::validate(frame, ingress_mac)?;
+    Ok(Inspected {
+        source: frame[26..30].try_into().unwrap(),
+        destination: frame[30..34].try_into().unwrap(),
+        transport,
+        ttl: frame[22],
+        ip_length: length,
+    })
+}
+
 impl<'a> Packet<'a> {
     /// Only ordinary unicast Ethernet IPv4 directed at `ingress_mac` is eligible.
     /// Subnet-directed broadcast and source validation are route/policy checks.
     pub fn parse(frame: &'a mut [u8], ingress_mac: [u8; 6]) -> Result<Self, Error> {
+        let (length, transport) = Self::validate(frame, ingress_mac)?;
+        Ok(Self { frame, length, transport })
+    }
+
+    fn validate(frame: &[u8], ingress_mac: [u8; 6]) -> Result<(usize, Transport), Error> {
         if frame.len() < 34 {
             return Err(Error::Truncated);
         }
@@ -171,11 +198,7 @@ impl<'a> Packet<'a> {
             }
             _ => return Err(Error::Protocol),
         };
-        Ok(Self {
-            frame,
-            length,
-            transport,
-        })
+        Ok((length, transport))
     }
 
     pub fn source(&self) -> [u8; 4] {

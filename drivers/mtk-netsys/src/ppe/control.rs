@@ -2713,6 +2713,87 @@ mod tests {
         let Outcome::Restored(second) = (unsafe { peer.stop(&mut io, 10) }) else { panic!("detach return") };
         assert!(first.is_zero() && second.is_zero());
     }
+    #[cfg(feature = "ppe-32k")]
+    #[test]
+    fn reciprocal_ipv4_tcp_pppoe_can_fill_both_foe_tables() {
+        let lan_mac = [2,0x42,0x70,4,0,2];
+        let local = [2,0,0,0,0,1];
+        let peer_mac = [2,0,0,0,0,2];
+        let uplink = |remote_port| Tuple { source: [10,0,0,2], destination: [198,18,0,2],
+            source_port: 45000, destination_port: remote_port };
+        let reverse = |t: Tuple| Tuple { source: t.destination, destination: t.source,
+            source_port: t.destination_port, destination_port: t.source_port };
+        let translated = |remote_port, port| Tuple { source: [198,18,0,1], source_port: port,
+            ..uplink(remote_port) };
+        // Arrange for both directions to visit the same bucket for each
+        // remote port, including the final bucket with its unusable last way.
+        let port = (49152..=u16::MAX).find(|&port|
+            napt_bucket(uplink(32768)) == napt_bucket(reverse(translated(32768, port)))).unwrap();
+        let rules = |remote_port| {
+            let orig = uplink(remote_port);
+            let snat = translated(remote_port, port);
+            let up = NaptBinding::mxl_lan_to_wan(orig, snat, lan_mac, local, peer_mac)
+                .unwrap().with_pppoe_session(17).unwrap().with_protocol(Protocol::Tcp);
+            let down = NaptBinding::wan_to_mxl_lan(reverse(snat), reverse(orig), lan_mac, peer_mac)
+                .unwrap().with_protocol(Protocol::Tcp).with_qdma_ingress().unwrap();
+            assert_eq!(up.index(), down.index());
+            (up, down)
+        };
+        fill_reciprocal_tables(rules);
+    }
+
+    #[cfg(feature = "ppe-32k")]
+    #[test]
+    fn reciprocal_ipv6_pppoe_can_fill_both_foe_tables() {
+        let inside = [0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,2];
+        let outside = [0x20,1,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,3];
+        let local = [2,0,0,0,0,1];
+        let peer = [2,0,0,0,0,2];
+        for protocol in [Protocol::Tcp, Protocol::Udp] {
+            fill_reciprocal_tables(|port| {
+                let a = Tuple6 { source: inside, destination: outside, source_port: 45000, destination_port: port };
+                let b = Tuple6 { source: outside, destination: inside, source_port: port, destination_port: 45000 };
+                let up = NaptBinding::ipv6_route(a, Some([2,0x42,0x70,4,0,2]), local, peer).unwrap()
+                    .with_direct_egress().unwrap().with_pppoe_session(17).unwrap().with_protocol(protocol);
+                let down = NaptBinding::ipv6_route(b, None, local, peer).unwrap()
+                    .with_mxl_alias(2).unwrap().with_protocol(protocol).with_qdma_ingress().unwrap();
+                (up, down)
+            });
+        }
+    }
+
+    #[cfg(feature = "ppe-32k")]
+    fn fill_reciprocal_tables(rules: impl Fn(u16) -> (NaptBinding, NaptBinding)) {
+        let (first, back) = rules(32768);
+        let mut io = mxl_mock();
+        let PauseOutcome::Paused(mut up) = (unsafe { prepare_single_napt(&mut io, table(), 10, &first) })
+            else { panic!("prepare uplink") };
+        let second = CpuTable::new(Box::leak(std::vec![0; TABLE_BYTES].into_boxed_slice()), 0x44000000).unwrap();
+        let PauseOutcome::Paused(mut down) = (unsafe { prepare_pppoe_return_peer(&mut io, second, 10, &back, &up) })
+            else { panic!("prepare return") };
+        for remote in 32769..=u16::MAX {
+            let (outbound, inbound) = rules(remote);
+            io.ops.clear();
+            let insert = |owner: PausedSession, io: &mut Mock, rule: &NaptBinding| {
+                match unsafe { owner.insert_napt(io, 10, rule) } {
+                    EditOutcome::Updated(p, ticket) => (p, Some(ticket.index())),
+                    EditOutcome::Rejected(p, EditError::BucketFull | EditError::Capacity) => (p, None),
+                    _ => panic!("unexpected admission result"),
+                }
+            };
+            let (next_up, a) = insert(up, &mut io, &outbound);
+            let (next_down, b) = insert(down, &mut io, &inbound);
+            assert_eq!(a, b);
+            up = next_up;
+            down = next_down;
+        }
+        for owner in [up, down] {
+            assert_eq!(owner.0.rules.len(), MAX_RULES);
+            assert_eq!(owner.0.table.nonzero_entries(), MAX_RULES);
+            assert!(matches!(unsafe { owner.stop(&mut io, 10) }, Outcome::Restored(t) if t.is_zero()));
+        }
+    }
+
     #[test]
     fn qdma_return_keeps_all_physical_ingress_on_cpu() {
         let binding = mxl_binding().with_qdma_ingress().unwrap();

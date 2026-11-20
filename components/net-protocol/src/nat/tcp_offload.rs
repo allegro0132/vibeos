@@ -14,6 +14,10 @@ pub struct TcpPermit {
     incarnation: u64,
 }
 impl TcpPermit {
+    /// NAT table slot for indexing hints. Reuse requires validating the
+    /// mapping generation and TCP incarnation through the original table.
+    pub fn flow_slot(self) -> usize { self.receipt.flow }
+
     pub fn direction(self) -> Direction {
         self.receipt.direction()
     }
@@ -50,11 +54,6 @@ impl<const N: usize> TcpForwardCache<N> {
         }
     }
     pub const fn capacity(&self)->usize {N}
-    /// Enumerate committed hints when rebuilding a paused hardware table.
-    /// Callers must revalidate the reciprocal pair and both egress paths.
-    pub fn entries(&self) -> impl Iterator<Item = (TcpPermit, Egress)> + '_ {
-        self.entries.iter().flatten().copied()
-    }
     pub fn clear(&mut self) {self.entries.fill(None);self.next=0;}
     pub fn forget(&mut self,direction:Direction,tuple:TcpTuple) {
         for entry in &mut self.entries[cache_set::<N>(direction,tuple)] {

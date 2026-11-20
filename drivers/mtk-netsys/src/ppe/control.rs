@@ -728,6 +728,28 @@ pub unsafe fn prepare_single_napt_on(
         StartOutcome::Failed(outcome) => PauseOutcome::Failed(outcome),
     }
 }
+/// Attach a CPU-fed return table alongside an owned, paused PPPoE uplink.
+///
+/// # Safety
+/// Own both engines and separate permanent tables until the uplink is stopped,
+/// then drain and stop the return table. Only authenticated CPU submissions
+/// may target the return engine. No physical WAN ingress is opened.
+pub unsafe fn prepare_pppoe_return_peer(
+    io: &mut impl Registers, table: CpuTable<'static>, timeout: u64,
+    binding: &NaptBinding, uplink: &PausedSession,
+) -> PauseOutcome {
+    let a = table.region();
+    let b = uplink.0.table.region();
+    if !binding.qdma_ingress() || !uplink.0.pppoe || uplink.0.engine != Engine::Ppe0
+        || !matches!(uplink.0.path, FlowPath::MxlToWan(_)) || (u64::from(a.base()) < b.end()
+            && u64::from(b.base()) < a.end()) {
+        return PauseOutcome::Failed(Outcome::Rejected(table, Error::Preconditions));
+    }
+    match unsafe { start_table(io, table, timeout, Some(binding), false, Engine::Ppe1, Some(uplink)) } {
+        StartOutcome::Active(s) => PauseOutcome::Paused(PausedSession(s)),
+        StartOutcome::Failed(outcome) => PauseOutcome::Failed(outcome),
+    }
+}
 unsafe fn start_table(
     io: &mut impl Registers,
     mut table: CpuTable<'static>,
@@ -764,11 +786,13 @@ unsafe fn start_table_with(
             .map_or(0, |p| p.0.table.region().base());
         s.table_base == expected && s.cache == 0 && !s.busy()
     });
-    if path == FlowPath::QdmaToMxl && (engine != Engine::Ppe1 || peer.is_some() || !publish)
+    let return_peer = path == FlowPath::QdmaToMxl && engine == Engine::Ppe1 && publish && !admit
+        && peer.is_some_and(|p| p.0.engine == Engine::Ppe0 && p.0.pppoe && matches!(p.0.path, FlowPath::MxlToWan(_)));
+    if path == FlowPath::QdmaToMxl && (engine != Engine::Ppe1 || (peer.is_some() && !return_peer) || !publish)
         || engine == Engine::Ppe2
         || (engine == Engine::Ppe1 && !matches!(path, FlowPath::MxlToWan(_) | FlowPath::QdmaToMxl))
         || !peer_valid || (pppoe && (peer.is_some() || !publish))
-        || peer.is_some_and(|p| p.0.pppoe)
+        || (peer.is_some_and(|p| p.0.pppoe) && !return_peer)
         || !empty
         || timeout == 0
         || timeout >= 1 << 63
@@ -806,9 +830,9 @@ unsafe fn start_table_with(
         // Same framing convention as Linux mtk_ppe_update_mtu: IP MTU +
         // 14-byte Ethernet header, then 0..3 VLAN headers. Do not inherit a
         // bootloader jumbo limit or MTU-drop policy. Exceptions go to CPU.
-        // Reserve the PPPoE header and PPP protocol bytes against the limit
-        // until the egress MTU accounting has been qualified on the board.
-        let base = u32::from(binding.map_or(1500, |b| b.mtu)) + 14 - if pppoe { 8 } else { 0 };
+        // PPE compares the emitted Ethernet frame, including the inserted
+        // PPPoE header and PPP protocol. The binding MTU is the inner IP MTU.
+        let base = u32::from(binding.map_or(1500, |b| b.mtu)) + 14 + if pppoe { 8 } else { 0 };
         let limits = [
             u32::MAX,
             0,
@@ -875,14 +899,31 @@ impl PausedSession {
         self.check_configuration(io, ENABLE)?;
         idle_on(io, self.0.engine, timeout)
     }
+    /// QDMA completion while only the other engine's LAN ingress is open.
+    /// The IRQ cutoff may already have returned that ingress to the CPU.
+    pub fn drain_pppoe_peer(&self, io: &mut impl Registers, uplink: &Session, timeout: u64) -> Result<(), Error> {
+        if self.0.path != FlowPath::QdmaToMxl || self.0.engine != Engine::Ppe1
+            || uplink.engine != Engine::Ppe0 || !uplink.pppoe || !matches!(uplink.path, FlowPath::MxlToWan(_))
+            || !uplink.path.ingress_matches(io) || !matches!(io.read(0x540), 0x20713000 | 0x20710000)
+            || io.read(WAN) != self.0.ingress_cpu || io.read(TABLE_BASE) != uplink.table.region().base() {
+            return Err(Error::Preconditions);
+        }
+        io.barrier();
+        self.check_bank(io, ENABLE)?;
+        idle_on(io, Engine::Ppe1, timeout)
+    }
     fn edit_check(&self, io: &mut impl Registers) -> Result<(), Error> {
         self.check_configuration(io, ENABLE | BUSY)
     }
     fn check_configuration(&self, io: &mut impl Registers, global_mask: u32) -> Result<(), Error> {
+        if !self.0.path.ingress_matches(io) || io.read(self.0.path.admission_register()) != self.0.ingress_cpu {
+            return Err(Error::Preconditions);
+        }
+        self.check_bank(io, global_mask)
+    }
+    fn check_bank(&self, io: &mut impl Registers, global_mask: u32) -> Result<(), Error> {
         let engine = self.0.engine;
-        if !self.0.path.ingress_matches(io)
-            || io.read(self.0.path.admission_register()) != self.0.ingress_cpu
-            || io.read(ppe_reg(engine, TABLE_BASE)) != self.0.table.region().base()
+        if io.read(ppe_reg(engine, TABLE_BASE)) != self.0.table.region().base()
             || io.read(ppe_reg(engine, GLOBAL)) & global_mask != ENABLE
             || io.read(ppe_reg(engine, 0x2320)) != 0
             || io.read(ppe_reg(engine, TABLE_CONFIG)) != TABLE_CONFIG_VALUE
@@ -1617,7 +1658,8 @@ mod tests {
         assert_eq!(&bytes[..4], &0x60420034u32.to_le_bytes());
         assert_eq!(&bytes[44..48], &[0, 0, 0x64, 0x88]);
         assert_eq!(&bytes[60..64], &[0x34, 0x12, 1, 0]);
-        assert_eq!(io.registers[&0x230c], 1498 | (1502 << 16));
+        assert_eq!(io.registers[&0x230c], 1514 | (1518 << 16));
+        assert_eq!(io.registers[&0x2310], 1522 | (1526 << 16));
         let EditOutcome::Rejected(paused, EditError::Egress) =
             (unsafe { paused.insert_napt(&mut io, 10, &outbound_binding()) })
         else { panic!("mixed encapsulation") };
@@ -2597,6 +2639,33 @@ mod tests {
         assert!(matches!(fault.error, Error::Readback { offset: WAN }));
         assert_eq!(fault._table.nonzero_entries(), 1);
         assert!(!fault._table.all_invalid());
+    }
+    #[test]
+    fn pppoe_return_peer_requires_disjoint_tables_and_never_admits_physical_wan() {
+        let mut io = mxl_mock();
+        let up = outbound_binding().with_pppoe_session(1).unwrap();
+        let back = mxl_binding().with_qdma_ingress().unwrap();
+        let PauseOutcome::Paused(uplink) = (unsafe { prepare_single_napt(&mut io, table(), 10, &up) })
+            else { panic!("prepare PPPoE uplink") };
+        let writes = io.writes;
+        assert!(matches!(unsafe { prepare_pppoe_return_peer(&mut io, table(), 10, &back, &uplink) },
+            PauseOutcome::Failed(Outcome::Rejected(_, Error::Preconditions))));
+        assert_eq!(io.writes, writes);
+        let second = CpuTable::new(Box::leak(std::vec![0; TABLE_BYTES].into_boxed_slice()), 0x44000000).unwrap();
+        let PauseOutcome::Paused(peer) = (unsafe { prepare_pppoe_return_peer(&mut io, second, 10, &back, &uplink) })
+            else { panic!("prepare CPU-fed return") };
+        let StartOutcome::Active(active) = (unsafe { uplink.resume(&mut io) }) else { panic!("resume uplink") };
+        assert_eq!(io.registers[&0x540], 0x20713000);
+        assert_eq!(io.registers[&WAN], 0x20710000);
+        peer.drain_pppoe_peer(&mut io, &active, 10).unwrap();
+        assert!(peer.drain_qdma(&mut io, 10).is_err());
+        io.registers.insert(WAN, 0x20714444);
+        assert_eq!(peer.drain_pppoe_peer(&mut io, &active, 10), Err(Error::Preconditions));
+        io.registers.insert(WAN, 0x20710000);
+        let Outcome::Restored(first) = (unsafe { active.stop(&mut io, 10) }) else { panic!("detach uplink") };
+        peer.drain_qdma(&mut io, 10).unwrap();
+        let Outcome::Restored(second) = (unsafe { peer.stop(&mut io, 10) }) else { panic!("detach return") };
+        assert!(first.is_zero() && second.is_zero());
     }
     #[test]
     fn qdma_return_keeps_all_physical_ingress_on_cpu() {

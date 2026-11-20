@@ -927,9 +927,30 @@ impl<I: Io> Nic<I> {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+struct DescriptorArena(usize);
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+impl DescriptorArena {
+    fn word(&self, offset: usize) -> u32 {
+        assert!(offset < ARENA_SIZE && offset & 3 == 0);
+        unsafe { core::ptr::read_volatile((self.0 + offset) as *const u32) }
+    }
+    fn set_word(&mut self, offset: usize, value: u32) {
+        assert!(offset < ARENA_SIZE && offset & 3 == 0);
+        unsafe { core::ptr::write_volatile((self.0 + offset) as *mut u32, value) }
+    }
+    fn barrier(&self) {
+        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    }
+}
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub struct Mmio {
     #[cfg(feature = "qdma-test")]
     qdma: Option<qdma::engine::Engine>,
+    // With PDMA TX disabled, only the NIC owner and the QDMA completion
+    // bridge touch the legacy TX descriptors. Real QDMA descriptors and all
+    // payload buffers remain in the original non-cacheable DMA allocation.
+    #[cfg(feature = "qdma-test")]
+    tx_shadows: qdma::bridge::TxShadows,
     arena: usize,
     clock: fn() -> u64,
 }
@@ -940,7 +961,8 @@ impl Mmio {
     /// Normal-NC arena of at least ARENA_SIZE bytes, no cached aliases. Arena
     /// remains reserved even if this owner is dropped or a task faults.
     pub unsafe fn new(arena: usize, clock: fn() -> u64) -> Self {
-        Self { arena, clock, #[cfg(feature = "qdma-test")] qdma: None }
+        Self { arena, clock, #[cfg(feature = "qdma-test")] qdma: None,
+            #[cfg(feature = "qdma-test")] tx_shadows: qdma::bridge::TxShadows::new() }
     }
     /// # Safety
     /// The prepared ring owns permanent NC descriptors at `base`, and its
@@ -973,13 +995,13 @@ impl Io for Mmio {
     }
     #[cfg(feature = "qdma-test")]
     fn poll_transmit(&mut self) -> Result<(), Error> {
-        let Some(mut q)=self.qdma.take() else {return Ok(());};
-        let result=q.poll(self);self.qdma=Some(q);result
+        let Some(q) = self.qdma.as_mut() else { return Ok(()); };
+        q.poll(&mut self.tx_shadows)
     }
     #[cfg(feature = "qdma-test")]
     fn notify_transmit(&mut self,end:usize) -> Result<(), Error> {
-        let Some(mut q)=self.qdma.take() else {self.set_reg(0x6808,end as u32);return Ok(());};
-        let result=unsafe {q.notify(self,end)};self.qdma=Some(q);result
+        let Some(q) = self.qdma.as_mut() else { self.set_reg(0x6808, end as u32); return Ok(()); };
+        unsafe { q.notify(&mut self.tx_shadows, end) }
     }
     fn dma_address(&self) -> u64 {
         self.arena as u64
@@ -993,12 +1015,19 @@ impl Io for Mmio {
         unsafe { core::ptr::write_volatile((0x15100000 + o) as *mut u32, v) }
     }
     fn word(&self, o: usize) -> u32 {
-        assert!(o < ARENA_SIZE && o & 3 == 0);
-        unsafe { core::ptr::read_volatile((self.arena + o) as *const u32) }
+        #[cfg(feature = "qdma-test")]
+        if o < RING * 32 && self.qdma.is_some() {
+            return qdma::bridge::ShadowIo::read_shadow(&self.tx_shadows, o);
+        }
+        DescriptorArena(self.arena).word(o)
     }
     fn set_word(&mut self, o: usize, v: u32) {
-        assert!(o < ARENA_SIZE && o & 3 == 0);
-        unsafe { core::ptr::write_volatile((self.arena + o) as *mut u32, v) }
+        #[cfg(feature = "qdma-test")]
+        if o < RING * 32 && self.qdma.is_some() {
+            qdma::bridge::ShadowIo::write_shadow(&mut self.tx_shadows, o, v);
+            return;
+        }
+        DescriptorArena(self.arena).set_word(o, v);
     }
     fn byte(&self, o: usize) -> u8 {
         assert!(o < ARENA_SIZE);
@@ -1016,11 +1045,7 @@ impl Io for Mmio {
         assert!(cfg!(feature="tx-offload") && slot<RING);
         unsafe {core::slice::from_raw_parts_mut((self.arena+LARGE_POOL+slot*TX_LARGE) as *mut u8,TX_LARGE)}
     }
-    fn barrier(&self) {
-        unsafe {
-            core::arch::asm!("dsb sy", options(nostack));
-        }
-    }
+    fn barrier(&self) { DescriptorArena(self.arena).barrier(); }
     fn now(&self) -> u64 {
         (self.clock)()
     }

@@ -3,6 +3,45 @@
 use super::{Completion, Io as QueueIo, TxRing};
 use crate::{Error, Io, TxPort, RING};
 
+/// PDMA descriptor shadows are separate from the QDMA engine that tracks them.
+/// Borrow just these words when publishing or reclaiming a batch.
+pub trait ShadowIo {
+    fn read_shadow(&self, offset: usize) -> u32;
+    fn write_shadow(&mut self, offset: usize, value: u32);
+    fn order_shadows(&self);
+}
+
+impl<T: Io> ShadowIo for T {
+    fn read_shadow(&self, offset: usize) -> u32 { self.word(offset) }
+    fn write_shadow(&mut self, offset: usize, value: u32) { self.set_word(offset, value); }
+    fn order_shadows(&self) { self.barrier(); }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "qdma-test"))]
+pub(crate) struct TxShadows([u32; RING * 8]);
+
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "qdma-test"))]
+impl TxShadows {
+    pub(crate) fn new() -> Self { Self([0; RING * 8]) }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "qdma-test"))]
+impl ShadowIo for TxShadows {
+    fn read_shadow(&self, offset: usize) -> u32 {
+        assert_eq!(offset & 3, 0);
+        self.0[offset / 4]
+    }
+    fn write_shadow(&mut self, offset: usize, value: u32) {
+        assert_eq!(offset & 3, 0);
+        self.0[offset / 4] = value;
+    }
+    fn order_shadows(&self) {
+        // Retain the ordering between QDMA's observed release and the point
+        // at which its buffer can be reused by software.
+        unsafe { core::arch::asm!("dsb sy", options(nostack)); }
+    }
+}
+
 pub struct Bridge {
     ring: TxRing<34>,
     inflight: [Option<Completion>; RING],
@@ -30,7 +69,7 @@ impl Bridge {
     pub unsafe fn notify(
         &mut self,
         queue: &mut impl QueueIo,
-        dma: &mut impl Io,
+        dma: &mut impl ShadowIo,
         end: usize,
     ) -> Result<(), Error> {
         if self.poisoned {
@@ -45,7 +84,7 @@ impl Bridge {
     unsafe fn notify_inner(
         &mut self,
         queue: &mut impl QueueIo,
-        dma: &mut impl Io,
+        dma: &mut impl ShadowIo,
         end: usize,
     ) -> Result<(), Error> {
         if end >= RING {
@@ -53,15 +92,15 @@ impl Bridge {
         }
         while self.queued != end {
             let slot = self.queued;
-            let status = dma.word(slot * 32 + 4);
+            let status = dma.read_shadow(slot * 32 + 4);
             if self.inflight[slot].is_some() || status & 0xc0000000 != 0x40000000 {
                 return Err(Error::Malformed);
             }
-            let address = dma.word(slot * 32);
+            let address = dma.read_shadow(slot * 32);
             let length = ((status >> 8) & 0xffff) as u16;
-            let destination = dma.word(slot * 32 + 16) >> 16;
+            let destination = dma.read_shadow(slot * 32 + 16) >> 16;
             let descriptor = if destination == 4 {
-                if dma.word(slot * 32 + 20) != 0 || dma.word(slot * 32 + 24) != 0 {
+                if dma.read_shadow(slot * 32 + 20) != 0 || dma.read_shadow(slot * 32 + 24) != 0 {
                     return Err(Error::Malformed);
                 }
                 unsafe { self.ring.stage_ppe1(queue, address as u64, length as usize) }
@@ -72,8 +111,8 @@ impl Bridge {
                     15 => TxPort::ExternalTagged,
                     _ => return Err(Error::Malformed),
                 };
-                let word5 = dma.word(slot * 32 + 20);
-                let word6 = dma.word(slot * 32 + 24);
+                let word5 = dma.read_shadow(slot * 32 + 20);
+                let word6 = dma.read_shadow(slot * 32 + 24);
                 let mxl_tso = port == TxPort::ExternalTagged && word5 == 0xf0000000
                     && word6 >> 16 == 1 && crate::offload::mxl_tso_tag(word6 as u16);
                 if word5 & !0xf0000000 != 0 || word6 & !0x1ffff != 0
@@ -96,7 +135,7 @@ impl Bridge {
         }
         self.ring.publish(queue).map_err(|_| Error::Malformed)
     }
-    pub fn poll(&mut self, queue: &mut impl QueueIo, dma: &mut impl Io) -> Result<(), Error> {
+    pub fn poll(&mut self, queue: &mut impl QueueIo, dma: &mut impl ShadowIo) -> Result<(), Error> {
         if self.poisoned {
             return Err(Error::Malformed);
         }
@@ -106,18 +145,19 @@ impl Bridge {
         }
         result
     }
-    fn poll_inner(&mut self, queue: &mut impl QueueIo, dma: &mut impl Io) -> Result<(), Error> {
+    fn poll_inner(&mut self, queue: &mut impl QueueIo, dma: &mut impl ShadowIo) -> Result<(), Error> {
         let mut completed = [None; RING];
-        self.ring.reclaim_batch(queue, &mut completed).map_err(|_| Error::Malformed)?;
-        for (descriptor, done) in completed.into_iter().flatten() {
+        let count = self.ring.reclaim_batch(queue, &mut completed).map_err(|_| Error::Malformed)?;
+        for &(descriptor, done) in completed[..count].iter().flatten() {
             let slot = self.owners[descriptor].ok_or(Error::Malformed)?;
-            if self.inflight[slot] != Some(done) || dma.word(slot * 32 + 4) & (1 << 31) != 0 {
+            let status = dma.read_shadow(slot * 32 + 4);
+            if self.inflight[slot] != Some(done) || status & (1 << 31) != 0 {
                 return Err(Error::Malformed);
             }
             // Match trusted submission records, never a hardware-written buffer
             // pointer. The QDMA descriptor remains its release anchor.
-            dma.barrier();
-            dma.set_word(slot * 32 + 4, dma.word(slot * 32 + 4) | (1 << 31));
+            dma.order_shadows();
+            dma.write_shadow(slot * 32 + 4, status | (1 << 31));
             self.inflight[slot] = None;
             self.owners[descriptor] = None;
         }

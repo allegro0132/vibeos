@@ -62,7 +62,7 @@ impl Engine {
     pub fn stop(&mut self, timeout: u64, now: impl FnMut() -> u64) -> Result<(), Error> {
         self.control.stop(&mut self.registers, timeout, now)
     }
-    pub fn poll(&mut self, dma: &mut impl crate::Io) -> Result<(), Error> {
+    pub fn poll(&mut self, dma: &mut impl super::bridge::ShadowIo) -> Result<(), Error> {
         if !self.control.running() {
             return Err(Error::NotReady);
         }
@@ -74,7 +74,7 @@ impl Engine {
     }
     /// # Safety
     /// Nic owns shadows and buffers according to Bridge::notify's contract.
-    pub unsafe fn notify(&mut self, dma: &mut impl crate::Io, end: usize) -> Result<(), Error> {
+    pub unsafe fn notify(&mut self, dma: &mut impl super::bridge::ShadowIo, end: usize) -> Result<(), Error> {
         if !self.control.running() {
             return Err(Error::NotReady);
         }

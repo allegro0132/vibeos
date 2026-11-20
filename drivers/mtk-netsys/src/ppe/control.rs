@@ -238,6 +238,7 @@ pub struct Session {
     ingress_cpu: u32,
     mtu: u16,
     pppoe: bool,
+    pppoe_ipv6_egress: Option<[u8; 20]>,
     path: FlowPath,
     rules: Rules,
 }
@@ -621,6 +622,12 @@ impl NaptBinding {
         }
         Ok(self)
     }
+    // Full NETSYS IPv6 L2 rewrite, including both MACs and the PPP session ID.
+    fn pppoe_ipv6_egress(&self) -> Option<[u8; 20]> {
+        if !self.entry.is_ipv6() || !self.has_pppoe() { return None; }
+        let start = self.entry.l2_offset();
+        Some(self.entry.0[start..start + 20].try_into().unwrap())
+    }
     fn has_pppoe(&self) -> bool {
         u32::from_le_bytes(self.entry.0[..4].try_into().unwrap()) & super::IB1_PPPOE != 0
     }
@@ -861,6 +868,7 @@ unsafe fn start_table_with(
             ingress_cpu,
             mtu: binding.map_or(1500, |b| b.mtu),
             pppoe,
+            pppoe_ipv6_egress: binding.and_then(NaptBinding::pppoe_ipv6_egress),
             path,
             rules,
         }),
@@ -959,7 +967,10 @@ impl PausedSession {
         timeout: u64,
         binding: &NaptBinding,
     ) -> EditOutcome<RuleTicket> {
-        if binding.path != self.0.path || binding.has_pppoe() || self.0.pppoe {
+        let same_ipv6_session = self.0.engine == Engine::Ppe0
+            && self.0.pppoe_ipv6_egress.is_some()
+            && self.0.pppoe_ipv6_egress == binding.pppoe_ipv6_egress();
+        if binding.path != self.0.path || ((binding.has_pppoe() || self.0.pppoe) && !same_ipv6_session) {
             return EditOutcome::Rejected(self, EditError::Egress);
         }
         if binding.mtu != self.0.mtu {
@@ -1692,6 +1703,15 @@ mod tests {
         assert_eq!(&bytes[..4], &0x22c20034u32.to_le_bytes());
         assert_eq!(&bytes[60..64], &[0, 0, 0x64, 0x88]);
         assert_eq!(&bytes[76..80], &[0x12, 0x49, 2, 2]);
+        let additional = |sid, peer| NaptBinding::ipv6_route(Tuple6 { source_port: 54001, ..tuple },
+            Some(mac), [2; 6], peer).unwrap().with_direct_egress().unwrap().with_mtu(1492).unwrap()
+            .with_pppoe_session(sid).unwrap();
+        let EditOutcome::Rejected(paused, EditError::Egress) =
+            (unsafe { paused.insert_napt(&mut io, 10, &additional(0x4913, [4; 6])) }) else { panic!("wrong SID") };
+        let EditOutcome::Rejected(paused, EditError::Egress) =
+            (unsafe { paused.insert_napt(&mut io, 10, &additional(0x4912, [6; 6])) }) else { panic!("wrong peer") };
+        let EditOutcome::Updated(paused, _) =
+            (unsafe { paused.insert_napt(&mut io, 10, &additional(0x4912, [4; 6])) }) else { panic!("second tuple") };
         assert!(matches!(unsafe { paused.stop(&mut io, 10) }, Outcome::Restored(_)));
     }
     #[test]

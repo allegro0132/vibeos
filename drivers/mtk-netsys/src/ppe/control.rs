@@ -238,7 +238,7 @@ pub struct Session {
     ingress_cpu: u32,
     mtu: u16,
     pppoe: bool,
-    pppoe_ipv6_egress: Option<[u8; 20]>,
+    pppoe_egress: Option<(bool, [u8; 20])>,
     path: FlowPath,
     rules: Rules,
 }
@@ -622,11 +622,11 @@ impl NaptBinding {
         }
         Ok(self)
     }
-    // Full NETSYS IPv6 L2 rewrite, including both MACs and the PPP session ID.
-    fn pppoe_ipv6_egress(&self) -> Option<[u8; 20]> {
-        if !self.entry.is_ipv6() || !self.has_pppoe() { return None; }
+    // Match the entry family and complete L2 rewrite, including both MACs and the SID.
+    fn pppoe_egress(&self) -> Option<(bool, [u8; 20])> {
+        if !self.has_pppoe() || (!self.entry.is_ipv6() && self.protocol() != Protocol::Tcp) { return None; }
         let start = self.entry.l2_offset();
-        Some(self.entry.0[start..start + 20].try_into().unwrap())
+        Some((self.entry.is_ipv6(), self.entry.0[start..start + 20].try_into().unwrap()))
     }
     fn has_pppoe(&self) -> bool {
         u32::from_le_bytes(self.entry.0[..4].try_into().unwrap()) & super::IB1_PPPOE != 0
@@ -868,7 +868,7 @@ unsafe fn start_table_with(
             ingress_cpu,
             mtu: binding.map_or(1500, |b| b.mtu),
             pppoe,
-            pppoe_ipv6_egress: binding.and_then(NaptBinding::pppoe_ipv6_egress),
+            pppoe_egress: binding.and_then(NaptBinding::pppoe_egress),
             path,
             rules,
         }),
@@ -967,10 +967,10 @@ impl PausedSession {
         timeout: u64,
         binding: &NaptBinding,
     ) -> EditOutcome<RuleTicket> {
-        let same_ipv6_session = self.0.engine == Engine::Ppe0
-            && self.0.pppoe_ipv6_egress.is_some()
-            && self.0.pppoe_ipv6_egress == binding.pppoe_ipv6_egress();
-        if binding.path != self.0.path || ((binding.has_pppoe() || self.0.pppoe) && !same_ipv6_session) {
+        let same_pppoe_session = self.0.engine == Engine::Ppe0
+            && self.0.pppoe_egress.is_some()
+            && self.0.pppoe_egress == binding.pppoe_egress();
+        if binding.path != self.0.path || ((binding.has_pppoe() || self.0.pppoe) && !same_pppoe_session) {
             return EditOutcome::Rejected(self, EditError::Egress);
         }
         if binding.mtu != self.0.mtu {
@@ -1683,6 +1683,32 @@ mod tests {
         assert!(table.is_zero());
         assert_eq!(io.registers[&0x540], 0x20710000);
         assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(WAN, _))));
+    }
+    #[test]
+    fn ipv4_tcp_pppoe_edits_share_only_the_same_encapsulation() {
+        let mut io = mxl_mock();
+        let peer = [2, 0, 0, 0, 0, 2];
+        let rule = |port, sid, dst| {
+            let lan = Tuple { source: [192,168,79,100], destination: [192,168,78,100],
+                source_port: port, destination_port: 443 };
+            let wan = Tuple { source: [192,168,78,1], ..lan };
+            NaptBinding::mxl_lan_to_wan(lan, wan, [2,0x42,0x70,4,0,2], [2,0,0,0,0,1], dst)
+                .unwrap().with_pppoe_session(sid).unwrap().with_protocol(Protocol::Tcp)
+        };
+        let first = rule(45000, 17, peer);
+        let PauseOutcome::Paused(mut owner) = (unsafe { prepare_single_napt(&mut io, table(), 10, &first) })
+            else { panic!("prepare") };
+        for invalid in [rule(45001, 18, peer), rule(45001, 17, [4;6]),
+            rule(45001, 17, peer).with_protocol(Protocol::Udp)] {
+            let EditOutcome::Rejected(paused, EditError::Egress) = (unsafe { owner.insert_napt(&mut io, 10, &invalid) })
+                else { panic!("mixed PPPoE egress") };
+            owner = paused;
+        }
+        let EditOutcome::Updated(owner, second) = (unsafe { owner.insert_napt(&mut io, 10, &rule(45001, 17, peer)) })
+            else { panic!("second TCP connection") };
+        assert_ne!(owner.initial_ticket().unwrap().index(), second.index());
+        let Outcome::Restored(table) = (unsafe { owner.stop(&mut io, 10) }) else { panic!("stop") };
+        assert!(table.is_zero());
     }
     #[test]
     fn ipv6_tcp_pppoe_rule_uses_ipv6_l2_offsets() {

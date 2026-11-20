@@ -210,11 +210,17 @@ impl<I: Io> ReceiveBatch<'_, I> {
         }
     }
 
+    /// Notify DMA of staged RX/TX descriptors without waiting for completion.
+    /// The caller still owns the batch and its forwarding authority.
+    pub fn publish(&mut self) {
+        self.nic.publish_notifications(&mut self.pending);
+        self.count = 0;
+    }
+
     /// Publish all staged descriptors and wait for their release before the
     /// routing owner drains the PPE or processes a control-plane exception.
     pub fn drain_transmit(&mut self, timeout: u64) -> Result<(), Error> {
-        self.nic.publish_notifications(&mut self.pending);
-        self.count = 0;
+        self.publish();
         let start = self.nic.io.now();
         while !self.nic.transmit_drained() {
             self.nic.poll_transmit()?;

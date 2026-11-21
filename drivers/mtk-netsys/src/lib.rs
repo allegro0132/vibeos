@@ -150,6 +150,7 @@ pub struct TxReceipt { slot:usize, generation:u64 }
 pub mod packet_copy;
 pub struct Nic<I: Io> {
     tx_generation:[u64;RING],
+    ppe1_tx: u32,
     outstanding_tx: core::sync::atomic::AtomicU32,
     io: I,
     tx: usize,
@@ -229,6 +230,31 @@ impl<I: Io> ReceiveBatch<'_, I> {
         Ok(())
     }
 
+    /// Wait for all submissions using the PPE1 table, across batches. Native
+    /// egress frames retain their buffers under the normal TX ownership mask.
+    pub fn drain_ppe1_transmit(&mut self, timeout: u64) -> Result<(), Error> {
+        self.publish();
+        let start = self.nic.io.now();
+        loop {
+            self.nic.poll_transmit()?;
+            self.nic.io.barrier();
+            let mut slots = self.nic.ppe1_tx;
+            while slots != 0 {
+                let slot = slots.trailing_zeros() as usize;
+                if self.nic.io.word(slot * 32 + 4) & DONE != 0 {
+                    self.nic.ppe1_tx &= !(1 << slot);
+                }
+                slots &= slots - 1;
+            }
+            if self.nic.ppe1_tx == 0 {
+                return Ok(());
+            }
+            if self.nic.io.now().wrapping_sub(start) >= timeout {
+                return Err(Error::Timeout);
+            }
+        }
+    }
+
     /// Process a CPU-owned RSS exception without injecting it into a fake DMA
     /// RX ring. Busy is checked before the callback; on Pending the caller
     /// retains this buffer. Forwarded output is copied once to permanent TX.
@@ -280,8 +306,9 @@ impl<I: Io> ReceiveBatch<'_, I> {
     /// Transfer the owned RX buffer directly to PPE1. Returning None from select
     /// defers the original descriptor and requires leaving the frame intact.
     /// # Safety
-    /// Retain the isolated PPE1 table and all flow authority through completion
-    /// of all TX in this batch and the subsequent PPE drain.
+    /// Retain the isolated table and flow authority until PPE1-bound TX
+    /// descriptors have completed and the PPE itself has drained. Ordinary
+    /// egress descriptors keep their independent NIC ownership.
     pub unsafe fn receive_ppe1(&mut self, select: impl FnOnce(Received, usize, &mut [u8]) -> Option<(usize, usize)>)
         -> Result<Option<Processed>, Error> {
         if !self.nic.io.tx_offload_supported() { return Err(Error::NotReady); }
@@ -364,13 +391,14 @@ impl<I: Io> Nic<I> {
         self.io.set_word(d+16,if reinject {4<<16} else {match port {TxPort::Internal|TxPort::InternalTagged=>1<<16,TxPort::Wan=>2<<16,TxPort::ExternalTagged=>15<<16}});
         self.io.set_word(d+20,meta.map_or(0,|m|m.word5));self.io.set_word(d+24,meta.map_or(0,|m|m.word6));
         offload::record(meta);self.io.barrier();self.io.set_word(d+4,LAST|((length as u32)<<8));self.io.barrier();
-        self.advance_tx();tx_cost(1,prepared);Ok(TxReceipt{slot,generation})
+        self.advance_tx(reinject);tx_cost(1,prepared);Ok(TxReceipt{slot,generation})
     }
     pub fn new(io: I) -> Self {
         Self {
             io,
             tx: 0,
             tx_generation:[0;RING],
+            ppe1_tx: 0,
             outstanding_tx: core::sync::atomic::AtomicU32::new(0),
             rx: 0,
             ready: false,
@@ -525,7 +553,14 @@ impl<I: Io> Nic<I> {
         if let Err(error) = result { self.ready=false; return Err(error); }
         Ok(())
     }
-    fn advance_tx(&mut self) {
+    fn advance_tx(&mut self, reinject: bool) {
+        // This slot was CPU-owned before staging. On reuse its previous
+        // submission is complete, even if the old mark has not been polled.
+        let bit = 1 << self.tx;
+        self.ppe1_tx &= !bit;
+        if reinject {
+            self.ppe1_tx |= bit;
+        }
         *self.outstanding_tx.get_mut() |= 1 << self.tx;
         self.tx = (self.tx + 1) % RING;
     }
@@ -597,7 +632,7 @@ impl<I: Io> Nic<I> {
         self.io
             .set_word(descriptor + 4, LAST | ((length as u32) << 8));
         self.io.barrier();
-        self.advance_tx();
+        self.advance_tx(false);
         self.notify_transmit()?;
         Ok(())
     }
@@ -685,7 +720,7 @@ impl<I: Io> Nic<I> {
         self.io
             .set_word(descriptor + 4, LAST | ((wire_length as u32) << 8));
         self.io.barrier();
-        self.advance_tx();
+        self.advance_tx(false);
         pending.tx=true;
         Ok(true)
     }
@@ -851,7 +886,7 @@ impl<I: Io> Nic<I> {
                 self.io
                     .set_word(tx_descriptor + 4, LAST | ((wire_length as u32) << 8));
                 self.io.barrier();
-                self.advance_tx();
+                self.advance_tx(reinject);
                 pending.tx = true;
                 true
             }
@@ -1376,10 +1411,17 @@ mod tests {
         }).unwrap().unwrap().transmitted);
         assert_eq!(n.tx_buffers[0], buffer);
         assert_eq!(n.rx_buffers[0], replacement);
-        assert_eq!(n.io.word(20), 0x70000000);
-        assert_eq!(n.io.word(24), 0x1b064);
-        assert_eq!(n.io.word(4), LAST | ((plain.len() as u32) << 8));
-        assert_eq!(&n.io.dma[buffer..buffer + plain.len()], &plain);
+        if cfg!(feature = "tx-offload") {
+            assert_eq!(n.io.word(20), 0x70000000);
+            assert_eq!(n.io.word(24), 0x1b064);
+            assert_eq!(n.io.word(4), LAST | ((plain.len() as u32) << 8));
+            assert_eq!(&n.io.dma[buffer..buffer + plain.len()], &plain);
+        } else {
+            assert_eq!(n.io.word(20), 0);
+            assert_eq!(n.io.word(24), 0);
+            assert_eq!(n.io.word(4), LAST | ((tagged.len() as u32) << 8));
+            assert_eq!(&n.io.dma[buffer..buffer + tagged.len()], &tagged);
+        }
     }
 
     #[test]
@@ -1684,6 +1726,41 @@ mod tests {
         assert_eq!(n.io.word(0), n.io.physical as u32 + base as u32 + 12);
         assert_eq!(n.io.word(16), 4 << 16);
         assert_eq!((n.io.word(20), n.io.word(24)), (0, 0));
+    }
+
+    #[test]
+    fn ppe1_completion_excludes_native_egress_but_keeps_its_buffer_owned() {
+        let mut n = Nic::new_with_rx_headroom(Mock::new());
+        n.initialize(100).unwrap();
+        n.io.offload = true;
+        n.io.set_word(RX + 4, DONE | LAST | (72 << 8));
+        let mut batch = n.receive_batch();
+        unsafe { batch.receive_ppe1(|_, start, _| Some((start + 8, 64))) }
+            .unwrap().unwrap();
+        let ordinary = batch.submit_tracked(TxPort::Wan, &[0; 64], None).unwrap();
+        assert_eq!(batch.drain_ppe1_transmit(5), Err(Error::Timeout));
+        batch.nic.io.set_word(4, DONE);
+        assert_eq!(batch.drain_ppe1_transmit(5), Ok(()));
+        assert!(!batch.nic.tx_completed(ordinary));
+        assert!(!batch.nic.transmit_drained());
+    }
+
+    #[test]
+    fn ppe1_drain_keeps_earlier_slots_and_recognizes_native_reuse() {
+        let mut n = Nic::new(Mock::new());
+        n.initialize(100).unwrap();
+        n.io.offload = true;
+        for slot in 0..RING {
+            n.stage_packet(TxPort::Internal, &[0; 64], None, slot < 2).unwrap();
+        }
+        n.io.set_word(32 + 4, DONE);
+        assert_eq!(n.receive_batch().drain_ppe1_transmit(5), Err(Error::Timeout));
+        n.io.set_word(4, DONE);
+        let replacement = n.stage_tracked(TxPort::Wan, &[0; 64], None).unwrap();
+        assert_eq!(replacement.slot, 0);
+        assert_eq!(n.receive_batch().drain_ppe1_transmit(5), Ok(()));
+        assert!(!n.tx_completed(replacement));
+        assert!(!n.transmit_drained());
     }
 
     #[test]

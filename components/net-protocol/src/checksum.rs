@@ -18,16 +18,18 @@ pub(crate) fn sum(bytes: &[u8]) -> u32 {
             result += (*byte as u32) << (if i & 1 == 0 { 8 } else { 0 });
         }
         let odd = prefix.len() & 1 != 0;
+        let mut lanes = 0u64;
         for &word in words {
             // An odd prefix makes the first byte of each aligned word the low
             // checksum byte. Reversing byte order swaps all four word lanes;
             // lane order is immaterial to their sum.
             let word = if odd { word.to_le() } else { word.to_be() };
-            result += ((word & 0xffff)
-                + ((word >> 16) & 0xffff)
-                + ((word >> 32) & 0xffff)
-                + (word >> 48)) as u32;
+            // Two independent 32-bit lanes, each adding two 16-bit words.
+            // Even a maximum IP packet cannot carry out of the low lane.
+            const MASK: u64 = 0x0000ffff0000ffff;
+            lanes += (word & MASK) + ((word >> 16) & MASK);
         }
+        result += (lanes as u32) + (lanes >> 32) as u32;
         for (i, byte) in suffix.iter().enumerate() {
             result += (*byte as u32) << (if (i + prefix.len()) & 1 == 0 { 8 } else { 0 });
         }

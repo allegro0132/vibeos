@@ -70,12 +70,6 @@ fn failed_table(outcome: Outcome) -> (CpuTable<'static>, Error) {
         Outcome::Restored(table) => (table, Error::Preconditions),
     }
 }
-fn mac_matches(io: &mut impl Registers, base: usize, mac: [u8; 6]) -> bool {
-    mac != [0; 6]
-        && mac[0] & 1 == 0
-        && io.read(base + 8) == u32::from_be_bytes(mac[2..].try_into().unwrap())
-        && io.read(base + 12) == u16::from_be_bytes(mac[..2].try_into().unwrap()) as u32
-}
 impl Pair {
     fn tables(self) -> [CpuTable<'static>; 2] {
         [self.wan.table, self.lan.table]

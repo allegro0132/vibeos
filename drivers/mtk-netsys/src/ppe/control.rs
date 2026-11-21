@@ -99,7 +99,7 @@ impl IngressCutoff {
         if let Some(value) = self.mxl { io.write(0x540, value); }
         // A built-in switch that joined the MxL table returns to PDMA with
         // it. Any other policy there is not this cutoff's to touch.
-        let internal = self.mxl.is_some() && io.read(0x500) == INTERNAL_ADMIT;
+        let internal = self.mxl.is_some() && matches!(io.read(0x500), INTERNAL_ADMIT | INTERNAL_PPPOE_ADMIT);
         if internal { io.write(0x500, INTERNAL_CPU); }
         io.barrier();
         let wan = io.read(0x1500) != self.wan;
@@ -112,7 +112,7 @@ impl IngressCutoff {
         let wan = io.read(0x1500) == self.wan;
         let mxl = self.mxl.is_none_or(|value| {
             let (mxl, internal) = (io.read(0x540), io.read(0x500));
-            mxl == value && internal != INTERNAL_ADMIT
+            mxl == value && !matches!(internal, INTERNAL_ADMIT | INTERNAL_PPPOE_ADMIT)
         });
         wan && mxl
     }
@@ -120,6 +120,7 @@ impl IngressCutoff {
 /// Built-in switch GDMA policy: every class to PDMA, and the same with the
 /// router's own unicast admitted to PPE1 beside the MxL ingress.
 pub(super) const INTERNAL_CPU: u32 = 0xc0700000;
+const INTERNAL_PPPOE_ADMIT: u32 = 0xc1703000;
 pub(super) const INTERNAL_ADMIT: u32 = 0xc1704000;
 
 /// Retains a permanent allocation after uncertain device state. There is no
@@ -238,6 +239,7 @@ pub struct Session {
     ingress_cpu: u32,
     mtu: u16,
     pppoe: bool,
+    builtin_pppoe: bool,
     pppoe_egress: Option<(bool, [u8; 20])>,
     path: FlowPath,
     rules: Rules,
@@ -322,6 +324,12 @@ pub unsafe fn start_empty(
 /// never an arbitrary customer VLAN or a physical-port selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlowPath { QdmaToMxl, WanToInternal, WanToMxl, MxlToWan([u8; 6]) }
+fn mac_matches(io: &mut impl Registers, base: usize, mac: [u8; 6]) -> bool {
+    mac != [0; 6]
+        && mac[0] & 1 == 0
+        && io.read(base + 8) == u32::from_be_bytes(mac[2..].try_into().unwrap())
+        && io.read(base + 12) == u16::from_be_bytes(mac[..2].try_into().unwrap()) as u32
+}
 impl FlowPath {
     fn admission_register(self) -> usize {
         match self { Self::MxlToWan(_) => 0x540, _ => WAN }
@@ -821,6 +829,10 @@ unsafe fn start_table_with(
         rules.insert(RuleRecord::new(ticket, binding.key()));
         initial = Some(ticket);
     }
+    let builtin_pppoe = !admit && pppoe && engine == Engine::Ppe0
+        && binding.is_some_and(|b| !b.entry.is_ipv6())
+        && matches!(path, FlowPath::MxlToWan(mac) if io.read(0x500) == INTERNAL_CPU
+            && mac_matches(io, 0x500, mac));
     let auxiliary = AUX.map(|o| io.read(ppe_reg(engine, o)));
     let result = (|| {
         write_checked(io, ppe_reg(engine, TABLE_CONFIG), before.table_config & !BACKGROUND)?;
@@ -868,6 +880,7 @@ unsafe fn start_table_with(
             ingress_cpu,
             mtu: binding.map_or(1500, |b| b.mtu),
             pppoe,
+            builtin_pppoe,
             pppoe_egress: binding.and_then(NaptBinding::pppoe_egress),
             path,
             rules,
@@ -912,7 +925,7 @@ impl PausedSession {
     pub fn drain_pppoe_peer(&self, io: &mut impl Registers, uplink: &Session, timeout: u64) -> Result<(), Error> {
         if self.0.path != FlowPath::QdmaToMxl || self.0.engine != Engine::Ppe1
             || uplink.engine != Engine::Ppe0 || !uplink.pppoe || !matches!(uplink.path, FlowPath::MxlToWan(_))
-            || !uplink.path.ingress_matches(io) || !matches!(io.read(0x540), 0x20713000 | 0x20710000)
+            || !uplink.pppoe_ingress_matches(io) || !matches!(io.read(0x540), 0x20713000 | 0x20710000)
             || io.read(WAN) != self.0.ingress_cpu || io.read(TABLE_BASE) != uplink.table.region().base() {
             return Err(Error::Preconditions);
         }
@@ -1055,7 +1068,13 @@ impl PausedSession {
             {
                 return Err(Error::Preconditions);
             }
-            write_checked(io, session.path.admission_register(), session.path.admission_value(session.ingress_cpu, engine))
+            if session.builtin_pppoe {
+                let FlowPath::MxlToWan(mac) = session.path else { return Err(Error::Preconditions); };
+                if io.read(0x500) != INTERNAL_CPU || !mac_matches(io, 0x500, mac) { return Err(Error::Preconditions); }
+            }
+            write_checked(io, session.path.admission_register(), session.path.admission_value(session.ingress_cpu, engine))?;
+            if session.builtin_pppoe { write_checked(io, 0x500, INTERNAL_PPPOE_ADMIT)?; }
+            Ok(())
         })();
         match result {
             Ok(()) => StartOutcome::Active(session),
@@ -1073,6 +1092,12 @@ impl PausedSession {
 }
 
 impl Session {
+    fn pppoe_ingress_matches(&self, io: &mut impl Registers) -> bool {
+        if !self.builtin_pppoe || io.read(0x500) == INTERNAL_CPU { return self.path.ingress_matches(io); }
+        matches!(self.path, FlowPath::MxlToWan(mac) if io.read(0x500) == INTERNAL_PPPOE_ADMIT
+            && io.read(WAN) == 0x20710000 && mac_matches(io, 0x540, mac) && mac_matches(io, 0x500, mac))
+    }
+
     /// Whether this exact installation is awaiting drain and final removal.
     pub fn retirement_pending(&self, ticket: RuleTicket) -> bool {
         self.rules.get(ticket).is_some_and(|r| r.retiring)
@@ -1096,7 +1121,8 @@ impl Session {
         if record.retiring {
             return RetireOutcome::Rejected(self, RetireError::AlreadyPending);
         }
-        let valid = self.path.ingress_matches(io)
+        let valid = self.pppoe_ingress_matches(io)
+            && (!self.builtin_pppoe || io.read(0x500) == INTERNAL_PPPOE_ADMIT)
             && io.read(self.path.admission_register()) == self.path.admission_value(self.ingress_cpu, engine)
             && io.read(ppe_reg(engine, TABLE_BASE)) == self.table.region().base()
             && io.read(ppe_reg(engine, GLOBAL)) & ENABLE != 0
@@ -1131,6 +1157,7 @@ impl Session {
             if timeout == 0 || timeout >= 1 << 63 {
                 return Err(Error::Preconditions);
             }
+            if self.builtin_pppoe { write_checked(io, 0x500, INTERNAL_CPU)?; }
             write_checked(io, self.path.admission_register(), self.ingress_cpu)?;
             if !self.path.ingress_matches(io) { return Err(Error::Preconditions); }
             idle_on(io, engine, timeout)
@@ -1153,6 +1180,7 @@ impl Session {
                 return Err(Error::Preconditions);
             }
             // Stop new selected admission before stopping lookup or touching base.
+            if self.builtin_pppoe { write_checked(io, 0x500, INTERNAL_CPU)?; }
             write_checked(io, self.path.admission_register(), self.ingress_cpu)?;
             if !self.path.ingress_matches(io) { return Err(Error::Preconditions); }
             idle_on(io, engine, timeout)?;
@@ -1684,6 +1712,27 @@ mod tests {
         assert_eq!(io.registers[&0x540], 0x20710000);
         assert!(!io.ops.iter().any(|op| matches!(op, Op::Write(WAN, _))));
     }
+    #[test]
+    fn ipv4_pppoe_builtin_gate_follows_pause_resume_and_irq_cutoff() {
+        let mut io = mxl_mock();
+        for (to, from) in [(0x508, 0x548), (0x50c, 0x54c)] {
+            let mac = io.read(from);
+            io.registers.insert(to, mac);
+        }
+        io.registers.insert(0x500, INTERNAL_CPU);
+        let rule = outbound_binding().with_pppoe_session(42).unwrap();
+        let PauseOutcome::Paused(paused) = (unsafe { prepare_single_napt(&mut io, table(), 10, &rule) })
+            else { panic!("prepare") };
+        let StartOutcome::Active(active) = (unsafe { paused.resume(&mut io) }) else { panic!("resume") };
+        assert_eq!(io.read(0x500), INTERNAL_PPPOE_ADMIT);
+        let cutoff = IngressCutoff::new(0x20710000, Some(0x20710000)).unwrap();
+        assert!(!cutoff.closed(&mut io));
+        unsafe { cutoff.close(&mut io) }.unwrap();
+        assert!(cutoff.closed(&mut io));
+        assert_eq!(io.read(0x500), INTERNAL_CPU);
+        assert!(matches!(unsafe { active.stop(&mut io, 10) }, Outcome::Restored(_)));
+    }
+
     #[test]
     fn ipv4_tcp_pppoe_edits_share_only_the_same_encapsulation() {
         let mut io = mxl_mock();

@@ -107,6 +107,18 @@ pub fn inspect(frame: &[u8], ingress_mac: [u8; 6]) -> Result<Inspected, Error> {
     })
 }
 
+/// Inspect an IPv4 datagram from an already authenticated link envelope.
+pub fn inspect_datagram(ip: &[u8]) -> Result<Inspected, Error> {
+    let (length, transport) = Packet::validate_datagram(ip)?;
+    Ok(Inspected {
+        source: ip[12..16].try_into().unwrap(),
+        destination: ip[16..20].try_into().unwrap(),
+        transport,
+        ttl: ip[8],
+        ip_length: length,
+    })
+}
+
 impl<'a> Packet<'a> {
     /// Only ordinary unicast Ethernet IPv4 directed at `ingress_mac` is eligible.
     /// Subnet-directed broadcast and source validation are route/policy checks.
@@ -126,7 +138,11 @@ impl<'a> Packet<'a> {
         {
             return Err(Error::Ethernet);
         }
-        let ip = &frame[14..];
+        Self::validate_datagram(&frame[14..])
+    }
+
+    fn validate_datagram(ip: &[u8]) -> Result<(usize, Transport), Error> {
+        if ip.len() < 20 { return Err(Error::Truncated); }
         let header = (ip[0] as usize & 15) * 4;
         if ip[0] >> 4 != 4 || header < 20 {
             return Err(Error::Header);

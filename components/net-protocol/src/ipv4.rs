@@ -97,7 +97,13 @@ pub struct Inspected {
 /// Apply the same address, protocol, fragmentation and checksum checks as
 /// Packet::parse without requiring a writable mapping of the packet.
 pub fn inspect(frame: &[u8], ingress_mac: [u8; 6]) -> Result<Inspected, Error> {
-    let (length, transport) = Packet::validate(frame, ingress_mac)?;
+    inspect_rx(frame, ingress_mac, false)
+}
+
+/// A NIC may vouch for the TCP checksum of this exact, immutable IPv4 frame.
+/// All Ethernet, IPv4 header, length, fragment and transport layout checks remain.
+pub fn inspect_rx(frame: &[u8], ingress_mac: [u8; 6], tcp_checksum_verified: bool) -> Result<Inspected, Error> {
+    let (length, transport) = Packet::validate(frame, ingress_mac, tcp_checksum_verified)?;
     Ok(Inspected {
         source: frame[26..30].try_into().unwrap(),
         destination: frame[30..34].try_into().unwrap(),
@@ -109,7 +115,7 @@ pub fn inspect(frame: &[u8], ingress_mac: [u8; 6]) -> Result<Inspected, Error> {
 
 /// Inspect an IPv4 datagram from an already authenticated link envelope.
 pub fn inspect_datagram(ip: &[u8]) -> Result<Inspected, Error> {
-    let (length, transport) = Packet::validate_datagram(ip)?;
+    let (length, transport) = Packet::validate_datagram(ip, false)?;
     Ok(Inspected {
         source: ip[12..16].try_into().unwrap(),
         destination: ip[16..20].try_into().unwrap(),
@@ -123,11 +129,11 @@ impl<'a> Packet<'a> {
     /// Only ordinary unicast Ethernet IPv4 directed at `ingress_mac` is eligible.
     /// Subnet-directed broadcast and source validation are route/policy checks.
     pub fn parse(frame: &'a mut [u8], ingress_mac: [u8; 6]) -> Result<Self, Error> {
-        let (length, transport) = Self::validate(frame, ingress_mac)?;
+        let (length, transport) = Self::validate(frame, ingress_mac, false)?;
         Ok(Self { frame, length, transport })
     }
 
-    fn validate(frame: &[u8], ingress_mac: [u8; 6]) -> Result<(usize, Transport), Error> {
+    fn validate(frame: &[u8], ingress_mac: [u8; 6], tcp_checksum_verified: bool) -> Result<(usize, Transport), Error> {
         if frame.len() < 34 {
             return Err(Error::Truncated);
         }
@@ -138,10 +144,10 @@ impl<'a> Packet<'a> {
         {
             return Err(Error::Ethernet);
         }
-        Self::validate_datagram(&frame[14..])
+        Self::validate_datagram(&frame[14..], tcp_checksum_verified)
     }
 
-    fn validate_datagram(ip: &[u8]) -> Result<(usize, Transport), Error> {
+    fn validate_datagram(ip: &[u8], tcp_checksum_verified: bool) -> Result<(usize, Transport), Error> {
         if ip.len() < 20 { return Err(Error::Truncated); }
         let header = (ip[0] as usize & 15) * 4;
         if ip[0] >> 4 != 4 || header < 20 {
@@ -179,7 +185,7 @@ impl<'a> Packet<'a> {
                 {
                     return Err(Error::Transport);
                 }
-                if fold(pseudo + sum(payload)) != 0xffff {
+                if !tcp_checksum_verified && fold(pseudo + sum(payload)) != 0xffff {
                     return Err(Error::Checksum);
                 }
                 Transport::Tcp {
@@ -384,3 +390,38 @@ impl<'a> Packet<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod nic_checksum_tests {
+    use super::*;
+
+    #[test]
+    fn tcp_proof_only_skips_transport_checksum_for_that_frame() {
+        let mac = [2, 0, 0, 0, 0, 1];
+        let mut f = [0; 54];
+        f[..6].copy_from_slice(&mac);
+        f[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        f[12..15].copy_from_slice(&[8, 0, 0x45]);
+        f[16..18].copy_from_slice(&40u16.to_be_bytes());
+        f[22..24].copy_from_slice(&[64, 6]);
+        f[26..34].copy_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2]);
+        f[46] = 0x50;
+        let fix_header = |f: &mut [u8]| {
+            f[24..26].fill(0);
+            let checksum = !fold(sum(&f[14..34]));
+            f[24..26].copy_from_slice(&checksum.to_be_bytes());
+        };
+        fix_header(&mut f);
+        assert!(matches!(inspect(&f, mac), Err(Error::Checksum)));
+        assert!(matches!(inspect_rx(&f, mac, true).unwrap().transport, Transport::Tcp { .. }));
+        f[46] = 0;
+        assert!(matches!(inspect_rx(&f, mac, true), Err(Error::Transport)));
+        f[46] = 0x50;
+        f[24] ^= 1;
+        assert!(matches!(inspect_rx(&f, mac, true), Err(Error::Checksum)));
+        f[23] = 17;
+        f[38..42].copy_from_slice(&[0, 20, 0, 1]);
+        fix_header(&mut f);
+        assert!(matches!(inspect_rx(&f, mac, true), Err(Error::Checksum)));
+    }
+}

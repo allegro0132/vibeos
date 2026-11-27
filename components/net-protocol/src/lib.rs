@@ -15,7 +15,19 @@
 
 extern crate alloc;
 
+#[cfg(feature = "receive-ring")]
+pub mod receive_ring;
+#[cfg(feature = "payload-wipe")]
+pub mod wipe;
+pub mod tx_packet;
+#[cfg(feature = "pppoe")]
+pub mod pppoe;
+#[cfg(feature = "packet-offload")]
+pub mod packet_accel;
 pub mod command;
+pub mod dhcp_server;
+pub mod dns_relay;
+pub mod vlan;
 pub mod arp;
 mod checksum;
 pub mod ipv4;

@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+payload-wipe = ["dep:zeroize"]
+receive-ring = ["payload-wipe", "smoltcp/tcp-buffer-exchange"]
+pppoe = ["dep:md-5"]
+pppoe-test-fixtures = ["pppoe"]
+packet-offload = ["smoltcp/proto-ipv6"]
+packet-offload-test-fixtures = ["packet-offload"]
 # Explicit board/service policy; other images keep their current ICMP behavior.
 icmp-echo = ["smoltcp/auto-icmp-echo-reply"]
 gro-prefix-views = ["gro-checked"]
@@ -32,6 +38,8 @@ bounded-gro = []
 tcp-large-window = []
 
 [dependencies]
+zeroize = { version = "1", default-features = false, optional = true }
+md-5 = { version = "0.10", default-features = false, optional = true }
 smoltcp = { version = "=0.14.0", default-features = false, features = [
     "alloc",
     "medium-ethernet",

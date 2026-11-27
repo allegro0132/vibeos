@@ -39,6 +39,7 @@ mod lock_stall;
 #[cfg(feature = "lock-stall-probe")]
 pub use lock_stall::{LoopStallKind, LoopStallProbe};
 pub mod sync;
+pub mod work_slots;
 
 pub mod net_segmentation;
 

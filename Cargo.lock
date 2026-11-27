@@ -36,6 +36,19 @@ dependencies = [
 [[package]]
 name = "aes-gcm"
 version = "0.11.0"
+dependencies = [
+ "aead",
+ "aes",
+ "cipher 0.5.2",
+ "ctr",
+ "ghash",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
@@ -1321,6 +1334,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2161,7 +2184,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d801accda99469cde6d73da741422610fdf6508a72d9a69d1b55cb241c720597"
 dependencies = [
  "aes",
- "aes-gcm",
+ "aes-gcm 0.11.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "chacha20 0.10.1",
  "cipher 0.5.2",
  "des",
@@ -3150,9 +3173,11 @@ dependencies = [
 name = "vibeos-net-protocol"
 version = "0.1.0"
 dependencies = [
+ "md-5",
  "smoltcp",
  "vibeos-core",
  "vibeos-net-api",
+ "zeroize",
 ]
 
 [[package]]
@@ -3246,6 +3271,16 @@ dependencies = [
  "vibeos-durable-format",
  "vibeos-segment-format",
  "vibeos-storage-device",
+]
+
+[[package]]
+name = "vibeos-sf21h8898"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.11.0",
+ "vibeos-core",
+ "vibeos-hal",
+ "vibeos-net-protocol",
 ]
 
 [[package]]

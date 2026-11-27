@@ -1,0 +1,20 @@
+[package]
+name = "vibeos-sf21h8898"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+wrap-memcpy = ["extended-dma"]
+extended-dma = ["vibeos-net-protocol/packet-offload"]
+local-offload = ["extended-dma"]
+ce-queue = ["extended-dma"]
+ce-service-profile = ["extended-dma"]
+ce-record-profile = ["extended-dma"]
+ce-poll-profile = ["extended-dma"]
+copy-profile = ["extended-dma"]
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+vibeos-hal = { path = "../../hal" }
+vibeos-core = { path = "../../core" }
+vibeos-net-protocol = { path = "../../components/net-protocol" }
+aes-gcm = { path = "../../vendor/aes-gcm", default-features = false, features = ["aes", "eip197-backend"] }

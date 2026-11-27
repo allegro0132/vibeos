@@ -240,7 +240,7 @@ pub struct Session {
     mtu: u16,
     pppoe: bool,
     builtin_pppoe: bool,
-    pppoe_egress: Option<(bool, [u8; 20])>,
+    pppoe_egress: Option<[u8; 20]>,
     path: FlowPath,
     rules: Rules,
 }
@@ -630,11 +630,11 @@ impl NaptBinding {
         }
         Ok(self)
     }
-    // Match the entry family and complete L2 rewrite, including both MACs and the SID.
-    fn pppoe_egress(&self) -> Option<(bool, [u8; 20])> {
-        if !self.has_pppoe() || (!self.entry.is_ipv6() && self.protocol() != Protocol::Tcp) { return None; }
+    // IPv4 and IPv6 encode the same PPPoE Ethernet rewrite at different offsets.
+    fn pppoe_egress(&self) -> Option<[u8; 20]> {
+        if !self.has_pppoe() { return None; }
         let start = self.entry.l2_offset();
-        Some((self.entry.is_ipv6(), self.entry.0[start..start + 20].try_into().unwrap()))
+        Some(self.entry.0[start..start + 20].try_into().unwrap())
     }
     fn has_pppoe(&self) -> bool {
         u32::from_le_bytes(self.entry.0[..4].try_into().unwrap()) & super::IB1_PPPOE != 0
@@ -1747,8 +1747,7 @@ mod tests {
         let first = rule(45000, 17, peer);
         let PauseOutcome::Paused(mut owner) = (unsafe { prepare_single_napt(&mut io, table(), 10, &first) })
             else { panic!("prepare") };
-        for invalid in [rule(45001, 18, peer), rule(45001, 17, [4;6]),
-            rule(45001, 17, peer).with_protocol(Protocol::Udp)] {
+        for invalid in [rule(45001, 18, peer), rule(45001, 17, [4;6])] {
             let EditOutcome::Rejected(paused, EditError::Egress) = (unsafe { owner.insert_napt(&mut io, 10, &invalid) })
                 else { panic!("mixed PPPoE egress") };
             owner = paused;
@@ -1756,6 +1755,14 @@ mod tests {
         let EditOutcome::Updated(owner, second) = (unsafe { owner.insert_napt(&mut io, 10, &rule(45001, 17, peer)) })
             else { panic!("second TCP connection") };
         assert_ne!(owner.initial_ticket().unwrap().index(), second.index());
+        let v6 = NaptBinding::ipv6_route(Tuple6 { source: [0x20; 16], destination: [0x21; 16],
+            source_port: 45002, destination_port: 443 }, Some([2,0x42,0x70,4,0,2]),
+            [2,0,0,0,0,1], peer).unwrap().with_direct_egress().unwrap().with_pppoe_session(17).unwrap();
+        let EditOutcome::Updated(owner, v6_ticket) = (unsafe { owner.insert_napt(&mut io, 10, &v6) })
+            else { panic!("same-session IPv6 connection") };
+        let EditOutcome::Updated(owner, ()) = (unsafe { owner.remove_napt(&mut io, 10, second) })
+            else { panic!("remove IPv4 connection") };
+        assert!(owner.0.rules.get(v6_ticket).is_some());
         let Outcome::Restored(table) = (unsafe { owner.stop(&mut io, 10) }) else { panic!("stop") };
         assert!(table.is_zero());
     }

@@ -93,6 +93,12 @@ fn power(value: u16, state: u16) -> Result<()> {
     }
     Ok(())
 }
+/// BMSR link status is latch-low. The second read reports current carrier.
+pub fn carrier() -> Result<bool> {
+    mdio(PHY, 1, None)?;
+    Ok(mdio(PHY, 1, None)? & 4 != 0)
+}
+
 pub fn start_lan_phy() -> Result<()> {
     if mdio(6, 2, None)? != 0xadb4 || mdio(6, 3, None)? != 0x0412 {
         return Err("SF1211F ID");
